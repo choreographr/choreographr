@@ -101,6 +101,13 @@ pub(crate) fn build_chat_completions_body(
             params.model,
         )
     });
+    // Extended prompt-cache retention is per model and opt-in; the resolver
+    // emits nothing unless the model declares both a dialect and a long TTL
+    // tier. Chat Completions never carries the newer `prompt_cache_options`
+    // spelling (`is_responses = false`): its only extended value is
+    // Responses-API-only.
+    let retention =
+        crate::cache_retention::cache_retention_fields(&config.provider_slug, params.model, false);
     serde_json::to_value(&ChatCompletionsRequest {
         model: params.model,
         messages: &wire.messages,
@@ -112,6 +119,8 @@ pub(crate) fn build_chat_completions_body(
         reasoning_effort: params.reasoning_effort,
         prompt_cache_key: affinity.prompt_cache_key,
         session_id: affinity.session_id,
+        prompt_cache_retention: retention.prompt_cache_retention,
+        prompt_cache_options: retention.prompt_cache_options,
     })
     .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))
 }

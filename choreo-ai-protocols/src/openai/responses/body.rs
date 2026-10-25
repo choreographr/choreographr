@@ -202,6 +202,10 @@ pub(super) fn build_responses_request_body(
             params.model,
         )
     });
+    // Extended prompt-cache retention, per model and opt-in. The Responses API
+    // is where the newer dialect's extended `"12h"` value is accepted.
+    let retention =
+        crate::cache_retention::cache_retention_fields(&config.provider_slug, params.model, true);
 
     let body = serde_json::to_value(&ResponsesRequest {
         model: params.model,
@@ -219,6 +223,8 @@ pub(super) fn build_responses_request_body(
         tool_choice,
         prompt_cache_key: affinity.prompt_cache_key,
         session_id: affinity.session_id,
+        prompt_cache_retention: retention.prompt_cache_retention,
+        prompt_cache_options: retention.prompt_cache_options,
     })
     .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
 
@@ -253,6 +259,10 @@ pub(super) fn build_simple_responses_body(
         // The one-shot prompt API carries no session, so no cache-affinity hint.
         prompt_cache_key: None,
         session_id: None,
+        // Retention is a per-model turn policy; the session-less one-shot
+        // prompt helper sends none.
+        prompt_cache_retention: None,
+        prompt_cache_options: None,
     })
     .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
     Ok((url, body))

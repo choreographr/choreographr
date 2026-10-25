@@ -16,6 +16,7 @@ use tracing::trace;
 
 use choreo_proto::{ChatReasoningField, ReasoningCapability};
 
+use crate::cache_retention::CacheRetentionDialect;
 use crate::openai::RequestFormat;
 use crate::session_routing::CacheAffinity;
 
@@ -140,6 +141,24 @@ pub fn cache_affinity(provider_slug: &str) -> CacheAffinity {
         .iter()
         .find(|e| e.slug == provider_slug)
         .map_or_default(|e| e.cache_affinity)
+}
+
+/// The extended prompt-cache retention dialect the catalog declares for a
+/// **specific model**, or [`CacheRetentionDialect::None`] for an unknown
+/// provider/model (or one the overlay did not opt in).
+///
+/// Deliberately per-model: the retention field's spelling depends on the
+/// model's generation (pre-GPT-5.6 `prompt_cache_retention` vs GPT-5.6+
+/// `prompt_cache_options`), and a provider that serves both cannot carry one
+/// value. There is no provider-level fallback for that reason.
+///
+/// This reports only the declared spelling; the request-time resolver in
+/// `cache_retention` additionally requires the model to declare a long TTL
+/// tier before emitting anything.
+#[must_use]
+pub fn cache_retention(provider_slug: &str, model: &str) -> CacheRetentionDialect {
+    with_model_fact(provider_slug, model, |m| m.cache_retention)
+        .unwrap_or(CacheRetentionDialect::None)
 }
 
 /// Look up the context window for a model on a given provider.

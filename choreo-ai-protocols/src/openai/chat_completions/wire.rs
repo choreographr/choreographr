@@ -12,6 +12,7 @@ use tracing::debug;
 
 use super::super::{AssistantToolCall, ChatToolDefinition, Usage};
 use super::reasoning_stream::{ReasoningStreamState, TurnReasoning};
+use crate::cache_retention::CacheRetentionOptions;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 
 // ── Chat Completions wire types ──────────────────────────────────────────
@@ -47,6 +48,17 @@ where
     /// two affinity fields is set for a given request.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<&'a str>,
+    /// Extended prompt-cache retention for pre-GPT-5.6 `OpenAI` models (see
+    /// [`crate::CacheRetentionDialect`]); omitted unless the model opted in and
+    /// declares a long TTL tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_retention: Option<&'static str>,
+    /// Extended prompt-cache retention for GPT-5.6+ `OpenAI` models, nested
+    /// under `prompt_cache_options`. Never emitted on Chat Completions: the
+    /// only extended value (`"12h"`) is Responses-API-only, so the field is
+    /// present for wire symmetry but stays `None` here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_options: Option<CacheRetentionOptions>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]

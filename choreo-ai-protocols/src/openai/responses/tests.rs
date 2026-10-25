@@ -156,6 +156,8 @@ fn responses_request_serializes_with_store_true() {
         tool_choice: None,
         prompt_cache_key: None,
         session_id: None,
+        prompt_cache_retention: None,
+        prompt_cache_options: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     assert_eq!(value["store"], true);
@@ -190,6 +192,8 @@ fn responses_request_serializes_with_tools() {
         tool_choice: None,
         prompt_cache_key: None,
         session_id: None,
+        prompt_cache_retention: None,
+        prompt_cache_options: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     let tools = value["tools"].as_array().unwrap();
@@ -222,6 +226,8 @@ fn responses_request_serializes_with_programmatic_tool_calling() {
         tool_choice: None,
         prompt_cache_key: None,
         session_id: None,
+        prompt_cache_retention: None,
+        prompt_cache_options: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     let tools = value["tools"].as_array().unwrap();
@@ -247,6 +253,8 @@ fn responses_request_omits_optional_fields_when_none() {
         tool_choice: None,
         prompt_cache_key: None,
         session_id: None,
+        prompt_cache_retention: None,
+        prompt_cache_options: None,
     };
     let value = serde_json::to_value(&req).unwrap();
     let obj = value.as_object().unwrap();
@@ -1324,4 +1332,114 @@ fn responses_max_output_tokens_prefers_the_override() {
     };
     assert_eq!(build(Some(1))["max_output_tokens"], 1);
     assert_eq!(build(None)["max_output_tokens"], 4096);
+}
+
+// -- extended prompt-cache retention --------------------------------
+
+/// Build a Responses body for `provider`/`model` whose catalog entry declares
+/// `dialect` and (when `long_secs` is `Some`) a long TTL tier. The catalog is
+/// swapped under the catalog lock and restored on drop.
+fn retention_responses_body(
+    provider: &str,
+    model: &str,
+    dialect: crate::CacheRetentionDialect,
+    long_secs: Option<u32>,
+) -> serde_json::Value {
+    let mut catalog = crate::catalog::test_util::tiny_catalog();
+    catalog[0].slug = provider.to_string();
+    let entry = &mut catalog[0].models[0];
+    entry.model = model.to_string();
+    entry.cache_retention = dialect;
+    entry.prompt_cache = Some(crate::PromptCacheTtl {
+        short_secs: Some(300),
+        long_secs,
+    });
+    crate::catalog::replace_catalog(catalog);
+
+    let config = super::super::ServiceConfig {
+        provider_slug: provider.to_string(),
+        ..Default::default()
+    };
+    let mut no_retry = None;
+    let params = super::super::TurnParams {
+        model,
+        messages: &[],
+        tools: &[],
+        reasoning_effort: None,
+        on_retry: &mut no_retry,
+        on_uploaded: None,
+        cancel_rx: None,
+        route: None,
+        previous_response_id: None,
+        tool_results: &[],
+        programmatic_tool_calling: false,
+        max_output_tokens_override: None,
+        no_retry: false,
+    };
+    build_responses_request_body(&config, &params, false)
+        .expect("body builds")
+        .1
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn responses_body_emits_no_retention_by_default() {
+    let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
+    let body = retention_responses_body(
+        "retention-responses-test",
+        "ret-model",
+        crate::CacheRetentionDialect::None,
+        Some(86_400),
+    );
+    assert!(body.get("prompt_cache_retention").is_none(), "{body}");
+    assert!(body.get("prompt_cache_options").is_none(), "{body}");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn responses_body_emits_the_pre_5_6_retention_spelling() {
+    let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
+    let body = retention_responses_body(
+        "retention-responses-test",
+        "ret-model",
+        crate::CacheRetentionDialect::PromptCacheRetention,
+        Some(86_400),
+    );
+    assert_eq!(body["prompt_cache_retention"], "24h");
+    assert!(body.get("prompt_cache_options").is_none(), "{body}");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn responses_body_emits_the_12h_options_spelling() {
+    // The Responses API is where the newer dialect's extended `12h` value is
+    // accepted; it nests under `prompt_cache_options.ttl` and never coexists
+    // with the older top-level field.
+    let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
+    let body = retention_responses_body(
+        "retention-responses-test",
+        "ret-model",
+        crate::CacheRetentionDialect::PromptCacheOptions,
+        Some(43_200),
+    );
+    assert_eq!(body["prompt_cache_options"]["ttl"], "12h");
+    assert!(body.get("prompt_cache_retention").is_none(), "{body}");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn responses_body_withholds_retention_after_a_rejected_field() {
+    let provider = "retention-rejected-responses-test";
+    let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
+    crate::session_routing::note_cache_field_rejected(
+        provider,
+        crate::cache_retention::PROMPT_CACHE_OPTIONS_FIELD,
+    );
+    let body = retention_responses_body(
+        provider,
+        "ret-model",
+        crate::CacheRetentionDialect::PromptCacheOptions,
+        Some(43_200),
+    );
+    assert!(body.get("prompt_cache_options").is_none(), "{body}");
 }

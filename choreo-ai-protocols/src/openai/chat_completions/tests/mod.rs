@@ -669,6 +669,8 @@ fn chat_completions_request_omits_reasoning_effort_when_none() {
         reasoning_effort: None,
         prompt_cache_key: None,
         session_id: None,
+        prompt_cache_retention: None,
+        prompt_cache_options: None,
     })
     .unwrap();
     assert!(body.get("reasoning_effort").is_none(), "should be omitted");
@@ -1432,6 +1434,8 @@ fn max_tokens_override_lands_in_the_models_output_field() {
             reasoning_effort: None,
             prompt_cache_key: None,
             session_id: None,
+            prompt_cache_retention: None,
+            prompt_cache_options: None,
         })
         .unwrap()
     };
@@ -1526,4 +1530,136 @@ fn body_sends_no_affinity_without_a_session_id() {
     let body = affinity_body(crate::CacheAffinity::PromptCacheKey, None);
     assert!(body.get("prompt_cache_key").is_none(), "{body}");
     assert!(body.get("session_id").is_none(), "{body}");
+}
+
+// -- extended prompt-cache retention --------------------------------
+//
+// Retention is per model and gated on the curated long TTL, so these tests
+// swap the process-global catalog with a one-model entry that declares the
+// dialect and long tier. The swap is serialized under the catalog key and the
+// guard restores the bundled catalog on drop.
+
+/// Build a plain chat body for `provider`/`model` with no catalog-dependent
+/// overrides, so only the retention resolver contributes a selector.
+fn retention_body(provider: &str, model: &str) -> serde_json::Value {
+    let config = super::super::ServiceConfig {
+        provider_slug: provider.to_string(),
+        ..Default::default()
+    };
+    let messages = [ChatRequestMessage::simple("user", "hi".into())];
+    build_chat_completions_body(
+        &config,
+        &ChatCompletionsBodyParams {
+            model,
+            messages: &messages,
+            tools: None,
+            stream: false,
+            stream_options: None,
+            reasoning_effort: None,
+            max_output_tokens_override: None,
+            session_id: None,
+        },
+    )
+    .unwrap()
+}
+
+/// Swap in a catalog whose single model declares `dialect` and a long TTL tier
+/// (or none, when `long_secs` is `None`).
+fn replace_with_retention_catalog(
+    model: &str,
+    dialect: crate::CacheRetentionDialect,
+    long_secs: Option<u32>,
+) -> crate::catalog::test_util::RestoreBundledOnDrop {
+    let restore = crate::catalog::test_util::RestoreBundledOnDrop;
+    let mut catalog = crate::catalog::test_util::tiny_catalog();
+    catalog[0].slug = "retention-chat-test".to_string();
+    let entry = &mut catalog[0].models[0];
+    entry.model = model.to_string();
+    entry.cache_retention = dialect;
+    entry.prompt_cache = Some(crate::PromptCacheTtl {
+        short_secs: Some(300),
+        long_secs,
+    });
+    crate::catalog::replace_catalog(catalog);
+    restore
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn body_emits_no_retention_by_default() {
+    // The `None` dialect emits nothing even though the model declares a long
+    // tier — the overlay must opt in explicitly.
+    let _restore =
+        replace_with_retention_catalog("ret-old", crate::CacheRetentionDialect::None, Some(86_400));
+    let body = retention_body("retention-chat-test", "ret-old");
+    assert!(body.get("prompt_cache_retention").is_none(), "{body}");
+    assert!(body.get("prompt_cache_options").is_none(), "{body}");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn body_emits_the_pre_5_6_retention_spelling() {
+    let _restore = replace_with_retention_catalog(
+        "ret-old",
+        crate::CacheRetentionDialect::PromptCacheRetention,
+        Some(86_400),
+    );
+    let body = retention_body("retention-chat-test", "ret-old");
+    assert_eq!(body["prompt_cache_retention"], "24h");
+    assert!(body.get("prompt_cache_options").is_none(), "{body}");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn body_requires_a_declared_long_tier() {
+    // The dialect alone is not enough: without a curated long tier there is no
+    // extended retention to ask for, so nothing is emitted.
+    let _restore = replace_with_retention_catalog(
+        "ret-old",
+        crate::CacheRetentionDialect::PromptCacheRetention,
+        None,
+    );
+    let body = retention_body("retention-chat-test", "ret-old");
+    assert!(body.get("prompt_cache_retention").is_none(), "{body}");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn body_never_emits_the_12h_options_spelling_on_chat_completions() {
+    // `prompt_cache_options.ttl = "12h"` is Responses-only; Chat Completions
+    // omits the selector entirely rather than sending an unsupported value.
+    let _restore = replace_with_retention_catalog(
+        "ret-new",
+        crate::CacheRetentionDialect::PromptCacheOptions,
+        Some(43_200),
+    );
+    let body = retention_body("retention-chat-test", "ret-new");
+    assert!(body.get("prompt_cache_options").is_none(), "{body}");
+    assert!(body.get("prompt_cache_retention").is_none(), "{body}");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn body_withholds_retention_after_a_rejected_field() {
+    // A 400 naming the retention field downgrades the provider; the next body
+    // carries no selector. The slug is unique because the registry is
+    // process-wide, and the catalog is swapped so the model would otherwise
+    // emit.
+    let provider = "retention-rejected-chat-test";
+    let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
+    let mut catalog = crate::catalog::test_util::tiny_catalog();
+    catalog[0].slug = provider.to_string();
+    catalog[0].models[0].model = "ret-old".to_string();
+    catalog[0].models[0].cache_retention = crate::CacheRetentionDialect::PromptCacheRetention;
+    catalog[0].models[0].prompt_cache = Some(crate::PromptCacheTtl {
+        short_secs: Some(300),
+        long_secs: Some(86_400),
+    });
+    crate::catalog::replace_catalog(catalog);
+    crate::session_routing::note_cache_field_rejected(
+        provider,
+        crate::cache_retention::PROMPT_CACHE_RETENTION_FIELD,
+    );
+    let body = retention_body(provider, "ret-old");
+    assert!(body.get("prompt_cache_retention").is_none(), "{body}");
 }

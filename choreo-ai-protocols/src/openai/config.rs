@@ -659,7 +659,7 @@ mod tests {
         // has already rejected the field stays off even when forced on. The
         // slug is unique to this test because the registry is process-wide.
         let slug = "override-rejection-test-slug";
-        crate::session_routing::note_cache_affinity_rejected(
+        crate::session_routing::note_cache_field_rejected(
             slug,
             crate::session_routing::PROMPT_CACHE_KEY_FIELD,
         );

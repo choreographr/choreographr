@@ -88,6 +88,32 @@ fn cache_affinity_follows_a_catalog_swap() {
 
 #[test]
 #[serial_test::serial(catalog)]
+fn cache_retention_defaults_to_none_and_follows_a_catalog_swap() {
+    // Nothing in the bundled overlay opts into extended retention yet, so every
+    // model resolves to `None` — the mechanism ships dormant.
+    assert_eq!(
+        cache_retention("openai", "gpt-5.4"),
+        CacheRetentionDialect::None
+    );
+    assert_eq!(
+        cache_retention("nonexistent", "any"),
+        CacheRetentionDialect::None
+    );
+
+    // The resolver reads the live model entry, so a swap that pins a dialect is
+    // visible immediately.
+    let _restore = RestoreBundledOnDrop;
+    let mut catalog = tiny_catalog();
+    catalog[0].models[0].cache_retention = CacheRetentionDialect::PromptCacheOptions;
+    crate::catalog::replace_catalog(catalog);
+    assert_eq!(
+        cache_retention("tiny-test", "tiny-model"),
+        CacheRetentionDialect::PromptCacheOptions,
+    );
+}
+
+#[test]
+#[serial_test::serial(catalog)]
 fn lookup_context_window_unknown_provider() {
     assert_eq!(lookup_context_window("nonexistent", "any-model"), None);
 }

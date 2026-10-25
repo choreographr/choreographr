@@ -338,6 +338,9 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
                 }),
                 // Prompt-cache TTL is overlay policy, never a models.dev fact.
                 prompt_cache: None,
+                // Extended retention spelling is overlay policy too, and
+                // model-level: models.dev records no such fact.
+                cache_retention: crate::CacheRetentionDialect::None,
             }
         })
         .collect();

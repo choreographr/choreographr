@@ -603,9 +603,10 @@ The catalog is a two-layer pipeline in `choreo-ai-protocols/src/catalog/`: a
 URLs, and per-model context/reasoning/cost data), and a **bundled policy
 overlay** (`catalog/models-overlay.toml`) supplies everything models.dev cannot
 express (wire-protocol selection, endpoint and default-model policy, per-model
-passback exceptions, the prompt-cache TTL tiers, the request-body-compression
-opt-in, the per-session cache-affinity dialect, and the wholesale overlay-only
-providers models.dev does not cover). The overlay is merged **at load time**,
+passback exceptions, the prompt-cache TTL tiers, the per-model extended-cache
+retention spelling, the request-body-compression opt-in, the per-session
+cache-affinity dialect, and the wholesale overlay-only providers models.dev does
+not cover). The overlay is merged **at load time**,
 never baked into the committed blob `catalog/catalog.bin`, so the runtime
 refresh (S4) can re-merge the same base with a user overlay. The pipeline, the
 per-model normalization, the exact overlay schema, and the merge precedence
@@ -875,28 +876,64 @@ Like the compression coding, the dialect is baked into the provider client at
 construction, so an overlay edit reaches live sessions through the catalog-swap
 client invalidation (`client_config_changed` compares it).
 
+#### Extended cache retention
+
+A prompt cache is ephemeral by default, so a warm ping only helps within the
+provider's short tier (typically a few minutes). Some providers expose a longer
+retention tier a request can ask for, which is what makes **cache warming**
+useful across a longer idle window. The wire shape is not stable across a
+provider's model generations, so it is a **per-model** overlay scalar
+(`cache_retention` on `[provider.<slug>.models."<model>"]`) mapped to
+`choreo-ai-protocols::CacheRetentionDialect`, never a provider-level setting —
+`openai` serves both generations, and one value cannot be right for both:
+
+- `prompt-cache-retention` — pre-GPT-5.6 OpenAI models: a top-level
+  `prompt_cache_retention` field whose extended value is `"24h"` (accepted on
+  both the Chat Completions and Responses APIs).
+- `prompt-cache-options` — GPT-5.6+ models (`gpt-6*`, `gpt-5.6*`): a nested
+  `prompt_cache_options.ttl`, whose only extended value `"12h"` is
+  **Responses-API only**. On Chat Completions the remaining `"30m"` is the
+  field's default (no extension), so the builder omits the selector entirely.
+- `none` (the default) — emit nothing.
+
+Two gates keep this opt-in and safe. First, nothing is emitted unless the model
+**also declares a long tier** in the existing curated prompt-cache TTL data
+(`ModelEntry::prompt_cache` / `ProviderEntry::prompt_cache`, the
+`PromptCacheTtl { short_secs, long_secs }` pair) — the selector reuses that
+curation instead of adding a parallel source of truth. Second, the dialect is
+**never inferred from a model-id string**: an un-pinned model gets no selector,
+because guessing a generation is exactly what breaks when a provider adds a
+model. Anthropic's 1-hour tier is a different mechanism (`anthropic-beta`) and
+stays out of scope; DeepSeek, Gemini, and the Chinese providers expose no
+retention selector. The bundled overlay ships **no seeded model** yet — the
+curated long tier exists only for the Anthropic providers — so the mechanism is
+in place and dormant until a model is pinned with a justified long TTL.
+
 #### Downgrade on a rejected field
 
-The hint fails safe. A provider that answers the affinity field with an HTTP
-**400 naming that very field** — `prompt_cache_key`, or `session_id` for the
-`OpenRouter` dialect — is treated as rejecting the parameter, and the field is
-withheld from every later request of that provider for the rest of the process.
-The detector is narrow, so nothing unrelated downgrades: only a `400` counts (a
-`429`, a `5xx`, or any other `4xx` never does), and the detail must mention the
-field the request actually carried (`affinity_rejection_field`, which reads the
-built body — never logging it). A provider that merely *ignores* an unknown
-field answers 2xx and is never recorded, and a `400` that names some other
-problem (a malformed request, an unknown model) leaves the hint in place. An
-`Off` provider's body carries no affinity field, so it can never be downgraded.
-The rejection is recorded once the attempt is **final** — after the retry loop
-has exhausted its retries — not per attempt, so a retried request cannot record
-it more than once.
+The hint fails safe. A provider that answers a prompt-cache request field with
+an HTTP **400 naming that very field** — `prompt_cache_key`, or `session_id` for
+the `OpenRouter` dialect, or either retention spelling
+(`prompt_cache_retention` / `prompt_cache_options`) — is treated as rejecting
+the parameter, and the field is withheld from every later request of that
+provider for the rest of the process. The detector is narrow, so nothing
+unrelated downgrades: only a `400` counts (a `429`, a `5xx`, or any other `4xx`
+never does), and the detail must mention the field the request actually carried
+(`cache_field_rejection_field`, which reads the built body — never logging it).
+A provider that merely *ignores* an unknown field answers 2xx and is never
+recorded, and a `400` that names some other problem (a malformed request, an
+unknown model) leaves the hint in place. A body that carries none of these
+fields can never be downgraded. The rejection is recorded once the attempt is
+**final** — after the retry loop has exhausted its retries — not per attempt, so
+a retried request cannot record it more than once.
 
-The memory is the process-wide `session_routing::AFFINITY_REJECTED` set — the
-**sixteenth** sanctioned shared-state exception (see AGENTS.md), read under a
-shared lock when a body is built for an affinity-opted-in provider (the `Off`
-default skips the lookup) and written once per provider on a matching `400`, so
-it carries no protocol data and readers never contend.
+The memory is the process-wide `session_routing::CACHE_FIELD_REJECTED` set — the
+**sixteenth** sanctioned shared-state exception (see AGENTS.md). It is one
+registry for the whole prompt-cache request surface, so a provider that rejects
+an affinity key is not asked to accept a retention selector (or vice versa). It
+is read under a shared lock when a body is built for an opted-in provider (the
+`Off` default skips the lookup) and written once per provider on a matching
+`400`, so it carries no protocol data and readers never contend.
 
 The field a request actually sends resolves through three layers, highest
 priority first: a **per-account override** (`prompt_cache_affinity` on

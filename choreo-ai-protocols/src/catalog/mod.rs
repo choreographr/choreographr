@@ -44,11 +44,11 @@ pub use entry::{
 };
 pub use loader::{bundled_overlay_src, load_bundled_base};
 pub use lookup::{
-    ChatReasoningEcho, cache_affinity, chat_reasoning_echo, image_edit_models_for_provider,
-    image_models_for_provider, lookup_context_window, lookup_max_output_tokens, model_cost,
-    model_reasoning_capability, model_reasoning_passback, model_request_format,
-    model_supports_image_output, model_supports_temperature, model_supports_vision,
-    prompt_cache_ttl,
+    ChatReasoningEcho, cache_affinity, cache_retention, chat_reasoning_echo,
+    image_edit_models_for_provider, image_models_for_provider, lookup_context_window,
+    lookup_max_output_tokens, model_cost, model_reasoning_capability, model_reasoning_passback,
+    model_request_format, model_supports_image_output, model_supports_temperature,
+    model_supports_vision, prompt_cache_ttl,
 };
 pub use modelsdev::normalize_modelsdev;
 pub use oauth::oauth_provider_descriptors;

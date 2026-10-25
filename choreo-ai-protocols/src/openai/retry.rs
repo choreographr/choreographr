@@ -99,18 +99,20 @@ pub(crate) fn retry_send(
         retry_cfg,
         ctx,
     );
-    // Record a genuine cache-affinity rejection once the attempt is final — the
-    // retry loop above has already exhausted its retries, so this runs once per
-    // request, never per attempt. A response only counts when it is a 400 whose
-    // detail names the field this request actually carried
-    // (`affinity_rejection_field`); the built `body` confirms which field that
-    // was, and it is inspected here, never logged. Recording it makes
-    // `effective_cache_affinity` withhold the field from every later request of
-    // this provider, so a rejected parameter cannot waste another turn.
+    // Record a genuine prompt-cache-field rejection once the attempt is final —
+    // the retry loop above has already exhausted its retries, so this runs once
+    // per request, never per attempt. A response only counts when it is a 400
+    // whose detail names the field this request actually carried
+    // (`cache_field_rejection_field`); the built `body` confirms which field
+    // that was (an affinity key, or an extended-retention selector), and it is
+    // inspected here, never logged. Recording it makes `effective_cache_affinity`
+    // and the retention resolver withhold every such field from later requests
+    // of this provider, so a rejected parameter cannot waste another turn.
     if let Err(crate::retry::ProviderHttpError::ClientError { status, detail }) = &result
-        && let Some(field) = crate::session_routing::affinity_rejection_field(body, *status, detail)
+        && let Some(field) =
+            crate::session_routing::cache_field_rejection_field(body, *status, detail)
     {
-        crate::session_routing::note_cache_affinity_rejected(&config.provider_slug, field);
+        crate::session_routing::note_cache_field_rejected(&config.provider_slug, field);
     }
     result.map_err(OpenAiError::from)
 }

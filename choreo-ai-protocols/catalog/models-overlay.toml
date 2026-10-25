@@ -65,6 +65,22 @@
 #   reasoning_passback = "tool_loop" | "all_turns" | "none" | "signature" | "response_id"
 #   prompt_cache_short = 300     # per-model TTL override (wins over the provider default)
 #   prompt_cache_long = 3600
+#   cache_retention = "prompt-cache-retention"  # none (default) |
+#                                # prompt-cache-retention (pre-GPT-5.6 top-level
+#                                # `prompt_cache_retention` = "24h") |
+#                                # prompt-cache-options (GPT-5.6+ nested
+#                                # `prompt_cache_options.ttl` = "12h", Responses
+#                                # API only). MODEL-LEVEL ONLY: the field's
+#                                # spelling depends on the model generation, so a
+#                                # provider default cannot serve a provider that
+#                                # hosts both. Emitted only when the model also
+#                                # declares prompt_cache_long.
+#
+# NOTE: no model is seeded with `cache_retention` yet. The curated TTL data
+# declares a long tier only for the Anthropic providers, whose 1-hour tier is a
+# different mechanism (`anthropic-beta`, out of scope here), and no OpenAI model
+# declares a long tier. The mechanism is in place and dormant: seed a model's
+# `cache_retention` only together with a justified `prompt_cache_long`.
 
 # alibaba -> alibaba (policy from the pre-models.dev TOML)
 [provider.alibaba]

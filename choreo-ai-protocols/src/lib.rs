@@ -51,6 +51,7 @@ pub mod videos;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+mod cache_retention;
 mod context_window;
 // Provider OAuth client-identity policy (compiled, keyed by slug).
 mod identity;
@@ -69,11 +70,12 @@ mod traits;
 mod types;
 
 pub use anthropic::{AnthropicClient, AnthropicConfig};
+pub use cache_retention::CacheRetentionDialect;
 pub use catalog::{
     AuthKind, ChatReasoningEcho, GrantEncoding, ModelCost, ModelEntry, OAuthProfile,
     PROVIDER_CATALOG, PromptCacheTtl, ProviderEntry, ProviderProtocol, ReasoningPassback,
     RefreshError, RefreshOutcome, all_display_names, all_slugs, bundled_overlay_src,
-    cache_affinity, catalog_snapshot, chat_reasoning_echo, fetch_modelsdev,
+    cache_affinity, cache_retention, catalog_snapshot, chat_reasoning_echo, fetch_modelsdev,
     image_edit_models_for_provider, image_models_for_provider, load_bundled_base,
     lookup_context_window, lookup_max_output_tokens, lookup_provider, merge_overlay, model_cost,
     model_reasoning_capability, model_reasoning_passback, model_request_format,

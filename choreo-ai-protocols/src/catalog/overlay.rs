@@ -31,6 +31,11 @@
 //!                                     # both halves.
 //! prompt_cache_short = 300             # per-model TTL override
 //! prompt_cache_long = 3600
+//! cache_retention = "prompt-cache-retention"  # none | prompt-cache-retention |
+//!                                     # prompt-cache-options — the extended
+//!                                     # retention spelling THIS model accepts
+//!                                     # (default none). Emitted only when the
+//!                                     # model also declares a long TTL tier.
 //!
 //! # OAuth profile (overlay-only policy). All fields except `client_id` are
 //! # required; a partial block is warned and skipped, leaving the provider's
@@ -65,6 +70,11 @@
 //!   keys on a model entry set that model's override (which wins over the
 //!   provider default at lookup time — see `prompt_cache_ttl`). Each tier is
 //!   optional and set independently.
+//! - **Extended cache retention** (`cache_retention`) is **model-level only**:
+//!   the retention field's spelling depends on the model generation (pre-GPT-5.6
+//!   `prompt_cache_retention` vs GPT-5.6+ `prompt_cache_options`), so it can
+//!   never be a provider default. The selector is emitted only when the model
+//!   also declares a long TTL tier (above).
 //! - **New providers** (models.dev does not cover them) are defined
 //!   wholesale: a `[provider.<slug>]` table that does not exist in the base
 //!   creates the provider, and its `models` sub-table fills in the entries.
@@ -77,6 +87,7 @@ use tracing::{debug, trace, warn};
 use super::{
     GrantEncoding, ModelEntry, OAuthProfile, ProviderEntry, ProviderProtocol, ReasoningPassback,
 };
+use crate::cache_retention::CacheRetentionDialect;
 use crate::retry::RequestCompression;
 use crate::session_routing::CacheAffinity;
 use crate::shared::MaxTokensField;
@@ -509,6 +520,25 @@ fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
                     warn!(
                         model = %model.model,
                         "overlay: prompt_cache_long is not an integer; skipping",
+                    );
+                }
+            }
+            // Extended prompt-cache retention spelling: per-MODEL policy
+            // because the field depends on the model's generation (OpenAI
+            // serves both a pre-GPT-5.6 and a GPT-5.6+ spelling), and a
+            // provider-level value would force one onto the other. The tokens
+            // are the `CacheRetentionDialect` overlay spellings; `none` (or any
+            // unrecognized value) sends no selector, the safe default.
+            "cache_retention" => {
+                if let Some(dialect) = value
+                    .as_str()
+                    .and_then(CacheRetentionDialect::from_overlay_str)
+                {
+                    model.cache_retention = dialect;
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: cache_retention must be \"none\", \"prompt-cache-retention\", or \"prompt-cache-options\"; skipping",
                     );
                 }
             }

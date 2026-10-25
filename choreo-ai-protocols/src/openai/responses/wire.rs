@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::super::{ChatToolDefinition, Usage};
+use crate::cache_retention::CacheRetentionOptions;
 use crate::types::CallerInfo;
 
 // ── Responses API wire types ─────────────────────────────────────────────
@@ -91,6 +92,16 @@ pub(crate) struct ResponsesRequest<'a> {
     /// `session_id`). At most one of the two affinity fields is set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) session_id: Option<&'a str>,
+    /// Extended prompt-cache retention for pre-GPT-5.6 `OpenAI` models (see
+    /// [`crate::CacheRetentionDialect`]); omitted unless the model opted in and
+    /// declares a long TTL tier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_retention: Option<&'static str>,
+    /// Extended prompt-cache retention for GPT-5.6+ `OpenAI` models, nested
+    /// under `prompt_cache_options`; the Responses API is where the extended
+    /// `"12h"` value is accepted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) prompt_cache_options: Option<CacheRetentionOptions>,
 }
 
 /// Raw Responses API response envelope.

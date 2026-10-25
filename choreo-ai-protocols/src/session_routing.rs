@@ -26,11 +26,21 @@
 //! Either way a *fixed* key is wrong: it would pin every session to one bucket
 //! and, on the newer models, split cache accounting apart. Only the daemon's
 //! real session id gives each conversation its own affinity.
+//!
+//! # Shared rejection registry
+//!
+//! This module also owns the process-wide registry of providers that rejected
+//! a *prompt-cache request field* with an HTTP 400. It covers the affinity
+//! fields above and the extended-retention selectors in
+//! [`crate::cache_retention`] (a provider's prompt-cache request surface is one
+//! family of optional additions, so one rejected field withholds them all).
 
 use std::collections::HashSet;
 use std::sync::{LazyLock, RwLock};
 
 use tracing::{debug, warn};
+
+use crate::cache_retention::{PROMPT_CACHE_OPTIONS_FIELD, PROMPT_CACHE_RETENTION_FIELD};
 
 /// Maximum length of an `OpenRouter` session id, per its documented constraint.
 const OPENROUTER_SESSION_MAX_LEN: usize = 256;
@@ -164,25 +174,32 @@ fn is_valid_openrouter_session_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Provider slugs whose endpoint answered the affinity body field with an HTTP
-/// 400 naming that field, i.e. reject the hint rather than ignore it.
+/// Provider slugs whose endpoint answered a prompt-cache request field with an
+/// HTTP 400 naming that field, i.e. reject it rather than ignore it.
 ///
-/// [`effective_cache_affinity`] reads this before a request body is built and
-/// [`note_cache_affinity_rejected`] inserts into it once a 400 is final, so one
-/// rejected request permanently (for the process) stops that provider from
-/// receiving the field — resending a parameter the server rejects can only
-/// waste a turn. A provider that *ignores* an unknown field never appears here
-/// (it answers 2xx), so only a genuine rejection downgrades.
+/// The registry covers every optional prompt-cache addition this crate puts on
+/// the request body: the affinity fields above (`prompt_cache_key`,
+/// `session_id`) and the extended-retention selectors
+/// ([`PROMPT_CACHE_RETENTION_FIELD`], [`PROMPT_CACHE_OPTIONS_FIELD`]). One
+/// registry, not one per field: the same provider rejecting one unknown
+/// prompt-cache field is not asked to accept the others. A provider that
+/// *ignores* an unknown field never appears here (it answers 2xx), so only a
+/// genuine rejection downgrades.
 ///
-/// This is a process-wide behavioral cache: every request of an
-/// affinity-opted-in provider consults it (a shared read lock — the
-/// [`CacheAffinity::Off`] default skips the lookup entirely), and only a
-/// matching 400 writes it (a write lock, once per provider), so readers never
-/// contend with one another.
+/// [`effective_cache_affinity`] and [`crate::cache_retention`] read this before
+/// a request body is built and [`note_cache_field_rejected`] inserts into it
+/// once a 400 is final, so one rejected request permanently (for the process)
+/// stops that provider from receiving any of them — resending a parameter the
+/// server rejects can only waste a turn.
+///
+/// This is a process-wide behavioral cache: every request of an opted-in
+/// provider consults it (a shared read lock — the [`CacheAffinity::Off`] default
+/// skips the lookup entirely), and only a matching 400 writes it (a write lock,
+/// once per provider), so readers never contend with one another.
 /// It is single-purpose bookkeeping that carries no protocol data (a set of
 /// provider slugs); the lock recovery follows AGENTS.md's poisoned-lock rule,
 /// with a lost entry an acceptable failure mode for a downgrade hint.
-static AFFINITY_REJECTED: LazyLock<RwLock<HashSet<String>>> =
+static CACHE_FIELD_REJECTED: LazyLock<RwLock<HashSet<String>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
 /// The cache affinity to actually use for `slug`: `configured`, unless this
@@ -202,11 +219,7 @@ pub(crate) fn effective_cache_affinity(slug: &str, configured: CacheAffinity) ->
     if configured == CacheAffinity::Off {
         return CacheAffinity::Off;
     }
-    let rejected = AFFINITY_REJECTED
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(slug);
-    if rejected {
+    if cache_field_rejected(slug) {
         CacheAffinity::Off
     } else {
         configured
@@ -233,11 +246,25 @@ pub fn cache_affinity_downgraded(slug: &str, configured: CacheAffinity) -> bool 
         && effective_cache_affinity(slug, configured) == CacheAffinity::Off
 }
 
-/// Record that `slug` rejected the affinity field `field`, so future requests
-/// send no hint. Warns once per slug, naming only the provider and the field
-/// (never the request or response body).
-pub(crate) fn note_cache_affinity_rejected(slug: &str, field: &str) {
-    let fresh = AFFINITY_REJECTED
+/// Whether this process already learned, from an HTTP 400 naming the field,
+/// that `slug` rejects a prompt-cache request field (affinity or retention).
+///
+/// This is the single read side of [`CACHE_FIELD_REJECTED`], shared by the
+/// affinity resolver and the extended-retention resolver so they can never
+/// consult different memories.
+#[must_use]
+pub(crate) fn cache_field_rejected(slug: &str) -> bool {
+    CACHE_FIELD_REJECTED
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(slug)
+}
+
+/// Record that `slug` rejected the prompt-cache request field `field`, so
+/// future requests send none of them. Warns once per slug, naming only the
+/// provider and the field (never the request or response body).
+pub(crate) fn note_cache_field_rejected(slug: &str, field: &str) {
+    let fresh = CACHE_FIELD_REJECTED
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(slug.to_string());
@@ -245,38 +272,41 @@ pub(crate) fn note_cache_affinity_rejected(slug: &str, field: &str) {
         warn!(
             provider = %slug,
             field = %field,
-            "provider rejected the per-session cache-affinity field (HTTP 400); \
+            "provider rejected a prompt-cache request field (HTTP 400); \
              omitting it for the rest of this process",
         );
     }
 }
 
-/// The affinity field name present in a built request body, if any.
+/// The prompt-cache request field present in a built request body, if any.
 ///
-/// Both wire spellings are mutually exclusive on a body, so the first match is
-/// the one that was actually sent — the field a 400 must name to count as a
-/// rejection of the hint rather than of something else in the request.
-pub(crate) fn sent_affinity_field(body: &serde_json::Value) -> Option<&'static str> {
-    if body.get(PROMPT_CACHE_KEY_FIELD).is_some() {
-        Some(PROMPT_CACHE_KEY_FIELD)
-    } else if body.get(SESSION_ID_FIELD).is_some() {
-        Some(SESSION_ID_FIELD)
-    } else {
-        None
-    }
+/// Every wire spelling is mutually exclusive on a body (the two affinity
+/// dialects and the two retention dialects never coexist), so the first match
+/// is the one that was actually sent — the field a 400 must name to count as a
+/// rejection rather than of something else in the request.
+pub(crate) fn sent_cache_field(body: &serde_json::Value) -> Option<&'static str> {
+    [
+        PROMPT_CACHE_KEY_FIELD,
+        SESSION_ID_FIELD,
+        PROMPT_CACHE_RETENTION_FIELD,
+        PROMPT_CACHE_OPTIONS_FIELD,
+    ]
+    .into_iter()
+    .find(|field| body.get(*field).is_some())
 }
 
-/// The affinity field a terminal response rejects, or `None` when it is not a
-/// genuine rejection of the hint that was sent.
+/// The prompt-cache request field a terminal response rejects, or `None` when
+/// it is not a genuine rejection of the field that was sent.
 ///
 /// A response counts only when it is an HTTP **400** *and* its extracted detail
-/// mentions the very field carried by `body` (`prompt_cache_key`, or `session_id`
-/// for the `OpenRouter` dialect). Any other status (429, 5xx, a different 4xx)
-/// and any 400 that does not name the sent field — a malformed request, an
-/// unknown model, an unrelated schema error — returns `None`, so nothing else
+/// mentions the very field carried by `body` (`prompt_cache_key`, `session_id`
+/// for the `OpenRouter` dialect, `prompt_cache_retention`, or
+/// `prompt_cache_options`). Any other status (429, 5xx, a different 4xx) and any
+/// 400 that does not name the sent field — a malformed request, an unknown
+/// model, an unrelated schema error — returns `None`, so nothing else
 /// downgrades. `body` is inspected, never logged.
 #[must_use]
-pub(crate) fn affinity_rejection_field(
+pub(crate) fn cache_field_rejection_field(
     body: &serde_json::Value,
     status: u16,
     detail: &str,
@@ -284,7 +314,7 @@ pub(crate) fn affinity_rejection_field(
     if status != 400 {
         return None;
     }
-    let field = sent_affinity_field(body)?;
+    let field = sent_cache_field(body)?;
     detail.contains(field).then_some(field)
 }
 
@@ -381,7 +411,7 @@ mod tests {
     fn effective_affinity_is_off_after_a_rejection() {
         // A rejection recorded for this slug downgrades it for the rest of the
         // process, for every dialect it might have been configured with.
-        note_cache_affinity_rejected("affinity-rejected-slug", PROMPT_CACHE_KEY_FIELD);
+        note_cache_field_rejected("affinity-rejected-slug", PROMPT_CACHE_KEY_FIELD);
         assert_eq!(
             effective_cache_affinity("affinity-rejected-slug", CacheAffinity::PromptCacheKey),
             CacheAffinity::Off,
@@ -400,7 +430,7 @@ mod tests {
             effective_cache_affinity("affinity-off-slug", CacheAffinity::Off),
             CacheAffinity::Off,
         );
-        note_cache_affinity_rejected("affinity-off-slug", PROMPT_CACHE_KEY_FIELD);
+        note_cache_field_rejected("affinity-off-slug", PROMPT_CACHE_KEY_FIELD);
         assert_eq!(
             effective_cache_affinity("affinity-off-slug", CacheAffinity::Off),
             CacheAffinity::Off,
@@ -424,7 +454,7 @@ mod tests {
 
         // Intended and then rejected: a downgrade.
         let slug = "affinity-intent-rejected-slug";
-        note_cache_affinity_rejected(slug, PROMPT_CACHE_KEY_FIELD);
+        note_cache_field_rejected(slug, PROMPT_CACHE_KEY_FIELD);
         assert!(cache_affinity_downgraded(
             slug,
             CacheAffinity::PromptCacheKey
@@ -442,20 +472,20 @@ mod tests {
     }
 
     #[test]
-    fn sent_affinity_field_reads_the_body() {
+    fn sent_cache_field_reads_the_body() {
         let prompt = serde_json::json!({ "prompt_cache_key": "42" });
-        assert_eq!(sent_affinity_field(&prompt), Some(PROMPT_CACHE_KEY_FIELD));
+        assert_eq!(sent_cache_field(&prompt), Some(PROMPT_CACHE_KEY_FIELD));
         let openrouter = serde_json::json!({ "session_id": "abc-123" });
-        assert_eq!(sent_affinity_field(&openrouter), Some(SESSION_ID_FIELD));
+        assert_eq!(sent_cache_field(&openrouter), Some(SESSION_ID_FIELD));
         let neither = serde_json::json!({ "model": "gpt-5.4" });
-        assert_eq!(sent_affinity_field(&neither), None);
+        assert_eq!(sent_cache_field(&neither), None);
     }
 
     #[test]
     fn a_400_naming_the_sent_field_is_a_rejection() {
         let body = serde_json::json!({ "prompt_cache_key": "42" });
         assert_eq!(
-            affinity_rejection_field(
+            cache_field_rejection_field(
                 &body,
                 400,
                 "Unrecognized request argument supplied: prompt_cache_key",
@@ -470,7 +500,7 @@ mod tests {
         // — so this is not a rejection of the affinity hint.
         let body = serde_json::json!({ "prompt_cache_key": "42" });
         assert_eq!(
-            affinity_rejection_field(&body, 400, "unsupported: session_id"),
+            cache_field_rejection_field(&body, 400, "unsupported: session_id"),
             None,
         );
     }
@@ -479,7 +509,7 @@ mod tests {
     fn an_unrelated_400_is_not_a_rejection() {
         let body = serde_json::json!({ "prompt_cache_key": "42" });
         assert_eq!(
-            affinity_rejection_field(&body, 400, "invalid model: gpt-9"),
+            cache_field_rejection_field(&body, 400, "invalid model: gpt-9"),
             None,
         );
     }
@@ -489,11 +519,11 @@ mod tests {
         // Even when the body prose mentions the field, only a 400 downgrades.
         let body = serde_json::json!({ "prompt_cache_key": "42" });
         assert_eq!(
-            affinity_rejection_field(&body, 429, "rate limited: prompt_cache_key"),
+            cache_field_rejection_field(&body, 429, "rate limited: prompt_cache_key"),
             None,
         );
         assert_eq!(
-            affinity_rejection_field(&body, 500, "server error: prompt_cache_key"),
+            cache_field_rejection_field(&body, 500, "server error: prompt_cache_key"),
             None,
         );
     }
@@ -504,8 +534,51 @@ mod tests {
         // happens to mention the name cannot downgrade it.
         let body = serde_json::json!({ "model": "gpt-5.4" });
         assert_eq!(
-            affinity_rejection_field(&body, 400, "bad prompt_cache_key"),
+            cache_field_rejection_field(&body, 400, "bad prompt_cache_key"),
             None,
+        );
+    }
+
+    #[test]
+    fn sent_cache_field_sees_both_retention_selectors() {
+        // The extended-retention spellings are part of the same request
+        // surface, so the detector must find them too.
+        let older = serde_json::json!({ "prompt_cache_retention": "24h" });
+        assert_eq!(sent_cache_field(&older), Some(PROMPT_CACHE_RETENTION_FIELD),);
+        let newer = serde_json::json!({ "prompt_cache_options": { "ttl": "12h" } });
+        assert_eq!(sent_cache_field(&newer), Some(PROMPT_CACHE_OPTIONS_FIELD));
+    }
+
+    #[test]
+    fn a_400_naming_either_retention_field_is_a_rejection() {
+        let older = serde_json::json!({ "prompt_cache_retention": "24h" });
+        assert_eq!(
+            cache_field_rejection_field(
+                &older,
+                400,
+                "Unsupported parameter: 'prompt_cache_retention'",
+            ),
+            Some(PROMPT_CACHE_RETENTION_FIELD),
+        );
+        let newer = serde_json::json!({ "prompt_cache_options": { "ttl": "12h" } });
+        assert_eq!(
+            cache_field_rejection_field(&newer, 400, "Unknown parameter: prompt_cache_options",),
+            Some(PROMPT_CACHE_OPTIONS_FIELD),
+        );
+    }
+
+    #[test]
+    fn a_retention_rejection_withholds_every_cache_field() {
+        // One registry: a provider that rejected a retention selector is not
+        // asked to accept the affinity key (or vice versa) for the rest of the
+        // process. The slug is unique to this test because the registry is
+        // process-wide.
+        let slug = "retention-rejected-slug";
+        note_cache_field_rejected(slug, PROMPT_CACHE_RETENTION_FIELD);
+        assert!(cache_field_rejected(slug));
+        assert_eq!(
+            effective_cache_affinity(slug, CacheAffinity::PromptCacheKey),
+            CacheAffinity::Off,
         );
     }
 }

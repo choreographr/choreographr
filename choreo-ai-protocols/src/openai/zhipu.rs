@@ -217,6 +217,8 @@ mod tests {
             reasoning_effort: effort,
             prompt_cache_key: None,
             session_id: None,
+            prompt_cache_retention: None,
+            prompt_cache_options: None,
         })
         .unwrap();
         assert_eq!(body["reasoning_effort"], "high");

@@ -12,6 +12,7 @@ use std::fmt;
 use choreo_proto::ChatReasoningField;
 use serde::{Deserialize, Serialize};
 
+use crate::cache_retention::CacheRetentionDialect;
 use crate::retry::RequestCompression;
 use crate::session_routing::CacheAffinity;
 use crate::shared::MaxTokensField;
@@ -203,6 +204,19 @@ pub struct ModelEntry {
     /// override — fall through to the provider default" in [`super::prompt_cache_ttl`].
     #[serde(default)]
     pub prompt_cache: Option<PromptCacheTtl>,
+    /// Which extended prompt-cache retention selector (if any) this model's
+    /// provider accepts on the wire — overlay policy, and deliberately
+    /// **per-model**: the field's spelling differs across a provider's model
+    /// generations (pre-GPT-5.6 `prompt_cache_retention`, GPT-5.6+
+    /// `prompt_cache_options`), so a provider-level value cannot serve both.
+    ///
+    /// Defaults to [`CacheRetentionDialect::None`] (send nothing). The selector
+    /// is emitted only when the model *also* declares a long tier in
+    /// [`prompt_cache`](Self::prompt_cache) (or the provider default), so the
+    /// curated TTL data stays the single source of truth for which tier a model
+    /// exposes. See [`CacheRetentionDialect`].
+    #[serde(default)]
+    pub cache_retention: CacheRetentionDialect,
 }
 
 // Manual `impl` rather than `#[derive(Default)]` + `#[default]` because
@@ -231,6 +245,7 @@ impl Default for ModelEntry {
             supports_image_edit: false,
             cost: None,
             prompt_cache: None,
+            cache_retention: CacheRetentionDialect::None,
         }
     }
 }
