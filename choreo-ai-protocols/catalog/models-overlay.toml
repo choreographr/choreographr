@@ -73,8 +73,10 @@
 #                                # API only). MODEL-LEVEL ONLY: the field's
 #                                # spelling depends on the model generation, so a
 #                                # provider default cannot serve a provider that
-#                                # hosts both. Emitted only when the model also
-#                                # declares prompt_cache_long.
+#                                # hosts both. Emitted only when the model's
+#                                # RESOLVED prompt-cache TTL declares a long tier
+#                                # (its own prompt_cache_long, else the provider
+#                                # default).
 #
 # NOTE: no model is seeded with `cache_retention` yet. The curated TTL data
 # declares a long tier only for the Anthropic providers, whose 1-hour tier is a

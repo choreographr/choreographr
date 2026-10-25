@@ -836,7 +836,9 @@ levels, the Responses-API flag, per-model token prices), and a bundled
 **`models-overlay.toml`** policy layer
 supplies everything models.dev can't express — wire-protocol selection,
 endpoint policy, per-model passback exceptions, the prompt-cache TTL policy
-(`prompt_cache_short`/`prompt_cache_long`), request-body compression
+(`prompt_cache_short`/`prompt_cache_long`), the per-session cache-affinity
+dialect (`cache_affinity`) and the per-model extended-retention spelling
+(`cache_retention`), request-body compression
 (`request_compression = "gzip"`/`"zstd"`, opt-in since the server must
 decompress), and
 the local/niche providers
@@ -872,7 +874,7 @@ bundled overlay with the same schema — provider scalars (`protocol`,
 `cache_affinity`) and per-model
 entries (`[provider.<slug>.models."<model>"]` with `context_window`,
 `reasoning_supported`, `reasoning_levels`, `responses`, `reasoning_passback`,
-`prompt_cache_short`, `prompt_cache_long`),
+`prompt_cache_short`, `prompt_cache_long`, `cache_retention`),
 plus wholesale provider definitions for anything models.dev doesn't list. The
 file is watched (via a shared config-file watcher, together with
 `accounts.toml` and the ACL file) and reloads automatically on change (deleting it falls back to
