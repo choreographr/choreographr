@@ -586,7 +586,7 @@ fn responses_chains_reasoning_continuity_via_response_id() {
                 "arguments": "{\"city\":\"London\"}"
             }
         ],
-        "usage": {"prompt_tokens": 10, "completion_tokens": 8, "total_tokens": 18}
+        "usage": {"input_tokens": 10, "output_tokens": 8, "total_tokens": 18}
     }"#;
     let final_response = r#"{
         "id": "resp_2",
@@ -600,7 +600,7 @@ fn responses_chains_reasoning_continuity_via_response_id() {
                 "content": [{"type": "output_text", "text": "The weather in London is 72°F and sunny."}]
             }
         ],
-        "usage": {"prompt_tokens": 24, "completion_tokens": 6, "total_tokens": 30}
+        "usage": {"input_tokens": 24, "output_tokens": 6, "total_tokens": 30}
     }"#;
 
     let mock = MockProvider::start(vec![

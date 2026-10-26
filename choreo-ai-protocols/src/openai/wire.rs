@@ -22,9 +22,17 @@ pub(super) struct ModelInfo {
 }
 
 /// Token usage as reported by the provider, shared by every `OpenAI` reply
-/// shape: chat completions and Responses both report the same three top-level
-/// counts, and both nest a prompt-cache hit count (under a different key, see
-/// [`CachedTokenDetails`]).
+/// shape. The two APIs spell the top-level counts **differently**:
+///
+/// * Chat Completions reports `prompt_tokens` / `completion_tokens`.
+/// * The Responses API reports `input_tokens` / `output_tokens` (see
+///   `ResponseUsage` in the official SDKs — it has no `prompt_tokens`).
+///
+/// Both also report `total_tokens` and nest a prompt-cache hit count under
+/// [`CachedTokenDetails`] (a different key per API). The struct keeps the
+/// chat-completions field names as its canonical identifiers and accepts the
+/// Responses spellings via `#[serde(alias = …)]`, so the wire shape of either
+/// API deserializes into the same projection with no per-path branching.
 ///
 /// Providers differ in how much of the cache breakdown they expose, so every
 /// cache field is optional and at most one shape is present. [`Usage::cache_hit_tokens`]
@@ -37,7 +45,13 @@ pub(crate) struct Usage {
     /// the cache-hit tokens it reports alongside in
     /// `prompt_cache_hit_tokens`, so that count is a breakdown of this one, not
     /// an addition to it. Nothing may add `cached_tokens` to this value.
+    ///
+    /// `input_tokens` is the Responses API's spelling of the same count.
+    #[serde(alias = "input_tokens")]
     pub(crate) prompt_tokens: u32,
+    /// The output/completion count. `output_tokens` is the Responses API's
+    /// spelling.
+    #[serde(alias = "output_tokens")]
     pub(crate) completion_tokens: u32,
     pub(crate) total_tokens: u32,
     /// Chat-completions per-prompt breakdown. z.ai (and `OpenAI` itself) report
@@ -151,12 +165,24 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_tokens_details_project_into_cached_tokens() {
+    fn real_responses_usage_projects_input_output_and_cached_tokens() {
+        // The exact `ResponseUsage` shape the Responses API returns: `input_tokens`
+        // / `output_tokens` (NOT `prompt_tokens` / `completion_tokens`) with the
+        // cache hit nested under `input_tokens_details`. This pins the alias that
+        // lets the one projection serve both APIs. `input_tokens_details` also
+        // carries `cache_write_tokens` in the real payload — present here so the
+        // fixture matches the documented object exactly.
         let usage = parse(
-            r#"{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,
-                "input_tokens_details":{"cached_tokens":80}}"#,
+            r#"{"input_tokens":100,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":0},
+                "output_tokens":20,"output_tokens_details":{"reasoning_tokens":0},
+                "total_tokens":120}"#,
         );
-        assert_eq!(usage.to_token_usage().cached_tokens, 80);
+        let projected = usage.to_token_usage();
+        assert_eq!(projected.input_tokens, 100);
+        assert_eq!(projected.output_tokens, 20);
+        assert_eq!(projected.total_tokens, 120);
+        assert_eq!(projected.cached_tokens, 80);
+        assert_eq!(projected.cache_write_tokens, 0);
     }
 
     #[test]

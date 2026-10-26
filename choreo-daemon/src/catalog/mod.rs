@@ -69,7 +69,7 @@ use std::time::Instant;
 
 use choreo_ai_protocols::load_bundled_base;
 use crossbeam_channel::{Receiver, Sender, after, select};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config_watch::ConfigChange;
 use crate::daemon::DaemonCommand;
@@ -105,6 +105,16 @@ pub enum MaintenanceEvent {
         /// One-shot reply channel carrying the fetch result back to the requester.
         reply: mpsc::Sender<Result<RefreshReport, String>>,
     },
+    /// The command loop could not write the cache bin for the base this thread
+    /// last handed it (a live fetch whose persist failed).
+    ///
+    /// The etag this thread adopted for that fetch now describes content that
+    /// is NOT on disk, so the next conditional GET would 304 and never retry the
+    /// write. On receipt the thread drops its in-memory etag (`None`), forcing
+    /// the next revalidation to be an unconditional GET that rebuilds and
+    /// re-persists the cache. No payload: the base is retained on the command
+    /// loop (`DaemonState::catalog_applied_base`) until a persist succeeds.
+    CatalogPersistFailed,
 }
 
 /// Mutable state of the maintenance thread. It deliberately holds **no
@@ -293,6 +303,20 @@ fn maintenance_loop(
                     // run_refresh) so the DB anchor reflects reality.
                     record_attempt(db, &mut state);
                     run_refresh(daemon_tx, &mut state, any_force, replies);
+                }
+                Ok(MaintenanceEvent::CatalogPersistFailed) => {
+                    // The command loop could not write the cache bin for the base
+                    // we just handed it, so the etag we adopted now describes
+                    // content that is NOT on disk. Drop our in-memory etag so the
+                    // next revalidation is an unconditional GET that rebuilds and
+                    // re-persists the cache (a conditional GET with the newer etag
+                    // would 304 and never retry the write). The still-correct base
+                    // is retained on the command loop until a persist succeeds.
+                    debug!(
+                        "catalog cache persist failed; dropping the in-memory etag so the \
+                         next revalidation rebuilds and re-persists the cache",
+                    );
+                    state.etag = None;
                 }
                 Err(_) => {
                     info!("catalog maintenance channel closed; exiting");

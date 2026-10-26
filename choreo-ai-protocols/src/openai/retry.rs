@@ -112,7 +112,15 @@ pub(crate) fn retry_send(
         && let Some(field) =
             crate::session_routing::cache_field_rejection_field(body, *status, detail)
     {
-        crate::session_routing::note_cache_field_rejected(&config.provider_slug, field);
+        // The registry is keyed by the exact provider+model pair, so record the
+        // model this request actually sent (read from the body, never matched by
+        // prefix). A rejection on one model must not withhold the hint from a
+        // sibling model the provider still honours it on.
+        let model = body
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        crate::session_routing::note_cache_field_rejected(&config.provider_slug, model, field);
     }
     result.map_err(OpenAiError::from)
 }

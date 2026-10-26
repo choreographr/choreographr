@@ -246,7 +246,7 @@ fn parse_responses_stream_event_function_call_args() {
 #[test]
 fn parse_responses_stream_event_completed_with_usage() {
     let event = parse_responses_stream_event(
-        r#"{"type":"response.completed","usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}"#,
+        r#"{"type":"response.completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"#,
     )
     .expect("parse")
     .expect("event");
@@ -274,7 +274,7 @@ fn parse_responses_stream_event_completed_reads_the_wrapped_response_object() {
     // The documented terminal event wraps the whole `Response` object under
     // `response` — id and usage live there, not on the event root.
     let event = parse_responses_stream_event(
-        r#"{"type":"response.completed","sequence_number":42,"response":{"id":"resp_9","status":"completed","usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}}"#,
+        r#"{"type":"response.completed","sequence_number":42,"response":{"id":"resp_9","status":"completed","usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}}}"#,
     )
     .expect("parse")
     .expect("event");
@@ -293,7 +293,7 @@ fn parse_responses_stream_event_incomplete_carries_the_provider_reason() {
     // `incomplete` is a terminal success whose output may be partial; the
     // provider states why under `incomplete_details.reason`.
     let event = parse_responses_stream_event(
-        r#"{"type":"response.incomplete","response":{"id":"resp_5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"prompt_tokens":9,"completion_tokens":2,"total_tokens":11}}}"#,
+        r#"{"type":"response.incomplete","response":{"id":"resp_5","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":9,"output_tokens":2,"total_tokens":11}}}"#,
     )
     .expect("parse")
     .expect("event");

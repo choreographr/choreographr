@@ -96,7 +96,7 @@ pub(crate) fn build_chat_completions_body(
     // answered a 400 to this field stops receiving it for the process.
     let affinity = params.session_id.map_or_default(|session_id| {
         crate::session_routing::cache_affinity_fields(
-            config.effective_cache_affinity(),
+            config.effective_cache_affinity(params.model),
             session_id,
             params.model,
         )

@@ -288,16 +288,22 @@ impl ServiceConfig {
         }
     }
 
-    /// The cache affinity to actually send for this provider, after applying
-    /// the process-wide rejection registry (see `session_routing::effective_cache_affinity`).
+    /// The cache affinity to actually send for this provider and `model`, after
+    /// applying the process-wide rejection registry (see
+    /// `session_routing::effective_cache_affinity`).
     ///
     /// The configured [`Self::cache_affinity`] already folds in the per-account
     /// override and the catalog dialect; this only withholds a hint the provider
-    /// has rejected with a 400 in this process. Provides a slug/config pairing so
-    /// the body builders cannot consult the registry with the wrong slug.
+    /// has rejected with a 400 in this process for `model` (the registry is keyed
+    /// by the exact provider+model pair). Provides a slug/config pairing so the
+    /// body builders cannot consult the registry with the wrong slug.
     #[must_use]
-    pub fn effective_cache_affinity(&self) -> CacheAffinity {
-        crate::session_routing::effective_cache_affinity(&self.provider_slug, self.cache_affinity)
+    pub fn effective_cache_affinity(&self, model: &str) -> CacheAffinity {
+        crate::session_routing::effective_cache_affinity(
+            &self.provider_slug,
+            model,
+            self.cache_affinity,
+        )
     }
 
     /// Apply the per-account cache-affinity override from the protocol-agnostic
@@ -611,7 +617,10 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(config.cache_affinity, CacheAffinity::Off);
-        assert_eq!(config.effective_cache_affinity(), CacheAffinity::Off);
+        assert_eq!(
+            config.effective_cache_affinity("some-model"),
+            CacheAffinity::Off
+        );
     }
 
     #[test]
@@ -661,6 +670,7 @@ mod tests {
         let slug = "override-rejection-test-slug";
         crate::session_routing::note_cache_field_rejected(
             slug,
+            "forced-model",
             crate::session_routing::PROMPT_CACHE_KEY_FIELD,
         );
         let mut config = ServiceConfig {
@@ -673,7 +683,15 @@ mod tests {
         });
         // The configured dialect was forced on…
         assert_eq!(config.cache_affinity, CacheAffinity::PromptCacheKey);
-        // …but the request-time resolution withholds it.
-        assert_eq!(config.effective_cache_affinity(), CacheAffinity::Off);
+        // …but the request-time resolution withholds it for the rejected model…
+        assert_eq!(
+            config.effective_cache_affinity("forced-model"),
+            CacheAffinity::Off
+        );
+        // …and a different model still receives the forced-on hint.
+        assert_eq!(
+            config.effective_cache_affinity("other-model"),
+            CacheAffinity::PromptCacheKey
+        );
     }
 }

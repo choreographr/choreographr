@@ -1658,6 +1658,7 @@ fn body_withholds_retention_after_a_rejected_field() {
     crate::catalog::replace_catalog(catalog);
     crate::session_routing::note_cache_field_rejected(
         provider,
+        "ret-old",
         crate::cache_retention::PROMPT_CACHE_RETENTION_FIELD,
     );
     let body = retention_body(provider, "ret-old");

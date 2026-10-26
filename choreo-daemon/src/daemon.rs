@@ -2656,8 +2656,11 @@ impl DaemonState {
     /// 304 forever against a stale cache). If the bin write fails, the etag
     /// is deliberately NOT updated — it must never describe content that is
     /// not on disk — and the base is retained in memory instead, because the
-    /// cache is otherwise an overlay re-merge's only source for it. Failures
-    /// are logged, never fatal: the next refresh re-fetches and tries again.
+    /// cache is otherwise an overlay re-merge's only source for it. The
+    /// maintenance thread is also told to drop its in-memory etag, so the next
+    /// revalidation is an unconditional GET that re-persists the cache rather
+    /// than a conditional GET that would 304 against the stale on-disk content.
+    /// Failures are logged, never fatal.
     fn persist_catalog_cache(
         &mut self,
         base: &[choreo_ai_protocols::ProviderEntry],
@@ -2671,14 +2674,20 @@ impl DaemonState {
         if let Err(e) = crate::catalog::write_catalog_cache(base, &self.catalog_paths.bin) {
             warn!(
                 error = %e,
-                "failed to persist the catalog cache; the next refresh will re-fetch, \
-                 and the live base is retained in memory so an overlay edit cannot \
-                 revert it to the stale on-disk one",
+                "failed to persist the catalog cache; the maintenance thread will retry \
+                 with an unconditional GET, and the live base is retained in memory so an \
+                 overlay edit cannot revert it to the stale on-disk one",
             );
             // The disk cache is now behind the running catalog, so it can no
             // longer answer "what base is applied?" — keep the answer here
             // until a persist succeeds.
             self.catalog_applied_base = Some(std::sync::Arc::new(base.to_vec()));
+            // Tell the maintenance thread its adopted etag no longer describes
+            // the disk, so it drops it and rebuilds/re-persists on the next
+            // revalidation. Best-effort: a gone thread is a daemon shutting down.
+            if let Some(tx) = &self.maintenance_tx {
+                let _ = tx.send(crate::catalog::MaintenanceEvent::CatalogPersistFailed);
+            }
             return;
         }
         // The cache holds exactly the applied base again, so the in-memory

@@ -469,6 +469,10 @@ impl ProviderClient for OpenAiClient {
         "openai"
     }
 
+    fn cache_affinity(&self) -> crate::session_routing::CacheAffinity {
+        self.config.cache_affinity
+    }
+
     fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,

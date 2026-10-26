@@ -174,63 +174,79 @@ fn is_valid_openrouter_session_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// Provider slugs whose endpoint answered a prompt-cache request field with an
-/// HTTP 400 naming that field, i.e. reject it rather than ignore it.
+/// The `(provider slug, model id)` pairs whose endpoint answered a prompt-cache
+/// request field with an HTTP 400 naming that field, i.e. reject it rather than
+/// ignore it.
 ///
 /// The registry covers every optional prompt-cache addition this crate puts on
 /// the request body: the affinity fields above (`prompt_cache_key`,
 /// `session_id`) and the extended-retention selectors
 /// ([`PROMPT_CACHE_RETENTION_FIELD`], [`PROMPT_CACHE_OPTIONS_FIELD`]). One
-/// registry, not one per field: the same provider rejecting one unknown
-/// prompt-cache field is not asked to accept the others. A provider that
-/// *ignores* an unknown field never appears here (it answers 2xx), so only a
-/// genuine rejection downgrades.
+/// registry, not one per field: the same model rejecting one unknown
+/// prompt-cache field is not asked to accept the others. A model that *ignores*
+/// an unknown field never appears here (it answers 2xx), so only a genuine
+/// rejection downgrades.
+///
+/// It is keyed by the **exact `(provider, model)` pair** — never a provider-wide
+/// or prefix judgment — because a provider often accepts a field on one model and
+/// rejects it on another (a newest model that does not yet support
+/// `prompt_cache_key`, say). A rejection recorded for one model must never
+/// withhold the hint from a sibling model the provider still honours it on; the
+/// lookup is therefore an exact set-membership test on the pair, not a substring
+/// or prefix match on the model id.
 ///
 /// [`effective_cache_affinity`] and [`crate::cache_retention`] read this before
 /// a request body is built and [`note_cache_field_rejected`] inserts into it
 /// once a 400 is final, so one rejected request permanently (for the process)
-/// stops that provider from receiving any of them — resending a parameter the
+/// stops that model from receiving any of them — resending a parameter the
 /// server rejects can only waste a turn.
 ///
 /// This is a process-wide behavioral cache: every request of an opted-in
 /// provider consults it (a shared read lock — the [`CacheAffinity::Off`] default
 /// skips the lookup entirely), and only a matching 400 writes it (a write lock,
-/// once per provider), so readers never contend with one another.
+/// once per model), so readers never contend with one another.
 /// It is single-purpose bookkeeping that carries no protocol data (a set of
-/// provider slugs); the lock recovery follows AGENTS.md's poisoned-lock rule,
-/// with a lost entry an acceptable failure mode for a downgrade hint.
-static CACHE_FIELD_REJECTED: LazyLock<RwLock<HashSet<String>>> =
+/// provider+model slugs); the lock recovery follows AGENTS.md's poisoned-lock
+/// rule, with a lost entry an acceptable failure mode for a downgrade hint.
+static CACHE_FIELD_REJECTED: LazyLock<RwLock<HashSet<(String, String)>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 
-/// The cache affinity to actually use for `slug`: `configured`, unless this
-/// process has already learned from a 400 that `slug` rejects the field.
+/// The cache affinity to actually use for `slug`/`model`: `configured`,
+/// unless this process has already learned from a 400 that the pair rejects the
+/// field.
 ///
 /// The resolved precedence, lowest priority first, is the rejection registry
 /// (which can only withhold a hint), then the catalog's `cache_affinity`
 /// dialect carried in `configured`, then the per-account override already folded
 /// into `configured` at construction. Because the override is applied to
-/// `configured` before this lookup, a forced-on hint still reaches a provider
+/// `configured` before this lookup, a forced-on hint still reaches a pair
 /// that has not rejected it, while a rejection keeps it off even when forced.
 ///
-/// `Off` short-circuits **before** taking the lock, so a provider that never
-/// opted in never pays for the lookup.
+/// The registry is consulted for the exact `(slug, model)` pair, so a rejection
+/// on one model never withholds the hint from a sibling model. `Off`
+/// short-circuits **before** taking the lock, so a provider that never opted in
+/// never pays for the lookup.
 #[must_use]
-pub(crate) fn effective_cache_affinity(slug: &str, configured: CacheAffinity) -> CacheAffinity {
+pub(crate) fn effective_cache_affinity(
+    slug: &str,
+    model: &str,
+    configured: CacheAffinity,
+) -> CacheAffinity {
     if configured == CacheAffinity::Off {
         return CacheAffinity::Off;
     }
-    if cache_field_rejected(slug) {
+    if cache_field_rejected(slug, model) {
         CacheAffinity::Off
     } else {
         configured
     }
 }
 
-/// Whether the affinity hint `configured` for `slug` is being **withheld**
-/// because this process already learned, from a 400 naming the field, that the
-/// provider rejects it.
+/// Whether the affinity hint `configured` for `slug`/`model` is being
+/// **withheld** because this process already learned, from a 400 naming the
+/// field, that the pair rejects it.
 ///
-/// `true` requires both halves of the downgrade: the provider *intended* to
+/// `true` requires both halves of the downgrade: the request *intended* to
 /// send a hint (`configured` is not [`CacheAffinity::Off`]) **and** the
 /// request-time resolution comes back `Off` from the rejection registry. An
 /// `Off` provider sent nothing to reject, so it is never downgraded and always
@@ -239,38 +255,42 @@ pub(crate) fn effective_cache_affinity(slug: &str, configured: CacheAffinity) ->
 /// This is the signal the cache-warming gate reads. A warm ping's economics
 /// assume the re-send lands on a backend that still holds the prefix cache;
 /// with the hint withheld the provider may route the ping anywhere, so it could
-/// pay a full-price cache write the next real turn never reads.
+/// pay a full-price cache write the next real turn never reads. Callers pass the
+/// affinity the *request* would send (catalog + account override), so a forced-on
+/// hint that was then rejected is detected too.
 #[must_use]
-pub fn cache_affinity_downgraded(slug: &str, configured: CacheAffinity) -> bool {
+pub fn cache_affinity_downgraded(slug: &str, model: &str, configured: CacheAffinity) -> bool {
     configured != CacheAffinity::Off
-        && effective_cache_affinity(slug, configured) == CacheAffinity::Off
+        && effective_cache_affinity(slug, model, configured) == CacheAffinity::Off
 }
 
 /// Whether this process already learned, from an HTTP 400 naming the field,
-/// that `slug` rejects a prompt-cache request field (affinity or retention).
+/// that `slug`/`model` rejects a prompt-cache request field (affinity or
+/// retention).
 ///
 /// This is the single read side of [`CACHE_FIELD_REJECTED`], shared by the
 /// affinity resolver and the extended-retention resolver so they can never
-/// consult different memories.
+/// consult different memories. The lookup is an exact `(slug, model)` match.
 #[must_use]
-pub(crate) fn cache_field_rejected(slug: &str) -> bool {
+pub(crate) fn cache_field_rejected(slug: &str, model: &str) -> bool {
     CACHE_FIELD_REJECTED
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .contains(slug)
+        .contains(&(slug.to_string(), model.to_string()))
 }
 
-/// Record that `slug` rejected the prompt-cache request field `field`, so
-/// future requests send none of them. Warns once per slug, naming only the
-/// provider and the field (never the request or response body).
-pub(crate) fn note_cache_field_rejected(slug: &str, field: &str) {
+/// Record that `slug`/`model` rejected the prompt-cache request field `field`,
+/// so future requests send none of them. Warns once per pair, naming only the
+/// provider, the model, and the field (never the request or response body).
+pub(crate) fn note_cache_field_rejected(slug: &str, model: &str, field: &str) {
     let fresh = CACHE_FIELD_REJECTED
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(slug.to_string());
+        .insert((slug.to_string(), model.to_string()));
     if fresh {
         warn!(
             provider = %slug,
+            model = %model,
             field = %field,
             "provider rejected a prompt-cache request field (HTTP 400); \
              omitting it for the rest of this process",
@@ -394,45 +414,95 @@ mod tests {
 
     // -- the rejection registry ---------------------------------------
     //
-    // The static is process-wide, so every case below uses its OWN slug: cargo
-    // nextest runs each test in a fresh process, but libtest does not, and a
-    // shared slug would let one test's rejection leak into another's assertion.
+    // The static is process-wide, so every case below uses its OWN (slug, model)
+    // pair: cargo nextest runs each test in a fresh process, but libtest does
+    // not, and a shared key would let one test's rejection leak into another's
+    // assertion.
 
     #[test]
     fn effective_affinity_stays_configured_before_any_rejection() {
-        // A never-rejected slug keeps the configured dialect.
+        // A never-rejected pair keeps the configured dialect.
         assert_eq!(
-            effective_cache_affinity("affinity-clean-slug", CacheAffinity::PromptCacheKey),
+            effective_cache_affinity(
+                "affinity-clean-slug",
+                "clean-model",
+                CacheAffinity::PromptCacheKey
+            ),
             CacheAffinity::PromptCacheKey,
         );
     }
 
     #[test]
     fn effective_affinity_is_off_after_a_rejection() {
-        // A rejection recorded for this slug downgrades it for the rest of the
+        // A rejection recorded for this pair downgrades it for the rest of the
         // process, for every dialect it might have been configured with.
-        note_cache_field_rejected("affinity-rejected-slug", PROMPT_CACHE_KEY_FIELD);
+        note_cache_field_rejected(
+            "affinity-rejected-slug",
+            "some-model",
+            PROMPT_CACHE_KEY_FIELD,
+        );
         assert_eq!(
-            effective_cache_affinity("affinity-rejected-slug", CacheAffinity::PromptCacheKey),
+            effective_cache_affinity(
+                "affinity-rejected-slug",
+                "some-model",
+                CacheAffinity::PromptCacheKey
+            ),
             CacheAffinity::Off,
         );
         assert_eq!(
-            effective_cache_affinity("affinity-rejected-slug", CacheAffinity::OpenRouterSession),
+            effective_cache_affinity(
+                "affinity-rejected-slug",
+                "some-model",
+                CacheAffinity::OpenRouterSession
+            ),
             CacheAffinity::Off,
+        );
+    }
+
+    #[test]
+    fn rejection_is_scoped_to_the_exact_model_not_a_sibling_or_a_prefix() {
+        // A rejection on one model must not withhold the hint from a sibling
+        // model on the same provider — the lookup is an exact (provider, model)
+        // match, never a prefix or substring of the model id.
+        let slug = "affinity-model-scope-slug";
+        note_cache_field_rejected(slug, "rejected-model", PROMPT_CACHE_KEY_FIELD);
+        assert_eq!(
+            effective_cache_affinity(slug, "rejected-model", CacheAffinity::PromptCacheKey),
+            CacheAffinity::Off,
+        );
+        // A different model on the same provider is untouched...
+        assert_eq!(
+            effective_cache_affinity(slug, "sibling-model", CacheAffinity::PromptCacheKey),
+            CacheAffinity::PromptCacheKey,
+        );
+        // ...as is a model whose id merely has the rejected id as a prefix, and
+        // vice versa (exact match, not substring).
+        assert_eq!(
+            effective_cache_affinity(
+                slug,
+                "rejected-model-preview",
+                CacheAffinity::PromptCacheKey
+            ),
+            CacheAffinity::PromptCacheKey,
+        );
+        note_cache_field_rejected(slug, "long-model", PROMPT_CACHE_KEY_FIELD);
+        assert_eq!(
+            effective_cache_affinity(slug, "long", CacheAffinity::PromptCacheKey),
+            CacheAffinity::PromptCacheKey,
         );
     }
 
     #[test]
     fn off_provider_is_never_downgraded() {
         // `Off` short-circuits before the registry lookup, so it stays `Off`
-        // whether or not the slug has a recorded rejection.
+        // whether or not the pair has a recorded rejection.
         assert_eq!(
-            effective_cache_affinity("affinity-off-slug", CacheAffinity::Off),
+            effective_cache_affinity("affinity-off-slug", "m", CacheAffinity::Off),
             CacheAffinity::Off,
         );
-        note_cache_field_rejected("affinity-off-slug", PROMPT_CACHE_KEY_FIELD);
+        note_cache_field_rejected("affinity-off-slug", "m", PROMPT_CACHE_KEY_FIELD);
         assert_eq!(
-            effective_cache_affinity("affinity-off-slug", CacheAffinity::Off),
+            effective_cache_affinity("affinity-off-slug", "m", CacheAffinity::Off),
             CacheAffinity::Off,
         );
         // Because nothing was ever intended, no downgrade is signalled either —
@@ -440,6 +510,7 @@ mod tests {
         // provider must keep warming exactly as it would with no registry.
         assert!(!cache_affinity_downgraded(
             "affinity-off-slug",
+            "m",
             CacheAffinity::Off
         ));
     }
@@ -449,24 +520,28 @@ mod tests {
         // Intended, never rejected: not a downgrade.
         assert!(!cache_affinity_downgraded(
             "affinity-intent-clean-slug",
+            "m",
             CacheAffinity::PromptCacheKey,
         ));
 
         // Intended and then rejected: a downgrade.
         let slug = "affinity-intent-rejected-slug";
-        note_cache_field_rejected(slug, PROMPT_CACHE_KEY_FIELD);
+        note_cache_field_rejected(slug, "m", PROMPT_CACHE_KEY_FIELD);
         assert!(cache_affinity_downgraded(
             slug,
+            "m",
             CacheAffinity::PromptCacheKey
         ));
-        // Every dialect is downgraded alike, and an unknown provider is
-        // unaffected (`Off` from an empty catalog lookup).
+        // Every dialect is downgraded alike for the rejected pair, and an
+        // unrelated pair is unaffected.
         assert!(cache_affinity_downgraded(
             slug,
+            "m",
             CacheAffinity::OpenRouterSession
         ));
         assert!(!cache_affinity_downgraded(
             "affinity-never-recorded-slug",
+            "m",
             CacheAffinity::Off,
         ));
     }
@@ -574,10 +649,10 @@ mod tests {
         // process. The slug is unique to this test because the registry is
         // process-wide.
         let slug = "retention-rejected-slug";
-        note_cache_field_rejected(slug, PROMPT_CACHE_RETENTION_FIELD);
-        assert!(cache_field_rejected(slug));
+        note_cache_field_rejected(slug, "m", PROMPT_CACHE_RETENTION_FIELD);
+        assert!(cache_field_rejected(slug, "m"));
         assert_eq!(
-            effective_cache_affinity(slug, CacheAffinity::PromptCacheKey),
+            effective_cache_affinity(slug, "m", CacheAffinity::PromptCacheKey),
             CacheAffinity::Off,
         );
     }

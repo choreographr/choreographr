@@ -201,7 +201,7 @@ pub(crate) fn cache_retention_fields(
     }
     // The rejection registry can only withhold the selector: a provider that
     // answered a 400 naming the field is never sent it again.
-    if crate::session_routing::cache_field_rejected(provider_slug) {
+    if crate::session_routing::cache_field_rejected(provider_slug, model) {
         debug!(
             provider = %provider_slug,
             model = %model,

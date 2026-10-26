@@ -283,8 +283,8 @@ fn responses_response_deserializes_with_message_and_usage() {
                     }
                 ],
                 "usage": {
-                    "prompt_tokens": 10,
-                    "completion_tokens": 5,
+                    "input_tokens": 10,
+                    "output_tokens": 5,
                     "total_tokens": 15
                 }
             }
@@ -314,10 +314,10 @@ fn responses_turn_projects_input_tokens_details_into_cached_tokens() {
                  "content": [{"type": "output_text", "text": "hi"}]}
             ],
             "usage": {
-                "prompt_tokens": 1000,
-                "completion_tokens": 50,
+                "input_tokens": 1000,
+                "output_tokens": 50,
                 "total_tokens": 1050,
-                "input_tokens_details": {"cached_tokens": 900}
+                "input_tokens_details": {"cached_tokens": 900, "cache_write_tokens": 0}
             }
         }"#;
     let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
@@ -1433,6 +1433,7 @@ fn responses_body_withholds_retention_after_a_rejected_field() {
     let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
     crate::session_routing::note_cache_field_rejected(
         provider,
+        "ret-model",
         crate::cache_retention::PROMPT_CACHE_OPTIONS_FIELD,
     );
     let body = retention_responses_body(

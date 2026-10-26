@@ -102,7 +102,7 @@ fn reasoning_only_stream_is_a_turn_not_an_empty_response() {
             "response": {
                 "id": "resp_1",
                 "status": "completed",
-                "usage": {"prompt_tokens": 5, "completion_tokens": 40, "total_tokens": 45}
+                "usage": {"input_tokens": 5, "output_tokens": 40, "total_tokens": 45}
             }
         }),
     ]);
@@ -176,7 +176,7 @@ fn a_length_capped_stream_is_truncated_not_failed() {
                 "id": "resp_3",
                 "status": "incomplete",
                 "incomplete_details": {"reason": "max_output_tokens"},
-                "usage": {"prompt_tokens": 2, "completion_tokens": 9, "total_tokens": 11}
+                "usage": {"input_tokens": 2, "output_tokens": 9, "total_tokens": 11}
             }
         }),
     ]);

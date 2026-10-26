@@ -33,7 +33,7 @@
 //! pay a full-price write the next real turn never reads. A provider whose
 //! catalog affinity is `Off` never sets the fact and warms exactly as before.
 //!
-//! The module splits cleanly into two halves:
+//! The module splits along three responsibilities:
 //!
 //! * `policy` — the **pure, clock-injected** state machine: [`WarmPolicy`]
 //!   resolved from the parsed config, and [`WarmPolicy::arm`]/[`WarmPlan::decide`]
@@ -48,13 +48,20 @@
 //!   dropped at request end so the thread is always joined. The ping is
 //!   best-effort: it never touches session/turn state, never retries, and
 //!   swallows every error.
+//! * `arming` — `arm_for_tool_window`: resolves every [`WarmFacts`] field
+//!   from the live catalog and the provider's configured cache-affinity dialect
+//!   and arms the [`WarmHandle`], so the agent loop holds no policy knowledge
+//!   and the affinity safety gate sees the exact dialect the request sends
+//!   (catalog + account override, before the rejection registry).
 
+mod arming;
 mod driver;
 mod policy;
 
 #[cfg(test)]
 mod tests;
 
+pub(crate) use arming::{ToolWindowWarm, arm_for_tool_window};
 pub use driver::{WarmHandle, WarmRequest, spawn_warmer};
 pub use policy::{
     Action, CacheWarmingConfig, CacheWarmingMode, DEFAULT_MIN_EXPECTED_SAVINGS,

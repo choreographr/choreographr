@@ -3,6 +3,7 @@ use std::io;
 
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
 use crate::retry::{RequestUploadedCallback, RetryCallback};
+use crate::session_routing::CacheAffinity;
 use crate::types::{CallerInfo, ChatTurnResult, StreamEvent};
 use choreo_proto::InferenceError;
 
@@ -72,6 +73,21 @@ pub struct ChatTurnRequest<'a> {
 pub trait ProviderClient: Debug + Send + Sync {
     /// Return the provider slug for catalog lookups.
     fn provider_slug(&self) -> &str;
+
+    /// The per-session cache-affinity dialect this client attaches to its
+    /// request bodies, if any.
+    ///
+    /// This is the *configured* value (the catalog dialect folded with the
+    /// account override) **before** the process-wide rejection registry is
+    /// applied. It answers "did this request intend to send a hint?", which is
+    /// exactly what the cache-warming gate needs to tell an intentional hint
+    /// from one the registry withheld for a model that rejected it. Defaults to
+    /// [`CacheAffinity::Off`]; only the OpenAI-compatible client carries the
+    /// capability.
+    #[must_use]
+    fn cache_affinity(&self) -> CacheAffinity {
+        CacheAffinity::Off
+    }
 
     /// Non-streaming turn.
     ///

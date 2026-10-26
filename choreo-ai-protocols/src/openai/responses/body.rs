@@ -197,7 +197,7 @@ pub(super) fn build_responses_request_body(
     let session_id = params.route.map(|(session_id, _request_id)| session_id);
     let affinity = session_id.map_or_default(|session_id| {
         crate::session_routing::cache_affinity_fields(
-            config.effective_cache_affinity(),
+            config.effective_cache_affinity(params.model),
             session_id,
             params.model,
         )

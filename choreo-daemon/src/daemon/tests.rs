@@ -3298,10 +3298,13 @@ fn refresh_models_forwards_to_maintenance_thread() {
     state.handle_command(DaemonCommand::RefreshModels { force: true, reply });
 
     let msg = maintenance_rx.recv().unwrap();
-    // MaintenanceEvent has exactly one variant now (the config transport owns
-    // FS events), so a single-arm match suffices.
+    // A `/refresh-models` request is the only event this handler emits; a
+    // persist-failure notice comes from the catalog path, never here.
     match msg {
         MaintenanceEvent::RefreshNow { force, .. } => assert!(force),
+        MaintenanceEvent::CatalogPersistFailed => {
+            panic!("a /refresh-models request must not emit a persist-failure notice")
+        }
     }
 }
 
@@ -3532,6 +3535,9 @@ fn catalog_overlay_changed_keeps_the_applied_base_after_a_failed_persist() {
     // 150+ provider base and silently discard the fetch).
     let _restore = RestoreBundledCatalogOnDrop;
     let (mut state, _rx) = make_daemon_state();
+    // A maintenance channel, so we can observe the persist-failure notice.
+    let (maintenance_tx, maintenance_rx) = crossbeam_channel::unbounded();
+    state.maintenance_tx = Some(maintenance_tx);
     let dir = tempfile::tempdir().unwrap();
     // A FILE where the cache's parent dir should be makes the persist fail
     // deterministically (create_dir_all hits ENOTDIR) without touching
@@ -3553,6 +3559,12 @@ fn catalog_overlay_changed_keeps_the_applied_base_after_a_failed_persist() {
         state.catalog_applied_base.is_some(),
         "a failed persist must retain the applied base"
     );
+    // The maintenance thread is told to drop its etag so the next revalidation
+    // rebuilds and re-persists the cache (rather than 304-ing on the stale disk).
+    match maintenance_rx.try_recv() {
+        Ok(MaintenanceEvent::CatalogPersistFailed) => {}
+        other => panic!("expected CatalogPersistFailed, got {other:?}"),
+    }
 
     state.handle_command(DaemonCommand::CatalogOverlayChanged {
         user_overlay: Some("[provider.tiny-test]\ndisplay_name = \"Renamed\"\n".into()),

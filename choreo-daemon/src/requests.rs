@@ -1,6 +1,4 @@
-use crate::cache_warm::{
-    CacheWarmingMode, RetentionTier, WarmFacts, WarmRequest, is_replayable, spawn_warmer,
-};
+use crate::cache_warm::{CacheWarmingMode, spawn_warmer};
 use crate::context::{self, SkillMeta};
 use crate::providers::InferenceProvider;
 use crate::reasoning::{
@@ -18,10 +16,7 @@ use choreo_ai_protocols::{
     ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, ToolResultItem,
     model_reasoning_capability,
 };
-use choreo_ai_protocols::{
-    ProviderProtocol, cache_affinity, cache_affinity_downgraded, lookup_provider, model_cost,
-    prompt_cache_ttl,
-};
+use choreo_ai_protocols::{ProviderProtocol, lookup_provider};
 use choreo_proto::{
     AssistantToolCallRecord, DaemonMessageType, OutputStream, ReasoningProducer, SessionEvent,
     SessionStatus,
@@ -1023,50 +1018,32 @@ pub(crate) fn run_agent_loop(
 
                 // Arm the cache warmer for the blocking tool window that
                 // follows: the request just sent is the prefix the next real
-                // turn will re-read, so a 1-token re-send mid-tool refreshes
-                // its provider cache TTL. `messages`/`tools` are cloned into the
-                // snapshot — O(conversation), the same order
-                // `build_chat_request_messages` already costs each iteration —
-                // but ONLY on a tool turn, which is exactly the turn that then
-                // blocks. No arm happens on a `FinalText` result (the loop
-                // returns).
+                // turn will re-read, so a 1-token re-send mid-tool refreshes its
+                // provider cache TTL. The arming policy (including the
+                // affinity safety gate, which must see the exact dialect this
+                // request sends) lives in `cache_warm::arming`, so the loop
+                // holds no policy knowledge. Only a tool turn arms — it is the
+                // turn that then blocks; a `FinalText` result returns first.
                 if let Some(warmer) = &warmer {
-                    let is_anthropic = protocol_is_anthropic(&provider_slug);
-                    let facts = WarmFacts {
-                        cache_ttl: prompt_cache_ttl(&provider_slug, model),
-                        retention: RetentionTier::Short,
-                        prefix_tokens: estimated_prompt_tokens,
-                        cost: model_cost(&provider_slug, model),
-                        replayable: is_replayable(is_anthropic, thinking_enabled),
-                        // The warming economics assume the ping reaches a
-                        // backend that still holds this prefix's cache. That is
-                        // only guaranteed while the per-session affinity hint is
-                        // actually sent: once the provider has answered the field
-                        // with a 400 (the process-wide rejection registry), the
-                        // hint is withheld and the ping could be routed anywhere,
-                        // paying a full-price write the next real turn never
-                        // reads. So a catalog-opted-in provider whose hint was
-                        // downgraded to `Off` must not warm; a provider the
-                        // catalog leaves `Off` was never relying on the hint and
-                        // warms exactly as before.
-                        affinity_downgraded: cache_affinity_downgraded(
-                            &provider_slug,
-                            cache_affinity(&provider_slug),
-                        ),
-                    };
-                    warmer.arm(WarmRequest {
-                        model: model.to_string(),
-                        messages: messages.clone(),
-                        tools: tools.clone(),
-                        facts,
-                        session_id: ctx.session_id.to_string(),
-                        stream_id: stream_id.to_string(),
-                        // Anthropic accepts `max_tokens: 0` as its documented
-                        // cache pre-warm (writes the cache, bills no output) —
-                        // hence the inverted flag; every other protocol needs at
-                        // least one output token.
-                        max_output_tokens: u32::from(!is_anthropic),
-                    });
+                    crate::cache_warm::arm_for_tool_window(
+                        warmer,
+                        &crate::cache_warm::ToolWindowWarm {
+                            provider_slug: &provider_slug,
+                            model,
+                            // The dialect the request bodies actually send
+                            // (catalog + account override), so a forced-on hint
+                            // that was then rejected is detected and a forced-off
+                            // one is not mistaken for a sent hint.
+                            affinity: client.cache_affinity(),
+                            estimated_prompt_tokens,
+                            messages: messages.as_slice(),
+                            tools: tools.as_slice(),
+                            session_id: ctx.session_id,
+                            stream_id,
+                            is_anthropic: protocol_is_anthropic(&provider_slug),
+                            thinking_enabled,
+                        },
+                    );
                 }
 
                 // Partition tool calls into serial and concurrent.

@@ -928,12 +928,16 @@ fields can never be downgraded. The rejection is recorded once the attempt is
 a retried request cannot record it more than once.
 
 The memory is the process-wide `session_routing::CACHE_FIELD_REJECTED` set — the
-**sixteenth** sanctioned shared-state exception (see AGENTS.md). It is one
-registry for the whole prompt-cache request surface, so a provider that rejects
-an affinity key is not asked to accept a retention selector (or vice versa). It
-is read under a shared lock when a body is built for an opted-in provider (the
-`Off` default skips the lookup) and written once per provider on a matching
-`400`, so it carries no protocol data and readers never contend.
+**sixteenth** sanctioned shared-state exception (see AGENTS.md). It is keyed by
+the exact `(provider, model)` pair, never a provider-wide or model-prefix
+judgment: a provider often accepts a field on one model and rejects it on
+another, so a rejection recorded for one model must not withhold the hint from a
+sibling model the provider still honours it on. It is one registry for the whole
+prompt-cache request surface, so a pair that rejects an affinity key is not
+asked to accept a retention selector (or vice versa). It is read under a shared
+lock when a body is built for an opted-in provider (the `Off` default skips the
+lookup) and written once per pair on a matching `400`, so it carries no protocol
+data and readers never contend.
 
 The field a request actually sends resolves through three layers, highest
 priority first: a **per-account override** (`prompt_cache_affinity` on
@@ -956,17 +960,22 @@ read) assume the ping reaches a server that **still holds the prefix**. With the
 hint withheld the ping may be routed anywhere, so it can pay a full-price cache
 write the next real turn never reads — a coin flip the warmer must not take.
 
-The gate is deliberately narrow. The arming site (`run_agent_loop`) resolves the
-catalog dialect (`catalog::cache_affinity`) and asks
-`session_routing::cache_affinity_downgraded`, which is true only when **both**
-halves hold: the provider *intended* to send a hint (catalog affinity is not
-`Off`) **and** the effective affinity came back `Off` from the rejection
-registry. The resulting `WarmFacts::affinity_downgraded` fact rides into the pure
-policy, which returns `SkipReason::AffinityUnavailable` from its static
+The gate is deliberately narrow. The arming site delegates to
+`cache_warm::arming` (`arm_for_tool_window`), which resolves the dialect the
+request bodies actually send — `InferenceProvider::cache_affinity`, i.e. the
+catalog dialect folded with the per-account override, the same value the body
+builders use — and asks `session_routing::cache_affinity_downgraded`, which is
+true only when **both** halves hold: the request *intended* to send a hint (that
+dialect is not `Off`) **and** the effective affinity came back `Off` from the
+rejection registry for that `(provider, model)` pair. Resolving the real
+sent-dialect (not the bare catalog value) is what makes a forced-on override
+that was then rejected get caught, and a forced-off override not be mistaken for
+a sent hint. The resulting `WarmFacts::affinity_downgraded` fact rides into the
+pure policy, which returns `SkipReason::AffinityUnavailable` from its static
 ineligibility check — so the plan is never armed, no timer is wasted, and the
 decline shows up in `choreo_cache_warm_skips_total{reason="affinity_unavailable"}`.
-Every provider the catalog leaves `Off` (Anthropic, Google, DeepSeek, the
-`opencode` gateways) never sets the fact and warms exactly as before.
+Every provider that sends no hint never sets the fact and warms exactly as
+before.
 
 #### Transient gateway 400 (message content)
 
