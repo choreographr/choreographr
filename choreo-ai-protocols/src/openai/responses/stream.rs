@@ -145,6 +145,7 @@ where
             url: &url,
             auth,
             body: &body,
+            model,
             config,
             retry_cfg: &retry,
             route,

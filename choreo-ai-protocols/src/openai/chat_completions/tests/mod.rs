@@ -722,7 +722,7 @@ fn usage_parses_zai_cached_prompt_tokens() {
             .prompt_tokens_details
             .expect("details present")
             .cached_tokens,
-        64
+        Some(64)
     );
 }
 
@@ -1656,10 +1656,10 @@ fn body_withholds_retention_after_a_rejected_field() {
         long_secs: Some(86_400),
     });
     crate::catalog::replace_catalog(catalog);
-    crate::session_routing::note_cache_field_rejected(
+    crate::cache_field_rejection::note_cache_field_rejected(
         provider,
         "ret-old",
-        crate::cache_retention::PROMPT_CACHE_RETENTION_FIELD,
+        crate::cache_field_rejection::PROMPT_CACHE_RETENTION_FIELD,
     );
     let body = retention_body(provider, "ret-old");
     assert!(body.get("prompt_cache_retention").is_none(), "{body}");

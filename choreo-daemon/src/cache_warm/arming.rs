@@ -30,6 +30,10 @@ pub(crate) struct ToolWindowWarm<'a> {
     /// The affinity the request bodies send: the catalog dialect folded with the
     /// account override, **before** the rejection registry.
     pub(crate) affinity: CacheAffinity,
+    /// Whether the request bodies ask for the model's **long** prompt-cache
+    /// tier (see `ProviderClient::extended_cache_retention`), resolved by the
+    /// same rules the body builder applies.
+    pub(crate) extended_retention: bool,
     /// The estimated prompt-prefix size, in tokens.
     pub(crate) estimated_prompt_tokens: u32,
     /// The message prefix sent on the just-sent turn (replayed by the ping).
@@ -61,10 +65,16 @@ pub(crate) struct ToolWindowWarm<'a> {
 /// request intended a hint and the process-wide rejection registry withheld it
 /// for this `(provider, model)` pair. A provider the catalog leaves `Off` never
 /// sets the fact and warms exactly as before.
+///
+/// The retention tier is `Long` when the request bodies actually ask the
+/// provider for an extended cache — the same resolver the body builder uses, so
+/// the ping schedule is computed against the lifetime the cache will really
+/// have. Scheduling a 24 h cache on the short tier's minutes-long cadence would
+/// re-ping (and pay for a write) long before the cache would have expired.
 pub(crate) fn arm_for_tool_window(warmer: &WarmHandle, spec: &ToolWindowWarm<'_>) {
     let facts = WarmFacts {
         cache_ttl: prompt_cache_ttl(spec.provider_slug, spec.model),
-        retention: RetentionTier::Short,
+        retention: RetentionTier::for_extended_retention(spec.extended_retention),
         prefix_tokens: spec.estimated_prompt_tokens,
         cost: model_cost(spec.provider_slug, spec.model),
         replayable: is_replayable(spec.is_anthropic, spec.thinking_enabled),

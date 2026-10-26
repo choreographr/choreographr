@@ -421,6 +421,20 @@ fn reschedule_arithmetic() {
 }
 
 #[test]
+fn retention_tier_follows_the_sent_selector() {
+    // The arming site asks the client what its bodies send; this is the one
+    // mapping from that answer to a policy tier.
+    assert_eq!(
+        RetentionTier::for_extended_retention(false),
+        RetentionTier::Short
+    );
+    assert_eq!(
+        RetentionTier::for_extended_retention(true),
+        RetentionTier::Long
+    );
+}
+
+#[test]
 fn retention_tier_resolution() {
     let p = policy(MeterKind::Payg);
     // Long tier present and selected.

@@ -732,3 +732,94 @@ fn model_usage_rejection_reason_classifies_bodies() {
         None
     );
 }
+
+#[test]
+#[serial_test::serial(catalog)]
+fn extended_cache_retention_matches_what_a_request_would_send() {
+    // The warmer schedules its pings against the cache lifetime this answers, so
+    // it must agree with the body builder's selector on every gate: the model's
+    // dialect, the curated long tier, the API the body targets, and a field the
+    // provider already rejected.
+    use crate::{CacheRetentionDialect, PromptCacheTtl};
+    let provider = "long-retention-extended-test";
+    let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
+
+    // Pin one model on a tiny catalog. `openai_responses` decides which API the
+    // body targets, which matters for the newer (Responses-only) spelling.
+    let catalog_with = |dialect: CacheRetentionDialect, long_secs: Option<u32>, responses: bool| {
+        let mut catalog = crate::catalog::test_util::tiny_catalog();
+        catalog[0].slug = provider.to_string();
+        let entry = &mut catalog[0].models[0];
+        entry.model = "ret-model".to_string();
+        entry.cache_retention = dialect;
+        entry.openai_responses = responses;
+        entry.prompt_cache = Some(PromptCacheTtl {
+            short_secs: Some(300),
+            long_secs,
+        });
+        crate::catalog::replace_catalog(catalog);
+    };
+    let client = || {
+        let registry = crate::SocketRegistry::new();
+        OpenAiClient::new(
+            ServiceConfig {
+                provider_slug: provider.to_string(),
+                ..Default::default()
+            },
+            RequestAuth::api_key("test-key"),
+            &registry,
+        )
+        .expect("client builds")
+    };
+
+    // Dialect + long tier, older spelling: emitted on both APIs.
+    catalog_with(
+        CacheRetentionDialect::PromptCacheRetention,
+        Some(86_400),
+        false,
+    );
+    let chat = client();
+    assert!(chat.extended_cache_retention("ret-model"));
+    // A model the catalog did not pin sends no selector.
+    assert!(!chat.extended_cache_retention("unpinned-model"));
+    catalog_with(
+        CacheRetentionDialect::PromptCacheRetention,
+        Some(86_400),
+        true,
+    );
+    assert!(client().extended_cache_retention("ret-model"));
+
+    // The same dialect with no curated long tier: nothing is emitted, so the
+    // cache really does live the short tier.
+    catalog_with(CacheRetentionDialect::PromptCacheRetention, None, false);
+    assert!(!client().extended_cache_retention("ret-model"));
+
+    // The newer spelling's extended `"12h"` value is Responses-only: Chat
+    // Completions gets no selector, so it must not claim the long tier.
+    catalog_with(
+        CacheRetentionDialect::PromptCacheOptions,
+        Some(43_200),
+        false,
+    );
+    assert!(!client().extended_cache_retention("ret-model"));
+    catalog_with(
+        CacheRetentionDialect::PromptCacheOptions,
+        Some(43_200),
+        true,
+    );
+    assert!(client().extended_cache_retention("ret-model"));
+
+    // And a field the provider already rejected for this pair is withheld, so
+    // the request will not ask for the long tier.
+    catalog_with(
+        CacheRetentionDialect::PromptCacheRetention,
+        Some(86_400),
+        false,
+    );
+    crate::cache_field_rejection::note_cache_field_rejected(
+        provider,
+        "ret-model",
+        crate::cache_field_rejection::PROMPT_CACHE_RETENTION_FIELD,
+    );
+    assert!(!client().extended_cache_retention("ret-model"));
+}

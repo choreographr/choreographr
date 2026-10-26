@@ -1431,10 +1431,10 @@ fn responses_body_emits_the_12h_options_spelling() {
 fn responses_body_withholds_retention_after_a_rejected_field() {
     let provider = "retention-rejected-responses-test";
     let _restore = crate::catalog::test_util::RestoreBundledOnDrop;
-    crate::session_routing::note_cache_field_rejected(
+    crate::cache_field_rejection::note_cache_field_rejected(
         provider,
         "ret-model",
-        crate::cache_retention::PROMPT_CACHE_OPTIONS_FIELD,
+        crate::cache_field_rejection::PROMPT_CACHE_OPTIONS_FIELD,
     );
     let body = retention_responses_body(
         provider,

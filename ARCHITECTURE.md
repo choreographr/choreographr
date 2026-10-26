@@ -871,7 +871,9 @@ the prompt tokens — it would merely partition the accounting rather than impro
 routing. The session-less one-shot prompt API sends no hint. `OpenRouter` ignores
 an id outside `[A-Za-z0-9_-]` or longer than 256 bytes, so the resolver validates
 and omits an invalid id instead of sending a value the provider would drop. The
-dialect and its validation live in `choreo-ai-protocols/src/session_routing.rs`.
+dialect and its validation live in `choreo-ai-protocols/src/session_routing.rs`;
+the shared rejection registry every prompt-cache field is filtered through lives
+in `choreo-ai-protocols/src/cache_field_rejection.rs` (see below).
 Like the compression coding, the dialect is baked into the provider client at
 construction, so an overlay edit reaches live sessions through the catalog-swap
 client invalidation (`client_config_changed` compares it).
@@ -915,11 +917,16 @@ The hint fails safe. A provider that answers a prompt-cache request field with
 an HTTP **400 naming that very field** — `prompt_cache_key`, or `session_id` for
 the `OpenRouter` dialect, or either retention spelling
 (`prompt_cache_retention` / `prompt_cache_options`) — is treated as rejecting
-the parameter, and the field is withheld from every later request of that
-provider for the rest of the process. The detector is narrow, so nothing
+the parameter, and that `(provider, model)` pair receives none of them for the
+rest of the process. The detector is narrow, so nothing
 unrelated downgrades: only a `400` counts (a `429`, a `5xx`, or any other `4xx`
-never does), and the detail must mention the field the request actually carried
-(`cache_field_rejection_field`, which reads the built body — never logging it).
+never does), and the detail must name one of the fields the request actually
+carried (`cache_field_rejection_field`, which checks every prompt-cache field on
+the built body — never logging it). It checks every field, not just the first:
+the affinity and retention families are chosen by independent resolvers, so a
+single body can carry one of each, and a `400` naming the retention selector
+must downgrade a body that also carries an affinity key — otherwise the rejected
+field would be re-sent (and fail) on every later turn.
 A provider that merely *ignores* an unknown field answers 2xx and is never
 recorded, and a `400` that names some other problem (a malformed request, an
 unknown model) leaves the hint in place. A body that carries none of these
@@ -927,8 +934,12 @@ fields can never be downgraded. The rejection is recorded once the attempt is
 **final** — after the retry loop has exhausted its retries — not per attempt, so
 a retried request cannot record it more than once.
 
-The memory is the process-wide `session_routing::CACHE_FIELD_REJECTED` set — the
-**sixteenth** sanctioned shared-state exception (see AGENTS.md). It is keyed by
+The memory is the process-wide `cache_field_rejection::CACHE_FIELD_REJECTED`
+map — the **sixteenth** sanctioned shared-state exception (see AGENTS.md). Its
+field names, the detector, and the registry live in
+`choreo-ai-protocols/src/cache_field_rejection.rs`, while the affinity dialect
+resolver (`session_routing.rs`) and the retention resolver (`cache_retention.rs`)
+consume it, so neither resolver owns the shared memory. It is keyed by
 the exact `(provider, model)` pair, never a provider-wide or model-prefix
 judgment: a provider often accepts a field on one model and rejects it on
 another, so a rejection recorded for one model must not withhold the hint from a
@@ -937,7 +948,9 @@ prompt-cache request surface, so a pair that rejects an affinity key is not
 asked to accept a retention selector (or vice versa). It is read under a shared
 lock when a body is built for an opted-in provider (the `Off` default skips the
 lookup) and written once per pair on a matching `400`, so it carries no protocol
-data and readers never contend.
+data and readers never contend. The map is shaped provider → model ids so a
+lookup, which runs on every body build, borrows the caller's `&str`s and
+allocates nothing.
 
 The field a request actually sends resolves through three layers, highest
 priority first: a **per-account override** (`prompt_cache_affinity` on
@@ -976,6 +989,21 @@ ineligibility check — so the plan is never armed, no timer is wasted, and the
 decline shows up in `choreo_cache_warm_skips_total{reason="affinity_unavailable"}`.
 Every provider that sends no hint never sets the fact and warms exactly as
 before.
+
+#### The warming schedule follows the cache's real lifetime
+
+The same arming step resolves the other half of a ping's address:
+`WarmFacts::retention`, which `WarmPolicy` turns into the TTL the schedule is
+computed against (`RetentionTier::Long` reads the model's curated `long_secs`,
+`Short` its `short_secs`). It is `Long` exactly when the request bodies will
+carry an **extended-retention selector**, answered by
+`ProviderClient::extended_cache_retention` — which defers to the very resolver
+the body builders use, so the tier can never disagree with what is actually
+sent (dialect set, curated long tier declared, the API the body targets, and
+not a field the provider has already rejected). Without that link a model asking
+for a 24 h cache would be re-pinged on the short tier's minutes-long cadence,
+paying for cache writes the extended window never needed, and a model declaring
+only a long tier would never be warmed at all.
 
 #### Transient gateway 400 (message content)
 

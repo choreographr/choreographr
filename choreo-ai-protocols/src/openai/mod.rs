@@ -473,6 +473,20 @@ impl ProviderClient for OpenAiClient {
         self.config.cache_affinity
     }
 
+    fn extended_cache_retention(&self, model: &str) -> bool {
+        // Ask the SAME resolver the body builders use, so the answer can never
+        // disagree with what a request actually sends: the model's dialect, the
+        // curated long tier, the API the body targets (the newer spelling's
+        // extended value is Responses-only), and the rejection registry.
+        let is_responses = self.config.request_format_for_model(model) == RequestFormat::Responses;
+        !crate::cache_retention::cache_retention_fields(
+            &self.config.provider_slug,
+            model,
+            is_responses,
+        )
+        .is_empty()
+    }
+
     fn chat_completion_turn(
         &self,
         params: ChatTurnRequest<'_>,

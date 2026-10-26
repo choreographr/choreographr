@@ -89,6 +89,27 @@ pub trait ProviderClient: Debug + Send + Sync {
         CacheAffinity::Off
     }
 
+    /// Whether a request this client sends for `model` will carry an
+    /// **extended** prompt-cache retention selector, i.e. whether the provider
+    /// will keep that model's prompt cache for the model's LONG tier rather than
+    /// the default short one.
+    ///
+    /// The cache warmer reads this to pick the retention tier its ping schedule
+    /// is computed against: a request asking the provider for a 24 h cache must
+    /// not be re-pinged on the short tier's minutes-long cadence, which would
+    /// pay for cache writes the extended window never needed.
+    ///
+    /// The answer is "what a request would actually send", so it accounts for
+    /// the same gates the body builder applies — the model's dialect, the
+    /// curated long tier, the API the body targets, and a field the provider has
+    /// already rejected. Defaults to `false`: extended retention is an
+    /// `OpenAI`-compatible request field, and Anthropic's 1-hour tier is a
+    /// different mechanism (`anthropic-beta`) that the warmer does not drive.
+    #[must_use]
+    fn extended_cache_retention(&self, _model: &str) -> bool {
+        false
+    }
+
     /// Non-streaming turn.
     ///
     /// # Errors

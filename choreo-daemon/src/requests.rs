@@ -1035,6 +1035,10 @@ pub(crate) fn run_agent_loop(
                             // that was then rejected is detected and a forced-off
                             // one is not mistaken for a sent hint.
                             affinity: client.cache_affinity(),
+                            // And the tier the request bodies actually ask for,
+                            // so a model on the extended-retention selector is
+                            // scheduled against its real (long) cache lifetime.
+                            extended_retention: client.extended_cache_retention(model),
                             estimated_prompt_tokens,
                             messages: messages.as_slice(),
                             tools: tools.as_slice(),

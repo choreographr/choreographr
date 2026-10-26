@@ -143,6 +143,19 @@ pub enum RetentionTier {
     Long,
 }
 
+impl RetentionTier {
+    /// The tier a request really uses, from whether its body carries an
+    /// extended-retention selector.
+    ///
+    /// The one place the arming site's question ("will this request ask the
+    /// provider for the long tier?") becomes a policy input, so the mapping is
+    /// stated and tested rather than inlined at the call site.
+    #[must_use]
+    pub fn for_extended_retention(extended: bool) -> Self {
+        if extended { Self::Long } else { Self::Short }
+    }
+}
+
 /// The resolved cache-warming policy for one account: the global config
 /// ([`CacheWarmingConfig`]) merged with the account's `meter`/`cache_warming`
 /// overrides and its effective prompt-cache setting.

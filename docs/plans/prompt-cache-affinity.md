@@ -150,12 +150,12 @@ on another — the same failure mode Phase 1 fixed on the parse side.
 
 An optional field that a provider rejects with an HTTP **400 naming that field**
 cannot be retried into working; it has to be withdrawn. The process remembers the
-provider in `session_routing::CACHE_FIELD_REJECTED` and omits the field from every
-later request. The detector is deliberately narrow (only a `400`, only when the body
-names the field the request actually carried, only once the attempt is final after
-retries) so nothing unrelated downgrades a working provider. Operators can force the
-capability on or off per account with `prompt_cache_affinity`, without editing the
-catalog.
+provider in `cache_field_rejection::CACHE_FIELD_REJECTED` and omits the field from
+every later request. The detector is deliberately narrow (only a `400`, only when
+the body names one of the prompt-cache fields the request actually carried, only
+once the attempt is final after retries) so nothing unrelated downgrades a working
+provider. Operators can force the capability on or off per account with
+`prompt_cache_affinity`, without editing the catalog.
 
 ### Phase 4 — stop warming a cache you cannot reach (`267037b`)
 

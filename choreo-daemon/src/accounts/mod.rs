@@ -278,8 +278,13 @@ impl AccountConfig {
         Ok(())
     }
 
-    /// Apply this account's config overrides to a `ServiceConfig`.
-    pub fn apply_overrides(&self, config: &mut choreo_ai_protocols::openai::ServiceConfig) {
+    /// Apply this account's transport/endpoint overrides to a `ServiceConfig`.
+    ///
+    /// Named distinctly from the adapters' `apply_overrides(&ProviderOverrides)`
+    /// (which this account's [`provider_overrides`](Self::provider_overrides)
+    /// carrier feeds) so the two different operations are never confused at a
+    /// call site that performs both.
+    pub fn apply_to_service_config(&self, config: &mut choreo_ai_protocols::openai::ServiceConfig) {
         if let Some(base_url) = &self.base_url {
             config.base_url.clone_from(base_url);
         }
@@ -351,7 +356,7 @@ impl AccountConfig {
     /// Convert the shared override fields into the protocol-agnostic carrier
     /// used by the provider crates (`choreo-ai-protocols`).  OpenAI-specific
     /// fields are not represented — they are applied directly via
-    /// [`apply_overrides`](Self::apply_overrides).
+    /// [`apply_to_service_config`](Self::apply_to_service_config).
     #[must_use]
     pub fn provider_overrides(&self) -> choreo_ai_protocols::ProviderOverrides {
         choreo_ai_protocols::ProviderOverrides::from(self)
@@ -377,7 +382,7 @@ impl AccountConfig {
 /// from this field list (the carrier is the single source of truth for what
 /// gets forwarded to every provider).  OpenAI-specific fields are deliberately
 /// not represented here — they are applied directly via
-/// [`AccountConfig::apply_overrides`].
+/// [`AccountConfig::apply_to_service_config`].
 impl From<&AccountConfig> for choreo_ai_protocols::ProviderOverrides {
     fn from(config: &AccountConfig) -> Self {
         choreo_ai_protocols::ProviderOverrides {
@@ -916,7 +921,7 @@ provider = "openai"
     }
 
     #[test]
-    fn apply_overrides() {
+    fn apply_to_service_config() {
         let mut svc_config = choreo_ai_protocols::openai::ServiceConfig::default();
         let cfg = AccountConfig {
             base_url: Some("https://custom.api.com/v1".to_string()),
@@ -942,7 +947,7 @@ provider = "openai"
             retry_max_backoff_ms: Some(60000),
             ..AccountConfig::simple("ovr", "openai")
         };
-        cfg.apply_overrides(&mut svc_config);
+        cfg.apply_to_service_config(&mut svc_config);
         assert_eq!(svc_config.base_url, "https://custom.api.com/v1");
         assert!(!svc_config.streaming);
         assert_eq!(svc_config.retry_max_attempts, 5);

@@ -668,10 +668,10 @@ mod tests {
         // has already rejected the field stays off even when forced on. The
         // slug is unique to this test because the registry is process-wide.
         let slug = "override-rejection-test-slug";
-        crate::session_routing::note_cache_field_rejected(
+        crate::cache_field_rejection::note_cache_field_rejected(
             slug,
             "forced-model",
-            crate::session_routing::PROMPT_CACHE_KEY_FIELD,
+            crate::cache_field_rejection::PROMPT_CACHE_KEY_FIELD,
         );
         let mut config = ServiceConfig {
             provider_slug: slug.to_string(),

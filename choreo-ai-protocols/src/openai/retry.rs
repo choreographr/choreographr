@@ -28,6 +28,14 @@ pub(crate) struct RetrySend<'a> {
     /// here, so every call site stays a plain "send with retry".
     pub auth: &'a RequestAuth,
     pub body: &'a serde_json::Value,
+    /// The model this request targets, in the exact spelling the body carries.
+    ///
+    /// Used only to key the process-wide prompt-cache field rejection registry
+    /// (see [`crate::cache_field_rejection`]): a rejection must be recorded
+    /// against the model that actually sent the field, and threading it here
+    /// makes that pairing explicit instead of re-reading it out of the
+    /// serialized body.
+    pub model: &'a str,
     pub config: &'a ServiceConfig,
     pub retry_cfg: &'a RetryConfig,
     /// Gateway routing identity for the opencode zen/go providers: the turn's
@@ -49,6 +57,7 @@ pub(crate) fn retry_send(
         url,
         auth,
         body,
+        model,
         config,
         retry_cfg,
         route,
@@ -102,25 +111,21 @@ pub(crate) fn retry_send(
     // Record a genuine prompt-cache-field rejection once the attempt is final —
     // the retry loop above has already exhausted its retries, so this runs once
     // per request, never per attempt. A response only counts when it is a 400
-    // whose detail names the field this request actually carried
-    // (`cache_field_rejection_field`); the built `body` confirms which field
-    // that was (an affinity key, or an extended-retention selector), and it is
-    // inspected here, never logged. Recording it makes `effective_cache_affinity`
-    // and the retention resolver withhold every such field from later requests
-    // of this provider, so a rejected parameter cannot waste another turn.
+    // whose detail names a field this request actually carried
+    // (`cache_field_rejection_field`, which checks every prompt-cache field on
+    // the built `body`); the body is inspected here, never logged. Recording it
+    // makes `effective_cache_affinity` and the retention resolver withhold every
+    // such field from later requests of this `(provider, model)` pair, so a
+    // rejected parameter cannot waste another turn.
     if let Err(crate::retry::ProviderHttpError::ClientError { status, detail }) = &result
         && let Some(field) =
-            crate::session_routing::cache_field_rejection_field(body, *status, detail)
+            crate::cache_field_rejection::cache_field_rejection_field(body, *status, detail)
     {
-        // The registry is keyed by the exact provider+model pair, so record the
-        // model this request actually sent (read from the body, never matched by
-        // prefix). A rejection on one model must not withhold the hint from a
-        // sibling model the provider still honours it on.
-        let model = body
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        crate::session_routing::note_cache_field_rejected(&config.provider_slug, model, field);
+        crate::cache_field_rejection::note_cache_field_rejected(
+            &config.provider_slug,
+            model,
+            field,
+        );
     }
     result.map_err(OpenAiError::from)
 }

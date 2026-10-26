@@ -51,6 +51,9 @@ pub mod videos;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 
+// The process-wide prompt-cache request-field rejection registry (shared by
+// the affinity and extended-retention resolvers).
+mod cache_field_rejection;
 mod cache_retention;
 mod context_window;
 // Provider OAuth client-identity policy (compiled, keyed by slug).

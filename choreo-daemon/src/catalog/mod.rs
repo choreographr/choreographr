@@ -114,6 +114,11 @@ pub enum MaintenanceEvent {
     /// the next revalidation to be an unconditional GET that rebuilds and
     /// re-persists the cache. No payload: the base is retained on the command
     /// loop (`DaemonState::catalog_applied_base`) until a persist succeeds.
+    ///
+    /// The retry rides the next scheduled revalidation rather than firing
+    /// immediately: the running catalog is still correct and complete — only its
+    /// durable copy is behind — and a disk that just refused a write is unlikely
+    /// to accept one moments later.
     CatalogPersistFailed,
 }
 

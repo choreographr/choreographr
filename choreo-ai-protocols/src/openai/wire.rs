@@ -64,48 +64,50 @@ pub(crate) struct Usage {
     #[serde(default)]
     pub(crate) input_tokens_details: Option<CachedTokenDetails>,
     /// `DeepSeek`'s flat cache-hit count, reported at the top level of `usage`
-    /// instead of inside a details object.
+    /// instead of inside a details object. `DeepSeek` also reports a flat
+    /// `prompt_cache_miss_tokens` alongside it; it is deliberately not modelled,
+    /// because the miss count is simply `prompt_tokens - cached_tokens` and
+    /// nothing downstream needs a second way to say that.
     #[serde(default)]
     pub(crate) prompt_cache_hit_tokens: Option<u32>,
-    /// `DeepSeek`'s flat cache-miss count. It completes the flat pair so the
-    /// two counts are parsed together (hit + miss covers the whole prompt),
-    /// but no projection consumes it: the miss count is simply
-    /// `prompt_tokens - cached_tokens`, and nothing downstream needs a second
-    /// way to say that.
-    // Read only by the derived `Deserialize`; every other read goes through
-    // `cache_hit_tokens`. Kept as an `expect` because no test target reads it
-    // either, so the lint fires in every build.
-    #[expect(dead_code)]
-    #[serde(default)]
-    pub(crate) prompt_cache_miss_tokens: Option<u32>,
 }
 
 /// The `{ cached_tokens }` sub-object both `OpenAI` shapes nest their
 /// prompt-cache hit count in: `prompt_tokens_details` for chat completions and
 /// `input_tokens_details` for the Responses API.
+///
+/// `cached_tokens` is optional because the details object can be present
+/// WITHOUT a cached count — a provider that reports other breakdown members
+/// (audio tokens, say) but no prompt cache leaves it out. Treating that as `0`
+/// would outrank a flat count the same provider did send, so absence is kept
+/// distinct from a reported zero.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct CachedTokenDetails {
     #[serde(default)]
-    pub(crate) cached_tokens: u32,
+    pub(crate) cached_tokens: Option<u32>,
 }
 
 impl Usage {
     /// The prompt-cache hit count, from whichever shape the provider sent.
     ///
     /// The nested details objects are the canonical `OpenAI` shape, so they win
-    /// when present; `DeepSeek`'s flat `prompt_cache_hit_tokens` is the
-    /// fallback for a provider that reports only the flat pair. Preferring the
-    /// details object matters when a provider sends both: it is the field the
-    /// provider documents as authoritative, so a stray flat count must not
-    /// override it.
+    /// when present **and carrying a count**; `DeepSeek`'s flat
+    /// `prompt_cache_hit_tokens` is the fallback for a provider that reports
+    /// only the flat pair, and also covers a details object that reports other
+    /// breakdown members but no cache count. Preferring a reported details count
+    /// matters when a provider sends both: it is the field the provider
+    /// documents as authoritative, so a stray flat count must not override it.
     fn cache_hit_tokens(&self) -> u32 {
         self.prompt_tokens_details
             .as_ref()
-            .or(self.input_tokens_details.as_ref())
-            .map_or_else(
-                || self.prompt_cache_hit_tokens.unwrap_or(0),
-                |details| details.cached_tokens,
-            )
+            .and_then(|details| details.cached_tokens)
+            .or_else(|| {
+                self.input_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.cached_tokens)
+            })
+            .or(self.prompt_cache_hit_tokens)
+            .unwrap_or(0)
     }
 
     /// Project the provider usage onto the shared [`TokenUsage`] counter.
@@ -123,9 +125,11 @@ impl Usage {
             output_tokens: self.completion_tokens,
             total_tokens: self.total_tokens,
             cached_tokens: self.cache_hit_tokens(),
-            // No `OpenAI`-compatible shape carries a cache-write count: the
-            // cache is populated implicitly by the provider, never billed as a
-            // separate write. Anthropic is the one adapter that reports one.
+            // No `OpenAI`-compatible shape bills a separate cache WRITE: the
+            // cache is populated implicitly by the provider. A provider may
+            // still echo unmodelled extra keys inside a details object; nothing
+            // here reads them, and this stays 0. Anthropic is the one adapter
+            // that reports a write count.
             cache_write_tokens: 0,
         }
     }
@@ -165,15 +169,35 @@ mod tests {
     }
 
     #[test]
+    fn a_details_object_without_a_cache_count_falls_back_to_the_flat_pair() {
+        // A details object can be present while carrying no cache count (it is
+        // shared with other breakdown members), and a reported `0` is a real
+        // answer. Absence must therefore not outrank a flat count the provider
+        // did send — but a reported 0 must win over a stale flat one.
+        let absent = parse(
+            r#"{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,
+                "prompt_tokens_details":{"audio_tokens":0},
+                "prompt_cache_hit_tokens":64}"#,
+        );
+        assert_eq!(absent.to_token_usage().cached_tokens, 64);
+        let reported_zero = parse(
+            r#"{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,
+                "prompt_tokens_details":{"cached_tokens":0},
+                "prompt_cache_hit_tokens":64}"#,
+        );
+        assert_eq!(reported_zero.to_token_usage().cached_tokens, 0);
+    }
+
+    #[test]
     fn real_responses_usage_projects_input_output_and_cached_tokens() {
         // The exact `ResponseUsage` shape the Responses API returns: `input_tokens`
         // / `output_tokens` (NOT `prompt_tokens` / `completion_tokens`) with the
         // cache hit nested under `input_tokens_details`. This pins the alias that
-        // lets the one projection serve both APIs. `input_tokens_details` also
-        // carries `cache_write_tokens` in the real payload — present here so the
-        // fixture matches the documented object exactly.
+        // lets the one projection serve both APIs. A details object may also
+        // carry members this adapter does not model; they must not break the
+        // parse or change the projection.
         let usage = parse(
-            r#"{"input_tokens":100,"input_tokens_details":{"cached_tokens":80,"cache_write_tokens":0},
+            r#"{"input_tokens":100,"input_tokens_details":{"cached_tokens":80,"audio_tokens":0},
                 "output_tokens":20,"output_tokens_details":{"reasoning_tokens":0},
                 "total_tokens":120}"#,
         );
@@ -182,6 +206,8 @@ mod tests {
         assert_eq!(projected.output_tokens, 20);
         assert_eq!(projected.total_tokens, 120);
         assert_eq!(projected.cached_tokens, 80);
+        // No `OpenAI`-compatible shape bills a separate cache write, so the
+        // shared counter always projects 0 here regardless of unmodelled keys.
         assert_eq!(projected.cache_write_tokens, 0);
     }
 

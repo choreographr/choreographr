@@ -192,13 +192,17 @@ impl InferenceProvider {
                     cache_affinity: entry.cache_affinity,
                     ..Default::default()
                 };
-                config.apply_overrides(&mut svc_config);
+                // The transport/endpoint knobs this account overrides on the
+                // service config (base URL, streaming, timeouts, model limits).
+                config.apply_to_service_config(&mut svc_config);
                 // The protocol-agnostic carrier the Anthropic and Google adapters
-                // also consume. OpenAI's other shared overrides are applied
-                // directly by `AccountConfig::apply_overrides` above; this adds
-                // the carrier fields OpenAI alone reads — the per-session
-                // cache-affinity override.
-                svc_config.apply_overrides(&config.provider_overrides());
+                // also consume, applied exactly as they do: OpenAI's other shared
+                // overrides are already on `svc_config` from the call above, and
+                // this adds the carrier fields OpenAI alone reads — the
+                // per-session cache-affinity override. Built once, like the other
+                // two arms, so the carrier is not re-assembled per call.
+                let overrides = config.provider_overrides();
+                svc_config.apply_overrides(&overrides);
                 // Image generation is API-key-only, so capture the key (if any)
                 // BEFORE consuming the grant: an OAuth-only account simply has
                 // no image backend. The daemon-side grant is then projected
@@ -213,10 +217,10 @@ impl InferenceProvider {
                 // client — the image client is built from a clone of the
                 // identical `ServiceConfig` (its constructor overrides only the
                 // attempt deadline + retry budget the image path needs).
-                // `config.apply_overrides` ran on `svc_config` BEFORE the chat
-                // client was built, so the clone here sees every account-level
-                // override (base_url, user agent, backoff knobs) already
-                // applied. An image client is constructed even when the
+                // `config.apply_to_service_config` ran on `svc_config` BEFORE the
+                // chat client was built, so the clone here sees every
+                // account-level override (base_url, user agent, backoff knobs)
+                // already applied. An image client is constructed even when the
                 // account's models later fail a catalog image-capability
                 // check — the tool gates model choice at request time.
                 //
@@ -429,6 +433,17 @@ impl InferenceProvider {
     #[must_use]
     pub fn cache_affinity(&self) -> choreo_ai_protocols::CacheAffinity {
         self.client.cache_affinity()
+    }
+
+    /// Whether a request this provider sends for `model` will carry an extended
+    /// prompt-cache retention selector, i.e. whether its prompt cache will live
+    /// for the model's LONG tier rather than the default short one. Deferred to
+    /// the underlying client (only the OpenAI-compatible one has the capability;
+    /// the rest answer `false`). The cache warmer reads this to pick the tier its
+    /// ping schedule is computed against.
+    #[must_use]
+    pub fn extended_cache_retention(&self, model: &str) -> bool {
+        self.client.extended_cache_retention(model)
     }
 
     /// Resolve the context window for a model, using the client config first

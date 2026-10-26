@@ -31,22 +31,16 @@
 //!
 //! A provider that answers a 400 naming one of these fields is remembered by
 //! the process-wide cache-field rejection registry
-//! ([`crate::session_routing`]), and the selector is withheld for the rest of
-//! the process. It shares that registry with the per-session cache-affinity
+//! ([`crate::cache_field_rejection`]), and the selector is withheld for the rest
+//! of the process. It shares that registry with the per-session cache-affinity
 //! hint: both are additions to the same prompt-cache request surface, so a
 //! provider that rejects one unknown field is not asked to accept the other.
+//! The wire spellings themselves are named once, in that module's
+//! [`PROMPT_CACHE_FIELDS`](crate::cache_field_rejection::PROMPT_CACHE_FIELDS)
+//! list, so the detector and the resolvers here cannot disagree on them.
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-
-/// The top-level body field carrying the pre-GPT-5.6 retention selector.
-///
-/// Named once so the rejection detector and the resolver agree on the exact
-/// spelling a 400 must mention.
-pub(crate) const PROMPT_CACHE_RETENTION_FIELD: &str = "prompt_cache_retention";
-
-/// The nested body field carrying the GPT-5.6+ retention selector.
-pub(crate) const PROMPT_CACHE_OPTIONS_FIELD: &str = "prompt_cache_options";
 
 /// The extended-tier wire value for [`CacheRetentionDialect::PromptCacheRetention`]
 /// (the model keeps its prompt cache for 24 hours).
@@ -125,8 +119,12 @@ pub(crate) struct CacheRetentionFields {
 
 impl CacheRetentionFields {
     /// Whether the resolution produced nothing to send.
+    ///
+    /// Crate-internal (not private to this module) because the cache-warming
+    /// gate asks the same resolver what a request will send, so the warmer's
+    /// retention tier can never disagree with the body builder's selector.
     #[must_use]
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.prompt_cache_retention.is_none() && self.prompt_cache_options.is_none()
     }
 }
@@ -201,7 +199,7 @@ pub(crate) fn cache_retention_fields(
     }
     // The rejection registry can only withhold the selector: a provider that
     // answered a 400 naming the field is never sent it again.
-    if crate::session_routing::cache_field_rejected(provider_slug, model) {
+    if crate::cache_field_rejection::cache_field_rejected(provider_slug, model) {
         debug!(
             provider = %provider_slug,
             model = %model,
