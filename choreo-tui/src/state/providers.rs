@@ -9,9 +9,9 @@ pub(crate) struct ProviderInfo {
     pub(crate) display_name: String,
 }
 
-/// Providers pinned to the top of the new-account picker, shared with the
-/// GUI's setup panel so both front-ends feature the same names first.
-pub(crate) use choreo_client_core::FEATURED_PROVIDERS;
+// Providers pinned to the top of the new-account picker, shared with the
+// GUI's setup panel so both front-ends feature the same names first.
+use choreo_client_core::FEATURED_PROVIDERS;
 
 /// Sort a provider list for the new-account wizard's picker (step 1): the
 /// [`FEATURED_PROVIDERS`] first, in their listed order, then everything else

@@ -10,7 +10,7 @@
 //! once its credential is confirmed) lives in `connection/daemon.rs`.
 
 use super::App;
-pub(crate) use choreo_client_core::{SetupFollow, SetupProgress, suggest_account_name};
+use choreo_client_core::{SetupFollow, SetupProgress, suggest_account_name};
 
 impl App {
     /// Arm the follow-through for `account` when its key is being saved and
