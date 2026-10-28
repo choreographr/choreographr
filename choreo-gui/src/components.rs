@@ -178,7 +178,7 @@ pub(crate) fn HistoryList(state: Signal<AppState>) -> Element {
 pub(crate) fn SetupDialog(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>) -> Element {
     let guard = state.read();
     let visible = guard.setup.popup_visible(
-        guard.attached_session_id.is_some(),
+        guard.attached_session_id,
         guard.session_view.turns.is_empty(),
     );
     let progress = guard.setup.progress();

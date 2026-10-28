@@ -10,6 +10,10 @@
 //! stores its key in one submit, a button per keyed account, and a filterable
 //! model list.
 //!
+//! A new account's key is held back until the daemon confirms the account
+//! (`AccountAdded`), so a rejected account never leaves a stored key behind
+//! under a name nothing uses.
+//!
 //! Saving a key while the session has no account arms the shared
 //! [`SetupFollow`] chain: the daemon's `CredentialAdded` selects the account
 //! for the session, and its `SessionAccountSet` fetches the model list, so a
@@ -28,13 +32,20 @@ use choreo_client_core::{
 use choreo_proto::{
     AccountInfo, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent,
 };
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
+use std::fmt;
 use tracing::{debug, info};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Most models the popup lists at once. Some providers serve hundreds; past
 /// this the user narrows the list with the filter instead of scrolling.
 pub(crate) const MODEL_LIST_CAP: usize = 40;
+
+/// Most quiet request ids remembered at once. A request whose reply never
+/// arrives (a dropped connection, a daemon error with no id) would otherwise
+/// keep its id for the rest of the run; the popup has at most a few requests
+/// in flight, so evicting the oldest past this bound never drops a live one.
+const QUIET_REQUEST_CAP: usize = 16;
 
 /// Where a checklist step stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,12 +93,19 @@ pub(crate) struct SetupState {
     /// Models available through the session's account, from the latest
     /// popup-requested `Models` reply.
     pub(crate) models: Vec<String>,
+    /// The session `session_account`/`session_model` describe. A popup that
+    /// opens on its own waits until this is the attached session, so it never
+    /// judges one session's setup by another's account and model.
+    pub(crate) seeded_session: Option<u64>,
     /// The armed first-run follow-through, if any (see the module docs).
     pub(crate) follow: Option<SetupFollow>,
-    /// Ids of the popup's own `ListAccounts`/`ListModels` requests. Their
-    /// replies only feed the popup; the generic dispatch would otherwise
-    /// print every account and every model into the history.
-    pub(crate) quiet_requests: HashSet<u64>,
+    /// A new account's key, held until the daemon confirms the account.
+    pub(crate) pending_key: Option<PendingKey>,
+    /// Ids of the popup's own `ListAccounts`/`ListModels`/`ListSessions`
+    /// requests. Their replies only feed the popup; the generic dispatch would
+    /// otherwise print every account, model and session into the history.
+    /// Ordered so the oldest can be evicted (see [`QUIET_REQUEST_CAP`]).
+    pub(crate) quiet_requests: BTreeSet<u64>,
     /// The step-1 form.
     pub(crate) form: SetupForm,
     /// The user opened the setup popup from the toolbar: it stays up, even
@@ -115,6 +133,24 @@ pub(crate) struct SetupForm {
     pub(crate) error: Option<String>,
 }
 
+/// An API key waiting for its account to be created. The key is wiped when
+/// this is dropped, whether it was sent or the account was rejected.
+#[derive(Clone)]
+pub(crate) struct PendingKey {
+    /// The account the key belongs to, as named in the `AddAccount`.
+    pub(crate) account: String,
+    key: Zeroizing<String>,
+}
+
+// Hand-written so a `Debug` of the setup state can never print the key.
+impl fmt::Debug for PendingKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PendingKey")
+            .field("account", &self.account)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SetupState {
     /// The checklist state for the attached session.
     pub(crate) fn progress(&self) -> SetupProgress {
@@ -130,9 +166,29 @@ impl SetupState {
     /// and so closes on its own once the last step lands. Opened from the
     /// toolbar it stays up regardless; closed by the user it stops opening on
     /// its own, so it never nags someone who chose to set up later.
-    pub(crate) fn popup_visible(&self, session_attached: bool, session_empty: bool) -> bool {
-        session_attached
-            && (self.opened || (!self.dismissed && session_empty && !self.progress().is_complete()))
+    /// It also waits until the attached session's own account and model are
+    /// known (`seeded_session`), so a switch of sessions never opens or shuts
+    /// it on the previous session's state.
+    pub(crate) fn popup_visible(&self, attached: Option<u64>, session_empty: bool) -> bool {
+        let Some(attached) = attached else {
+            return false;
+        };
+        self.opened
+            || (!self.dismissed
+                && self.seeded_session == Some(attached)
+                && session_empty
+                && !self.progress().is_complete())
+    }
+
+    /// Forget the previous session's account, model and model list, and any
+    /// follow-through armed for it, after attaching to a different session.
+    fn forget_session(&mut self) {
+        debug!("setup: attached session changed, re-reading its state");
+        self.seeded_session = None;
+        self.session_account = None;
+        self.session_model = None;
+        self.models.clear();
+        self.follow = None;
     }
 
     /// Open the popup from the toolbar.
@@ -202,7 +258,12 @@ impl SetupState {
 /// [`SetupState::quiet_requests`]).
 fn send_quiet(state: &mut AppState, handle: &DaemonHandle, request: ClientMessageType) {
     let id = handle.send(request);
-    state.setup.quiet_requests.insert(id);
+    let quiet = &mut state.setup.quiet_requests;
+    quiet.insert(id);
+    // Ids are allocated in increasing order, so the first is the oldest.
+    while quiet.len() > QUIET_REQUEST_CAP {
+        quiet.pop_first();
+    }
 }
 
 /// Ask for the account list on behalf of the popup.
@@ -218,7 +279,8 @@ pub(crate) fn request_models(state: &mut AppState, handle: &DaemonHandle) {
 /// Submit the step-1 form: create the account if the name is new, store the
 /// key, and arm the follow-through. Validation failures land in the form's
 /// error and send nothing, so a half-filled form never creates a key-less
-/// account.
+/// account. A new account's key waits in [`SetupState::pending_key`] until
+/// the daemon confirms the account (see [`track_setup_message`]).
 pub(crate) fn submit_setup_form(state: &mut AppState, daemon_tx: Option<&DaemonHandle>) {
     // Take the key out of the form up front: from here on it lives only in
     // this local, which is zeroized (or consumed by the builder) on every path.
@@ -228,6 +290,14 @@ pub(crate) fn submit_setup_form(state: &mut AppState, daemon_tx: Option<&DaemonH
     let name = state.setup.form.account_name.trim().to_string();
     let provider = state.setup.form.provider.trim().to_string();
     let exists = state.setup.accounts.iter().any(|a| a.name == name);
+    // A resubmit while this account's creation is still in flight only
+    // replaces the waiting key: a second `AddAccount` would be rejected as a
+    // duplicate, and that rejection would discard the key.
+    let awaiting = state
+        .setup
+        .pending_key
+        .as_ref()
+        .is_some_and(|p| p.account == name);
 
     let problem = if daemon_tx.is_none() {
         Some("Not connected to the daemon.")
@@ -247,7 +317,12 @@ pub(crate) fn submit_setup_form(state: &mut AppState, daemon_tx: Option<&DaemonH
         return;
     };
 
-    if !exists {
+    state.setup.form.error = None;
+    if exists {
+        send_key(state, handle, &name, key);
+        return;
+    }
+    if !awaiting {
         info!(account = %name, %provider, "setup: creating account");
         handle.send(ClientMessageType::AddAccount {
             name: name.clone(),
@@ -260,16 +335,25 @@ pub(crate) fn submit_setup_form(state: &mut AppState, daemon_tx: Option<&DaemonH
             total_timeout_secs: None,
         });
     }
-    // The builder zeroizes the field strings once it has parsed them; the
-    // daemon processes this connection's requests in order, so the account
-    // exists by the time the key arrives.
-    match build_add_credential_message(name.clone(), "api_key".to_string(), vec![key]) {
+    // The daemon stores a credential under any name, so sending the key now
+    // would keep it even if the account is rejected. Hold it until
+    // `AccountAdded`; replacing an earlier pending key wipes that one.
+    debug!(account = %name, "setup: key held until the account is confirmed");
+    state.setup.pending_key = Some(PendingKey {
+        account: name,
+        key: Zeroizing::new(key),
+    });
+}
+
+/// Store `key` under `account` and arm the follow-through. The builder
+/// zeroizes the field strings once it has parsed them.
+fn send_key(state: &mut AppState, handle: &DaemonHandle, account: &str, key: String) {
+    match build_add_credential_message(account.to_string(), "api_key".to_string(), vec![key]) {
         Ok(message) => {
-            info!(account = %name, "setup: storing API key");
+            info!(%account, "setup: storing API key");
             handle.send(message);
-            state.setup.form.error = None;
             state.setup.follow = SetupFollow::arm(
-                &name,
+                account,
                 state.attached_session_id.is_some(),
                 state.setup.session_account.is_some(),
             );
@@ -342,9 +426,20 @@ pub(crate) fn track_setup_message(
         }
         // A credential or account change does not carry the new list, so
         // re-request it: `has_credential` is what ticks step 1.
-        DaemonMessageType::AccountAdded { .. }
-        | DaemonMessageType::AccountRemoved { .. }
-        | DaemonMessageType::CredentialRemoved { .. } => {
+        DaemonMessageType::AccountAdded { name } => {
+            if let Some(handle) = daemon_tx {
+                request_accounts(state, handle);
+                // The account the held key waits on exists now: store it.
+                if let Some(PendingKey { account, mut key }) =
+                    state.setup.pending_key.take_if(|p| p.account == *name)
+                {
+                    // Taking the key out leaves the wrapper empty; the
+                    // builder wipes the taken copy.
+                    send_key(state, handle, &account, std::mem::take(&mut *key));
+                }
+            }
+        }
+        DaemonMessageType::AccountRemoved { .. } | DaemonMessageType::CredentialRemoved { .. } => {
             if let Some(handle) = daemon_tx {
                 request_accounts(state, handle);
             }
@@ -364,6 +459,16 @@ pub(crate) fn track_setup_message(
             }
         }
         DaemonMessageType::AccountAddFailed { name, error } => {
+            // The key was never sent: dropping it here wipes it.
+            if state
+                .setup
+                .pending_key
+                .take_if(|p| p.account == *name)
+                .is_some()
+            {
+                info!(account = %name, "setup: account rejected, key discarded");
+                state.setup.follow = None;
+            }
             if *name == state.setup.form.account_name.trim() {
                 state.setup.form.error = Some(format!("Could not add the account: {error}"));
             }
@@ -386,6 +491,7 @@ pub(crate) fn track_setup_message(
                 None => sessions.first(),
             };
             if let Some(summary) = summary {
+                state.setup.seeded_session = Some(summary.session_id);
                 state
                     .setup
                     .session_account
@@ -403,6 +509,7 @@ pub(crate) fn track_setup_message(
                     request_models(state, handle);
                 }
             }
+            return quiet;
         }
         DaemonMessageType::Session {
             session_id,
@@ -416,8 +523,25 @@ pub(crate) fn track_setup_message(
             // The direct reply to this connection's own CreateSession: the
             // GUI attaches to it, so its account and model are the popup's.
             debug!(?session_id, "setup: attached to a newly created session");
+            state.setup.seeded_session = *session_id;
             state.setup.session_account.clone_from(account_name);
             state.setup.session_model.clone_from(selected_model);
+        }
+        DaemonMessageType::Session {
+            session_id: Some(session_id),
+            event: SessionEvent::SessionAttached,
+        } => {
+            // An attach ack carries no account or model, and this runs before
+            // the session handling records the new attachment. Unless the
+            // session list already seeded this very session (the attach that
+            // follows the first `Sessions`), the setup state describes the
+            // previous session: drop it and read this one's.
+            if state.setup.seeded_session != Some(*session_id) {
+                state.setup.forget_session();
+                if let Some(handle) = daemon_tx {
+                    send_quiet(state, handle, ClientMessageType::ListSessions);
+                }
+            }
         }
         DaemonMessageType::Session {
             session_id: Some(session_id),
@@ -547,31 +671,42 @@ mod tests {
 
     #[test]
     fn the_popup_opens_on_its_own_only_while_it_is_needed() {
-        let mut setup = SetupState::default();
+        let mut setup = SetupState {
+            seeded_session: Some(7),
+            ..SetupState::default()
+        };
         // No session to set up yet.
-        assert!(!setup.popup_visible(false, true));
+        assert!(!setup.popup_visible(None, true));
         // An empty session with setup left to do.
-        assert!(setup.popup_visible(true, true));
+        assert!(setup.popup_visible(Some(7), true));
         // A session that already has turns is someone's conversation.
-        assert!(!setup.popup_visible(true, false));
+        assert!(!setup.popup_visible(Some(7), false));
+        // Another session's state says nothing about this one.
+        assert!(!setup.popup_visible(Some(8), true));
 
         // Once setup is complete it closes on its own.
         setup.accounts = vec![account("a", true)];
         setup.session_account = Some("a".to_string());
         setup.session_model = Some("m".to_string());
-        assert!(!setup.popup_visible(true, true));
+        assert!(!setup.popup_visible(Some(7), true));
     }
 
     #[test]
     fn closing_the_popup_stops_it_reopening_but_the_toolbar_still_can() {
-        let mut setup = SetupState::default();
+        let mut setup = SetupState {
+            seeded_session: Some(7),
+            ..SetupState::default()
+        };
         setup.close_popup();
-        assert!(!setup.popup_visible(true, true));
+        assert!(!setup.popup_visible(Some(7), true));
 
         setup.open_popup();
-        assert!(setup.popup_visible(true, false), "opened by hand, it stays");
+        assert!(
+            setup.popup_visible(Some(7), false),
+            "opened by hand, it stays"
+        );
         setup.close_popup();
-        assert!(!setup.popup_visible(true, true));
+        assert!(!setup.popup_visible(Some(7), true));
     }
 
     #[test]
@@ -585,6 +720,12 @@ mod tests {
         assert_eq!(setup.form.account_name, "openai-2");
     }
 
+    fn account_added(name: &str) -> DaemonMessage {
+        DaemonMessage::broadcast(DaemonMessageType::AccountAdded {
+            name: name.to_string(),
+        })
+    }
+
     #[test]
     fn a_new_account_is_created_then_keyed_and_the_follow_is_armed() {
         let (handle, rx) = connected();
@@ -594,23 +735,105 @@ mod tests {
 
         submit_setup_form(&mut state, Some(&handle));
 
-        let sent = sent(&rx);
+        // Only the account goes out; the key waits for its confirmation.
         assert!(matches!(
-            &sent[..],
-            [
-                ClientMessageType::AddAccount { name, provider, .. },
-                ClientMessageType::AddCredential { service, .. },
-            ] if name == "anthropic" && provider == "anthropic" && service == "anthropic"
+            &sent(&rx)[..],
+            [ClientMessageType::AddAccount { name, provider, .. }]
+                if name == "anthropic" && provider == "anthropic"
         ));
         assert!(
             state.setup.form.api_key.is_empty(),
             "the key leaves the form"
         );
         assert_eq!(state.setup.form.error, None);
+        assert!(
+            state
+                .setup
+                .pending_key
+                .as_ref()
+                .is_some_and(|p| p.account == "anthropic")
+        );
+
+        // An unrelated account's confirmation does not release the key.
+        track_setup_message(&mut state, &account_added("other"), Some(&handle));
+        assert!(
+            !sent(&rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessageType::AddCredential { .. }))
+        );
+
+        track_setup_message(&mut state, &account_added("anthropic"), Some(&handle));
+        assert!(sent(&rx).iter().any(|m| matches!(
+            m,
+            ClientMessageType::AddCredential { service, .. } if service == "anthropic"
+        )));
+        assert!(state.setup.pending_key.is_none());
         assert_eq!(
             state.setup.follow,
             Some(SetupFollow::AwaitCredential("anthropic".to_string()))
         );
+    }
+
+    #[test]
+    fn a_rejected_account_discards_its_key_unsent() {
+        let (handle, rx) = connected();
+        let mut state = attached_state();
+        state.setup.pick_provider("anthropic");
+        state.setup.form.api_key = "sk".to_string();
+        submit_setup_form(&mut state, Some(&handle));
+        sent(&rx);
+
+        let failed = DaemonMessage::broadcast(DaemonMessageType::AccountAddFailed {
+            name: "anthropic".to_string(),
+            error: "unknown provider".to_string(),
+        });
+        track_setup_message(&mut state, &failed, Some(&handle));
+        assert!(state.setup.pending_key.is_none());
+        assert_eq!(state.setup.follow, None);
+        assert!(
+            state
+                .setup
+                .form
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown provider"))
+        );
+
+        // A late confirmation finds no key to send.
+        track_setup_message(&mut state, &account_added("anthropic"), Some(&handle));
+        assert!(
+            !sent(&rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessageType::AddCredential { .. }))
+        );
+    }
+
+    #[test]
+    fn a_resubmit_while_the_account_is_pending_only_replaces_the_key() {
+        let (handle, rx) = connected();
+        let mut state = attached_state();
+        state.setup.pick_provider("anthropic");
+        state.setup.form.api_key = "sk-1".to_string();
+        submit_setup_form(&mut state, Some(&handle));
+        state.setup.form.api_key = "sk-2".to_string();
+        submit_setup_form(&mut state, Some(&handle));
+
+        let adds = sent(&rx)
+            .iter()
+            .filter(|m| matches!(m, ClientMessageType::AddAccount { .. }))
+            .count();
+        assert_eq!(adds, 1, "the account is created once");
+        assert!(state.setup.pending_key.is_some());
+    }
+
+    #[test]
+    fn the_pending_key_never_appears_in_debug_output() {
+        let mut state = attached_state();
+        state.setup.pick_provider("anthropic");
+        state.setup.form.api_key = "sk-secret-value".to_string();
+        let (handle, _rx) = connected();
+        submit_setup_form(&mut state, Some(&handle));
+        assert!(!format!("{:?}", state.setup).contains("sk-secret-value"));
     }
 
     #[test]
@@ -619,6 +842,9 @@ mod tests {
         let mut state = attached_state();
         state.setup.accounts = vec![account("work", false)];
         state.setup.form.account_name = "work".to_string();
+        // An existing account already has its provider, so an empty
+        // provider field is not an error.
+        assert_eq!(state.setup.form.provider, "");
         state.setup.form.api_key = "sk".to_string();
 
         submit_setup_form(&mut state, Some(&handle));
@@ -757,6 +983,77 @@ mod tests {
             sent(&rx)
                 .iter()
                 .any(|m| matches!(m, ClientMessageType::ListModels))
+        );
+    }
+
+    #[test]
+    fn the_initial_attach_keeps_the_state_the_session_list_seeded() {
+        let (handle, rx) = connected();
+        let mut state = AppState::new("/tmp/choreographr.sock");
+        let sessions = DaemonMessage::broadcast(DaemonMessageType::Sessions {
+            sessions: vec![summary(3, Some("work"), Some("m"))],
+        });
+        track_setup_message(&mut state, &sessions, Some(&handle));
+        track_setup_message(
+            &mut state,
+            &session_event(3, SessionEvent::SessionAttached),
+            Some(&handle),
+        );
+        assert_eq!(state.setup.session_account.as_deref(), Some("work"));
+        assert_eq!(state.setup.seeded_session, Some(3));
+        assert_eq!(sent(&rx), [], "nothing to re-read");
+    }
+
+    #[test]
+    fn attaching_another_session_rereads_its_state_quietly() {
+        let (handle, rx) = connected();
+        let mut state = attached_state();
+        state.setup.seeded_session = Some(7);
+        state.setup.session_account = Some("work".to_string());
+        state.setup.session_model = Some("m".to_string());
+        state.setup.models = vec!["m".to_string()];
+        state.setup.follow = Some(SetupFollow::AwaitAccountSet("work".to_string()));
+
+        // `/attach 9`: the ack lands before the attachment is recorded.
+        track_setup_message(
+            &mut state,
+            &session_event(9, SessionEvent::SessionAttached),
+            Some(&handle),
+        );
+        assert_eq!(state.setup.session_account, None);
+        assert_eq!(state.setup.session_model, None);
+        assert_eq!(state.setup.models, Vec::<String>::new());
+        assert_eq!(state.setup.follow, None);
+        assert!(!state.setup.popup_visible(Some(9), true), "not yet known");
+        let request = rx.try_recv().expect("session list requested");
+        assert!(matches!(request.inner, ClientMessageType::ListSessions));
+
+        // The quiet reply seeds the new session and stays out of the history.
+        state.attached_session_id = Some(9);
+        let mut reply = DaemonMessage::broadcast(DaemonMessageType::Sessions {
+            sessions: vec![summary(7, Some("work"), Some("m")), summary(9, None, None)],
+        });
+        reply.id = Some(request.id);
+        assert!(track_setup_message(&mut state, &reply, Some(&handle)));
+        assert_eq!(state.setup.seeded_session, Some(9));
+        assert_eq!(state.setup.session_account, None);
+        assert!(state.setup.popup_visible(Some(9), true));
+    }
+
+    #[test]
+    fn unanswered_quiet_requests_are_evicted_oldest_first() {
+        let (handle, _rx) = connected();
+        let mut state = attached_state();
+        for _ in 0..QUIET_REQUEST_CAP + 5 {
+            request_accounts(&mut state, &handle);
+        }
+        let quiet = &state.setup.quiet_requests;
+        assert_eq!(quiet.len(), QUIET_REQUEST_CAP);
+        let newest = quiet.last().copied().unwrap_or_default();
+        assert_eq!(
+            quiet.first().copied(),
+            Some(newest - (QUIET_REQUEST_CAP as u64 - 1)),
+            "the most recent ids are the ones kept"
         );
     }
 
