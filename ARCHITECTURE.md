@@ -3297,6 +3297,13 @@ from a second report pass. Coverage counts inline `#[cfg(test)]` modules
 inside source files (only crate-level `tests/` directories are excluded), so
 the figure slightly overstates production-code coverage.
 
+**GUI tests in CI:** because `test-all` and `coverage` exclude `choreo-gui`, a
+separate `.github/workflows/gui-tests.yml` job runs `just test-gui` on every
+push and pull request that touches the GUI or a workspace crate it builds on.
+It installs the system libraries the Blitz/winit stack links at build time
+(fontconfig, libwayland-client) and is the only CI run that compiles and
+executes the GUI's tests.
+
 Run all tests:
 ```bash
 cargo test-all            # nextest: unit + integration, parallel
