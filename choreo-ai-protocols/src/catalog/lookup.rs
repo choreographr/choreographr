@@ -6,11 +6,13 @@
 //! `ArcSwap` global itself live in [`super`] (mod.rs); this module holds only
 //! the lookups, plus the tiny protocol-default helpers they share.
 //!
-//! Most resolvers funnel through [`with_model_fact`], which holds the
-//! `ArcSwap` guard once and hands the matched [`ModelEntry`] to a closure —
-//! the per-resolver differences (conservative `None` vs permissive `true`
-//! defaults) stay in each resolver so the doc comments and defaults remain
-//! the single source of truth for that behavior.
+//! Most resolvers read the catalog through [`with_provider`], which holds the
+//! `ArcSwap` guard once and hands the matched [`ProviderEntry`] to a closure
+//! (the model-level walkers [`with_model_fact`] and
+//! [`with_provider_and_model_fact`] build on it) — the per-resolver differences
+//! (conservative `None` vs permissive `true` defaults) stay in each resolver, so
+//! the doc comments and defaults remain the single source of truth for that
+//! behavior.
 
 use tracing::trace;
 
@@ -25,14 +27,32 @@ use super::{
     ReasoningPassback,
 };
 
+/// Shared projection: run `read` against the catalog entry for `slug` while the
+/// `ArcSwap` guard is held, and hand back exactly what `read` returned.
+///
+/// Every read-only provider lookup goes through this one function, so the
+/// traversal exists once and a lookup is just its own field projection. `R`
+/// cannot borrow from the entry — the guard is released when this returns — so a
+/// resolver that needs the entry to outlive the read has to clone what it needs
+/// inside `read`.
+///
+/// Returns `None` when no provider carries `slug`; each caller decides what that
+/// means for its own fact. [`super::lookup_provider`] deliberately does NOT route
+/// through this: it hands back an owned clone that outlives the guard, which is a
+/// different contract from a transient read.
+fn with_provider<R>(slug: &str, read: impl FnOnce(&ProviderEntry) -> R) -> Option<R> {
+    let catalog = PROVIDER_CATALOG.load();
+    catalog.iter().find(|e| e.slug == slug).map(read)
+}
+
 /// Shared walker: find the model entry for `(provider_slug, model)` against
 /// the live catalog, holding the `ArcSwap` guard only for the duration of the
 /// call, and map it through `f`.
 ///
 /// Every per-fact resolver walks the catalog through this one function: the
-/// guard is acquired once here (readers are lock-free, but a shared walk means
-/// the traversal logic can never drift between resolvers), and each resolver
-/// supplies only its own field projection and default mapping via `f`.
+/// guard is acquired once (in [`with_provider`]), where the traversal logic
+/// cannot drift between resolvers, and each resolver supplies only its own field
+/// projection and default mapping via `f`.
 ///
 /// Returns `None` when the provider slug or the model slug does not match any
 /// catalog entry — each resolver decides what that means for its own fact.
@@ -41,12 +61,10 @@ fn with_model_fact<T>(
     model: &str,
     f: impl FnOnce(&ModelEntry) -> T,
 ) -> Option<T> {
-    let catalog = PROVIDER_CATALOG.load();
-    let fact = catalog
-        .iter()
-        .find(|e| e.slug == provider_slug)
-        .and_then(|e| e.models.iter().find(|m| m.model == model))
-        .map(f);
+    let fact = with_provider(provider_slug, |provider| {
+        provider.models.iter().find(|m| m.model == model).map(f)
+    })
+    .flatten();
     // Trace the miss as well as the hit: a catalog gap that silently falls
     // through to a resolver default is exactly the situation worth seeing in
     // the logs when diagnosing wire-behavior surprises.
@@ -72,17 +90,14 @@ fn with_provider_and_model_fact<T>(
     model: &str,
     f: impl FnOnce(&ProviderEntry, &ModelEntry) -> T,
 ) -> Option<T> {
-    let catalog = PROVIDER_CATALOG.load();
-    let fact = catalog
-        .iter()
-        .find(|e| e.slug == provider_slug)
-        .and_then(|provider| {
-            provider
-                .models
-                .iter()
-                .find(|m| m.model == model)
-                .map(|m| f(provider, m))
-        });
+    let fact = with_provider(provider_slug, |provider| {
+        provider
+            .models
+            .iter()
+            .find(|m| m.model == model)
+            .map(|m| f(provider, m))
+    })
+    .flatten();
     trace!(
         provider = %provider_slug,
         model = %model,
@@ -136,11 +151,7 @@ pub fn prompt_cache_ttl(provider_slug: &str, model: &str) -> Option<PromptCacheT
 /// registry".
 #[must_use]
 pub fn cache_affinity(provider_slug: &str) -> CacheAffinity {
-    PROVIDER_CATALOG
-        .load()
-        .iter()
-        .find(|e| e.slug == provider_slug)
-        .map_or_default(|e| e.cache_affinity)
+    with_provider(provider_slug, |e| e.cache_affinity).unwrap_or_default()
 }
 
 /// Whether the given provider's Responses endpoint speaks the **stateless**
@@ -156,11 +167,7 @@ pub fn cache_affinity(provider_slug: &str) -> CacheAffinity {
 /// rather than two hand-kept switches.
 #[must_use]
 pub fn provider_responses_stateless(provider_slug: &str) -> bool {
-    PROVIDER_CATALOG
-        .load()
-        .iter()
-        .find(|e| e.slug == provider_slug)
-        .is_some_and(|e| e.responses_stateless)
+    with_provider(provider_slug, |e| e.responses_stateless).unwrap_or(false)
 }
 
 /// The extended prompt-cache retention dialect the catalog declares for a
@@ -240,18 +247,16 @@ pub fn model_supports_image_output(provider_slug: &str, model: &str) -> bool {
 /// Return the model IDs on the given provider that can produce images
 /// (`supports_image_output == true`), in the catalog's natural order (the
 /// snapshot/overlay insertion order). Unknown providers yield an empty list.
+#[must_use]
 pub fn image_models_for_provider(provider_slug: &str) -> Vec<String> {
-    let catalog = PROVIDER_CATALOG.load();
-    catalog
-        .iter()
-        .find(|e| e.slug == provider_slug)
-        .map_or_default(|e| {
-            e.models
-                .iter()
-                .filter(|m| m.supports_image_output)
-                .map(|m| m.model.clone())
-                .collect()
-        })
+    with_provider(provider_slug, |e| {
+        e.models
+            .iter()
+            .filter(|m| m.supports_image_output)
+            .map(|m| m.model.clone())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// Return the model IDs on the given provider that can *edit* an input image
@@ -264,17 +269,14 @@ pub fn image_models_for_provider(provider_slug: &str) -> Vec<String> {
 /// that has no edit endpoint).
 #[must_use]
 pub fn image_edit_models_for_provider(provider_slug: &str) -> Vec<String> {
-    let catalog = PROVIDER_CATALOG.load();
-    catalog
-        .iter()
-        .find(|e| e.slug == provider_slug)
-        .map_or_default(|e| {
-            e.models
-                .iter()
-                .filter(|m| m.supports_image_edit)
-                .map(|m| m.model.clone())
-                .collect()
-        })
+    with_provider(provider_slug, |e| {
+        e.models
+            .iter()
+            .filter(|m| m.supports_image_edit)
+            .map(|m| m.model.clone())
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// How a route wants replayed reasoning shaped on the chat-completions wire.
@@ -385,31 +387,28 @@ pub fn model_request_format(provider_slug: &str, model: &str) -> Option<RequestF
 /// Falls back to protocol defaults for unknown models (best-effort
 /// compatibility with new/untracked models).
 pub fn model_reasoning_capability(provider_slug: &str, model: &str) -> ReasoningCapability {
-    let catalog = PROVIDER_CATALOG.load();
-    let entry = catalog.iter().find(|e| e.slug == provider_slug);
-
-    let levels: Vec<String> = match entry {
-        Some(e) => {
-            let model_entry = e.models.iter().find(|m| m.model == model);
-            match model_entry {
-                // Known model that explicitly does not support reasoning
-                Some(m) if !m.reasoning_supported => vec![],
-                // Known model with explicit effort levels (OpenAi protocol only)
-                Some(m)
-                    if matches!(e.protocol, ProviderProtocol::OpenAi { .. })
-                        && !m.openai_reasoning_levels.is_empty() =>
-                {
-                    m.openai_reasoning_levels.clone()
-                }
-                // Known model with reasoning but no explicit levels → protocol defaults
-                Some(_) => protocol_default_levels(e.protocol),
-                // Unknown model → protocol defaults (best-effort for new models)
-                None => protocol_default_levels(e.protocol),
+    // The provider entry and the model walk it holds are one read, so the
+    // capability and the protocol its defaults come from cannot be resolved
+    // against two different catalog versions.
+    let levels: Vec<String> = with_provider(provider_slug, |e| {
+        match e.models.iter().find(|m| m.model == model) {
+            // Known model that explicitly does not support reasoning
+            Some(m) if !m.reasoning_supported => vec![],
+            // Known model with explicit effort levels (OpenAi protocol only)
+            Some(m)
+                if matches!(e.protocol, ProviderProtocol::OpenAi { .. })
+                    && !m.openai_reasoning_levels.is_empty() =>
+            {
+                m.openai_reasoning_levels.clone()
             }
+            // Known model with reasoning but no explicit levels → protocol defaults
+            Some(_) => protocol_default_levels(e.protocol),
+            // Unknown model → protocol defaults (best-effort for new models)
+            None => protocol_default_levels(e.protocol),
         }
-        // Unknown provider — no protocol to infer defaults from
-        None => vec![],
-    };
+    })
+    // Unknown provider — no protocol to infer defaults from.
+    .unwrap_or_default();
 
     trace!(
         provider = %provider_slug,
@@ -443,11 +442,8 @@ fn protocol_default_levels(protocol: ProviderProtocol) -> Vec<String> {
 /// to protocol defaults for unknown/new models, and `None` for unknown
 /// providers).
 pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPassback {
-    let catalog = PROVIDER_CATALOG.load();
-    let entry = catalog.iter().find(|e| e.slug == provider_slug);
-
-    let passback = match entry {
-        Some(e) => match e.models.iter().find(|m| m.model == model) {
+    let passback = with_provider(provider_slug, |e| {
+        match e.models.iter().find(|m| m.model == model) {
             // Known model: an explicit TOML override wins (`Some(..)`, incl.
             // `Some(ReasoningPassback::None)` for "never replay"); an unset
             // field (`None`) derives from the protocol (and, for OpenAi
@@ -457,10 +453,10 @@ pub fn model_reasoning_passback(provider_slug: &str, model: &str) -> ReasoningPa
             // OpenAi assumed chat-completions, matching
             // `ServiceConfig::default_request_format`).
             None => protocol_default_passback(e.protocol, false),
-        },
-        // Unknown provider — no protocol to infer a default from.
-        None => ReasoningPassback::None,
-    };
+        }
+    })
+    // Unknown provider — no protocol to infer a default from.
+    .unwrap_or(ReasoningPassback::None);
 
     trace!(
         provider = %provider_slug,

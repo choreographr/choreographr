@@ -360,6 +360,15 @@ impl ServiceConfig {
     /// process for `model` (the registry is keyed by the exact provider+model
     /// pair). Provides a slug/config pairing so the body builders cannot consult
     /// the registry with the wrong slug.
+    ///
+    /// The stateless fact is re-derived here on every call rather than accepted
+    /// as a caller-supplied flag, even where the caller has just resolved it for
+    /// its own purposes. That is deliberate: the affinity is a provider-scoped
+    /// resolution with a second caller on the chat path, and a caller-computed
+    /// flag is exactly how the request shape a body builder emits and the
+    /// affinity this reports could drift apart — one site would keep passing the
+    /// old fact while the other saw a refreshed catalog. Re-deriving it keeps
+    /// both views reading the same catalog fact.
     #[must_use]
     pub fn effective_cache_affinity(&self, model: &str) -> CacheAffinity {
         // Resolve the registry against the provider-level value, never the raw
