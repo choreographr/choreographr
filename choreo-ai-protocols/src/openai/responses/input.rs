@@ -118,8 +118,8 @@ pub(crate) type CallerIndex<'a> = HashMap<&'a str, &'a CallerInfo>;
 /// have to select which messages go out (a chained turn sends only the
 /// post-assistant tail, a stateless one sends the whole history minus the
 /// hoisted system prompt), and neither should have to clone the conversation to
-/// do it — an earlier slice-shaped signature forced a full deep copy of every
-/// prior turn (image bytes included) on every tool-loop iteration.
+/// do it — it can carry megabytes of attached image bytes, and a tool loop
+/// rebuilds the input on every iteration.
 ///
 /// `callers` resolves a tool result's attribution by its `call_id`, because the
 /// message being lowered is the OUTPUT and the attribution rode the assistant

@@ -63,10 +63,10 @@ pub(crate) enum ResponsesInputItem {
 
 /// Nested `reasoning` object for Responses requests.
 ///
-/// The Responses API moved the Chat Completions top-level `reasoning_effort`
-/// into this object (`reasoning.effort`), and the reasoning *summary* is
-/// requested here too (`reasoning.summary`) — it is **not** an `include`
-/// value (the `include` enum is a fixed set; `reasoning.summary` is a 400).
+/// This object carries both the effort (`reasoning.effort`) and the reasoning
+/// *summary* (`reasoning.summary`) — the summary is **not** an `include` value
+/// (the `include` enum is a fixed set; `reasoning.summary` is a 400), and a
+/// top-level `reasoning_effort` is not a Responses parameter at all.
 #[derive(Debug, Serialize)]
 pub(crate) struct ResponsesReasoning<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]

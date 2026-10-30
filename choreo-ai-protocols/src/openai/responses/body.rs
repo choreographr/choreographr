@@ -229,10 +229,9 @@ pub(super) fn build_responses_request_body(
     };
 
     // Reasoning config lives under a nested `reasoning` object in the Responses
-    // API. Two former mistakes are fixed here:
-    //   * the Chat Completions top-level `reasoning_effort` is rejected
-    //     ("Unsupported parameter: 'reasoning_effort' … moved to
-    //     'reasoning.effort'"), so the effort goes in `reasoning.effort`;
+    // API, and two rules follow from that shape:
+    //   * the effort goes in `reasoning.effort`; the Chat Completions top-level
+    //     `reasoning_effort` is an unsupported parameter on this API and 400s;
     //   * the reasoning summary is requested via `reasoning.summary` ("auto"),
     //     NOT via `include` — `include` accepts only a fixed enum
     //     (`reasoning.encrypted_content`, …) and 400s on `reasoning.summary`.

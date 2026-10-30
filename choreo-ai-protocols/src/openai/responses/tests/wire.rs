@@ -3,7 +3,7 @@
 //!
 //! Everything here is a pure `serde` assertion — no request is built and no
 //! provider is called — so a wire-shape regression names exactly the field that
-//! moved.
+//! broke.
 
 // Each subject module imports the items it names directly: it lives inside
 // `tests`, so the adapter's own modules are two `super`s up and the `openai`

@@ -186,8 +186,8 @@ fn hoisted_system_prompt_drops_every_system_message() {
 fn build_responses_input_chained_tail_carries_tool_outputs_from_messages() {
     // The chained tail is derived from the full message history: after a tool
     // round the last assistant message is the tool-call turn, so the tail is
-    // exactly that turn's tool outputs. The separately-passed result buffer of
-    // the old design is no longer needed to get them onto the wire.
+    // exactly that turn's tool outputs — nothing else has to be passed in for
+    // them to reach the wire.
     let messages = vec![
         ChatRequestMessage::simple("user", "weather?".into()),
         assistant_tool_call(),

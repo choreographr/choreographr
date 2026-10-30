@@ -272,9 +272,9 @@ fn non_streaming_captures_artifact_on_tool_use() {
 #[test]
 fn non_streaming_captures_unknown_reasoning_fields_verbatim() {
     // A newer reasoning item shape may carry reasoning text in a `content`
-    // array alongside `summary`. The raw-value capture must preserve the
-    // unknown field verbatim in the artifact — the previous typed
-    // re-serialization would have dropped it (and the display text in
+    // array alongside `summary`. Capturing the item as a raw value keeps the
+    // unknown field byte-for-byte in the artifact, where a typed projection
+    // re-serialized back to JSON would drop it (and the display text in
     // `summary` is still picked up for `reasoning`).
     let json_str = r#"{
             "id": "resp_new",

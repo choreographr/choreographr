@@ -71,8 +71,8 @@ fn responses_body_nests_reasoning_and_omits_it_for_non_reasoning() {
 
     // Case 3: non-reasoning model handed a stray non-`off` effort — the
     // whole `reasoning` object must still be suppressed (gated on the
-    // capability, not on effort being present). This pins the fix:
-    // emitting `reasoning: { effort }` here would be a provider 400.
+    // capability, not on effort being present). Emitting
+    // `reasoning: { effort }` here would be a provider 400.
     let (_url, body) = build("gpt-4o", Some("high"));
     assert!(body.get("reasoning").is_none(), "{body}");
     assert_eq!(body_keys(&body), ["input", "model", "store"]);
