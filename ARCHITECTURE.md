@@ -3012,6 +3012,9 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     than a flat messages list. The Responses body is built from the ONE canonical `messages`
     history: a chained turn derives its tail (the tool outputs after the last assistant turn)
     from it and links via `previous_response_id`, while a stateless turn sends the whole list.
+    A tail made up only of tool outputs carries no system item, so the server-side `function_call`
+    and the output answering it stay adjacent and the prompt is not re-sent every tool round; a
+    fresh user turn's tail leads with the rebuilt system prompt.
     The standard OpenAI Responses API keeps system messages inline as `{role: "system"}` items;
     the stateless ChatGPT/Codex dialect hoists the system prompt into the top-level
     `instructions` field, sets `store: false`, ignores `previous_response_id`, and asks for

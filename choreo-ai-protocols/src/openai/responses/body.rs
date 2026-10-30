@@ -27,8 +27,11 @@ pub(super) fn build_responses_input(
     // inflation). A fresh/stateless turn sends the full history. The tool
     // outputs of a finished tool round are already in `messages` (the session
     // turn stores them in the model's call order), so the chained tail is
-    // derived here rather than passed in as a separate buffer. Both branches
-    // borrow: the whole conversation is never copied to build a body.
+    // derived here rather than passed in as a separate buffer. A tail made up
+    // only of tool outputs stays output-only — no system item rides it — so it
+    // continues the stored response's call/output pairing unbroken (the rule
+    // and its reason live on [`chain_input_messages`]). Both branches borrow:
+    // the whole conversation is never copied to build a body.
     let items = if previous_response_id.is_some() {
         messages_to_responses_input(chain_input_messages(messages), system)?
     } else {
@@ -46,13 +49,20 @@ pub(super) fn build_responses_input(
     Ok(Some(input_value))
 }
 
-/// The minimal input for a fresh user turn chained onto a previous response:
-/// the newest system message (the daemon rebuilds the system prompt every
-/// request, so the latest one must reach the model even though the chain
-/// already carries the old one) plus every message AFTER the last
-/// assistant-role message — in the daemon's loop that is exactly the new user
-/// message. Everything up to and including the last assistant message is
-/// already in the chained response's context and must not be resent.
+/// The minimal input for a turn chained onto a previous response: the newest
+/// system message (the daemon rebuilds the system prompt every request, so the
+/// latest one must reach the model even though the chain already carries the
+/// old one) plus every message AFTER the last assistant-role message — in the
+/// daemon's loop that is the new user message of a fresh turn, or the tool
+/// outputs of a tool round. Everything up to and including the last assistant
+/// message is already in the chained response's context and must not be resent.
+///
+/// A tail whose every message is a `tool` result is a **tool round**, and it
+/// stays output-only: the chained response ends with the assistant's
+/// `function_call`, so the outputs answering that call must follow it directly.
+/// A `system` item between them would break a call/output adjacency the API
+/// pairs strictly, and would add one more copy of the prompt to the stored
+/// transcript on every tool-loop iteration.
 ///
 /// Only the *newest* system message is kept: any older system prompt is
 /// already in the chained context, and resending it would duplicate it. In
@@ -71,15 +81,27 @@ pub(super) fn chain_input_messages(
     // chained and every message stays.
     let last_assistant = messages.iter().rposition(|m| m.role == "assistant");
     let newest_system = messages.iter().rposition(|m| m.role == "system");
+    // Whether the post-assistant tail is a tool round: non-empty, and every
+    // message in it a tool result. An empty tail (the chain's own last message
+    // is the assistant turn) and a tail carrying a user/system message are both
+    // "not a tool round", so the newest system prompt keeps its keep-arm there.
+    let tool_round = last_assistant.is_some_and(|last| {
+        let tail = messages.get(last + 1..).unwrap_or_default();
+        !tail.is_empty() && tail.iter().all(|m| m.role == "tool")
+    });
     messages.iter().enumerate().filter_map(move |(i, m)| {
         // Single pass over every message: drop everything at/before the last
         // assistant message (it is in the chained context) EXCEPT the newest
         // system message, which is rebuilt every turn and must still reach the
-        // model. Older system messages — whether in the chained region or inside
-        // the tail — are dropped, so the newest one is never duplicated.
+        // model — unless this is a tool round, where a system item would split
+        // the call from the output that answers it. Older system messages —
+        // whether in the chained region or inside the tail — are dropped, so the
+        // newest one is never duplicated.
         let keep = match last_assistant {
             None => true,
-            Some(last) => (i > last && m.role != "system") || Some(i) == newest_system,
+            Some(last) => {
+                (i > last && m.role != "system") || (Some(i) == newest_system && !tool_round)
+            }
         };
         keep.then_some(m)
     })

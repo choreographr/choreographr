@@ -15,6 +15,38 @@ use crate::openai::reasoning_details::MAX_REASONING_BYTES;
 use choreo_proto::ReasoningArtifact;
 use serde_json::json;
 
+/// The assistant turn that requests one `get_weather` call, as the daemon
+/// records it in a tool round (content-less, the call in `tool_calls`).
+fn assistant_tool_call() -> ChatRequestMessage {
+    ChatRequestMessage {
+        role: "assistant",
+        content: None,
+        images: Vec::new(),
+        tool_call_id: None,
+        tool_calls: Some(vec![AssistantToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: AssistantToolFunction {
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        reasoning_artifact: None,
+    }
+}
+
+/// The tool result answering [`assistant_tool_call`]'s call.
+fn tool_result(output: &str) -> ChatRequestMessage {
+    ChatRequestMessage {
+        role: "tool",
+        content: Some(output.to_string()),
+        images: Vec::new(),
+        tool_call_id: Some("call_1".to_string()),
+        tool_calls: None,
+        reasoning_artifact: None,
+    }
+}
+
 #[test]
 fn build_responses_input_empty_is_an_empty_items_array() {
     let result = build_responses_input(&[], None, SystemPrompt::Inline).unwrap();
@@ -58,33 +90,10 @@ fn build_responses_input_chained_tail_carries_tool_outputs_from_messages() {
     // round the last assistant message is the tool-call turn, so the tail is
     // exactly that turn's tool outputs. The separately-passed result buffer of
     // the old design is no longer needed to get them onto the wire.
-    let assistant = ChatRequestMessage {
-        role: "assistant",
-        content: None,
-        images: Vec::new(),
-        tool_call_id: None,
-        tool_calls: Some(vec![AssistantToolCall {
-            id: "call_1".to_string(),
-            kind: "function".to_string(),
-            function: AssistantToolFunction {
-                name: "get_weather".to_string(),
-                arguments: "{}".to_string(),
-            },
-        }]),
-        reasoning_artifact: None,
-    };
-    let tool = ChatRequestMessage {
-        role: "tool",
-        content: Some("72F".to_string()),
-        images: Vec::new(),
-        tool_call_id: Some("call_1".to_string()),
-        tool_calls: None,
-        reasoning_artifact: None,
-    };
     let messages = vec![
         ChatRequestMessage::simple("user", "weather?".into()),
-        assistant,
-        tool,
+        assistant_tool_call(),
+        tool_result("72F"),
     ];
     let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
@@ -94,6 +103,54 @@ fn build_responses_input_chained_tail_carries_tool_outputs_from_messages() {
     assert_eq!(arr[0]["type"], "function_call_output");
     assert_eq!(arr[0]["call_id"], "call_1");
     assert_eq!(arr[0]["output"], "72F");
+}
+
+#[test]
+fn build_responses_input_chained_tool_round_sends_only_the_tool_outputs() {
+    // The daemon's real tool-loop shape, system prompt included. A chained
+    // follow-up of a tool round appends to a stored response whose last item is
+    // the assistant's `function_call`, so the tail must be nothing but the
+    // outputs answering it: a system item between the call and its output would
+    // break the pairing the API requires, and would pile one more copy of the
+    // prompt into the transcript on every round.
+    let messages = vec![
+        ChatRequestMessage::simple("system", "be helpful".into()),
+        ChatRequestMessage::simple("user", "weather?".into()),
+        assistant_tool_call(),
+        tool_result("72F"),
+    ];
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
+    let value = result.expect("expected Some value");
+    assert_eq!(
+        value,
+        json!([{"type": "function_call_output", "call_id": "call_1", "output": "72F"}]),
+        "the tool round rides alone — exactly one output, no system item"
+    );
+}
+
+#[test]
+fn build_responses_input_chained_mixed_tail_keeps_the_system_prompt() {
+    // A tool output followed by a new user message is not a tool round: there is
+    // no pending call/output pairing left to protect, so the newest system
+    // prompt leads the tail exactly as it does on a fresh chained turn.
+    let messages = vec![
+        ChatRequestMessage::simple("system", "be helpful".into()),
+        ChatRequestMessage::simple("user", "weather?".into()),
+        assistant_tool_call(),
+        tool_result("72F"),
+        ChatRequestMessage::simple("user", "and tomorrow?".into()),
+    ];
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
+    let value = result.expect("expected Some value");
+    assert_eq!(
+        value,
+        json!([
+            {"type": "message", "role": "system", "content": "be helpful"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "72F"},
+            {"type": "message", "role": "user", "content": "and tomorrow?"},
+        ]),
+        "a user turn in the tail keeps the newest system prompt"
+    );
 }
 
 #[test]
