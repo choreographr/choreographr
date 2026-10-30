@@ -4,11 +4,12 @@
 //! The Responses wire format differs from chat completions in three ways this
 //! client has to own: a flat `input` item array instead of `messages`, its own
 //! opaque `reasoning` output items for round-tripping, and `previous_response_id`
-//! chaining. Those live in [`body`], [`turn`] and [`stream`] respectively; this
+//! chaining. Those live in [`input`], [`turn`] and [`stream`] respectively; this
 //! file keeps the request entry points and the dispatch shape.
 //!
 //! - [`wire`] — the request/response/output-item types.
-//! - [`body`] — messages → `input` lowering and request-body assembly.
+//! - [`input`] — messages → `input` item lowering (shared by both body paths).
+//! - [`body`] — request-body assembly around that lowered input.
 //! - [`turn`] — the reasoning-item artifact and the response → turn conversion.
 //! - [`stream`] — the streaming turn with tools (SSE loop + accumulator).
 
@@ -21,14 +22,19 @@ use crate::types::{ChatTurnResult, StreamEvent};
 use std::io;
 
 mod body;
+mod input;
 mod stream;
 mod turn;
 mod wire;
 
 use body::{build_responses_request_body, build_simple_responses_body};
+pub(crate) use input::{SystemPrompt, messages_to_responses_input};
 pub(crate) use stream::responses_request_streaming_with_tools;
 use turn::incomplete_stop;
 pub(crate) use turn::responses_response_to_turn;
+// The item type is named only by the test suite now that the lowering lives in
+// `input` and reaches `wire` directly.
+#[cfg(test)]
 pub(crate) use wire::ResponsesInputItem;
 use wire::{ResponseOutputItem, ResponsesResponse};
 

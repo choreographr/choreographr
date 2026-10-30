@@ -6,10 +6,10 @@
 //! builders share and the one private resolver that fills it in.
 //! The canonical [`ChatRequestMessage`] / [`ChatToolDefinition`] types that the
 //! Anthropic and Google clients translate into their own wire formats live in
-//! `message`, the Responses `input` lowering lives in `responses_input`, the
-//! usage / `/models` envelopes in `wire`, and the model-usage error annotation
-//! in `error`; each is re-exported here so every consumer keeps naming them as
-//! `openai::…`.
+//! `message`, the Responses adapter (wire types, `input` lowering, request body,
+//! streaming turn) lives under `responses`, the usage / `/models` envelopes in
+//! `wire`, and the model-usage error annotation in `error`; each is re-exported
+//! here so every consumer keeps naming them as `openai::…`.
 
 mod chat_completions;
 mod chat_projection;
@@ -19,7 +19,6 @@ mod error;
 mod message;
 mod reasoning_details;
 mod responses;
-mod responses_input;
 mod retry;
 mod sse;
 #[cfg(test)]
@@ -39,7 +38,7 @@ pub use message::{
     AssistantToolCall, AssistantToolFunction, ChatImagePart, ChatRequestMessage,
     ChatToolDefinition, ChatToolFunction,
 };
-pub(crate) use responses_input::{SystemPrompt, messages_to_responses_input};
+pub(crate) use responses::{SystemPrompt, messages_to_responses_input};
 
 pub use chat_projection::{
     CHAT_REASONING_WIRE_KEYS, ChatWireMessage, ChatWireMessages, chat_assistant_payload_is_empty,

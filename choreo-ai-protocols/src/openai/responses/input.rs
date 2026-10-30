@@ -4,19 +4,18 @@
 //! `input` array of typed items (`message`, `function_call`,
 //! `function_call_output`, and the provider's own replayed `reasoning` items),
 //! so the canonical
-//! [`ChatRequestMessage`] slice has to be lowered item by item. The item types
-//! themselves belong to the Responses adapter (see [`super::responses`]); this
-//! module is only the shared messages→input builder both Responses request
-//! builders call.
+//! [`ChatRequestMessage`](super::super::ChatRequestMessage) history has to be
+//! lowered item by item. The item types themselves live in [`super::wire`]; this
+//! module is the messages→input builder both Responses request builders call.
 
 use std::io;
 
 use choreo_proto::ReasoningArtifact;
 use tracing::{debug, warn};
 
-use super::reasoning_details::MAX_REASONING_BYTES;
-use super::responses;
-use super::{ChatRequestMessage, OpenAiError};
+use super::super::reasoning_details::MAX_REASONING_BYTES;
+use super::super::{ChatRequestMessage, OpenAiError};
+use super::wire::ResponsesInputItem;
 
 /// Where a `system` message belongs on the Responses wire.
 ///
@@ -36,9 +35,7 @@ pub(crate) enum SystemPrompt {
 /// Serialize a Responses input item to its wire JSON value. Kept as a tiny
 /// helper because the Responses adapter owns the item type but the conversion
 /// happens here, in the shared messages→input builder.
-fn responses_input_item_value(
-    item: &responses::ResponsesInputItem,
-) -> Result<serde_json::Value, OpenAiError> {
+fn responses_input_item_value(item: &ResponsesInputItem) -> Result<serde_json::Value, OpenAiError> {
     serde_json::to_value(item).map_err(|e| OpenAiError::Io(io::Error::other(e)))
 }
 
@@ -136,12 +133,10 @@ pub(crate) fn messages_to_responses_input<'a>(
                     continue;
                 }
                 if let Some(ref content) = msg.content {
-                    items.push(responses_input_item_value(
-                        &responses::ResponsesInputItem::Message {
-                            role: "system".to_string(),
-                            content: serde_json::Value::String(content.clone()),
-                        },
-                    )?);
+                    items.push(responses_input_item_value(&ResponsesInputItem::Message {
+                        role: "system".to_string(),
+                        content: serde_json::Value::String(content.clone()),
+                    })?);
                 }
             }
             "user" | "assistant" => {
@@ -175,12 +170,10 @@ pub(crate) fn messages_to_responses_input<'a>(
                     .is_some_and(|content| !content.trim().is_empty())
                     || !msg.images.is_empty()
                 {
-                    items.push(responses_input_item_value(
-                        &responses::ResponsesInputItem::Message {
-                            role: msg.role.to_string(),
-                            content: msg.responses_content_value(),
-                        },
-                    )?);
+                    items.push(responses_input_item_value(&ResponsesInputItem::Message {
+                        role: msg.role.to_string(),
+                        content: msg.responses_content_value(),
+                    })?);
                 }
                 // An assistant turn's tool requests are their own input items,
                 // placed after its message exactly as the provider emitted
@@ -190,7 +183,7 @@ pub(crate) fn messages_to_responses_input<'a>(
                 if msg.role == "assistant" {
                     for call in msg.tool_calls.iter().flatten() {
                         items.push(responses_input_item_value(
-                            &responses::ResponsesInputItem::FunctionCall {
+                            &ResponsesInputItem::FunctionCall {
                                 call_id: call.id.clone(),
                                 name: call.function.name.clone(),
                                 arguments: call.function.arguments.clone(),
@@ -205,7 +198,7 @@ pub(crate) fn messages_to_responses_input<'a>(
                     && let Some(ref content) = msg.content
                 {
                     items.push(responses_input_item_value(
-                        &responses::ResponsesInputItem::FunctionCallOutput {
+                        &ResponsesInputItem::FunctionCallOutput {
                             call_id: call_id.clone(),
                             output: content.clone(),
                         },
