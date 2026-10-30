@@ -37,12 +37,12 @@ pub(super) fn build_responses_input(
     // System messages go into `input` as `{role: "system"}` items; the stateless
     // ChatGPT/Codex backend hoists them into `instructions` before this runs
     // (see `split_system_prompt`) so no system item reaches it.
-    let input_value = if items.is_empty() {
-        serde_json::Value::String(String::new())
-    } else {
-        serde_json::to_value(&items)
-            .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?
-    };
+    //
+    // Nothing to send is an EMPTY ITEMS ARRAY, not an empty string: `input` is an
+    // array of typed items here, so `[]` is the honest degenerate shape. A `""`
+    // would instead be a request to send one empty-text user message.
+    let input_value = serde_json::to_value(&items)
+        .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
     Ok(Some(input_value))
 }
 
@@ -169,7 +169,11 @@ pub(super) fn build_responses_request_body(
 
     let mut responses_tools: Vec<ResponsesTool> =
         params.tools.iter().map(ResponsesTool::from).collect();
-    if params.programmatic_tool_calling && !stateless {
+    // No `!stateless` guard here: `params.programmatic_tool_calling` already
+    // comes from `ServiceConfig::programmatic_tool_calling_for_model`, which is
+    // where the stateless dialect's rejection of hosted tools is decided. One
+    // policy site, so the withholding cannot drift from the tool list.
+    if params.programmatic_tool_calling {
         responses_tools.push(ResponsesTool {
             kind: "programmatic_tool_calling".to_string(),
             name: String::new(),
@@ -244,7 +248,11 @@ pub(super) fn build_responses_request_body(
         // `input` (the provider's passback policy is `all_turns`). A chained
         // provider needs none — `previous_response_id` already carries its
         // reasoning, and an unused `include` would only add a rejected field.
-        include: stateless.then_some(vec!["reasoning.encrypted_content"]),
+        //
+        // Gated on the reasoning capability too, for the same reason the
+        // `reasoning` object below is: `include` is validated strictly, and a
+        // model that does not reason has no reasoning item to return.
+        include: (stateless && reasoning_capable).then_some(vec!["reasoning.encrypted_content"]),
         // store must be true for `previous_response_id` chaining on the standard
         // Responses API, and is off for the stateless ChatGPT/Codex backend.
         store: !stateless,

@@ -23,12 +23,7 @@ pub(crate) enum ResponsesInputItem {
         content: serde_json::Value,
     },
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput {
-        call_id: String,
-        output: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        caller: Option<CallerInfo>,
-    },
+    FunctionCallOutput { call_id: String, output: String },
     /// An assistant turn's tool request, replayed when the history is rebuilt
     /// from messages rather than chained through `previous_response_id`.
     ///
@@ -36,13 +31,15 @@ pub(crate) enum ResponsesInputItem {
     /// the call itself has to appear earlier in `input`; the API rejects an
     /// output whose call was never introduced. `arguments` is the raw JSON
     /// string exactly as the model emitted it (never re-serialized).
+    ///
+    /// Neither variant carries a `caller`: programmatic tool calling is withheld
+    /// for the stateless dialect that rebuilds history, and the chained tail
+    /// carries only tool outputs, so no attribution ever rides an input item.
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: String,
         name: String,
         arguments: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        caller: Option<CallerInfo>,
     },
 }
 

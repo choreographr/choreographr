@@ -30,10 +30,11 @@ fn responses_input_item_value(
 /// Decode one persisted `ResponsesItems` artifact for replay, or `None` when it
 /// cannot be replayed.
 ///
-/// Two refusals, both payload-free and both non-fatal (see the caller): the
+/// Three refusals, all payload-free and all non-fatal (see the caller): the
 /// payload is over the crate's reasoning byte budget — the same number the chat
-/// adapter enforces, so a heavy turn cannot ride every later request — or it is
-/// not the JSON array the capture wrote.
+/// adapter enforces, so a heavy turn cannot ride every later request — it is not
+/// the JSON array the capture wrote, or every item in it is refused by
+/// [`reasoning_only`].
 fn decode_reasoning_items(bytes: &[u8]) -> Option<Vec<serde_json::Value>> {
     if bytes.len() > MAX_REASONING_BYTES {
         warn!(
@@ -45,6 +46,7 @@ fn decode_reasoning_items(bytes: &[u8]) -> Option<Vec<serde_json::Value>> {
         return None;
     }
     if let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(bytes) {
+        let items = reasoning_only(items);
         debug!(
             item_count = items.len(),
             "re-emitting responses reasoning items from artifact"
@@ -58,6 +60,33 @@ fn decode_reasoning_items(bytes: &[u8]) -> Option<Vec<serde_json::Value>> {
         );
         None
     }
+}
+
+/// Keep only the items that are actually `reasoning` items.
+///
+/// The replay splices these values into `input` verbatim, ahead of the assistant
+/// message they belong to, so an item of any other kind would be an input the
+/// request never legitimately produced — a `message` item could inject a turn
+/// the conversation never had, and a `function_call_output` would answer a call
+/// the API never saw. The capture path only ever stores reasoning items, so this
+/// is a shape check on our own cache rather than on provider input: a corrupted
+/// or tampered artifact loses its non-reasoning items (with a count logged)
+/// instead of steering the request.
+fn reasoning_only(items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let total = items.len();
+    let kept: Vec<serde_json::Value> = items
+        .into_iter()
+        .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning"))
+        .collect();
+    if kept.len() < total {
+        warn!(
+            dropped = total - kept.len(),
+            kept = kept.len(),
+            "persisted responses reasoning artifact carries non-reasoning items; \
+             not replaying them"
+        );
+    }
+    kept
 }
 
 /// Convert `ChatRequestMessage` slice to Responses API input format.
@@ -137,7 +166,6 @@ pub(crate) fn messages_to_responses_input(
                                 call_id: call.id.clone(),
                                 name: call.function.name.clone(),
                                 arguments: call.function.arguments.clone(),
-                                caller: None,
                             },
                         )?);
                     }
@@ -152,21 +180,20 @@ pub(crate) fn messages_to_responses_input(
                         &responses::ResponsesInputItem::FunctionCallOutput {
                             call_id: call_id.clone(),
                             output: content.clone(),
-                            caller: None,
                         },
                     )?);
                 }
             }
             _ => {
                 warn!(
-                    "unexpected message role in messages_to_responses_input: {}",
-                    msg.role
+                    role = %msg.role,
+                    "unexpected message role in messages_to_responses_input"
                 );
             }
         }
     }
 
-    debug!("messages_to_responses_input: {} items", items.len());
+    debug!(item_count = items.len(), "messages_to_responses_input");
 
     Ok(items)
 }
