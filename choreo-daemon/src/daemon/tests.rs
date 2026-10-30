@@ -3229,6 +3229,7 @@ fn tiny_base() -> Vec<choreo_ai_protocols::ProviderEntry> {
         prompt_cache: None,
         request_compression: choreo_ai_protocols::RequestCompression::Identity,
         cache_affinity: choreo_ai_protocols::CacheAffinity::Off,
+        responses_stateless: false,
         oauth: None,
         models: vec![choreo_ai_protocols::ModelEntry {
             model: "tiny-1".into(),

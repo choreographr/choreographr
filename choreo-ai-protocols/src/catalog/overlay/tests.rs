@@ -22,6 +22,7 @@ fn base() -> Vec<ProviderEntry> {
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
             cache_affinity: CacheAffinity::Off,
+            responses_stateless: false,
             oauth: None,
             models: vec![
                 ModelEntry {
@@ -48,6 +49,7 @@ fn base() -> Vec<ProviderEntry> {
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
             cache_affinity: CacheAffinity::Off,
+            responses_stateless: false,
             oauth: None,
             models: vec![ModelEntry {
                 model: "zoo-1".into(),

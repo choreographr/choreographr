@@ -363,6 +363,10 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
         // models.dev carries nothing about session-routing hints, so every
         // provider starts with no hint.
         cache_affinity: CacheAffinity::Off,
+        // The stateless Responses dialect is overlay policy, never a base fact —
+        // models.dev carries nothing about a backend's transcript semantics, so
+        // every provider starts on the standard chaining shape.
+        responses_stateless: false,
         // OAuth profiles are overlay policy, never a base fact — models.dev
         // carries nothing about authorization servers.
         oauth: None,

@@ -319,6 +319,7 @@ fn install_catalog() -> CatalogGuard {
         prompt_cache: None,
         request_compression: RequestCompression::Identity,
         cache_affinity: CacheAffinity::Off,
+        responses_stateless: false,
         oauth: None,
         models: vec![ModelEntry {
             model: OAUTH_MODEL.into(),

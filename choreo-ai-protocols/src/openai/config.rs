@@ -9,11 +9,6 @@ const DEFAULT_MODEL_LIST_PATH: &str = "/models";
 const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
-/// The catalog slug of the ChatGPT/Codex subscription backend. Its Responses
-/// endpoint is a non-standard, stateless dialect — see
-/// [`ServiceConfig::responses_stateless`].
-const CODEX_PROVIDER_SLUG: &str = "chatgpt";
-
 // Extra headers for the opencode.ai gateway live in
 // [`crate::shared::opencode_gateway_headers`], applied per request from the
 // turn's real session/request ids (see `ChatTurnRequest`).
@@ -172,9 +167,15 @@ impl ServiceConfig {
     /// `previous_response_id` with `store: true` and accepts inline system
     /// items, so gating on this flag leaves those providers byte-for-byte
     /// unchanged.
+    ///
+    /// This is a **catalog fact** (the overlay's provider-level
+    /// `responses_stateless` key), not a slug comparison here: the daemon's
+    /// reasoning policy already reads the same catalog to decide whether a route
+    /// chains, and one hand-kept slug list in the adapter beside it would be a
+    /// second switch that could silently disagree.
     #[must_use]
     pub fn responses_stateless(&self) -> bool {
-        self.provider_slug == CODEX_PROVIDER_SLUG
+        crate::catalog::provider_responses_stateless(&self.provider_slug)
     }
 
     /// Whether the catalogue records the model as reasoning-capable, i.e.
@@ -582,7 +583,8 @@ mod tests {
 
     #[test]
     fn responses_stateless_is_chatgpt_only() {
-        // The Codex backend is the stateless Responses dialect...
+        // The Codex backend is the stateless Responses dialect, pinned by the
+        // bundled overlay's provider-level `responses_stateless` fact...
         let codex = ServiceConfig {
             provider_slug: "chatgpt".to_string(),
             ..Default::default()
@@ -595,6 +597,13 @@ mod tests {
             ..Default::default()
         };
         assert!(!openai.responses_stateless());
+        // A provider the catalog has never heard of gets the standard chaining
+        // shape: the stateless dialect is opt-in per backend, never a default.
+        let unknown = ServiceConfig {
+            provider_slug: "no-such-provider".to_string(),
+            ..Default::default()
+        };
+        assert!(!unknown.responses_stateless());
     }
 
     #[test]

@@ -56,6 +56,16 @@
 #                                # (DeepSeek, Google), uses cache_control
 #                                # (Anthropic), or already routes via gateway
 #                                # headers (the opencode slugs).
+#   responses_stateless = true   # default false. Whether this provider's
+#                                # Responses endpoint is the stateless dialect:
+#                                # the system prompt rides `instructions` (never a
+#                                # `system` input item), `store` is off, nothing
+#                                # chains via `previous_response_id`, and the full
+#                                # history is sent on every request. A property
+#                                # of the BACKEND, not of a model id — pair it
+#                                # with a per-model `reasoning_passback` that is
+#                                # not `response_id`, or reasoning continuity is
+#                                # lost (see the `chatgpt` block below).
 #
 #   [provider.<slug>.models."<model>"]
 #   context_window = 123456
@@ -614,6 +624,13 @@
   display_name = "ChatGPT (Codex subscription)"
   base_url = "https://chatgpt.com/backend-api/codex"
   default_model = "gpt-5.6-luna"
+  # The Codex backend is the stateless Responses dialect: it rejects a
+  # `system`-role input item (the prompt rides `instructions` instead), keeps no
+  # server-side transcript, and ignores `previous_response_id`. This one flag is
+  # what drives the whole request shape (see `ServiceConfig::responses_stateless`)
+  # and is the catalog fact the daemon's reasoning policy reads to decide the
+  # route chains nothing — pinning it here is what keeps those two in step.
+  responses_stateless = true
 
 # Wire facts verified against the Codex CLI: issuer auth.openai.com, the
 # device-code flow under /deviceauth, a form-encoded code exchange against a

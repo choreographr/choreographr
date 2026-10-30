@@ -143,6 +143,26 @@ pub fn cache_affinity(provider_slug: &str) -> CacheAffinity {
         .map_or_default(|e| e.cache_affinity)
 }
 
+/// Whether the given provider's Responses endpoint speaks the **stateless**
+/// dialect, from the overlay's provider-level `responses_stateless` fact.
+///
+/// Unknown providers report `false`: the standard chaining Responses shape is
+/// the permissive default, since a provider the catalog has never heard of is
+/// far more likely to be an ordinary `OpenAI`-compatible endpoint than the one
+/// non-standard backend. The `chatgpt`/Codex route is the only provider that
+/// pins it (see the bundled overlay), which is what makes
+/// [`ServiceConfig::responses_stateless`](crate::openai::ServiceConfig::responses_stateless)
+/// and the daemon's `previous_response_id` policy two views of ONE catalog fact
+/// rather than two hand-kept switches.
+#[must_use]
+pub fn provider_responses_stateless(provider_slug: &str) -> bool {
+    PROVIDER_CATALOG
+        .load()
+        .iter()
+        .find(|e| e.slug == provider_slug)
+        .is_some_and(|e| e.responses_stateless)
+}
+
 /// The extended prompt-cache retention dialect the catalog declares for a
 /// **specific model**, or [`CacheRetentionDialect::None`] for an unknown
 /// provider/model (or one the overlay did not opt in).

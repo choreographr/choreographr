@@ -143,6 +143,7 @@ pub fn merge_overlay(base: &[ProviderEntry], overlay_src: &str) -> Vec<ProviderE
                 prompt_cache: None,
                 request_compression: RequestCompression::Identity,
                 cache_affinity: CacheAffinity::Off,
+                responses_stateless: false,
                 oauth: None,
             };
             apply_provider_overlay(&mut entry, table, &mut models_touched);
@@ -237,6 +238,22 @@ fn apply_provider_overlay(
                     warn!(
                         slug = %entry.slug,
                         "overlay: cache_affinity must be \"off\", \"prompt-cache-key\", or \"openrouter-session\"; skipping",
+                    );
+                }
+            }
+            // Whether the Responses endpoint is the stateless dialect. Provider
+            // policy models.dev cannot express: it is a property of the
+            // backend's transcript semantics, not of any model id. Absent (or
+            // non-boolean) leaves the standard chaining shape in place, the safe
+            // default — the stateless shape changes three wire fields at once,
+            // so it is only ever right for a backend that requires it.
+            "responses_stateless" => {
+                if let Some(stateless) = value.as_bool() {
+                    entry.responses_stateless = stateless;
+                } else {
+                    warn!(
+                        slug = %entry.slug,
+                        "overlay: responses_stateless is not a boolean; skipping",
                     );
                 }
             }

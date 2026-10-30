@@ -91,6 +91,7 @@ fn install_short_ttl_catalog() -> CatalogGuard {
         }),
         request_compression: choreo_ai_protocols::RequestCompression::Identity,
         cache_affinity: choreo_ai_protocols::CacheAffinity::Off,
+        responses_stateless: false,
         oauth: None,
         models: vec![ModelEntry {
             model: MODEL.into(),

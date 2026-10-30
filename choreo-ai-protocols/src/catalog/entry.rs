@@ -372,6 +372,21 @@ pub struct ProviderEntry {
     /// itself: the real per-session id is filled in at request time.
     #[serde(default)]
     pub cache_affinity: CacheAffinity,
+    /// Whether this provider's Responses endpoint speaks the **stateless**
+    /// dialect — overlay policy; models.dev carries no such fact. Defaults to
+    /// `false`, so a provider the overlay does not pin is treated as the
+    /// standard chaining Responses API.
+    ///
+    /// The stateless dialect (the `chatgpt` provider's Codex backend) rejects a
+    /// `system`-role input item (the prompt rides the top-level `instructions`
+    /// field instead), keeps no server-side transcript (`store: false`, no
+    /// `previous_response_id` chain), and therefore has to be sent the full
+    /// history on every request. It is a *provider* fact rather than a
+    /// per-model one because all three of those are properties of the backend,
+    /// not of the model id — a new model id on a stateless provider still needs
+    /// the stateless request shape. See [`super::provider_responses_stateless`].
+    #[serde(default)]
+    pub responses_stateless: bool,
     /// The provider's OAuth profile, when it can be signed into with OAuth.
     /// Overlay-only policy (models.dev carries no OAuth facts); its presence is
     /// what makes [`ProviderEntry::auth_kind`] report [`AuthKind::OAuth`].

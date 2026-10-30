@@ -48,7 +48,7 @@ pub use lookup::{
     image_edit_models_for_provider, image_models_for_provider, lookup_context_window,
     lookup_max_output_tokens, model_cost, model_reasoning_capability, model_reasoning_passback,
     model_request_format, model_supports_image_output, model_supports_temperature,
-    model_supports_vision, prompt_cache_ttl,
+    model_supports_vision, prompt_cache_ttl, provider_responses_stateless,
 };
 pub use modelsdev::normalize_modelsdev;
 pub use oauth::oauth_provider_descriptors;
@@ -183,6 +183,7 @@ pub(crate) mod test_util {
             prompt_cache: None,
             request_compression: RequestCompression::Identity,
             cache_affinity: crate::session_routing::CacheAffinity::Off,
+            responses_stateless: false,
             oauth: None,
             models: vec![crate::catalog::ModelEntry {
                 model: "tiny-model".into(),
@@ -527,6 +528,16 @@ mod tests {
         // ChatGPT backend has no `/models` endpoint — is non-empty.
         let entry = lookup_provider("chatgpt").expect("chatgpt is in the bundled catalog");
         assert_eq!(entry.base_url, "https://chatgpt.com/backend-api/codex");
+        // The provider-level fact the request shape and the daemon's reasoning
+        // policy both read (see `every_stateless_provider_replays_rather_than_chains`).
+        assert!(
+            entry.responses_stateless,
+            "the Codex backend is the stateless Responses dialect"
+        );
+        assert!(provider_responses_stateless("chatgpt"));
+        // The standard OpenAI Responses API chains, so it is not pinned.
+        assert!(!provider_responses_stateless("openai"));
+        assert!(!provider_responses_stateless("no-such-provider"));
         let oauth = entry
             .oauth
             .as_ref()
@@ -564,6 +575,42 @@ mod tests {
         assert!(
             !entry.models.is_empty(),
             "chatgpt's curated model list is its only model source"
+        );
+    }
+
+    #[test]
+    fn every_stateless_provider_replays_rather_than_chains() {
+        // The stateless Responses dialect and the reasoning passback policy are
+        // two readings of the SAME backend property, and they have to agree:
+        // the request shape sends no `previous_response_id` and stores nothing,
+        // so a model resolving to `ResponseId` on such a provider would have its
+        // captured reasoning silently stop being replayed — the model would lose
+        // reasoning continuity across turns with no error anywhere.
+        //
+        // Pin the invariant across the WHOLE catalog rather than only the three
+        // curated `chatgpt` models, so a model id added to a stateless provider
+        // without the matching `reasoning_passback` pin fails here instead of in
+        // production.
+        let catalog = PROVIDER_CATALOG.load();
+        let mut checked = 0usize;
+        for entry in catalog.iter().filter(|e| e.responses_stateless) {
+            for model in &entry.models {
+                assert_ne!(
+                    model_reasoning_passback(&entry.slug, &model.model),
+                    ReasoningPassback::ResponseId,
+                    "{}:{} is on a stateless provider, so it cannot chain via a \
+                     response id",
+                    entry.slug,
+                    model.model,
+                );
+                checked += 1;
+            }
+        }
+        // The check must actually have run over the stateless provider's models;
+        // an empty set would make it vacuously true.
+        assert!(
+            checked >= 3,
+            "expected the stateless provider's curated models, checked {checked}",
         );
     }
 

@@ -1344,6 +1344,18 @@ one for it (one predicate, `chains_via_response_id`), so an id the stateless
 backend happens to return can never become a stale chain a later request
 replays.
 
+Which backend is stateless is a **provider-level catalog fact** (the overlay's
+`responses_stateless` key, read through `catalog::provider_responses_stateless`),
+not an adapter-side slug list: the same fact drives the request shape
+(`ServiceConfig::responses_stateless` — `instructions` hoisting, `store: false`,
+no chain, full history, no hosted tools) and, via the passback policy it must be
+paired with, the daemon's chaining decision. A catalog test
+(`every_stateless_provider_replays_rather_than_chains`) walks every model of
+every stateless provider and fails if one resolves to
+`ReasoningPassback::ResponseId`, so a model added without the matching passback
+pin breaks the build rather than silently dropping reasoning continuity in
+production.
+
 **Which key wins.** The catalog's declared echo field is authoritative and
 outranks the field a payload was *observed* under: `ReasoningArtifact::
 ChatReasoning` records the observation (a hint, used only when the route declares
@@ -2992,7 +3004,8 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     the stateless ChatGPT/Codex dialect hoists the system prompt into the top-level
     `instructions` field, sets `store: false`, ignores `previous_response_id`, and asks for
     `include: ["reasoning.encrypted_content"]` so captured reasoning items can be replayed
-    into `input` on the next request (`ServiceConfig::responses_stateless`; see Reasoning
+    into `input` on the next request (`ServiceConfig::responses_stateless`, which
+    reads the overlay's provider-level `responses_stateless` fact; see Reasoning
     round-trip for why the replay replaces the chain). Chat Completions relies on the full
     message history.
 
