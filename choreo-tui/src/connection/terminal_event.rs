@@ -4,9 +4,11 @@
 //! keyboard-protocol handling (the enhancement flags requested at startup and
 //! the SHIFT normalisation that restores legacy-equivalent events), the
 //! bracketed-paste routing into whichever input buffer is active, the
-//! fullscreen-overlay guard, and the daemon→UI `UiEvent` handler. The per-page
-//! key/mouse handlers live in the sibling page modules this dispatches to; the
-//! UI loop itself lives in the sibling `ui_loop` module.
+//! pointer-hover sampling every mouse event feeds (see the block in
+//! `handle_terminal_event`), the fullscreen-overlay guard, and the daemon→UI
+//! `UiEvent` handler. The per-page key/mouse handlers live in the sibling page
+//! modules this dispatches to; the UI loop itself lives in the sibling
+//! `ui_loop` module.
 
 use crate::state::{AccountWizardStep, App, Page, UiEvent};
 use choreo_client_core::ClientError;
@@ -159,16 +161,46 @@ pub(crate) fn handle_terminal_event(
         return Ok(());
     }
 
-    // Mouse motion carries no screen change: it only moves the terminal's
-    // pointer shape (OSC 22), which the UI loop emits outside `terminal.draw`.
-    // Recording the position and returning here keeps motion out of every page
-    // handler — a `Moved` event is neither a click nor a drag, and the
-    // selection gesture must not treat it as one.
-    if let Event::Mouse(mouse) = &event
-        && mouse.kind == MouseEventKind::Moved
-    {
+    // Every mouse event carries the pointer's cell, so every one of them is a
+    // hover sample — not only `Moved`.  A terminal reports button-less motion as
+    // `Moved` while its any-event tracking (DECSET 1003) is in force and no
+    // button is held; while it believes a button is down it reports the same
+    // motion as a `Drag`, and a surface whose tracking mode has lapsed reports
+    // no motion at all.  Sampling every kind keeps the pointer shape following
+    // the pointer in each case instead of freezing on the last target — a
+    // frozen hover is otherwise unrecoverable, because the shape is emitted only
+    // when it changes, so a hover that stops being refreshed stops emitting.
+    if let Event::Mouse(mouse) = &event {
+        // A discrete action (click or wheel notch) landing somewhere the motion
+        // stream never reported means the terminal is delivering mouse input but
+        // not motion: either its any-event mode lapsed or another program on the
+        // same pty reset it.  Ask the UI loop to re-assert the mode (an
+        // idempotent private-mode set) so the shape starts tracking again
+        // instead of staying frozen until the surface is replaced.
+        //
+        // `Moved`/`Drag`/`Up` deliberately never ask: motion is the healthy
+        // signal, a drag arrives per cell crossed (so asking there would write
+        // the mode set dozens of times per selection), and a release belongs to
+        // the gesture its press started.  A latched button — which makes motion
+        // arrive as a drag — is terminal-side state that re-sending the mode set
+        // cannot clear; sampling drags above is what covers it.
+        let discrete = matches!(
+            mouse.kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        );
+        if discrete && app.pointer_hover != Some((mouse.column, mouse.row)) {
+            app.mouse_tracking_reassert = true;
+        }
         app.pointer_hover = Some((mouse.column, mouse.row));
-        return Ok(());
+        // Bare motion is not a click or a drag: no page handler wants it, and
+        // the selection gesture must not treat it as one, so it stops here.
+        if mouse.kind == MouseEventKind::Moved {
+            return Ok(());
+        }
     }
 
     // Terminal-resize events are handled irrespective of page or fullscreen

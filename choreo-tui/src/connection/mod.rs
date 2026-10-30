@@ -1133,4 +1133,132 @@ mod tests {
             "a click must still trigger a repaint"
         );
     }
+
+    #[test]
+    fn pointer_hover_is_sampled_from_drags_clicks_and_wheel_not_only_motion() {
+        use crate::terminal::pointer::PointerShape;
+
+        // A terminal reports button-less motion as `Moved` only while no button
+        // is held; with a button latched it reports the same movement as a
+        // `Drag`, and a surface whose any-event mode lapsed reports only clicks
+        // and wheel notches.  All of them carry the pointer's cell, so every one
+        // must refresh the hover — a hover refreshed from motion alone freezes
+        // on the last target for the rest of the session, because the shape is
+        // emitted only when it changes.
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for id in 0..20 {
+            insert_turn(&mut app, id, "user text", "assistant response");
+        }
+        app.rebuild_height_prefix();
+        assert!(app.scrollbar_visible(), "the scrollbar must be drawn");
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let scrollbar = app.history_viewport.width;
+
+        // Establish the hand over the scrollbar column, then move off it as the
+        // terminal does while a button is held.
+        dispatch_terminal_event(
+            mouse_event(MouseEventKind::Moved, scrollbar, 0),
+            &mut app,
+            &tx,
+        )
+        .expect("dispatch motion");
+        assert_eq!(app.sync_pointer(), Some(PointerShape::Pointer));
+
+        dispatch_terminal_event(
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 3, 2),
+            &mut app,
+            &tx,
+        )
+        .expect("dispatch drag");
+        assert_eq!(app.pointer_hover, Some((3, 2)), "a drag samples the hover");
+        assert_eq!(app.sync_pointer(), Some(PointerShape::Text));
+
+        // A wheel notch back over the scrollbar column.
+        dispatch_terminal_event(
+            mouse_event(MouseEventKind::ScrollDown, scrollbar, 4),
+            &mut app,
+            &tx,
+        )
+        .expect("dispatch wheel");
+        assert_eq!(
+            app.pointer_hover,
+            Some((scrollbar, 4)),
+            "a wheel samples it"
+        );
+        assert_eq!(app.sync_pointer(), Some(PointerShape::Pointer));
+
+        // And a click over the text.
+        dispatch_terminal_event(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 2),
+            &mut app,
+            &tx,
+        )
+        .expect("dispatch click");
+        assert_eq!(app.pointer_hover, Some((3, 2)), "a click samples it");
+        assert_eq!(app.sync_pointer(), Some(PointerShape::Text));
+    }
+
+    #[test]
+    fn a_click_where_no_motion_was_reported_requests_a_tracking_reassert() {
+        // The mouse-tracking mode is terminal-side state the client cannot read
+        // back, so a surface that stops reporting motion is detected from the
+        // input itself: a click or wheel notch at a cell the motion stream never
+        // reported means the terminal is delivering mouse input but not motion.
+        let mut app = test_app();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let click = |app: &mut App,
+                     tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
+                     column,
+                     row| {
+            dispatch_terminal_event(
+                mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+                app,
+                tx,
+            )
+            .expect("dispatch click")
+        };
+
+        // No hover has ever been sampled: the click arrives with no motion
+        // behind it, so the mode is re-asserted.
+        assert!(!app.mouse_tracking_reassert);
+        click(&mut app, &tx, 5, 5);
+        assert!(
+            app.mouse_tracking_reassert,
+            "a click with no known hover re-asserts the mode"
+        );
+
+        // A click on the cell the last sample left us on proves motion is
+        // reaching us; nothing needs re-asserting.
+        app.mouse_tracking_reassert = false;
+        click(&mut app, &tx, 5, 5);
+        assert!(!app.mouse_tracking_reassert);
+
+        // A click somewhere motion never reported means the motion stream lapsed.
+        click(&mut app, &tx, 40, 9);
+        assert!(
+            app.mouse_tracking_reassert,
+            "a click off the last sample re-asserts the mode"
+        );
+
+        // Drags arrive per cell crossed, so they never ask (the latched-button
+        // case they cover is fixed by sampling them, not by the mode set), and
+        // motion is the healthy signal itself.
+        app.mouse_tracking_reassert = false;
+        dispatch_terminal_event(
+            mouse_event(MouseEventKind::Drag(MouseButton::Left), 41, 9),
+            &mut app,
+            &tx,
+        )
+        .expect("dispatch drag");
+        assert!(!app.mouse_tracking_reassert, "a drag never re-asserts");
+
+        // Suspend and exit hand the terminal back, so a pending request is
+        // dropped with the rest of the pointer state.
+        app.mouse_tracking_reassert = true;
+        app.forget_pointer();
+        assert!(!app.mouse_tracking_reassert);
+        assert_eq!(app.pointer_hover, None);
+    }
 }

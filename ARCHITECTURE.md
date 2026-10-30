@@ -2172,14 +2172,25 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   column, the history pane's text, the composer box, and the reasoning /
   tool-result header ranges), and is emitted from the UI loop outside
   `terminal.draw` only when the shape changes, so mouse motion never dirties a
-  frame; it is reset to `default` on suspend and exit. The synchronized-update
-  markers (DECSET 2026) are written by the `Backend::draw` wrapper
-  (`backend.rs`) as a begin/end pair around each frame's cell stream, through the
-  same writer and with no flush between them, so the terminal presents a frame
-  atomically. Neither is capability-probed: an unsupported terminal ignores a
-  private-mode set or an unknown cursor keyword, while a *query* reply would land
-  on stdin, where crossterm parses it as individual keystrokes and types it into
-  the user's prompt.
+  frame; it is reset to `default` on suspend and exit. The hover position behind
+  it is sampled from **every** mouse event, not only from motion: a terminal
+  reports button-less motion as `Moved` only while its any-event tracking
+  (DECSET 1003) is in force and no button is held, reports the same movement as
+  a `Drag` while it believes a button is down, and reports no motion at all once
+  the mode lapses. Because the shape is emitted only on change, a hover
+  refreshed from motion alone would freeze on the last target for the rest of
+  the session, which is unrecoverable from inside the app; sampling clicks,
+  drags and wheel notches keeps it tracking, and a click or wheel notch landing
+  where the motion stream never reported asks the loop to re-assert the tracking
+  mode (an idempotent private-mode set, the client's only self-recovery — the
+  mode itself is terminal-side state it cannot read back). The
+  synchronized-update markers (DECSET 2026) are written by the `Backend::draw`
+  wrapper (`backend.rs`) as a begin/end pair around each frame's cell stream,
+  through the same writer and with no flush between them, so the terminal
+  presents a frame atomically. Neither is capability-probed: an unsupported
+  terminal ignores a private-mode set or an unknown cursor keyword, while a
+  *query* reply would land on stdin, where crossterm parses it as individual
+  keystrokes and types it into the user's prompt.
 
   The policy is tiered, and which tier a value belongs to is decided by whether
   anything other than a widget reads it:

@@ -767,6 +767,26 @@ fn run_ui_loop(
             }
         }
 
+        // Re-assert the mouse-tracking mode when the input path reports it has
+        // degraded (see `App::mouse_tracking_reassert`): a surface whose
+        // any-event tracking lapsed still delivers clicks and drags but no
+        // motion, which freezes the pointer shape with no way back from inside
+        // the app.  Like the pointer shape this writes raw bytes to the
+        // terminal, so it runs here, never inside the render closure.  The
+        // command is the same idempotent private-mode set the startup and resume
+        // paths enable, and a failed write only costs the recovery — so it is
+        // logged and swallowed rather than ending the session.
+        if app.mouse_tracking_reassert {
+            app.mouse_tracking_reassert = false;
+            match crossterm::execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)
+            {
+                Ok(()) => tracing::debug!("[choreo-tui] re-asserted mouse tracking"),
+                Err(error) => {
+                    tracing::warn!(%error, "[choreo-tui] could not re-assert mouse tracking");
+                }
+            }
+        }
+
         // Publish the pointer shape (OSC 22) for the current hover target.
         // Like the window title this writes raw bytes to stdout, so it must
         // run here and never inside the `terminal.draw` render closure.  The

@@ -5,7 +5,15 @@
 //! derived from the *last known pointer position* plus the current hit-test
 //! state, never from "did a mouse-motion event just arrive" — so a target that
 //! disappears (a scrollbar hidden because the history now fits the viewport)
-//! resets to the default arrow with no mouse motion at all.
+//! resets to the default arrow with no further input at all.
+//!
+//! That position is sampled from **every** mouse event, not only from motion:
+//! a terminal reports button-less motion as `Moved` only while its any-event
+//! tracking is in force and no button is held, and reports the same movement as
+//! a `Drag` otherwise (or not at all, if the mode lapsed). Since the shape is
+//! emitted only when it changes, a hover refreshed from motion alone would
+//! freeze on the last target for the rest of the session; see
+//! `crate::connection::terminal_event`.
 //!
 //! The hit-tests are the same ones click handling uses (`mouse_in_scrollbar_column`,
 //! `mouse_in_history_box`, `App::input_box_rect`, and the reasoning/tool-result
@@ -108,14 +116,19 @@ impl App {
         Some(desired)
     }
 
-    /// Forget the pointer: the hover position and the shape last emitted.
+    /// Forget the pointer: the hover position, the shape last emitted, and any
+    /// pending request to re-assert the mouse-tracking mode.
     ///
     /// The suspend and exit paths reset the terminal's pointer to the default
     /// arrow and call this, so nothing re-sends a stale shape afterwards — the
     /// ordinary change detection re-emits only once the pointer actually moves
-    /// onto a target again.
+    /// onto a target again. A pending re-assert is dropped for the same reason:
+    /// both callers are handing the terminal back, so re-enabling mouse tracking
+    /// afterwards would fight the teardown (and, on suspend, would run while the
+    /// process is stopped).
     pub(crate) fn forget_pointer(&mut self) {
         self.pointer_hover = None;
         self.term_pointer = None;
+        self.mouse_tracking_reassert = false;
     }
 }

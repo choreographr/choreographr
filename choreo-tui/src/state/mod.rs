@@ -311,10 +311,24 @@ pub(crate) struct App {
     /// the next computation re-emits.
     pub(crate) term_pointer: Option<crate::terminal::pointer::PointerShape>,
     /// The pointer's last reported position in terminal coordinates, recorded
-    /// from a mouse-motion event. The pointer shape is *derived* from it against
-    /// the current hit-test state (see `state/pointer.rs`), so a hover target
-    /// that disappears still resets the shape without any further motion.
+    /// from every mouse event (motion, drag, click, wheel) — the event kinds
+    /// that carry a cell and the shapes a terminal actually reports it with. The
+    /// pointer shape is *derived* from it against the current hit-test state
+    /// (see `state/pointer.rs`), so a hover target that disappears still resets
+    /// the shape without any further input.
     pub(crate) pointer_hover: Option<(u16, u16)>,
+    /// Set when the input path shows it has degraded, so the UI loop re-asserts
+    /// the terminal's mouse-tracking mode outside `terminal.draw`.
+    ///
+    /// The mode is a set of DEC private modes enabled once at startup; a surface
+    /// whose any-event tracking (`?1003`) lapses keeps delivering clicks, drags
+    /// and wheel notches but never motion, which silently freezes the pointer
+    /// shape for the life of the session (the shape is emitted only on change).
+    /// Re-sending the mode set is idempotent and is the only recovery the client
+    /// can drive itself, so it is requested from the input path (where the
+    /// degradation is observed) and written by the loop (which owns terminal
+    /// output).
+    pub(crate) mouse_tracking_reassert: bool,
     /// Persistent latch of whether the daemon's credential keystore is locked.
     /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
     /// and the subscribe-time lock-state push in `handle_daemon_message`;
@@ -454,6 +468,7 @@ impl App {
             term_title: None,
             term_pointer: None,
             pointer_hover: None,
+            mouse_tracking_reassert: false,
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,
