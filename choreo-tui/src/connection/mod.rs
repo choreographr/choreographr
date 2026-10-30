@@ -155,7 +155,7 @@ mod tests {
     use crossbeam_channel as channel;
     use crossterm::event::{Event, KeyCode, KeyboardEnhancementFlags};
     #[cfg(unix)]
-    use nix::sys::signal::Signal;
+    use nix::sys::signal::{Signal, raise};
 
     #[cfg(unix)]
     #[test]
@@ -1260,5 +1260,58 @@ mod tests {
         app.forget_pointer();
         assert!(!app.mouse_tracking_reassert);
         assert_eq!(app.pointer_hover, None);
+    }
+
+    /// The signal self-pipes are what turn a caught signal back into a resume
+    /// command, so pin the property the whole design rests on: a delivery wakes
+    /// *its own* pipe and no other, which is the only way the identity survives
+    /// (the handler writes one unidentifiable byte).
+    ///
+    /// The handlers run synchronously inside `raise`, so each pipe is already
+    /// readable when it returns — no waiting, no polling.
+    #[cfg(unix)]
+    #[test]
+    fn each_caught_signal_wakes_only_its_own_pipe() {
+        use mio::{Poll, Token};
+
+        let mut signals = resume::Signals::register().expect("register the signal pipes");
+        let mut poll = Poll::new().expect("create poll");
+        signals
+            .register_with(&mut poll)
+            .expect("park the pipes in the poll");
+        let (tx, rx) = channel::unbounded::<ResumeCommand>();
+        let token = |index: usize| Token(resume::SIGNAL_TOKEN_BASE + index);
+
+        // SIGCONT is index 0: it wakes that pipe with the resume command, and
+        // the other pipes have nothing to report.
+        raise(Signal::SIGCONT).expect("raise SIGCONT");
+        signals.on_token(token(0), &mut poll, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(ResumeCommand::ReinitTerminal)),
+            "SIGCONT must map to the terminal re-init"
+        );
+        signals.on_token(token(1), &mut poll, &tx);
+        signals.on_token(token(2), &mut poll, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a signal must not be reported by another signal's pipe"
+        );
+
+        // SIGTSTP is index 2: same property, the opposite command.
+        raise(Signal::SIGTSTP).expect("raise SIGTSTP");
+        signals.on_token(token(2), &mut poll, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(ResumeCommand::PrepareForSuspend)),
+            "SIGTSTP must map to the suspend preparation"
+        );
+
+        // SIGWINCH is index 1: it wakes its pipe but maps to no command — it
+        // exists only to wake the poll so crossterm emits `Event::Resize`.
+        raise(Signal::SIGWINCH).expect("raise SIGWINCH");
+        signals.on_token(token(1), &mut poll, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "SIGWINCH only wakes the poll; it maps to no command"
+        );
     }
 }
