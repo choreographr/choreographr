@@ -158,25 +158,6 @@ fn split_system_prompt(messages: &[ChatRequestMessage]) -> Option<String> {
     (!joined.is_empty()).then_some(joined)
 }
 
-/// Shared helper: extract the reasoning text from a Responses API
-/// reasoning-summary array.  Each entry may be a plain string or an object
-/// with a `"text"` field.
-pub(super) fn extract_reasoning_text(summary: &[serde_json::Value]) -> Option<String> {
-    let parts: Vec<String> = summary
-        .iter()
-        .filter_map(|v| {
-            v.as_str()
-                .map(String::from)
-                .or_else(|| v.get("text").and_then(|t| t.as_str().map(String::from)))
-        })
-        .collect();
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" "))
-    }
-}
-
 /// Shared helper: build the URL and serialised request body for a
 /// Responses API request with tools (and optionally tool results from a
 /// previous turn).

@@ -11,7 +11,6 @@ use std::io;
 use tracing::{debug, warn};
 
 use super::super::reasoning_details::MAX_REASONING_BYTES;
-use super::body::extract_reasoning_text;
 use super::wire::{ResponseOutputItem, ResponsesResponse};
 use crate::openai::turn::{TurnParts, assemble_turn};
 use crate::types::{ChatToolCall, ChatTurnResult};
@@ -124,6 +123,31 @@ pub(super) fn merge_reasoning_item(items: &mut Vec<serde_json::Value>, item: ser
             }
         }
         None => items.push(item),
+    }
+}
+
+/// Extract the display text from a Responses API reasoning-summary array.
+///
+/// The API nests a reasoning item's visible summary here, and the entries are
+/// not uniform: an entry is either a bare string or an object carrying its text
+/// under `text`. Both shapes are read and joined with a space, so a summary
+/// split across several entries reads as one paragraph. Nothing readable yields
+/// `None` rather than an empty string — an encrypted-only item has no summary
+/// text at all, and `None` is what keeps a textless turn from inventing a blank
+/// display string.
+pub(super) fn extract_reasoning_text(summary: &[serde_json::Value]) -> Option<String> {
+    let parts: Vec<String> = summary
+        .iter()
+        .filter_map(|v| {
+            v.as_str()
+                .map(String::from)
+                .or_else(|| v.get("text").and_then(|t| t.as_str().map(String::from)))
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
     }
 }
 
