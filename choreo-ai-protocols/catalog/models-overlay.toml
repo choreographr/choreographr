@@ -284,19 +284,9 @@
   max_tokens_field = "max_tokens"
   default_model = "kimi-k2.7-code"
 
-# glm-5.3-flash: served by the go gateway but not yet in the models.dev
-# snapshot (upstream currently exposes it under the internal names
-# ox-alpha / x-preview-f). Defined wholesale here so the model resolves:
-# the GLM 5.x family carries `interleaved: {field: "reasoning_content"}`
-# on models.dev, so the gateway requires the reasoning_content echo on
-# every assistant message — set explicitly until the snapshot catches up.
+# glm-5.3-flash: the gateway-specific reasoning echo and output ceiling are
+# still pinned here; its context window is sourced from models.dev.
 [provider.opencode-go.models."glm-5.3-flash"]
-  # 1M context / 128K output: the fact is not derivable from the snapshot
-  # (which still lacks the model under this provider), so it is pinned here.
-  # 1_000_000 is the value every upstream models.dev listing carries
-  # (vancine / tokengo / orcarouter); a stale 200k pin used to live here and
-  # made the UI's context display and compaction weighting wrong.
-  context_window = 1000000
   # 128K max output, per the official GLM-5.3-Flash model card
   # (docs.z.ai/guides/vlm/glm-5.3-flash — "Maximum Output Tokens: 128K";
   # verified 2026-09). Without this pin the model's output ceiling resolved
