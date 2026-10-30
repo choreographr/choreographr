@@ -55,7 +55,11 @@
 #                                # providers whose cache is automatic/prefix-based
 #                                # (DeepSeek, Google), uses cache_control
 #                                # (Anthropic), or already routes via gateway
-#                                # headers (the opencode slugs).
+#                                # headers (the opencode slugs). The stateless
+#                                # Responses dialect never receives one whatever
+#                                # this says: that backend documents no affinity
+#                                # field, and the client withholds it at the one
+#                                # request-time resolution point.
 #   responses_stateless = true   # default false. Whether this provider's
 #                                # Responses endpoint is the stateless dialect:
 #                                # the system prompt rides `instructions` (never a

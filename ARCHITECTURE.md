@@ -874,6 +874,18 @@ and omits an invalid id instead of sending a value the provider would drop. The
 dialect and its validation live in `choreo-ai-protocols/src/session_routing.rs`;
 the shared rejection registry every prompt-cache field is filtered through lives
 in `choreo-ai-protocols/src/cache_field_rejection.rs` (see below).
+
+One provider class is withheld outright: the **stateless Responses dialect**
+(the `chatgpt`/Codex backend) never receives an affinity field, whatever the
+overlay or a per-account `prompt_cache_affinity` override says.
+`ServiceConfig::effective_cache_affinity` folds that in beside the rejection
+registry, the same single-resolution point the hosted-tool withholding uses, so
+no body builder can emit one. The reason is verification, not preference: that
+backend documents no affinity field, and an unverified body field either 400s the
+turn or is ignored — while the provider's automatic prefix caching still applies
+to the replayed history without a key. Opting the dialect in later means
+verifying the field against the backend, then removing the guard in the one place
+it lives.
 Like the compression coding, the dialect is baked into the provider client at
 construction, so an overlay edit reaches live sessions through the catalog-swap
 client invalidation (`client_config_changed` compares it).

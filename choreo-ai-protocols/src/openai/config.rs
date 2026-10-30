@@ -322,12 +322,27 @@ impl ServiceConfig {
     /// `session_routing::effective_cache_affinity`).
     ///
     /// The configured [`Self::cache_affinity`] already folds in the per-account
-    /// override and the catalog dialect; this only withholds a hint the provider
-    /// has rejected with a 400 in this process for `model` (the registry is keyed
-    /// by the exact provider+model pair). Provides a slug/config pairing so the
-    /// body builders cannot consult the registry with the wrong slug.
+    /// override and the catalog dialect; this withholds a hint the provider has
+    /// rejected with a 400 in this process for `model` (the registry is keyed by
+    /// the exact provider+model pair), and never sends one at all on the
+    /// stateless dialect. Provides a slug/config pairing so the body builders
+    /// cannot consult the registry with the wrong slug.
     #[must_use]
     pub fn effective_cache_affinity(&self, model: &str) -> CacheAffinity {
+        // The stateless dialect is outside the verified prompt-cache surface. It
+        // documents no affinity body field, and this route resends the whole
+        // history on every request, so an unverified field would either 400 the
+        // turn or be silently ignored — neither is worth the risk for what is
+        // only a routing hint on top of the provider's automatic prefix caching.
+        //
+        // Withheld HERE rather than in the body builder so every Responses path
+        // inherits it, including a per-account `prompt_cache_affinity = true`
+        // override: "the backend does not take this field" outranks an operator
+        // forcing it on, exactly as the hosted-tool withholding does in
+        // [`Self::programmatic_tool_calling_for_model`].
+        if self.responses_stateless() {
+            return CacheAffinity::Off;
+        }
         crate::session_routing::effective_cache_affinity(
             &self.provider_slug,
             model,
@@ -734,6 +749,42 @@ mod tests {
         };
         config.apply_overrides(&crate::ProviderOverrides::default());
         assert_eq!(config.cache_affinity, CacheAffinity::PromptCacheKey);
+    }
+
+    #[test]
+    fn stateless_provider_never_sends_a_cache_affinity_hint() {
+        // The stateless dialect documents no affinity field, so it is withheld —
+        // including against a forced-on per-account override, which is the only
+        // way the configured dialect could become a non-`Off` value here.
+        let mut codex = ServiceConfig {
+            provider_slug: "chatgpt".to_string(),
+            ..Default::default()
+        };
+        codex.apply_overrides(&crate::ProviderOverrides {
+            prompt_cache_affinity: Some(true),
+            ..Default::default()
+        });
+        // The configured value was forced on…
+        assert_eq!(codex.cache_affinity, CacheAffinity::PromptCacheKey);
+        // …but the request-time resolution withholds it for the whole dialect.
+        assert_eq!(
+            codex.effective_cache_affinity("gpt-5.6-luna"),
+            CacheAffinity::Off
+        );
+        // The standard Responses provider keeps honouring the same override, so
+        // the withholding is the dialect's and not a global one.
+        let mut openai = ServiceConfig {
+            provider_slug: "openai".to_string(),
+            ..Default::default()
+        };
+        openai.apply_overrides(&crate::ProviderOverrides {
+            prompt_cache_affinity: Some(true),
+            ..Default::default()
+        });
+        assert_eq!(
+            openai.effective_cache_affinity("gpt-5.6-sol"),
+            CacheAffinity::PromptCacheKey
+        );
     }
 
     #[test]
