@@ -22,14 +22,6 @@ use zeroize::Zeroizing;
 /// `codex_cli_rs`; Choreographr sends its own.
 const ORIGINATOR: &str = "choreographr";
 
-/// The catalog slug of the `ChatGPT`/Codex backend.
-///
-/// It is the only provider whose wire asks for a vendor-CLI `originator`
-/// header: the value is a client identification the backend checks, not a
-/// general auth header, so sending it anywhere else would be at best noise and
-/// at worst a rejected request.
-const CODEX_PROVIDER_SLUG: &str = "chatgpt";
-
 /// The auth material for an account, resolved by the daemon: the durable grant
 /// plus any cached ephemeral access token. `OAuth` carries the whole
 /// `ServiceCredential` so the refresh path has the grant; the client never sees
@@ -129,10 +121,16 @@ pub fn derive_headers(
         headers.push(("chatgpt-account-id".to_string(), account_id.to_string()));
     }
     // The Codex backend requires a stable, non-empty originator id; ours never
-    // changes, so it is a constant rather than any per-request value. Scoped to
-    // that one backend because it is a client identification the backend
-    // checks, not something another OAuth provider understands.
-    if provider_slug == CODEX_PROVIDER_SLUG {
+    // changes, so it is a constant rather than any per-request value. It is
+    // scoped on the catalog fact the rest of the Codex handling already reads —
+    // the stateless Responses dialect — and not on a slug comparison here: the
+    // originator is a client identification the Codex backend checks, and in the
+    // catalog that stateless dialect *is* the Codex backend, so reusing the fact
+    // keeps one switch instead of a second hand-kept slug list that could
+    // silently disagree with it. A future stateless Responses backend that is not
+    // Codex would need its own overlay key rather than a wider gate here, since
+    // the header is one backend's expectation, not a property of the dialect.
+    if choreo_ai_protocols::catalog::provider_responses_stateless(provider_slug) {
         headers.push(("originator".to_string(), ORIGINATOR.to_string()));
     }
     headers
@@ -171,13 +169,16 @@ mod tests {
     }
 
     #[test]
+    // `derive_headers` reads the process-wide catalog for the Codex fact, so
+    // serialize under the same key as the catalog-swap tests.
+    #[serial_test::serial(catalog)]
     fn oauth_with_token_projects_and_derives_headers() {
         let auth = ProviderAuth::OAuth {
             credential: Box::new(oauth_credential(Some("acct-123"))),
             access_token: Some(Zeroizing::new("access-token".into())),
         };
         let request = auth
-            .into_request_auth(CODEX_PROVIDER_SLUG)
+            .into_request_auth("chatgpt")
             .expect("oauth with token projects");
         match &request {
             RequestAuth::OAuth {
@@ -204,14 +205,16 @@ mod tests {
             access_token: None,
         };
         let err = auth
-            .into_request_auth(CODEX_PROVIDER_SLUG)
+            .into_request_auth("chatgpt")
             .expect_err("no token must not project");
         assert!(err.contains("sign in first"), "{err}");
     }
 
     #[test]
+    // Same catalog read as the other `derive_headers` cases.
+    #[serial_test::serial(catalog)]
     fn derive_headers_omits_account_id_when_absent() {
-        let headers = derive_headers(&oauth_credential(None), CODEX_PROVIDER_SLUG);
+        let headers = derive_headers(&oauth_credential(None), "chatgpt");
         assert_eq!(
             headers,
             vec![("originator".to_string(), ORIGINATOR.to_string())]
@@ -219,6 +222,8 @@ mod tests {
     }
 
     #[test]
+    // Same catalog read as the other `derive_headers` cases.
+    #[serial_test::serial(catalog)]
     fn derive_headers_scopes_the_originator_to_the_codex_backend() {
         // The originator is a client identification the Codex backend checks, so
         // an OAuth account on any other provider must not send it. The account
@@ -238,6 +243,27 @@ mod tests {
     }
 
     #[test]
+    // Same catalog read as the other `derive_headers` cases.
+    #[serial_test::serial(catalog)]
+    fn derive_headers_scopes_the_originator_on_the_catalog_fact() {
+        // The header is gated on the catalog's stateless-Responses fact, so a
+        // provider the catalog has never heard of is not the Codex backend and
+        // gets no originator: an unknown slug must not be treated as one.
+        let headers = derive_headers(&oauth_credential(None), "no-such-provider");
+        assert!(
+            headers.is_empty(),
+            "an unknown slug gets no originator: {headers:?}"
+        );
+        // A known provider that chains (not stateless) sends none either, so the
+        // gate is the fact and not "has a catalog entry".
+        let headers = derive_headers(&oauth_credential(None), "openrouter");
+        assert!(
+            headers.is_empty(),
+            "a chaining Responses provider gets no originator: {headers:?}"
+        );
+    }
+
+    #[test]
     fn derive_headers_empty_for_api_key_credential() {
         let credential = ServiceCredential::ApiKey {
             key: "sk-test".into(),
@@ -245,7 +271,7 @@ mod tests {
         // An API-key credential is not OAuth, so no credential-derived headers
         // are produced — the originator header is OAuth-only.
         assert_eq!(
-            derive_headers(&credential, CODEX_PROVIDER_SLUG),
+            derive_headers(&credential, "chatgpt"),
             [] as [(String, String); 0]
         );
     }

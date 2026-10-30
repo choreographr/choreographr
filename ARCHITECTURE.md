@@ -646,8 +646,12 @@ request).
 The credential-derived headers are policy, kept in one function
 (`auth.rs::derive_headers`) so a later provider is added as data: the
 `ChatGPT`/Codex `chatgpt-account-id` header (the `account_id` claim extracted at
-login, sent only when present) and a stable `originator` app id. An API-key grant
-sends none of them.
+login, sent only when present) and a stable `originator` app id, scoped on the
+same catalog `responses_stateless` fact the rest of the Codex handling reads
+rather than on a second hand-kept slug list — in the catalog that stateless
+dialect *is* the Codex backend, and the header is a client identification that
+backend checks. A stateless Responses backend that is not Codex would need its
+own overlay key instead of a wider gate. An API-key grant sends none of them.
 
 Two facts drive the auth shape, and each lives in exactly one place. The
 **catalog `oauth` profile** (`choreo-ai-protocols/src/catalog/`) is user-editable
