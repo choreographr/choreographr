@@ -1,4 +1,24 @@
-//! Terminal backend wrapper that works around a ratatui VS16 rendering bug.
+//! Terminal backend wrapper that presents each frame atomically and works
+//! around a ratatui VS16 rendering bug.
+//!
+//! # Job 1: synchronized output (DECSET 2026)
+//!
+//! [`Backend::draw`] frames the cell stream in the synchronized-update markers
+//! (`\x1b[?2026h` … `\x1b[?2026l`), so the terminal buffers the writes and
+//! presents the frame in one go instead of painting a half-drawn screen while
+//! the diff stream is still arriving.  The markers go through the *same* writer
+//! as the cells and nothing flushes between them, so the begin marker precedes
+//! the first cell write and the end marker follows the last, all in the single
+//! buffered flush `ratatui::Terminal::draw` performs.
+//!
+//! The markers are **unconditional, never probed**.  Both sequences are plain
+//! DEC private-mode sets, so a terminal that does not implement mode 2026 ignores
+//! them; and they carry meaning only as a begin/end pair around one frame, so a
+//! capability query would have nothing to switch on — while a query's reply
+//! would land on the input stream, where crossterm parses it as individual
+//! keystrokes and types it into the user's prompt.
+//!
+//! # Job 2: the VS16 reserved-cell workaround
 //!
 //! `ratatui` 0.30.2 (via `ratatui-core` 0.1.2 and `ratatui-crossterm` 0.1.2)
 //! draws any row containing an emoji-presentation sequence that carries a
@@ -31,25 +51,37 @@
 //! removes.  Delete this module — and its wiring in `connection` — when the
 //! workspace resolves a release carrying both fixes: `ratatui-core` 0.1.3
 //! (#2686, the buffer-diff change) and `ratatui-crossterm` 0.1.3 (#2721, the
-//! backend change), or any later versions.
+//! backend change), or any later versions.  The synchronized-output framing is
+//! independent of that workaround and survives its removal.
 
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::{Cell, CellWidth};
 use ratatui::layout::{Position, Size};
 use std::io::{self, Write};
 
+/// The begin marker of a synchronized update (DECSET 2026): the terminal
+/// buffers the screen writes that follow until the matching end marker, so one
+/// frame is presented atomically instead of half-drawn.
+const SYNC_BEGIN: &str = "\x1b[?2026h";
+
+/// The end marker of a synchronized update (DECRST 2026), releasing everything
+/// written since [`SYNC_BEGIN`] for display.
+const SYNC_END: &str = "\x1b[?2026l";
+
 /// The [`Backend`] the TUI drives: a crossterm backend writing to stdout,
-/// wrapped to suppress the VS16 reserved-cell artifact (see the module docs).
+/// wrapped to frame each frame as a synchronized update and to suppress the
+/// VS16 reserved-cell artifact (see the module docs).
 pub(crate) type TuiBackend = WideGlyphSafeBackend<io::Stdout>;
 
-/// A [`CrosstermBackend`] wrapper that filters the reserved trailing cell of a
-/// VS16 emoji cluster out of each frame's diff stream.
+/// A [`CrosstermBackend`] wrapper with two jobs (see the module docs): it frames
+/// each frame's cell stream as a terminal synchronized update, and it filters
+/// the reserved trailing cell of a VS16 emoji cluster out of that stream.
 ///
 /// Implements [`Backend`] by delegating everything to the inner backend and
-/// only rewriting the cell iterator [`Backend::draw`] receives; also forwards
-/// [`Write`] so the caller's `crossterm::execute!` calls on `backend_mut()`
-/// keep working unchanged.  Generic over the writer so the filtering can be
-/// unit-tested against a capturing `Vec<u8>`.
+/// only rewriting [`Backend::draw`]'s cell stream; also forwards [`Write`] so
+/// the caller's `crossterm::execute!` calls on `backend_mut()` keep working
+/// unchanged.  Generic over the writer so both behaviours can be unit-tested
+/// against a capturing `Vec<u8>`.
 pub(crate) struct WideGlyphSafeBackend<W: Write>(CrosstermBackend<W>);
 
 impl<W: Write> WideGlyphSafeBackend<W> {
@@ -78,10 +110,17 @@ impl<W: Write> Backend for WideGlyphSafeBackend<W> {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
+        // Synchronized update: the begin marker goes out through the SAME
+        // writer as the cells, before the first of them, and the end marker
+        // after the last — all buffered, with no flush in between, so
+        // `Terminal::draw`'s flush presents the whole pair at once.  A
+        // terminal without mode 2026 simply ignores both sequences.
+        self.0.write_all(SYNC_BEGIN.as_bytes())?;
         self.0.draw(SuppressVs16Continuation {
             inner: content,
             prev: None,
-        })
+        })?;
+        self.0.write_all(SYNC_END.as_bytes())
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
@@ -292,5 +331,72 @@ mod tests {
             "the cell after the cluster must be preceded by a cursor move to \
              column 3, otherwise the row shifts right; got {rendered:?}"
         );
+    }
+
+    /// Draw `next` as a diff against a blank buffer and return the captured
+    /// bytes as a string.
+    fn draw_diff(next: &ratatui::buffer::Buffer) -> String {
+        let prev = ratatui::buffer::Buffer::empty(next.area);
+        let capture = Capture::default();
+        let mut backend = WideGlyphSafeBackend::new(capture.clone());
+        backend
+            .draw(prev.diff_iter(next))
+            .expect("draw must succeed");
+        let bytes = capture.0.lock().expect("capture lock").clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// Assert that the frame's writes are framed by exactly one begin marker
+    /// before the first cell symbol and exactly one end marker after the last
+    /// one.
+    fn assert_sync_framed(rendered: &str, cells: &str) {
+        let first_cell = rendered.find(cells).expect("cell text must be written");
+        let last_cell_end = first_cell + cells.len();
+        assert!(
+            rendered.starts_with(SYNC_BEGIN),
+            "the begin marker must precede the first cell write; got {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with(SYNC_END),
+            "the end marker must follow the last cell write; got {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches(SYNC_BEGIN).count(),
+            1,
+            "exactly one begin marker per frame; got {rendered:?}"
+        );
+        assert_eq!(
+            rendered.matches(SYNC_END).count(),
+            1,
+            "exactly one end marker per frame; got {rendered:?}"
+        );
+        assert!(
+            first_cell > 0 && last_cell_end < rendered.len() - SYNC_END.len(),
+            "the cells must sit strictly between the markers; got {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn frames_an_unfiltered_frame_in_a_synchronized_update() {
+        use ratatui::layout::Rect;
+        use ratatui::style::Style;
+
+        // Plain ASCII: nothing is filtered out, so this pins the marker framing
+        // on the ordinary path.
+        let mut next = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 5, 1));
+        next.set_string(0, 0, "hello", Style::default());
+        assert_sync_framed(&draw_diff(&next), "hello");
+    }
+
+    #[test]
+    fn frames_a_filtered_vs16_frame_in_a_synchronized_update() {
+        use ratatui::layout::Rect;
+        use ratatui::style::Style;
+
+        // The filtered path (the reserved cell dropped) is framed identically:
+        // the markers wrap the cells that are actually written.
+        let mut next = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 10, 1));
+        next.set_string(0, 0, "\u{2764}\u{fe0f}x", Style::default());
+        assert_sync_framed(&draw_diff(&next), "\u{2764}\u{fe0f}");
     }
 }

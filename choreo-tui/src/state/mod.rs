@@ -3,10 +3,10 @@
 //! render model (height prefix-sum, markers, scroll, viewport, render cache),
 //! the streaming response auto-pin, the provider catalog, text-input machinery,
 //! page states, picker geometry, displayed-image fetch plumbing, the turn-event
-//! handlers, the model selector, and the session lifecycle live in sibling
-//! modules (`history`, `pin`, `providers`, `input`, `pages`, `model_selector`,
-//! `layout`, `images`, `turn`, `session`) and are
-//! re-exported here so the rest of the crate keeps referring to
+//! handlers, the model selector, the pointer-shape selection, and the session
+//! lifecycle live in sibling modules (`history`, `pin`, `providers`, `input`,
+//! `pages`, `pointer`, `model_selector`, `layout`, `images`, `turn`, `session`)
+//! and are re-exported here so the rest of the crate keeps referring to
 //! `crate::state::*` unchanged.
 
 use crate::RenderedImage;
@@ -34,6 +34,7 @@ mod model_selector;
 mod onboarding;
 mod pages;
 mod pin;
+mod pointer;
 mod providers;
 mod session;
 mod session_manager;
@@ -58,6 +59,8 @@ pub(crate) use model_selector::*;
 pub(crate) use onboarding::*;
 pub(crate) use pages::*;
 pub(crate) use pin::*;
+// `pointer` declares only inherent `App` methods, so there is nothing to
+// re-export: its `mod` declaration above is the whole wiring.
 pub(crate) use providers::*;
 pub(crate) use session::*;
 pub(crate) use session_manager::*;
@@ -302,6 +305,16 @@ pub(crate) struct App {
     /// The last window title (OSC 2) emitted, so an unchanged title is not
     /// re-sent every frame.
     pub(crate) term_title: Option<String>,
+    /// The last pointer shape (OSC 22) emitted, so an unchanged shape is not
+    /// re-sent on every mouse-motion event within the same target. `None` means
+    /// nothing has been emitted yet (or the cache was forgotten on suspend), so
+    /// the next computation re-emits.
+    pub(crate) term_pointer: Option<crate::terminal::pointer::PointerShape>,
+    /// The pointer's last reported position in terminal coordinates, recorded
+    /// from a mouse-motion event. The pointer shape is *derived* from it against
+    /// the current hit-test state (see `state/pointer.rs`), so a hover target
+    /// that disappears still resets the shape without any further motion.
+    pub(crate) pointer_hover: Option<(u16, u16)>,
     /// Persistent latch of whether the daemon's credential keystore is locked.
     /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
     /// and the subscribe-time lock-state push in `handle_daemon_message`;
@@ -439,6 +452,8 @@ impl App {
             term_status_dirty: false,
             term_status_override: HashMap::new(),
             term_title: None,
+            term_pointer: None,
+            pointer_hover: None,
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,

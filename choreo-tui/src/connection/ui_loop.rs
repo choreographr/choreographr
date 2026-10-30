@@ -11,7 +11,7 @@ use crate::build_picker;
 use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::render;
 use crate::state::{App, LoginModal, Page, UiEvent};
-use crate::terminal::{progress, title};
+use crate::terminal::{pointer, progress, title};
 use choreo_client_core::{
     ClientError, ConnectionMode, LoginEvent, PendingContext, run_daemon_connection_with_autostart,
     run_daemon_connection_with_mode,
@@ -47,7 +47,7 @@ use super::resume::notify_disconnected;
 use super::resume::signal_to_resume_command;
 use super::resume::{ResumeCommand, handle_resume_command};
 use super::terminal_event::{
-    KITTY_KEYBOARD_FLAGS, UI_EVENT_QUEUE_HIGH_WATER_MARK, handle_terminal_event, handle_ui_event,
+    KITTY_KEYBOARD_FLAGS, UI_EVENT_QUEUE_HIGH_WATER_MARK, dispatch_terminal_event, handle_ui_event,
 };
 
 pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
@@ -522,6 +522,10 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     progress::update(None, None);
     app.term_status.clear_all();
     title::clear();
+    // Hand the pointer back to the terminal too, and forget the cached shape
+    // so nothing re-emits it.
+    pointer::set(pointer::PointerShape::Default);
+    app.forget_pointer();
 
     // The connection task's result is NEVER surfaced as an error: a failed
     // dial/handshake is a condition the user needs a readable explanation
@@ -616,8 +620,12 @@ fn run_ui_loop(
         select! {
             recv(terminal_rx) -> msg => {
                 if let Ok(event) = msg {
-                    handle_terminal_event(event, app, client_tx)?;
-                    dirty = true;
+                    // Only a screen-changing event dirties the frame; bare
+                    // pointer motion just updated the pointer shape, which is
+                    // emitted outside `terminal.draw` below.
+                    if dispatch_terminal_event(event, app, client_tx)? {
+                        dirty = true;
+                    }
                 }
             }
             recv(ui_rx) -> msg => {
@@ -676,9 +684,10 @@ fn run_ui_loop(
             let mut progress = false;
 
             while let Ok(event) = terminal_rx.try_recv() {
-                handle_terminal_event(event, app, client_tx)?;
+                if dispatch_terminal_event(event, app, client_tx)? {
+                    dirty = true;
+                }
                 progress = true;
-                dirty = true;
             }
             while let Ok(msg) = ui_rx.try_recv() {
                 progress = true;
@@ -756,6 +765,22 @@ fn run_ui_loop(
                 title::set(&desired_title);
                 app.term_title = Some(desired_title);
             }
+        }
+
+        // Publish the pointer shape (OSC 22) for the current hover target.
+        // Like the window title this writes raw bytes to stdout, so it must
+        // run here and never inside the `terminal.draw` render closure.  The
+        // shape is computed from the current hit-test state rather than from
+        // "a motion event arrived", so a hover target that disappears (a
+        // scrollbar hidden now that the history fits) resets to the default
+        // arrow with no mouse motion; `sync_pointer` dedupes the emission
+        // against the last shape written.
+        if let Some(shape) = app.sync_pointer() {
+            tracing::debug!(
+                shape = shape.css_name(),
+                "[choreo-tui] pointer shape changed"
+            );
+            pointer::set(shape);
         }
 
         // Skip rendering entirely when nothing has changed.

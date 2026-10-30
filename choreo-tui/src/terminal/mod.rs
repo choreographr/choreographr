@@ -4,14 +4,14 @@
 //! sent through [`write`]: one lock/write/flush of stdout with errors
 //! swallowed, so an unsupported or denying terminal degrades to "nothing
 //! happened" instead of disturbing the UI loop. The submodules build the
-//! individual sequences — OSC 9;4 progress ([`progress`]), OSC 52 clipboard
-//! ([`clipboard`]), OSC 2 window title ([`title`]), and OSC 7501 program
-//! status ([`status`]).
+//! individual sequences — OSC 9;4 progress ([`progress`]), OSC 22 pointer shape
+//! ([`pointer`]), OSC 52 clipboard ([`clipboard`]), OSC 2 window title
+//! ([`title`]), and OSC 7501 program status ([`status`]).
 //!
 //! This is a leaf module: it carries no view state and never depends on
 //! `App`. Lifecycle orchestration that needs `App` — publishing the status
-//! records, deduping the window title, clearing everything on suspend/exit —
-//! lives in `connection`.
+//! records, deduping the window title and the pointer shape, clearing
+//! everything on suspend/exit — lives in `connection`.
 //!
 //! **The strip policy is the grid's policy.** Both free-text OSC fields (the
 //! OSC 2 title and the OSC 7501 `title`/`msg`) drop exactly the characters the
@@ -30,6 +30,7 @@ use std::io::Write;
 use choreo_sanitize::is_unsafe_unicode;
 
 pub(crate) mod clipboard;
+pub(crate) mod pointer;
 pub(crate) mod progress;
 pub(crate) mod status;
 pub(crate) mod title;
@@ -37,7 +38,7 @@ pub(crate) mod title;
 /// Frame an OSC escape sequence: `ESC ] code ; body ST`.
 ///
 /// `ST` is the string terminator `ESC \` (0x1B 0x5C). `code` selects the
-/// sequence family (2, 9;4, 52, 7501) and `body` is everything between the
+/// sequence family (2, 9;4, 22, 52, 7501) and `body` is everything between the
 /// code and the terminator.
 pub(crate) fn osc(code: u16, body: &str) -> String {
     format!("\x1b]{code};{body}\x1b\\")

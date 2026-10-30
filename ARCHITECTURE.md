@@ -2111,6 +2111,24 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   attempt count; the context-window fill percentage is a gauge, not
   work-completion, and stays on 9;4.
 
+  **The other output-only escapes.** Two terminal-integration escapes carry no
+  free text, so the strip policy above does not apply to them, but they share the
+  same rule that keeps them off the input stream: they are **set commands, never
+  queries**. The OSC 22 pointer shape (`terminal/pointer.rs`, wired through
+  `state/pointer.rs`) names one of three CSS cursor keywords — `default`, `text`,
+  `pointer` — chosen from the same hit-tests click handling uses (the scrollbar
+  column, the history pane's text, the composer box, and the reasoning /
+  tool-result header ranges), and is emitted from the UI loop outside
+  `terminal.draw` only when the shape changes, so mouse motion never dirties a
+  frame; it is reset to `default` on suspend and exit. The synchronized-update
+  markers (DECSET 2026) are written by the `Backend::draw` wrapper
+  (`backend.rs`) as a begin/end pair around each frame's cell stream, through the
+  same writer and with no flush between them, so the terminal presents a frame
+  atomically. Neither is capability-probed: an unsupported terminal ignores a
+  private-mode set or an unknown cursor keyword, while a *query* reply would land
+  on stdin, where crossterm parses it as individual keystrokes and types it into
+  the user's prompt.
+
   The policy is tiered, and which tier a value belongs to is decided by whether
   anything other than a widget reads it:
 

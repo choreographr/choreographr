@@ -4,9 +4,9 @@
 //! Each child owns one concern — input, the session switcher, the scroll/height
 //! model, the reasoning/tool-result collapse state, image layout,
 //! viewport-change classification, streaming, the streaming response auto-pin,
-//! the request lifecycle, and the terminal-status records. This parent only
-//! declares the modules; fixtures live in `crate::tests::support`, so a child
-//! that needs one imports it from there.
+//! the request lifecycle, the pointer-shape selection, and the terminal-status
+//! records. This parent only declares the modules; fixtures live in
+//! `crate::tests::support`, so a child that needs one imports it from there.
 
 mod content_version;
 mod display_line;
@@ -16,6 +16,7 @@ mod images;
 mod input;
 mod markers;
 mod model_selector;
+mod pointer;
 mod reasoning;
 mod request_lifecycle;
 mod response_pin;

@@ -11,7 +11,9 @@
 use crate::state::{AccountWizardStep, App, Page, UiEvent};
 use choreo_client_core::ClientError;
 use choreo_proto::ClientMessage;
-use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags};
+use crossterm::event::{
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+};
 
 // The terminal-event dispatcher below calls the per-page handlers
 // unqualified; bring them into scope from their sibling modules so the call
@@ -157,6 +159,18 @@ pub(crate) fn handle_terminal_event(
         return Ok(());
     }
 
+    // Mouse motion carries no screen change: it only moves the terminal's
+    // pointer shape (OSC 22), which the UI loop emits outside `terminal.draw`.
+    // Recording the position and returning here keeps motion out of every page
+    // handler — a `Moved` event is neither a click nor a drag, and the
+    // selection gesture must not treat it as one.
+    if let Event::Mouse(mouse) = &event
+        && mouse.kind == MouseEventKind::Moved
+    {
+        app.pointer_hover = Some((mouse.column, mouse.row));
+        return Ok(());
+    }
+
     // Terminal-resize events are handled irrespective of page or fullscreen
     // state so the viewport is refreshed on the next frame.
     if let Event::Resize(cols, rows) = &event {
@@ -224,6 +238,25 @@ pub(crate) fn handle_terminal_event(
         Page::AIProviders => handle_ai_providers_event(&event, app, client_tx),
         Page::Chat => handle_chat_event(&event, app, client_tx),
     }
+}
+
+/// Feed one terminal event through the dispatcher and report whether the frame
+/// must be repainted.
+///
+/// Bare pointer motion is the one event that changes something *without*
+/// changing the screen: it updates the terminal's pointer shape, which the UI
+/// loop emits outside `terminal.draw`, so it must not dirty the frame.
+/// Everything else may have changed what is drawn, so it dirties it (an event
+/// that turns out to be a no-op only costs one redundant diff of identical
+/// cells).
+pub(super) fn dispatch_terminal_event(
+    event: Event,
+    app: &mut App,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+) -> Result<bool, ClientError> {
+    let pointer_only = matches!(&event, Event::Mouse(mouse) if mouse.kind == MouseEventKind::Moved);
+    handle_terminal_event(event, app, client_tx)?;
+    Ok(!pointer_only)
 }
 
 /// Insert pasted text into whichever input buffer is currently active.

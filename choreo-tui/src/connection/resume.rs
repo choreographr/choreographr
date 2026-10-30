@@ -11,7 +11,7 @@ use super::terminal_event::KITTY_KEYBOARD_FLAGS;
 use crate::backend::TuiBackend;
 use crate::state::App;
 #[cfg(unix)]
-use crate::terminal::{progress, title};
+use crate::terminal::{pointer, progress, title};
 use crossbeam_channel as channel;
 #[cfg(unix)]
 use crossterm::event::{
@@ -82,7 +82,10 @@ pub(super) fn notify_disconnected(rx: &channel::Receiver<()>) -> bool {
 ///
 /// `app` carries the terminal-native records that must be cleared on suspend
 /// and re-published on resume (the OSC 7501 program-status records and the
-/// OSC 2 window title), alongside the OSC 9;4 progress bar handled here.
+/// OSC 2 window title), alongside the OSC 9;4 progress bar handled here.  The
+/// OSC 22 pointer shape is cleared on suspend (and its cached value forgotten)
+/// but deliberately *not* re-published on resume: the next mouse motion
+/// re-emits it, so no stale hand is restored.
 #[cfg(unix)]
 pub(super) fn handle_resume_command(
     cmd: ResumeCommand,
@@ -121,6 +124,12 @@ pub(super) fn handle_resume_command(
             app.term_status.clear_all();
             title::clear();
             app.term_title = None;
+            // Hand the pointer back to the terminal as well, and forget both
+            // the hover position and the emitted shape: after the resume the
+            // ordinary change detection re-emits only once the mouse actually
+            // moves, so no stale hand is restored over the shell's content.
+            pointer::set(pointer::PointerShape::Default);
+            app.forget_pointer();
             crossterm::terminal::disable_raw_mode()?;
             crossterm::execute!(
                 terminal.backend_mut(),

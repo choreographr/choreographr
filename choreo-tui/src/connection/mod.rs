@@ -51,7 +51,10 @@ use choreo_proto::{DaemonMessage, DaemonMessageType};
 #[cfg(test)]
 use resume::{ResumeCommand, notify_disconnected, signal_to_resume_command};
 #[cfg(test)]
-use terminal_event::{KITTY_KEYBOARD_FLAGS, handle_ui_event, normalize_kitty_shift, shift_char};
+use terminal_event::{
+    KITTY_KEYBOARD_FLAGS, dispatch_terminal_event, handle_ui_event, normalize_kitty_shift,
+    shift_char,
+};
 
 /// Whether `key` is a `Ctrl`/`Alt` *modifier chord*.
 ///
@@ -1063,6 +1066,71 @@ mod tests {
             app.quit_message(),
             Some("the server is shutting down"),
             "the specific reason must survive the trailing EOF"
+        );
+    }
+
+    // ── Pointer shape (OSC 22) ──────────────────────────────────────────
+
+    /// Build a mouse event for the given kind at `(column, row)`.
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    #[test]
+    fn pointer_motion_changes_the_shape_once_and_never_dirties_the_frame() {
+        use crate::terminal::pointer::PointerShape;
+
+        let mut app = test_app();
+        app.history_viewport.width = 80;
+        app.history_viewport.height = 10;
+        for id in 0..20 {
+            insert_turn(&mut app, id, "user text", "assistant response");
+        }
+        app.rebuild_height_prefix();
+        assert!(app.scrollbar_visible(), "the scrollbar must be drawn");
+
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let column = app.history_viewport.width;
+
+        // Motion over the scrollbar column: the frame is NOT dirtied (nothing on
+        // screen changed), and the hand is emitted once for the new target.
+        assert!(
+            !dispatch_terminal_event(mouse_event(MouseEventKind::Moved, column, 0), &mut app, &tx)
+                .expect("dispatch motion"),
+            "pointer motion must not dirty the frame"
+        );
+        assert_eq!(app.pointer_hover, Some((column, 0)));
+        assert_eq!(app.sync_pointer(), Some(PointerShape::Pointer));
+
+        // Repeated motion within the same target emits nothing further.
+        assert!(
+            !dispatch_terminal_event(mouse_event(MouseEventKind::Moved, column, 1), &mut app, &tx)
+                .expect("dispatch motion")
+        );
+        assert_eq!(app.sync_pointer(), None, "the shape is unchanged");
+
+        // Moving onto the history pane's text changes it to the I-beam.
+        assert!(
+            !dispatch_terminal_event(mouse_event(MouseEventKind::Moved, 0, 1), &mut app, &tx)
+                .expect("dispatch motion")
+        );
+        assert_eq!(app.sync_pointer(), Some(PointerShape::Text));
+
+        // A click still dirties the frame — the pointer path suppressed only
+        // bare motion.
+        assert!(
+            dispatch_terminal_event(
+                mouse_event(MouseEventKind::Down(MouseButton::Left), column, 0),
+                &mut app,
+                &tx,
+            )
+            .expect("dispatch click"),
+            "a click must still trigger a repaint"
         );
     }
 }
