@@ -652,7 +652,6 @@
 
 [provider.chatgpt.models."gpt-5.6-sol"]
   responses = true
-  context_window = 272000
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
   # The Codex backend keeps no server-side transcript (`store: false`), so a
@@ -663,13 +662,11 @@
   reasoning_passback = "all_turns"
 [provider.chatgpt.models."gpt-5.6-terra"]
   responses = true
-  context_window = 272000
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
   reasoning_passback = "all_turns"
 [provider.chatgpt.models."gpt-5.6-luna"]
   responses = true
-  context_window = 272000
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
   reasoning_passback = "all_turns"
