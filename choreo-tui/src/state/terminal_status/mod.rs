@@ -14,6 +14,7 @@ use choreo_proto::SessionStatus;
 
 use super::App;
 use crate::terminal;
+use crate::terminal::status::{BlockedKind, RecordKey, StatusRecord};
 
 /// The tool NAME of a `ToolCall` status (never its arguments), used as an
 /// OSC 7501 `msg`. [`crate::terminal::status::record`] strips control
@@ -36,10 +37,11 @@ impl App {
         terminal::title::window_title(title)
     }
 
-    /// The OSC 7501 child records to publish right now, keyed by session id.
+    /// The OSC 7501 child records to publish right now, keyed by record.
     ///
-    /// Every record is a CHILD record (`id=<session_id>`); the OSC 9;4 root
-    /// record is owned by the progress family. The attached session is always
+    /// Every record is a CHILD record (one per session, plus `id=login` for a
+    /// live login flow); the OSC 9;4 root record is owned by the progress
+    /// family and is never written here. The attached session is always
     /// present, and every background session that is active — or that carries
     /// a persisted terminal outcome (`term_status_override`) — is added. The
     /// outcome case is what lets a background agent that just finished keep
@@ -47,10 +49,13 @@ impl App {
     /// protocol's "which agent needs me" use case); an idle/sleeping
     /// background session with no outcome is omitted so a stale `working`
     /// record is cleared.
-    pub(crate) fn desired_status_records(&self) -> Vec<(u64, String)> {
-        let mut desired: Vec<(u64, String)> = Vec::new();
+    pub(crate) fn desired_status_records(&self) -> Vec<(RecordKey, String)> {
+        let mut desired: Vec<(RecordKey, String)> = Vec::new();
+        if let Some(login) = self.login_status_record() {
+            desired.push((RecordKey::Login, login));
+        }
         if let Some(id) = self.attached_session_id {
-            desired.push((id, self.status_record(id, self.attached_status.as_ref())));
+            desired.push(self.status_record(id, self.attached_status.as_ref()));
         }
         for summary in &self.session_mgr.all {
             let id = summary.session_id;
@@ -60,17 +65,43 @@ impl App {
             if !summary.status.is_active() && !self.term_status_override.contains_key(&id) {
                 continue;
             }
-            desired.push((id, self.status_record(id, Some(&summary.status))));
+            desired.push(self.status_record(id, Some(&summary.status)));
         }
         desired
+    }
+
+    /// The OSC 7501 record for a live login flow, or `None` when no login modal
+    /// is open.
+    ///
+    /// The OAuth / device-code flow cannot continue until the user finishes the
+    /// sign-in in a browser, which is exactly `state=blocked:kind=auth`. It is
+    /// a CHILD record (`id=login`) like every report here: the OSC 9;4 family
+    /// owns the terminal-wide root record and this module never writes it, so
+    /// the sign-in must not borrow it either.
+    fn login_status_record(&self) -> Option<String> {
+        let modal = self.login.as_ref()?;
+        // `title` is the account and `msg` the streamed status line. The status
+        // line is already normalized for display where it is stored; the
+        // account is kept byte-exact (it is the credential key), so the
+        // record's own sanitizer is what makes either safe inside an OSC body.
+        let id = RecordKey::Login.protocol_id();
+        let record = StatusRecord {
+            kind: Some(BlockedKind::Auth),
+            title: Some(modal.account.as_str()),
+            msg: Some(modal.status.as_str()),
+            ..StatusRecord::new(&id, terminal::status::APP, "blocked")
+        };
+        Some(terminal::status::record(&record))
     }
 
     /// Build the OSC 7501 child record for `id`, given its live status (the
     /// attached session passes `attached_status`; a background session passes
     /// its summary status). A persisted terminal outcome
     /// (`term_status_override`) wins over the live state and suppresses the
-    /// tool `msg` — a finished/cancelled turn has no tool to name.
-    fn status_record(&self, id: u64, live: Option<&SessionStatus>) -> String {
+    /// tool `msg` — a finished/cancelled turn has no tool to name. `progress`
+    /// comes from the LIVE status only: an outcome is not "in progress", and a
+    /// state that is not `working` drops the key when the record is framed.
+    fn status_record(&self, id: u64, live: Option<&SessionStatus>) -> (RecordKey, String) {
         let override_state = self.term_status_override.get(&id).copied();
         let state = override_state
             .or_else(|| live.map(terminal::status::state_for))
@@ -80,8 +111,17 @@ impl App {
         } else {
             live.and_then(tool_call_name)
         };
+        let progress = live.and_then(terminal::status::progress_for);
         let title = self.session_title(id);
-        terminal::status::record(id, terminal::status::APP, state, title, msg)
+        let key = RecordKey::Session(id);
+        let protocol_id = key.protocol_id();
+        let record = StatusRecord {
+            progress,
+            title,
+            msg,
+            ..StatusRecord::new(&protocol_id, terminal::status::APP, state)
+        };
+        (key, terminal::status::record(&record))
     }
 
     /// The raw title of the session `id`, if it has one.

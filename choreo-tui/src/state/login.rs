@@ -194,7 +194,7 @@ impl App {
             return;
         };
         self.set_status(format!("signing in {account} ({provider})…"));
-        self.login = Some(LoginModal::start(descriptor, account, device));
+        self.set_login_modal(Some(LoginModal::start(descriptor, account, device)));
     }
 
     /// Handle a `ListOAuthProviders` reply: cache the descriptors and, if a
@@ -288,7 +288,10 @@ impl App {
             oauth,
         };
         self.set_status(format!("signing in MCP server {slug}…"));
-        self.login = Some(LoginModal::start_mcp(info, McpLoginOptions::default()));
+        self.set_login_modal(Some(LoginModal::start_mcp(
+            info,
+            McpLoginOptions::default(),
+        )));
     }
 
     // Private: the only caller is `on_mcp_status`, which reads the freshly
@@ -375,15 +378,38 @@ impl App {
                     self.arm_setup_follow(&service);
                     self.set_status(format!("signed in {service}; storing credential…"));
                 }
-                self.login = None;
+                self.set_login_modal(None);
             }
             Some(LoginOutcome::Error(message)) => {
                 self.set_status(format!("[error] {message}"));
-                self.login = None;
+                self.set_login_modal(None);
             }
             None => {}
         }
+        // Every event rewrites the modal's record (its status line is the
+        // `msg`), whether or not the flow reached a terminal outcome.
+        self.term_status_dirty = true;
         true
+    }
+
+    /// Install or clear the login modal, republishing the terminal records.
+    ///
+    /// The modal is mirrored as an OSC 7501 record (`id=login`,
+    /// `blocked`/`auth`), so opening or closing it changes the record set the UI
+    /// loop publishes: the dirty flag is what makes the record appear the
+    /// moment the flow opens and clear the moment it ends or is cancelled.
+    fn set_login_modal(&mut self, modal: Option<LoginModal>) {
+        let open = modal.is_some();
+        if open != self.login.is_some() {
+            // Provider slug and account are user data, so they stay out of the
+            // log line; only the transition and the record shape are reported.
+            tracing::debug!(
+                open,
+                "login modal state changed (OSC 7501 blocked/auth record)"
+            );
+        }
+        self.login = modal;
+        self.term_status_dirty = true;
     }
 
     /// Update the modal's displayed fields without re-creating it.
@@ -422,6 +448,9 @@ impl App {
     pub(crate) fn cancel_login(&mut self) -> bool {
         if let Some(modal) = self.login.take() {
             modal.cancel();
+            // Clearing the modal is what clears its terminal record, so the
+            // records must be rebuilt even though no event arrived.
+            self.term_status_dirty = true;
             self.set_status("sign-in cancelled".to_string());
             true
         } else {

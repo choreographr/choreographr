@@ -2099,6 +2099,18 @@ bytes), at the **transcript** (what the model sees on the next call), and at the
   forbids control bytes — a decoded one makes the terminal discard the whole
   report).
 
+  **The program-status record set.** Every OSC 7501 report is a *child* record —
+  one per session (`id=<session id>`) plus one for a live `/login` flow
+  (`id=login`) — because OSC 9;4 owns the terminal-wide root record and a 7501
+  report replaces its record wholesale. The login flow has no session to hang
+  off: it is blocked on the user finishing a sign-in in a browser, so it reports
+  `state=blocked:kind=auth` with the account as `title` and the streamed status
+  line as `msg`. `kind` is state-gated to `blocked` and `progress` to
+  `working`/`blocked`, so a key is emitted only where the spec gives it meaning.
+  The only honest `progress` figure the client has is a retrying request's
+  attempt count; the context-window fill percentage is a gauge, not
+  work-completion, and stays on 9;4.
+
   The policy is tiered, and which tier a value belongs to is decided by whether
   anything other than a widget reads it:
 
