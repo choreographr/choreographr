@@ -238,6 +238,17 @@ pub(crate) enum ResponseOutputItem {
         #[serde(default)]
         status: Option<String>,
     },
+    /// An output-item kind this client does not model.
+    ///
+    /// The backend behind the stateless Responses dialect is undocumented and
+    /// unversioned, so a new item kind can appear in `output` with no counterpart
+    /// here — and the streaming path already ignores events it does not model.
+    /// Failing the deserialization instead would lose an answer the provider
+    /// already billed for, and would make the two paths disagree about the same
+    /// response. An unknown item kind is data this client does not model, not a
+    /// malformed request, so it is skipped rather than rejected.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Deserialize)]

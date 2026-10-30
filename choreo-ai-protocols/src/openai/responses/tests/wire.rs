@@ -404,6 +404,20 @@ fn response_output_item_deserializes_program_output() {
 }
 
 #[test]
+fn response_output_item_deserializes_an_unknown_kind() {
+    // The stateless backend is undocumented and unversioned, so an item kind this
+    // client does not model has to deserialize rather than fail the whole
+    // response: one unmodelled item must not discard an answer the provider
+    // billed for.
+    let json_str = r#"{"type":"some_future_item","id":"item_1","payload":{"k":1}}"#;
+    let item: ResponseOutputItem = serde_json::from_str(json_str).unwrap();
+    assert!(
+        matches!(item, ResponseOutputItem::Unknown),
+        "an unmodelled item kind is Unknown, got {item:?}"
+    );
+}
+
+#[test]
 fn responses_tool_from_chat_tool_definition() {
     let tool_def =
         ChatToolDefinition::function("test_func", "A test function", json!({"type": "object"}));

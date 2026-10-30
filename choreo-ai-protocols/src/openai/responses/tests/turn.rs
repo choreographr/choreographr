@@ -79,6 +79,33 @@ fn a_reasoning_only_response_is_output_not_an_empty_response() {
 }
 
 #[test]
+fn an_unmodelled_output_item_kind_still_yields_the_surrounding_answer() {
+    // The stateless backend may add an output-item kind this client does not
+    // model. That is data it does not understand, not a malformed answer, so the
+    // turn must still carry the text the surrounding message item produced —
+    // failing here would discard output the provider billed for, and the
+    // streaming path already ignores events it does not model.
+    let json_str = r#"{
+            "id": "resp_unknown_item",
+            "status": "completed",
+            "output": [
+                {"type": "some_future_item", "id": "item_1", "payload": {"k": 1}},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "the answer"}]}
+            ]
+        }"#;
+    let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
+    match responses_response_to_turn(payload).expect("the surrounding items answer") {
+        ChatTurnResult::FinalText(f) => {
+            // A final-text turn by construction carries no tool calls, so the
+            // only thing to prove is that the message item's text survived.
+            assert_eq!(f.content, "the answer");
+        }
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
 fn a_response_without_content_or_reasoning_is_still_an_empty_response() {
     let payload: ResponsesResponse = serde_json::from_str(r#"{"id":"r","output":[]}"#).unwrap();
     assert!(matches!(

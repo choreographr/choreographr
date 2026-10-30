@@ -3040,7 +3040,13 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     classify) leaves a partial answer reported as a truncated `FinalText`, the same reading chat
     gives `finish_reason: length`. Reasoning text is streamed as
     `response.reasoning_summary_text.delta` fragments (the summary is the only reasoning text a
-    Responses model exposes); part boundaries carry no text and are not modelled.
+    Responses model exposes); part boundaries carry no text and are not modelled. An output item
+    of a kind this client does not model deserializes as `ResponseOutputItem::Unknown` and is
+    skipped — counted in a debug line, never logged with its payload — so the surrounding items
+    still produce the turn. The stateless backend is undocumented and unversioned, so a new item
+    kind is data the client does not model, not a malformed answer: failing the response would
+    discard output the provider billed for, and the streaming path already ignores events it does
+    not model.
 
     **Programmatic tool calling (Responses API, gpt-5.6+):** When enabled, the Responses
     request body includes a `programmatic_tool_calling` tool with `type: "programmatic_tool_calling"`.

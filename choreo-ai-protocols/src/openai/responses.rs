@@ -86,9 +86,10 @@ pub(crate) fn responses_request(
 
     let mut content = String::new();
     for raw in payload.output {
-        // Parse each raw item for message-text extraction; a malformed item
-        // surfaces as an error (matching the previous typed-deserialization
-        // behavior) rather than being silently skipped.
+        // Parse each raw item for message-text extraction. A genuinely malformed
+        // item still surfaces as an error, while an item kind this client does
+        // not model deserializes as [`ResponseOutputItem::Unknown`] and simply
+        // contributes no text — the surrounding items still answer the prompt.
         let item: ResponseOutputItem =
             serde_json::from_value(raw).map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
         if let ResponseOutputItem::Message { content: parts, .. } = item
@@ -228,11 +229,16 @@ pub(crate) fn responses_request_with_tools(
         ..
     } = params;
 
-    let has_instructions = messages.iter().any(|m| m.role == "system");
+    // What this measures is the presence of a `system` message in the incoming
+    // `messages`, not whether the request ends up carrying `instructions`: the
+    // stateless dialect hoists that message out of `input` into the top-level
+    // field, while the chaining dialect leaves it inline. Naming it for the
+    // input shape keeps the log honest about what was observed.
+    let has_system_message = messages.iter().any(|m| m.role == "system");
     info!(
         model = %model,
         tool_count = tools.len(),
-        has_instructions = has_instructions,
+        has_system_message = has_system_message,
         "responses request with tools",
     );
 

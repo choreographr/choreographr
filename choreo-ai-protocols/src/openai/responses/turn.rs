@@ -149,6 +149,9 @@ pub(crate) fn responses_response_to_turn(
     let mut full_reasoning = String::new();
     let mut tool_calls: Vec<ChatToolCall> = Vec::new();
     let mut reasoning_items: Vec<serde_json::Value> = Vec::new();
+    // Kinds this client does not model are skipped, but counted so the omission
+    // stays diagnosable — a count, never the item payload.
+    let mut unknown_item_count = 0usize;
 
     for raw in payload.output {
         // Parse the raw item into the typed form for display/tool-call
@@ -222,7 +225,19 @@ pub(crate) fn responses_response_to_turn(
                     "programmatic tool calling program output",
                 );
             }
+            // An output-item kind this client does not model. It is data the
+            // provider chose to send, not a malformed answer, so the surrounding
+            // items still produce the turn — the streaming path ignores unknown
+            // events for the same reason.
+            ResponseOutputItem::Unknown => unknown_item_count += 1,
         }
+    }
+
+    if unknown_item_count > 0 {
+        debug!(
+            unknown_item_count,
+            "skipped responses output items of an unmodelled kind",
+        );
     }
 
     let reasoning_artifact = responses_items_artifact(&reasoning_items)?;
