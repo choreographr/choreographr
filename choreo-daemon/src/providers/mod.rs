@@ -210,7 +210,7 @@ impl InferenceProvider {
                 // not-yet-signed-in OAuth account becomes a clean error before
                 // any client is built.
                 let image_key = auth.api_key_cloned();
-                let request_auth = auth.into_request_auth()?;
+                let request_auth = auth.into_request_auth(&config.provider)?;
                 let client = OpenAiClient::new(svc_config.clone(), request_auth, registry)
                     .map_err(|e| format!("failed to create OpenAI client: {e}"))?;
                 // Same account, same base_url/user_agent/slug as the chat

@@ -22,6 +22,14 @@ use zeroize::Zeroizing;
 /// `codex_cli_rs`; Choreographr sends its own.
 const ORIGINATOR: &str = "choreographr";
 
+/// The catalog slug of the `ChatGPT`/Codex backend.
+///
+/// It is the only provider whose wire asks for a vendor-CLI `originator`
+/// header: the value is a client identification the backend checks, not a
+/// general auth header, so sending it anywhere else would be at best noise and
+/// at worst a rejected request.
+const CODEX_PROVIDER_SLUG: &str = "chatgpt";
+
 /// The auth material for an account, resolved by the daemon: the durable grant
 /// plus any cached ephemeral access token. `OAuth` carries the whole
 /// `ServiceCredential` so the refresh path has the grant; the client never sees
@@ -73,12 +81,15 @@ impl ProviderAuth {
 
     /// Project the daemon-side grant into the client-side request material.
     ///
+    /// `provider_slug` is the account's catalog provider: the credential-derived
+    /// headers are per backend, so it decides which of them apply.
+    ///
     /// # Errors
     ///
     /// Returns an error for an OAuth grant that has no cached access token yet
     /// (the account has not signed in, or a refresh has not yet produced one):
     /// there is no bearer to send.
-    pub fn into_request_auth(self) -> Result<RequestAuth, String> {
+    pub fn into_request_auth(self, provider_slug: &str) -> Result<RequestAuth, String> {
         match self {
             ProviderAuth::ApiKey { key } => Ok(RequestAuth::ApiKey(key)),
             ProviderAuth::OAuth {
@@ -86,7 +97,7 @@ impl ProviderAuth {
                 access_token: Some(access_token),
             } => Ok(RequestAuth::OAuth {
                 access_token,
-                extra_headers: derive_headers(&credential),
+                extra_headers: derive_headers(&credential, provider_slug),
             }),
             ProviderAuth::OAuth {
                 access_token: None, ..
@@ -95,26 +106,35 @@ impl ProviderAuth {
     }
 }
 
-/// The credential-derived extra request headers for an OAuth account.
+/// The credential-derived extra request headers for an OAuth account on
+/// `provider_slug`.
 ///
 /// The single place the wire-specific header names live, so a later provider is
 /// added here as data. A non-OAuth credential (an API key) derives none of
 /// these and yields an empty list.
 #[must_use]
-pub fn derive_headers(credential: &ServiceCredential) -> Vec<(String, String)> {
+pub fn derive_headers(
+    credential: &ServiceCredential,
+    provider_slug: &str,
+) -> Vec<(String, String)> {
     // These headers are OAuth-only: an API-key credential never sends them.
     let Some(oauth) = credential.as_oauth() else {
         return Vec::new();
     };
     let mut headers = Vec::new();
     // The `chatgpt-account-id` header is the identity claim extracted from the
-    // id_token at login; only sent when the credential carries one.
+    // id_token at login; only sent when the credential carries one (so it is
+    // already self-gating on a ChatGPT login).
     if let Some(account_id) = oauth.account_id {
         headers.push(("chatgpt-account-id".to_string(), account_id.to_string()));
     }
-    // The backend requires a stable, non-empty originator id; ours never
-    // changes, so it is a constant rather than any per-request value.
-    headers.push(("originator".to_string(), ORIGINATOR.to_string()));
+    // The Codex backend requires a stable, non-empty originator id; ours never
+    // changes, so it is a constant rather than any per-request value. Scoped to
+    // that one backend because it is a client identification the backend
+    // checks, not something another OAuth provider understands.
+    if provider_slug == CODEX_PROVIDER_SLUG {
+        headers.push(("originator".to_string(), ORIGINATOR.to_string()));
+    }
     headers
 }
 
@@ -145,7 +165,7 @@ mod tests {
         let auth = ProviderAuth::ApiKey {
             key: Zeroizing::new("sk-test".into()),
         };
-        let request = auth.into_request_auth().expect("api key projects");
+        let request = auth.into_request_auth("openai").expect("api key projects");
         assert!(matches!(&request, RequestAuth::ApiKey(key) if key.as_str() == "sk-test"));
         assert_eq!(request.extra_headers(), [] as [(String, String); 0]);
     }
@@ -156,7 +176,9 @@ mod tests {
             credential: Box::new(oauth_credential(Some("acct-123"))),
             access_token: Some(Zeroizing::new("access-token".into())),
         };
-        let request = auth.into_request_auth().expect("oauth with token projects");
+        let request = auth
+            .into_request_auth(CODEX_PROVIDER_SLUG)
+            .expect("oauth with token projects");
         match &request {
             RequestAuth::OAuth {
                 access_token,
@@ -182,17 +204,36 @@ mod tests {
             access_token: None,
         };
         let err = auth
-            .into_request_auth()
+            .into_request_auth(CODEX_PROVIDER_SLUG)
             .expect_err("no token must not project");
         assert!(err.contains("sign in first"), "{err}");
     }
 
     #[test]
     fn derive_headers_omits_account_id_when_absent() {
-        let headers = derive_headers(&oauth_credential(None));
+        let headers = derive_headers(&oauth_credential(None), CODEX_PROVIDER_SLUG);
         assert_eq!(
             headers,
             vec![("originator".to_string(), ORIGINATOR.to_string())]
+        );
+    }
+
+    #[test]
+    fn derive_headers_scopes_the_originator_to_the_codex_backend() {
+        // The originator is a client identification the Codex backend checks, so
+        // an OAuth account on any other provider must not send it. The account
+        // id, when the credential carries one, is a ChatGPT claim and rides
+        // either way.
+        let headers = derive_headers(&oauth_credential(Some("acct-1")), "openai");
+        assert_eq!(
+            headers,
+            vec![("chatgpt-account-id".to_string(), "acct-1".to_string())],
+            "no originator outside the Codex route: {headers:?}"
+        );
+        let headers = derive_headers(&oauth_credential(None), "anthropic");
+        assert!(
+            headers.is_empty(),
+            "another OAuth provider gets no Codex headers: {headers:?}"
         );
     }
 
@@ -203,7 +244,10 @@ mod tests {
         };
         // An API-key credential is not OAuth, so no credential-derived headers
         // are produced — the originator header is OAuth-only.
-        assert_eq!(derive_headers(&credential), [] as [(String, String); 0]);
+        assert_eq!(
+            derive_headers(&credential, CODEX_PROVIDER_SLUG),
+            [] as [(String, String); 0]
+        );
     }
 
     #[test]
