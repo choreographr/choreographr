@@ -224,15 +224,15 @@ pub(super) fn handle_chat_event(
                 if clipboard::copy_to_clipboard(&text) {
                     tracing::info!(
                         bytes = text.len(),
-                        "[choreo-tui] copied selection to clipboard via OSC 52"
+                        "[choreo-tui] copied selection to clipboard via OSC 52 + OSC 5522"
                     );
                     app.set_status("Selection copied to clipboard.".to_string());
                 } else {
-                    // Over the OSC 52 size cap: say so instead of
+                    // Over the clipboard size cap: say so instead of
                     // pretending the copy succeeded (see clipboard.rs).
                     tracing::warn!(
                         bytes = text.len(),
-                        "[choreo-tui] selection exceeds the OSC 52 size cap; not copied"
+                        "[choreo-tui] selection exceeds the clipboard size cap; not copied"
                     );
                     app.set_status("Selection too large to copy to clipboard.".to_string());
                 }
