@@ -39,7 +39,7 @@ pub use message::{
     AssistantToolCall, AssistantToolFunction, ChatImagePart, ChatRequestMessage,
     ChatToolDefinition, ChatToolFunction,
 };
-pub(crate) use responses_input::messages_to_responses_input;
+pub(crate) use responses_input::{SystemPrompt, messages_to_responses_input};
 
 pub use chat_projection::{
     CHAT_REASONING_WIRE_KEYS, ChatWireMessage, ChatWireMessages, chat_assistant_payload_is_empty,

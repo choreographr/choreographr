@@ -5,7 +5,7 @@ use serde_json::json;
 // suite names them directly, so it imports them directly too.
 use crate::openai::reasoning_details::MAX_REASONING_BYTES;
 use crate::openai::{
-    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
+    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition, SystemPrompt,
     messages_to_responses_input,
 };
 use crate::shared::MAX_TOOL_CALLS;
@@ -788,11 +788,39 @@ fn response_output_item_deserializes_program_output() {
 
 #[test]
 fn build_responses_input_empty_is_an_empty_items_array() {
-    let result = build_responses_input(&[], None).unwrap();
+    let result = build_responses_input(&[], None, SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     // No items is an empty array, never an empty string: a string `input` would
     // ask the server to expand into one empty-text user message.
     assert_eq!(value, json!([]));
+}
+
+#[test]
+fn hoisted_system_prompt_drops_every_system_message() {
+    // `SystemPrompt::Hoisted` is what keeps a `role: "system"` item off the
+    // stateless wire: it drops EVERY system message, not just the leading one the
+    // daemon happens to build, so a mid-history one cannot slip through either.
+    let messages = [
+        ChatRequestMessage::simple("system", "be helpful".into()),
+        ChatRequestMessage::simple("user", "hi".into()),
+        ChatRequestMessage::simple("system", "injected later".into()),
+    ];
+    let hoisted = messages_to_responses_input(messages.iter(), SystemPrompt::Hoisted)
+        .expect("hoisted lowering builds");
+    assert_eq!(hoisted.len(), 1, "only the user turn: {hoisted:?}");
+    assert_eq!(hoisted[0]["role"], "user");
+
+    // The standard API keeps both inline, so the two dialects stay distinguishable
+    // at the lowering boundary.
+    let inline = messages_to_responses_input(messages.iter(), SystemPrompt::Inline)
+        .expect("inline lowering builds");
+    assert_eq!(
+        inline.len(),
+        3,
+        "both system items and the user turn: {inline:?}"
+    );
+    assert_eq!(inline[0]["role"], "system");
+    assert_eq!(inline[2]["role"], "system");
 }
 
 #[test]
@@ -829,7 +857,7 @@ fn build_responses_input_chained_tail_carries_tool_outputs_from_messages() {
         assistant,
         tool,
     ];
-    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     // Only the tool output after the last assistant message rides the chain.
@@ -845,7 +873,7 @@ fn build_responses_input_with_messages() {
         ChatRequestMessage::simple("user", "hello".into()),
         ChatRequestMessage::simple("assistant", "hi there".into()),
     ];
-    let result = build_responses_input(&messages, None).unwrap();
+    let result = build_responses_input(&messages, None, SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -867,7 +895,7 @@ fn build_responses_input_chained_turn_sends_only_trailing_messages() {
         ChatRequestMessage::simple("assistant", "old answer".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     // system + the new user message only — the old turns are chained
@@ -889,7 +917,7 @@ fn build_responses_input_chained_turn_keeps_system_prompt() {
         ChatRequestMessage::simple("user", "turn one".into()),
         ChatRequestMessage::simple("assistant", "answer".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 1);
@@ -905,7 +933,7 @@ fn build_responses_input_chained_without_assistant_keeps_all() {
         ChatRequestMessage::simple("user", "hello".into()),
         ChatRequestMessage::simple("user", "again".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -924,7 +952,7 @@ fn build_responses_input_chained_keeps_only_newest_system_message() {
         ChatRequestMessage::simple("system", "new system".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -949,7 +977,7 @@ fn build_responses_input_chained_preserves_mid_tail_order() {
         ChatRequestMessage::simple("system", "late system".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 3);
@@ -1282,7 +1310,7 @@ fn messages_to_responses_input_reemits_reasoning_items() {
                 .to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg]).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["type"], "reasoning");
     assert_eq!(items[0]["id"], "re_1");
@@ -1309,7 +1337,7 @@ fn messages_to_responses_input_reasoning_items_preserve_order() {
                     .to_vec(),
             )),
         };
-    let items = messages_to_responses_input(&[msg]).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
     assert_eq!(items.len(), 3);
     assert_eq!(items[0]["id"], "re_1");
     assert_eq!(items[1]["id"], "re_2");
@@ -1331,7 +1359,8 @@ fn a_corrupt_reasoning_artifact_is_dropped_not_fatal() {
         tool_calls: None,
         reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(b"{not json".to_vec())),
     };
-    let items = messages_to_responses_input(&[msg]).expect("a corrupt artifact is not fatal");
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+        .expect("a corrupt artifact is not fatal");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
 }
@@ -1353,7 +1382,8 @@ fn an_over_budget_reasoning_artifact_is_not_replayed() {
         tool_calls: None,
         reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(oversized.into_bytes())),
     };
-    let items = messages_to_responses_input(&[msg]).expect("an oversized artifact is not fatal");
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+        .expect("an oversized artifact is not fatal");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
 }
@@ -1379,7 +1409,8 @@ fn a_replay_artifact_drops_non_reasoning_items() {
         tool_calls: None,
         reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(poisoned.to_vec())),
     };
-    let items = messages_to_responses_input(&[msg]).expect("a filtered artifact is not fatal");
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+        .expect("a filtered artifact is not fatal");
     assert_eq!(
         items.len(),
         2,
@@ -1405,7 +1436,8 @@ fn a_replay_artifact_with_only_foreign_items_replays_nothing() {
             br#"[{"type":"message","role":"user","content":"hi"}]"#.to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg]).expect("a filtered artifact is not fatal");
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+        .expect("a filtered artifact is not fatal");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
     assert_eq!(items[0]["role"], "assistant");
@@ -1440,7 +1472,7 @@ fn a_full_tool_call_map_still_accepts_a_known_call_id() {
 fn messages_to_responses_input_no_artifact_plain_message() {
     // Control: no artifact → plain message item, no reasoning on the wire.
     let msg = ChatRequestMessage::simple("assistant", "plain".into());
-    let items = messages_to_responses_input(&[msg]).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
     assert!(items[0].get("reasoning_content").is_none());
@@ -1452,7 +1484,7 @@ fn messages_to_responses_input_skips_empty_assistant_content() {
     // A blank assistant turn produces no message item: an empty text item is
     // meaningless and rejects on strict endpoints.
     let msg = ChatRequestMessage::simple("assistant", "  \n ".into());
-    let items = messages_to_responses_input(&[msg]).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
     assert!(items.is_empty(), "{items:?}");
 }
 
@@ -1470,7 +1502,7 @@ fn messages_to_responses_input_keeps_reasoning_items_for_an_empty_turn() {
             br#"[{"type":"reasoning","id":"rs_1","encrypted_content":"eJxT"}]"#.to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg]).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
     assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(items[0]["type"], "reasoning");
 }
@@ -1503,7 +1535,8 @@ fn messages_to_responses_input_replays_the_function_calls_its_outputs_answer() {
         tool_calls: None,
         reasoning_artifact: None,
     };
-    let items = messages_to_responses_input(&[assistant, tool_result]).unwrap();
+    let items =
+        messages_to_responses_input(&[assistant, tool_result], SystemPrompt::Inline).unwrap();
     assert_eq!(items.len(), 2, "{items:?}");
     assert_eq!(items[0]["type"], "function_call");
     assert_eq!(items[0]["call_id"], "call_1");
@@ -1533,7 +1566,7 @@ fn messages_to_responses_input_places_reasoning_before_the_call_it_explains() {
             br#"[{"type":"reasoning","id":"rs_1"}]"#.to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg]).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
     let kinds: Vec<&str> = items
         .iter()
         .map(|item| item["type"].as_str().unwrap_or_default())

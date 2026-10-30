@@ -18,6 +18,21 @@ use super::reasoning_details::MAX_REASONING_BYTES;
 use super::responses;
 use super::{ChatRequestMessage, OpenAiError};
 
+/// Where a `system` message belongs on the Responses wire.
+///
+/// The standard Responses API accepts `{role: "system"}` items inline in
+/// `input`, while the stateless ChatGPT/Codex dialect rejects them outright and
+/// takes the prompt in the top-level `instructions` field instead — so the
+/// lowering is told which of the two it is building for rather than re-deriving
+/// it per message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SystemPrompt {
+    /// Lower `system` messages into `input` items (the standard API).
+    Inline,
+    /// Skip them: the caller has hoisted the prompt into `instructions`.
+    Hoisted,
+}
+
 /// Serialize a Responses input item to its wire JSON value. Kept as a tiny
 /// helper because the Responses adapter owns the item type but the conversion
 /// happens here, in the shared messages→input builder.
@@ -89,24 +104,37 @@ fn reasoning_only(items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     kept
 }
 
-/// Convert `ChatRequestMessage` slice to Responses API input format.
-/// System messages go into `input` as `{role: "system"}` items (not the
-/// `instructions` field); the `instructions` field is a separate top-level
-/// parameter set via explicit provider configuration.
+/// Convert a `ChatRequestMessage` source to Responses API input format.
+///
+/// Takes an ITERATOR of borrowed messages rather than a slice: both callers have
+/// to select which messages go out (a chained turn sends only the post-assistant
+/// tail, a stateless one sends the whole history minus the hoisted system
+/// prompt), and neither should have to clone the conversation to do it — an
+/// earlier slice-shaped signature forced a full deep copy of every prior turn
+/// (image bytes included) on every tool-loop iteration.
+///
+/// `system` decides what happens to `system`-role messages: emitted as
+/// `{role: "system"}` items, or dropped because the caller hoisted them into
+/// the top-level `instructions` field. The `instructions` field is otherwise a
+/// separate top-level parameter set via explicit provider configuration.
 ///
 /// Assistant messages additionally re-emit the opaque reasoning items from
 /// the round-trip artifact (if any) directly into `input`, BEFORE the message
 /// content item — mirroring the provider's output ordering where a reasoning
 /// item precedes its message. `reasoning_content` is never emitted here:
 /// that field is chat-completions-only and invalid on Responses messages.
-pub(crate) fn messages_to_responses_input(
-    messages: &[ChatRequestMessage],
+pub(crate) fn messages_to_responses_input<'a>(
+    messages: impl IntoIterator<Item = &'a ChatRequestMessage>,
+    system: SystemPrompt,
 ) -> Result<Vec<serde_json::Value>, OpenAiError> {
     let mut items: Vec<serde_json::Value> = Vec::new();
 
     for msg in messages {
         match msg.role {
             "system" => {
+                if system == SystemPrompt::Hoisted {
+                    continue;
+                }
                 if let Some(ref content) = msg.content {
                     items.push(responses_input_item_value(
                         &responses::ResponsesInputItem::Message {

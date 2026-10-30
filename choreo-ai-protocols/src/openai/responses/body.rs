@@ -8,7 +8,7 @@
 
 use std::io;
 
-use super::super::{ChatRequestMessage, endpoint_url, messages_to_responses_input};
+use super::super::{ChatRequestMessage, SystemPrompt, endpoint_url, messages_to_responses_input};
 use super::wire::{ResponsesReasoning, ResponsesRequest, ResponsesTool};
 
 // ── Shared helpers ───────────────────────────────────────────────────────
@@ -19,6 +19,7 @@ use super::wire::{ResponsesReasoning, ResponsesRequest, ResponsesTool};
 pub(super) fn build_responses_input(
     messages: &[ChatRequestMessage],
     previous_response_id: Option<&str>,
+    system: SystemPrompt,
 ) -> Result<Option<serde_json::Value>, super::super::OpenAiError> {
     // A chained turn sends only the messages that postdate the last assistant
     // response — the server already holds the rest via `previous_response_id`,
@@ -26,13 +27,12 @@ pub(super) fn build_responses_input(
     // inflation). A fresh/stateless turn sends the full history. The tool
     // outputs of a finished tool round are already in `messages` (the session
     // turn stores them in the model's call order), so the chained tail is
-    // derived here rather than passed in as a separate buffer.
+    // derived here rather than passed in as a separate buffer. Both branches
+    // borrow: the whole conversation is never copied to build a body.
     let items = if previous_response_id.is_some() {
-        messages_to_responses_input(&chain_input_messages(messages))?
+        messages_to_responses_input(chain_input_messages(messages), system)?
     } else {
-        // No chain: the full history is the request. Pass `messages` by
-        // reference so a long session is not cloned on every first call.
-        messages_to_responses_input(messages)?
+        messages_to_responses_input(messages, system)?
     };
     // System messages go into `input` as `{role: "system"}` items; the stateless
     // ChatGPT/Codex backend hoists them into `instructions` before this runs
@@ -60,55 +60,51 @@ pub(super) fn build_responses_input(
 /// the request; in the defensive shapes where a system prompt appears
 /// mid-tail, it stays in its original position rather than being hoisted,
 /// so the conversation order is preserved.
-pub(super) fn chain_input_messages(messages: &[ChatRequestMessage]) -> Vec<ChatRequestMessage> {
-    match messages.iter().rposition(|m| m.role == "assistant") {
-        // No assistant message yet — nothing has been chained, keep all. A
-        // chain id implies a prior model call that produced an assistant
-        // response, so this arm is defensive only.
-        None => messages.to_vec(),
-        Some(last_assistant) => {
-            // Single pass over every message: drop everything at/before the
-            // last assistant message (it is in the chained context) EXCEPT
-            // the newest system message, which is rebuilt every turn and must
-            // still reach the model. Older system messages — whether in the
-            // chained region or inside the tail — are dropped, so the newest
-            // one is never duplicated.
-            let newest_system = messages.iter().rposition(|m| m.role == "system");
-            messages
-                .iter()
-                .enumerate()
-                .filter(|(i, m)| {
-                    (*i > last_assistant && m.role != "system") || Some(*i) == newest_system
-                })
-                .map(|(_, m)| m.clone())
-                .collect()
-        }
-    }
+///
+/// Yields borrowed messages: the tail is a *selection*, not a copy, so a chained
+/// turn pays nothing for the history the server already holds.
+pub(super) fn chain_input_messages(
+    messages: &[ChatRequestMessage],
+) -> impl Iterator<Item = &ChatRequestMessage> {
+    // A chain id implies a prior model call that produced an assistant response,
+    // so `last_assistant` is `None` only defensively — then nothing has been
+    // chained and every message stays.
+    let last_assistant = messages.iter().rposition(|m| m.role == "assistant");
+    let newest_system = messages.iter().rposition(|m| m.role == "system");
+    messages.iter().enumerate().filter_map(move |(i, m)| {
+        // Single pass over every message: drop everything at/before the last
+        // assistant message (it is in the chained context) EXCEPT the newest
+        // system message, which is rebuilt every turn and must still reach the
+        // model. Older system messages — whether in the chained region or inside
+        // the tail — are dropped, so the newest one is never duplicated.
+        let keep = match last_assistant {
+            None => true,
+            Some(last) => (i > last && m.role != "system") || Some(i) == newest_system,
+        };
+        keep.then_some(m)
+    })
 }
 
 /// Split the system prompt out of a canonical message list for a backend that
 /// forbids `system`-role input items (the ChatGPT/Codex backend).
 ///
-/// Returns the joined system-prompt string (for the top-level `instructions`
-/// field) and the remaining messages, with every `system` message removed, so
-/// the input array carries no `role: "system"` item. A blank system prompt
-/// yields `None` rather than an empty `instructions` string.
-fn split_system_prompt(
-    messages: &[ChatRequestMessage],
-) -> (Option<String>, Vec<ChatRequestMessage>) {
-    let mut prompt: Vec<&str> = Vec::new();
-    let mut rest: Vec<ChatRequestMessage> = Vec::with_capacity(messages.len());
-    for msg in messages {
-        if msg.role == "system" {
-            if let Some(content) = msg.content.as_deref().filter(|c| !c.trim().is_empty()) {
-                prompt.push(content);
-            }
-        } else {
-            rest.push(msg.clone());
-        }
-    }
+/// Returns the joined system-prompt string for the top-level `instructions`
+/// field; the caller then lowers `messages` with [`SystemPrompt::Hoisted`], which
+/// skips the `system` messages instead of emitting them, so the input array
+/// carries no `role: "system"` item. A blank system prompt yields `None` rather
+/// than an empty `instructions` string.
+///
+/// Deliberately returns only the prompt and never a filtered message list: the
+/// conversation can carry megabytes of attached image bytes, and copying it just
+/// to drop a leading message would repeat that copy on every tool-loop iteration.
+fn split_system_prompt(messages: &[ChatRequestMessage]) -> Option<String> {
+    let prompt: Vec<&str> = messages
+        .iter()
+        .filter(|msg| msg.role == "system")
+        .filter_map(|msg| msg.content.as_deref().filter(|c| !c.trim().is_empty()))
+        .collect();
     let joined = prompt.join("\n\n");
-    ((!joined.is_empty()).then_some(joined), rest)
+    (!joined.is_empty()).then_some(joined)
 }
 
 /// Shared helper: extract the reasoning text from a Responses API
@@ -149,14 +145,18 @@ pub(super) fn build_responses_request_body(
     // request, so its system prompt is hoisted into `instructions`, the chained
     // tool tail is not used, and `store` is off. Every other Responses provider
     // keeps the system message inline, chains its tail, and stores — untouched.
+    //
+    // The hoist only JOINS the prompt; `SystemPrompt::Hoisted` then makes the
+    // lowering skip those messages, so `messages` is borrowed throughout.
     let stateless = config.responses_stateless();
-    let (instructions, filtered_messages) = if stateless {
-        let (prompt, rest) = split_system_prompt(params.messages);
-        (prompt, Some(rest))
+    let instructions = stateless
+        .then(|| split_system_prompt(params.messages))
+        .flatten();
+    let system = if stateless {
+        SystemPrompt::Hoisted
     } else {
-        (None, None)
+        SystemPrompt::Inline
     };
-    let messages = filtered_messages.as_deref().unwrap_or(params.messages);
     // Stateless providers send the FULL `messages` (already containing every
     // earlier tool-loop turn) with no chain; chained providers continue their
     // chain, deriving the tool-result tail from `messages` inside the builder.
@@ -165,7 +165,7 @@ pub(super) fn build_responses_request_body(
     } else {
         params.previous_response_id
     };
-    let input_value = build_responses_input(messages, previous_response_id)?;
+    let input_value = build_responses_input(params.messages, previous_response_id, system)?;
 
     let mut responses_tools: Vec<ResponsesTool> =
         params.tools.iter().map(ResponsesTool::from).collect();
@@ -314,19 +314,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn split_hoists_system_prompt_and_drops_system_messages() {
+    fn split_joins_the_system_prompt_and_leaves_the_messages_untouched() {
         let messages = vec![
             ChatRequestMessage::simple("system", "be helpful".into()),
             ChatRequestMessage::simple("user", "hi".into()),
         ];
-        let (prompt, rest) = split_system_prompt(&messages);
-        assert_eq!(prompt.as_deref(), Some("be helpful"));
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].role, "user");
-        assert!(
-            rest.iter().all(|m| m.role != "system"),
-            "no system message survives the split"
+        assert_eq!(
+            split_system_prompt(&messages).as_deref(),
+            Some("be helpful")
         );
+        // The split is a read, never a filter: the caller's slice is unchanged
+        // and the system item is dropped later, by `SystemPrompt::Hoisted`.
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]
@@ -337,18 +336,40 @@ mod tests {
             ChatRequestMessage::simple("system", "second".into()),
             ChatRequestMessage::simple("user", "hi".into()),
         ];
-        let (prompt, rest) = split_system_prompt(&messages);
         // Non-blank system prompts joined by a blank line; the blank one dropped.
-        assert_eq!(prompt.as_deref(), Some("first\n\nsecond"));
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].role, "user");
+        assert_eq!(
+            split_system_prompt(&messages).as_deref(),
+            Some("first\n\nsecond")
+        );
     }
 
     #[test]
     fn split_with_no_system_message_yields_none() {
         let messages = vec![ChatRequestMessage::simple("user", "hi".into())];
-        let (prompt, rest) = split_system_prompt(&messages);
-        assert!(prompt.is_none());
-        assert_eq!(rest.len(), 1);
+        assert!(split_system_prompt(&messages).is_none());
+    }
+
+    #[test]
+    fn chain_selection_borrows_from_the_original_history() {
+        // The chained tail is a SELECTION over the caller's slice, not a copy:
+        // its items must point into the original history. A `.clone()` here
+        // would deep-copy every prior turn (image bytes included) on every
+        // tool-loop iteration, which is what this test exists to prevent.
+        let messages = vec![
+            ChatRequestMessage::simple("system", "be helpful".into()),
+            ChatRequestMessage::simple("user", "first".into()),
+            ChatRequestMessage::simple("assistant", "answer".into()),
+            ChatRequestMessage::simple("user", "second".into()),
+        ];
+        let tail: Vec<&ChatRequestMessage> = chain_input_messages(&messages).collect();
+        assert_eq!(tail.len(), 2, "the newest system message plus the tail");
+        assert!(
+            std::ptr::eq(tail[0], &raw const messages[0]),
+            "the hoisted system prompt is borrowed, not copied"
+        );
+        assert!(
+            std::ptr::eq(tail[1], &raw const messages[3]),
+            "the new user turn is borrowed, not copied"
+        );
     }
 }
