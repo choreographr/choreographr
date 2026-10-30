@@ -1,6 +1,7 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
 use crate::tests::support::{make_session_full, test_app};
+use choreo_client_core::FEATURED_PROVIDERS;
 use choreo_proto::{
     AccountInfo, CatalogProvider, ClientMessage, ClientMessageType, DaemonMessage,
     DaemonMessageType, McpAuthState, McpServerStatus, RefreshStatus, SessionStatus, Turn,

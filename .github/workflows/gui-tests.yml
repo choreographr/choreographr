@@ -1,0 +1,77 @@
+name: GUI tests
+
+# Runs choreo-gui's unit suite via `just test-gui`. The `test-all` and
+# `coverage` aliases exclude choreo-gui (its Blitz/wgpu stack is too heavy for
+# every commit-gate run), so without this job no CI run compiles or executes
+# the GUI's tests. Clippy and rustdoc already cover the crate locally through
+# the commit gate; this job is the clean-runner signal that its tests pass.
+#
+# Scoped to the inputs that can change the result: the GUI crate itself plus
+# the workspace crates it builds on.
+
+on:
+  push:
+    branches: [master]
+    # One anchor, aliased by both triggers, so the path list has a single
+    # edit point.
+    paths: &gui_paths
+      - 'choreo-gui/**'
+      - 'choreo-client-core/**'
+      - 'choreo-proto/**'
+      - 'choreo-shared/**'
+      - 'choreo-keystore/**'
+      - 'choreo-markdown/**'
+      - 'choreo-sanitize/**'
+      - 'choreo-transport/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+      - '.config/nextest.toml'
+      - 'rust-toolchain.toml'
+      - 'justfile'
+      - '.github/workflows/gui-tests.yml'
+  pull_request:
+    paths: *gui_paths
+  workflow_dispatch:
+
+# A newer push to the same branch supersedes an in-flight run.
+concurrency:
+  group: gui-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-gui:
+    name: GUI unit tests (test-gui)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # The workspace pins nightly (rust-toolchain.toml) and the dev profile's
+      # -Z flags need it.
+      - name: Install Rust toolchain
+        run: rustup toolchain install nightly --profile minimal --no-self-update
+
+      # Blitz's text stack links the system fontconfig and winit links
+      # libwayland-client at build time (neither is loaded with dlopen), and
+      # openssl-sys is not vendored.
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libfontconfig1-dev libwayland-dev libssl-dev
+
+      # The GUI does not build zlob, but the `test-gui` recipe shares the
+      # test recipes' `_require-zig` check; the version is pinned for the
+      # reason given in release.yml's header note.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just,cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run the GUI suite
+        run: just test-gui

@@ -1,6 +1,7 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
 use crate::tests::support::test_app;
+use choreo_client_core::SetupFollow;
 use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 

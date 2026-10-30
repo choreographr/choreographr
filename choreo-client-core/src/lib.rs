@@ -26,6 +26,8 @@
 //!   front-end routes its requests through.
 //! - [`history`] — the read-only session view ([`SessionView`]) assembling
 //!   transcript state for rendering.
+//! - [`onboarding`] — the first-run setup rules both front-ends share
+//!   ([`SetupProgress`], [`SetupFollow`], [`suggest_account_name`]).
 //! - [`diff`] — the unified-diff data model ([`FileDiff`] and friends) the
 //!   front-ends render.
 //! - [`error`] — the crate-wide [`ClientError`] type.
@@ -48,6 +50,7 @@ pub mod error;
 pub mod history;
 pub mod known_servers;
 pub mod oauth;
+pub mod onboarding;
 pub mod pending;
 pub mod shell;
 
@@ -81,6 +84,7 @@ pub use oauth::{
     LoginEvent, LoginOptions, LoginSession, McpLoginInfo, McpLoginOptions, OAuthLoginError,
     start_login, start_mcp_login,
 };
+pub use onboarding::{FEATURED_PROVIDERS, SetupFollow, SetupProgress, suggest_account_name};
 pub use pending::{Pending, PendingContext, PendingReplies, Timeout, deadline_for};
 pub use shell::{
     Command, McpCommand, UnlockMethod, command_echo, is_valid_account_name, parse_input_line,

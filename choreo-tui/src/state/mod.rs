@@ -13,7 +13,7 @@ use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob};
 use crate::selection::TextSelection;
 use crate::terminal;
-use choreo_client_core::{PendingReplies, SessionView};
+use choreo_client_core::{PendingReplies, SessionView, SetupFollow};
 use choreo_proto::{ReasoningCapability, SessionStatus, TokenUsage, socket_path};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::collections::{HashMap, HashSet};
@@ -56,7 +56,6 @@ pub(crate) use keymap::*;
 pub(crate) use layout::*;
 pub(crate) use login::*;
 pub(crate) use model_selector::*;
-pub(crate) use onboarding::*;
 pub(crate) use pages::*;
 pub(crate) use pin::*;
 // `pointer` declares only inherent `App` methods, so there is nothing to

@@ -53,7 +53,7 @@ Choreographr (workspace)
 │                       baking, HEIC/HEIF with a pre-decode allocation guard)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
-├── choreo-client-core     Shared client logic (parsing, images, history, credentials)
+├── choreo-client-core     Shared client logic (parsing, images, history, credentials, first-run setup)
 ├── choreo-markdown        Markdown parser and HTML renderer (pulldown-cmark + ammonia),
 │                       plus a LaTeX math → Unicode pretty-printer (`render_math_pretty`)
 ├── choreo-mcp             MCP (Model Context Protocol) client built on the official `rmcp`
@@ -3468,6 +3468,13 @@ which is why the per-crate summary is derived from the lcov file rather than
 from a second report pass. Coverage counts inline `#[cfg(test)]` modules
 inside source files (only crate-level `tests/` directories are excluded), so
 the figure slightly overstates production-code coverage.
+
+**GUI tests in CI:** because `test-all` and `coverage` exclude `choreo-gui`, a
+separate `.github/workflows/gui-tests.yml` job runs `just test-gui` on every
+push and pull request that touches the GUI or a workspace crate it builds on.
+It installs the system libraries the Blitz/winit stack links at build time
+(fontconfig, libwayland-client) and is the only CI run that compiles and
+executes the GUI's tests.
 
 Run all tests:
 ```bash

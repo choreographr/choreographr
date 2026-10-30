@@ -1,7 +1,8 @@
-//! First-run setup guidance: the "what is left before I can chat" checklist
-//! shown on an empty chat page, the default account name the new-account
-//! wizard pre-fills, and the one-shot follow-through that walks a freshly
-//! created account straight into the active session and the model picker.
+//! First-run setup guidance: the App-side glue over the shared setup rules
+//! in `choreo_client_core::onboarding` — reading the checklist state off the
+//! attached session, arming the follow-through that walks a freshly created
+//! account straight into the session and the model picker, and pre-filling
+//! the new-account wizard's name.
 //!
 //! Everything here is pure state derivation over `App` (no I/O, no channels),
 //! so the rules are unit-testable without a daemon. The render side lives in
@@ -9,44 +10,7 @@
 //! once its credential is confirmed) lives in `connection/daemon.rs`.
 
 use super::App;
-use choreo_client_core::is_valid_account_name;
-
-/// How far the attached session is through first-run setup. Each flag is
-/// one step of the welcome checklist, in the order the user has to do them:
-/// an account must hold an API key before a session can use it, and the
-/// model list is fetched through the session's account.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SetupProgress {
-    /// At least one AI provider account has a stored credential (API key).
-    pub(crate) has_keyed_account: bool,
-    /// The attached session has an account selected.
-    pub(crate) session_has_account: bool,
-    /// The attached session has a model selected.
-    pub(crate) session_has_model: bool,
-}
-
-impl SetupProgress {
-    /// All steps done: a prompt can be sent.
-    pub(crate) fn is_complete(self) -> bool {
-        self.has_keyed_account && self.session_has_account && self.session_has_model
-    }
-}
-
-/// The two-stage first-run follow-through after the user saves an API key
-/// while the attached session has no account. Each stage waits for the
-/// daemon's confirmation rather than firing optimistically: selecting an
-/// account whose key the daemon rejected would only produce a second error,
-/// and the model list is fetched through the session's account, so opening
-/// the picker before the selection lands would list nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum SetupFollow {
-    /// Waiting for `CredentialAdded` for this account; then select it for
-    /// the attached session.
-    AwaitCredential(String),
-    /// Waiting for `SessionAccountSet` for this account; then open the
-    /// model picker.
-    AwaitAccountSet(String),
-}
+use choreo_client_core::{SetupFollow, SetupProgress, suggest_account_name};
 
 impl App {
     /// Arm the follow-through for `account` when its key is being saved and
@@ -54,9 +18,11 @@ impl App {
     /// an account keeps it: adding a second key must not silently switch
     /// what an in-use session talks to.
     pub(crate) fn arm_setup_follow(&mut self, account: &str) {
-        self.setup_follow = (self.attached_session_id.is_some()
-            && self.attached_account_slug.is_none())
-        .then(|| SetupFollow::AwaitCredential(account.to_string()));
+        self.setup_follow = SetupFollow::arm(
+            account,
+            self.attached_session_id.is_some(),
+            self.attached_account_slug.is_some(),
+        );
     }
 
     /// Pick the wizard's highlighted provider (advancing to the name step)
@@ -82,27 +48,12 @@ impl App {
     /// The attached session's setup state, read from the accounts list and
     /// the session's display state (the same fields the status bar shows).
     pub(crate) fn setup_progress(&self) -> SetupProgress {
-        let display = self.active_display_ref();
-        // Step 1 is judged against the account the session will actually use:
-        // the selected one when there is one, otherwise any keyed account the
-        // user could select next. A global "some account has a key" would tick
-        // the box for an account this session is NOT using, while the model
-        // list is fetched through the session's own account — so a session
-        // pointed at a key-less account would look ready and then fail at
-        // step 3.
-        let has_keyed_account = match self.attached_account_slug.as_deref() {
-            Some(slug) => self
-                .ai_providers
-                .accounts
-                .iter()
-                .any(|a| a.name == slug && a.has_credential),
-            None => self.ai_providers.accounts.iter().any(|a| a.has_credential),
-        };
-        SetupProgress {
-            has_keyed_account,
-            session_has_account: self.attached_account_slug.is_some(),
-            session_has_model: display.is_some_and(|d| d.selected_model.is_some()),
-        }
+        SetupProgress::derive(
+            &self.ai_providers.accounts,
+            self.attached_account_slug.as_deref(),
+            self.active_display_ref()
+                .is_some_and(|d| d.selected_model.is_some()),
+        )
     }
 
     /// Whether the chat page should show the welcome panel in place of the
@@ -117,52 +68,9 @@ impl App {
     }
 }
 
-/// The default name the new-account wizard pre-fills for an account on
-/// `provider_slug`: the provider slug itself, made valid for an account name
-/// (lowercase alphanumerics, `-`, `_`), with a `-2`, `-3`, … suffix when an
-/// account of that name already exists. A first-time user can just press
-/// Enter; someone adding a second key for the same provider gets a distinct
-/// name instead of a "name taken" error.
-pub(crate) fn suggest_account_name(provider_slug: &str, existing: &[&str]) -> String {
-    // Catalog slugs are mostly valid already; the few that are not use dots
-    // (`wafer.ai`) or capitals, which map onto a hyphen / lowercase.
-    let mut base: String = provider_slug
-        .chars()
-        .map(|c| {
-            let c = c.to_ascii_lowercase();
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    if !is_valid_account_name(&base) {
-        // An empty or otherwise unusable slug still gets a usable default.
-        base = "account".to_string();
-    }
-    let taken = |name: &str| existing.contains(&name);
-    if !taken(&base) {
-        return base;
-    }
-    // `base` is taken here, so strip to a `-N` suffix (N from 2). `existing`
-    // is finite, so this search always terminates on a free name; returning it
-    // directly (rather than an `unwrap_or` fallback) keeps the result a name
-    // the caller does not already hold.
-    let mut suffix = 2;
-    loop {
-        let candidate = format!("{base}-{suffix}");
-        if !taken(&candidate) {
-            return candidate;
-        }
-        suffix += 1;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::App;
     use choreo_proto::AccountInfo;
 
     fn account(name: &str, has_credential: bool) -> AccountInfo {
@@ -171,40 +79,6 @@ mod tests {
             provider: "anthropic".to_string(),
             has_credential,
         }
-    }
-
-    #[test]
-    fn suggestion_is_the_provider_slug_when_free() {
-        assert_eq!(suggest_account_name("anthropic", &[]), "anthropic");
-    }
-
-    #[test]
-    fn suggestion_sanitizes_invalid_characters() {
-        assert_eq!(suggest_account_name("wafer.ai", &[]), "wafer-ai");
-        assert_eq!(suggest_account_name("Mixed.Case", &[]), "mixed-case");
-    }
-
-    #[test]
-    fn suggestion_falls_back_for_an_empty_slug() {
-        assert_eq!(suggest_account_name("", &[]), "account");
-    }
-
-    #[test]
-    fn suggestion_suffixes_past_taken_names() {
-        assert_eq!(
-            suggest_account_name("openai", &["openai", "openai-2"]),
-            "openai-3"
-        );
-    }
-
-    #[test]
-    fn suggestion_skips_every_taken_suffix() {
-        // The suffix search must advance past an unbroken run of taken names
-        // rather than stop at some bound.
-        assert_eq!(
-            suggest_account_name("svc", &["svc", "svc-2", "svc-3", "svc-4"]),
-            "svc-5"
-        );
     }
 
     #[test]
@@ -251,23 +125,6 @@ mod tests {
         app.ai_providers
             .set_accounts(vec![account("a", true), account("b", true)]);
         assert!(app.setup_progress().has_keyed_account);
-    }
-
-    #[test]
-    fn complete_requires_every_step() {
-        let all = SetupProgress {
-            has_keyed_account: true,
-            session_has_account: true,
-            session_has_model: true,
-        };
-        assert!(all.is_complete());
-        assert!(
-            !SetupProgress {
-                session_has_model: false,
-                ..all
-            }
-            .is_complete()
-        );
     }
 
     #[test]

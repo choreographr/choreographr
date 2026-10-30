@@ -9,22 +9,9 @@ pub(crate) struct ProviderInfo {
     pub(crate) display_name: String,
 }
 
-/// Providers pinned to the top of the new-account picker, in this order.
-/// These are the ones most people arrive with a key for; listing them first
-/// means a first-time user sees a familiar name on the opening screen instead
-/// of a page of aggregators that happen to sort early. Slugs absent from the
-/// live catalog are simply skipped.
-pub(crate) const FEATURED_PROVIDERS: &[&str] = &[
-    "anthropic",
-    "openai",
-    "google",
-    "openrouter",
-    "xai",
-    "deepseek",
-    "mistral",
-    "groq",
-    "ollama",
-];
+// Providers pinned to the top of the new-account picker, shared with the
+// GUI's setup panel so both front-ends feature the same names first.
+use choreo_client_core::FEATURED_PROVIDERS;
 
 /// Sort a provider list for the new-account wizard's picker (step 1): the
 /// [`FEATURED_PROVIDERS`] first, in their listed order, then everything else

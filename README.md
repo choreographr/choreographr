@@ -433,6 +433,16 @@ itself off as you go, and names the keys for each step:
 3. **Choose a model** — `Alt+M` (opened for you after step 2). The list fills
    in on its own while the daemon fetches it for a new account.
 
+`choreo-gui` opens the same checklist as a **setup popup** over an empty
+session, with each step's controls built into it: pick a provider (or type its
+id), keep or change the suggested account name, paste the API key, and click
+**Save key**. Naming an existing account that has no key just adds the key.
+Click **Later** (or ×) to close it; the toolbar's **Setup** button reopens it
+at any time. As in the TUI, a session with no account selects the new account
+once the daemon confirms the key and then loads its models; click one to finish,
+and the popup closes. OAuth sign-in is not available in the GUI yet, so set up
+an OAuth account from the TUI.
+
 Then type a message and press Enter. Accounts can also be configured by hand in
 `~/.config/choreographr/accounts.toml` (see [Configuration](#configuration)),
 with a key added via `/add-key <service> <api_key>`.

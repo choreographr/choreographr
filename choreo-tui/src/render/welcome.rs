@@ -5,7 +5,8 @@
 //! so it names the exact keys for each step rather than leaving them to find
 //! `/account` or the help overlay on their own.
 
-use crate::state::{App, SetupProgress};
+use crate::state::App;
+use choreo_client_core::SetupProgress;
 use ratatui::{
     Frame,
     layout::{Alignment, Rect},

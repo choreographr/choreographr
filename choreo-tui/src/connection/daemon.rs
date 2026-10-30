@@ -1,6 +1,7 @@
 use super::route_session_update;
-use crate::state::{App, Page, ProviderInfo, SetupFollow, merge_token_usage};
+use crate::state::{App, Page, ProviderInfo, merge_token_usage};
 use crate::terminal::progress;
+use choreo_client_core::SetupFollow;
 use choreo_client_core::{
     AutoBindAttempt, ClientError, Pending, PendingContext, attempt_keystore_auto_bind,
     dispatch_daemon_message, record_unlock_key,
