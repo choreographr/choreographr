@@ -14,6 +14,7 @@
 //! A former `tests/foo.rs` keeps its file-level `#![cfg(...)]` / `#![allow(...)]`
 //! inner attributes — inside a module they apply to that module.
 
+mod chatgpt_stateless;
 mod images_wire;
 mod modelsdev_refresh;
 mod reasoning_roundtrip;
