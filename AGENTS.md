@@ -72,6 +72,16 @@ and bump the version as part of the release that first carries the new shape.
 
 When implementing a list of code changes across multiple files, delegate each task to a subsession and run them in series (one at a time), not in parallel. This avoids filesystem conflicts from concurrent edits to overlapping files and keeps each subsession's context focused. (There is no worktree-per-branch support yet, so subsessions share one working tree — hence the serial execution.)
 
+**A subsession starts from scratch.** It receives no conversation history, no tool
+results, and no reasoning from the session that spawned it — only the prompt it is
+given, plus its working directory, tool groups, and the `AGENTS.md`/skills found
+there. A prompt that says "as agreed", "the change described above", or "per the
+earlier discussion" is empty to it. Write every subsession prompt as a complete
+**standalone brief**: the goal, the relevant code and prior decisions, the
+constraints, and how to verify the result. That duty is recursive — a subsession's
+prompt must tell it to give any subsession it spawns an equally complete brief,
+because the same gap appears one level down.
+
 During development a subsession may iterate against just the crates it changed with `cargo nextest run -p <crates>` (the `cargo test-*` aliases bake in `--workspace` and reject `-p`, so call nextest directly — or use `just test-crate <crate>`). That is for fast feedback *while still editing* only — never a substitute or precursor gate: when the work is ready to verify, run `just pre-commit` directly (see [Commit Workflow](#commit-workflow)). **Before returning its report, a subsession must run the full [Commit Workflow](#commit-workflow) gate and commit its work**; a scoped `-p` run is never sufficient to commit from. A subsession that cannot complete the work must not commit and must leave its changes in the tree for the parent to inspect (see [Commit Workflow → Sub-sessions](#sub-sessions)).
 
 ## Dependency Management

@@ -2481,6 +2481,12 @@ message, drives the child's own `run_agent_loop()` (subject to the daemon-wide
 persists as a normal session. The tool's contract is documented in-source
 (`choreo-daemon`'s `tools/subsession.rs`).
 
+The child inherits the working directory and tool groups only — **not the
+parent's conversation**. Its first and only input is the prompt string, so the
+parent has to write a self-contained brief; a prompt referring to earlier turns
+is empty to the child. Because a child can spawn its own children, the same rule
+reapplies at every level (see AGENTS.md → Task Execution).
+
 The daemon tracks the parent→child relationship (`DaemonState::children`) so a
 parent's cancellation, exit, or deletion also stops its children — see the
 daemon's session-lifecycle docs for the cancellation-propagation and

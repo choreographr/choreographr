@@ -512,7 +512,8 @@ message history, model, and working directory. Sessions form
 a parent-child tree, support multiple concurrent client attachments, and survive
 daemon restarts via an embedded `redb` database. A *subsession* is a child
 session spawned by the `spawn_subsession` tool — it inherits the parent's
-working directory, runs its own full agent loop independently, and returns its
+working directory and tool groups but **not its conversation**: it runs its own
+full agent loop from the prompt it is given, independently, and returns its
 output as the parent's tool result. Subsessions persist permanently.
 
 **Tool.** A function the LLM can call to interact with the outside world (read

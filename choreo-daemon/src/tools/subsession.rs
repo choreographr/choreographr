@@ -21,7 +21,9 @@ use tracing::{debug, error, info, warn};
 /// Arguments for `spawn_subsession`.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct SpawnSubsessionArgs {
-    /// Task description for the sub-session to work on autonomously
+    /// Complete, standalone brief for the sub-session. It starts with no
+    /// conversation history, so include everything it needs: the goal, the
+    /// relevant files and prior decisions, the constraints, and how to verify.
     pub prompt: String,
     /// Optional title for the sub-session
     pub title: Option<String>,
@@ -46,7 +48,14 @@ impl Tool for SpawnSubsession {
     }
 
     fn description(&self) -> &'static str {
-        "Spawn a sub-session to autonomously work on a task. The sub-session inherits the parent session's working directory and runs its own tool-calling loop."
+        "Spawn a sub-session to autonomously work on a task. The sub-session starts with NO \
+         conversation history: it sees only the `prompt` you write, plus its working directory \
+         and the AGENTS.md/skills found there. Nothing else from this session — your turns, file \
+         reads, tool results, or reasoning — reaches it, so write the prompt as a complete \
+         standalone brief (goal, relevant files and decisions, constraints, how to verify). If it \
+         may itself delegate, tell it to pass an equally complete brief to any sub-session it \
+         spawns, for the same reason. It runs its own tool-calling loop and returns its final text, \
+         not a transcript."
     }
 
     fn describe_invocation(&self, args: &Self::Args) -> String {
@@ -201,6 +210,23 @@ impl Tool for SpawnSubsession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn description_states_the_child_starts_without_conversation_history() {
+        // The child's only input is the prompt, and a model that assumes the
+        // parent's conversation comes along writes briefs that are empty to it.
+        // The description is the contract the calling model reads, so its two
+        // load-bearing claims are pinned here.
+        let description = SpawnSubsession.description();
+        assert!(
+            description.contains("NO conversation history"),
+            "the description must say the child starts without history: {description}"
+        );
+        assert!(
+            description.contains("standalone brief"),
+            "the description must ask for a self-contained prompt: {description}"
+        );
+    }
 
     #[test]
     fn spawn_subsession_schema_has_required_prompt() {
