@@ -3,7 +3,6 @@ use serde_json::json;
 
 // The types and helpers the request paths reach through their own imports; the
 // suite names them directly, so it imports them directly too.
-use crate::ToolResultItem;
 use crate::openai::reasoning_details::MAX_REASONING_BYTES;
 use crate::openai::{
     AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
@@ -108,7 +107,6 @@ fn responses_body_nests_reasoning_and_omits_it_for_non_reasoning() {
             cancel_rx: None,
             route: None,
             previous_response_id: None,
-            tool_results: &[],
             programmatic_tool_calling: false,
             max_output_tokens_override: None,
             no_retry: false,
@@ -787,28 +785,54 @@ fn response_output_item_deserializes_program_output() {
 
 #[test]
 fn build_responses_input_empty_returns_empty_array() {
-    let result = build_responses_input(&[], &[], None).unwrap();
+    let result = build_responses_input(&[], None).unwrap();
     let value = result.expect("expected Some value");
     // Empty messages produce an empty-string input
     assert_eq!(value, json!(""));
 }
 
 #[test]
-fn build_responses_input_with_tool_results() {
-    let tool_results = vec![ToolResultItem {
-        call_id: "call_1".to_string(),
-        output: "weather_data".to_string(),
-        caller: None,
-    }];
-    // The tool-results branch ignores messages and the chain id entirely:
-    // the server reconstructs history from `previous_response_id`.
-    let result = build_responses_input(&tool_results, &[], Some("resp_1")).unwrap();
+fn build_responses_input_chained_tail_carries_tool_outputs_from_messages() {
+    // The chained tail is derived from the full message history: after a tool
+    // round the last assistant message is the tool-call turn, so the tail is
+    // exactly that turn's tool outputs. The separately-passed result buffer of
+    // the old design is no longer needed to get them onto the wire.
+    let assistant = ChatRequestMessage {
+        role: "assistant",
+        content: None,
+        images: Vec::new(),
+        tool_call_id: None,
+        tool_calls: Some(vec![AssistantToolCall {
+            id: "call_1".to_string(),
+            kind: "function".to_string(),
+            function: AssistantToolFunction {
+                name: "get_weather".to_string(),
+                arguments: "{}".to_string(),
+            },
+        }]),
+        reasoning_artifact: None,
+    };
+    let tool = ChatRequestMessage {
+        role: "tool",
+        content: Some("72F".to_string()),
+        images: Vec::new(),
+        tool_call_id: Some("call_1".to_string()),
+        tool_calls: None,
+        reasoning_artifact: None,
+    };
+    let messages = vec![
+        ChatRequestMessage::simple("user", "weather?".into()),
+        assistant,
+        tool,
+    ];
+    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
+    // Only the tool output after the last assistant message rides the chain.
+    assert_eq!(arr.len(), 1, "{arr:?}");
     assert_eq!(arr[0]["type"], "function_call_output");
     assert_eq!(arr[0]["call_id"], "call_1");
-    assert_eq!(arr[0]["output"], "weather_data");
+    assert_eq!(arr[0]["output"], "72F");
 }
 
 #[test]
@@ -817,7 +841,7 @@ fn build_responses_input_with_messages() {
         ChatRequestMessage::simple("user", "hello".into()),
         ChatRequestMessage::simple("assistant", "hi there".into()),
     ];
-    let result = build_responses_input(&[], &messages, None).unwrap();
+    let result = build_responses_input(&messages, None).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -839,7 +863,7 @@ fn build_responses_input_chained_turn_sends_only_trailing_messages() {
         ChatRequestMessage::simple("assistant", "old answer".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     // system + the new user message only — the old turns are chained
@@ -861,7 +885,7 @@ fn build_responses_input_chained_turn_keeps_system_prompt() {
         ChatRequestMessage::simple("user", "turn one".into()),
         ChatRequestMessage::simple("assistant", "answer".into()),
     ];
-    let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 1);
@@ -877,7 +901,7 @@ fn build_responses_input_chained_without_assistant_keeps_all() {
         ChatRequestMessage::simple("user", "hello".into()),
         ChatRequestMessage::simple("user", "again".into()),
     ];
-    let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -896,7 +920,7 @@ fn build_responses_input_chained_keeps_only_newest_system_message() {
         ChatRequestMessage::simple("system", "new system".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
@@ -921,7 +945,7 @@ fn build_responses_input_chained_preserves_mid_tail_order() {
         ChatRequestMessage::simple("system", "late system".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&[], &messages, Some("resp_1")).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1")).unwrap();
     let value = result.expect("expected Some value");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 3);
@@ -953,7 +977,6 @@ fn body_for(provider: &str, model: &str, messages: &[ChatRequestMessage]) -> ser
         cancel_rx: None,
         route: None,
         previous_response_id: None,
-        tool_results: &[],
         programmatic_tool_calling: false,
         max_output_tokens_override: None,
         no_retry: false,
@@ -1393,7 +1416,6 @@ fn responses_max_output_tokens_prefers_the_override() {
             cancel_rx: None,
             route: None,
             previous_response_id: None,
-            tool_results: &[],
             programmatic_tool_calling: false,
             max_output_tokens_override: override_,
             no_retry: false,
@@ -1443,7 +1465,6 @@ fn retention_responses_body(
         cancel_rx: None,
         route: None,
         previous_response_id: None,
-        tool_results: &[],
         programmatic_tool_calling: false,
         max_output_tokens_override: None,
         no_retry: false,

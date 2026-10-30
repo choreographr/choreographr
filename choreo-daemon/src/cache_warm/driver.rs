@@ -246,7 +246,6 @@ pub(super) fn ping_request<'a>(
         on_uploaded: None,
         cancel_rx: None,
         previous_response_id: None,
-        tool_results: &[],
         programmatic_tool_calling: false,
         session_id: request.session_id.clone(),
         request_id: request.stream_id.clone(),

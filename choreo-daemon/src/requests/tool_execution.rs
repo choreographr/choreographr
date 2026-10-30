@@ -3,8 +3,8 @@
 //! forwarder, and per-tool result recording — shared by the serial
 //! (`execute_tool_with_timeout`) and concurrent (`spawn_single_tool`) paths.
 //!
-//! The system-prompt / tool-result-collection helpers (`build_system_content`,
-//! `collect_tool_result`, `persist_loaded_skill`, …) live in the sibling
+//! The system-prompt / tool-result side-effect helpers (`build_system_content`,
+//! `apply_tool_result_side_effects`, `persist_loaded_skill`, …) live in the sibling
 //! `requests::system_content` module; both are re-exported from `requests.rs`
 //! via `pub(crate) use <mod>::*;` so every `crate::requests::X` reference keeps
 //! resolving, and `run_agent_loop` stays in `requests.rs`.
@@ -17,14 +17,16 @@
 //! enforces the per-tool timeout and drains the image channel. Dispatching N
 //! tools therefore adds up to 3N threads beyond the agent loop's own thread;
 //! the kernel scheduler handles that for typical N (< 10) with no trouble.
-use crate::requests::system_content::{CollectToolResultParams, collect_tool_result};
+use crate::requests::system_content::{
+    ToolResultSideEffectsParams, apply_tool_result_side_effects,
+};
 use crate::sessions::{RequestContext, SessionCommand, SessionState, turn_for_client};
 use crate::tools::context::ToolContext;
 use crate::tools::{
     PreparedImage, STREAMING_CHANNEL_CAPACITY, ToolError, ToolOutput, ToolOutputFormat,
     ToolRegistry, sanitize_transcript, truncate_tool_output,
 };
-use choreo_ai_protocols::{ChatToolCall, ToolResultItem};
+use choreo_ai_protocols::ChatToolCall;
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{
     DaemonMessageType, DisplayedImageRecord, ImageMetadata, SessionEvent, TokenUsage,
@@ -975,17 +977,18 @@ pub(crate) struct ToolCompletionParams<'a> {
     pub(crate) image: Option<PreparedImage>,
     pub(crate) ctx: &'a RequestContext,
     pub(crate) current_turn_id: u32,
-    pub(crate) tool_results: &'a mut Vec<ToolResultItem>,
     pub(crate) known_hint_paths: &'a mut Vec<PathBuf>,
     pub(crate) pending_hints: &'a mut Vec<String>,
 }
 
-/// Record a completed tool in the session and the next-call accumulator.
+/// Record a completed tool in the session.
 ///
 /// Shared by the serial and concurrent completion paths so both record a
-/// result identically: emit any produced image, fill the tool's seeded
-/// placeholder result in place (see [`SessionState::update_tool_result`]),
-/// and collect the output for the provider's next request.
+/// result identically: emit any produced image and fill the tool's seeded
+/// placeholder result in place (see [`SessionState::update_tool_result`]).
+/// The provider's next request is rebuilt from that session turn (which
+/// carries the result in the model's call order), so there is no separate
+/// result buffer to populate here.
 pub(crate) fn record_tool_completion(params: ToolCompletionParams<'_>) {
     let ToolCompletionParams {
         stream_id,
@@ -995,14 +998,13 @@ pub(crate) fn record_tool_completion(params: ToolCompletionParams<'_>) {
         image,
         ctx,
         current_turn_id,
-        tool_results,
         known_hint_paths,
         pending_hints,
     } = params;
     // Escape Unicode format characters (bidi overrides, ZWSP, …) before the
-    // content enters the transcript — the session record AND the next-call
-    // accumulator both derive from `output.content`, so this single point
-    // covers every tool at once. ESC/ANSI, newlines, and tabs pass through
+    // content enters the transcript — the session record (the sole source the
+    // next request is rebuilt from) derives from `output.content`, so this
+    // single point covers every tool at once. ESC/ANSI, newlines, and tabs pass through
     // untouched (shell/VM colors survive); only the text-reordering chars
     // that could spoof the model are escaped. The terminal is defended
     // separately by the TUI's render filter.
@@ -1048,11 +1050,9 @@ pub(crate) fn record_tool_completion(params: ToolCompletionParams<'_>) {
     }
 
     finish_tool_call(stream_id, session, tool_call, output, ctx, current_turn_id);
-    collect_tool_result(CollectToolResultParams {
-        tool_results,
+    apply_tool_result_side_effects(ToolResultSideEffectsParams {
         session,
         tool_call,
-        output,
         known_hint_paths,
         pending_hints,
     });

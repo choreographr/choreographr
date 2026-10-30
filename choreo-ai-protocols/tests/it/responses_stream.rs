@@ -66,7 +66,6 @@ fn stream_turn(
             on_uploaded: None,
             cancel_rx: None,
             previous_response_id: None,
-            tool_results: &[],
             programmatic_tool_calling: false,
             session_id: "1".to_string(),
             request_id: "1".to_string(),

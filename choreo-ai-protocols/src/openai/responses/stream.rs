@@ -122,7 +122,6 @@ where
         on_uploaded,
         cancel_rx,
         route,
-        tool_results,
         no_retry,
         ..
     } = params;
@@ -130,7 +129,6 @@ where
     info!(
         model = %model,
         tool_count = tools.len(),
-        tool_result_count = tool_results.len(),
         streaming = true,
         "responses streaming request with tools",
     );

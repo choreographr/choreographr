@@ -426,7 +426,6 @@ fn record_tool_completion_persists_vision_image_at_emit_time() {
         }),
         ..Default::default()
     };
-    let mut tool_results: Vec<ToolResultItem> = Vec::new();
     let mut known_hint_paths = Vec::new();
     let mut pending_hints = Vec::new();
 
@@ -438,7 +437,6 @@ fn record_tool_completion_persists_vision_image_at_emit_time() {
         image: None,
         ctx: &ctx,
         current_turn_id: turn_id,
-        tool_results: &mut tool_results,
         known_hint_paths: &mut known_hint_paths,
         pending_hints: &mut pending_hints,
     });
@@ -3630,78 +3628,6 @@ fn missing_calls_empty_when_all_delivered() {
     }];
     let delivered = HashSet::from(["a".to_string()]);
     assert_eq!(missing_calls(&call_infos, &delivered).count(), 0);
-}
-
-// -- sort_by_call_order tests -----------------------------------------
-
-#[test]
-fn sort_by_call_order_restores_model_order() {
-    // Model issued calls a, b, c; the tools completed in the reverse order
-    // (c first). The next-call accumulator must be restored to a, b, c so
-    // tool messages mirror the assistant's tool_calls array.
-    let tool_calls = vec![
-        AssistantToolCallRecord {
-            call_id: "a".into(),
-            name: "read_file".into(),
-            arguments_json: "{}".into(),
-        },
-        AssistantToolCallRecord {
-            call_id: "b".into(),
-            name: "grep".into(),
-            arguments_json: "{}".into(),
-        },
-        AssistantToolCallRecord {
-            call_id: "c".into(),
-            name: "sh".into(),
-            arguments_json: "{}".into(),
-        },
-    ];
-    let mut items = vec![
-        ToolResultItem {
-            call_id: "c".into(),
-            output: "c-out".into(),
-            caller: None,
-        },
-        ToolResultItem {
-            call_id: "a".into(),
-            output: "a-out".into(),
-            caller: None,
-        },
-        ToolResultItem {
-            call_id: "b".into(),
-            output: "b-out".into(),
-            caller: None,
-        },
-    ];
-    sort_by_call_order(&tool_calls, &mut items, |r| r.call_id.as_str());
-    let order: Vec<_> = items.iter().map(|r| r.call_id.as_str()).collect();
-    assert_eq!(order, vec!["a", "b", "c"]);
-}
-
-#[test]
-fn sort_by_call_order_sinks_unknown_call_ids() {
-    // A streaming stub created before its start event arrived has no
-    // matching tool_call; it must sink to the end, keeping relative order.
-    let tool_calls = vec![AssistantToolCallRecord {
-        call_id: "a".into(),
-        name: "read_file".into(),
-        arguments_json: "{}".into(),
-    }];
-    let mut items = vec![
-        ToolResultItem {
-            call_id: "ghost".into(),
-            output: "g-out".into(),
-            caller: None,
-        },
-        ToolResultItem {
-            call_id: "a".into(),
-            output: "a-out".into(),
-            caller: None,
-        },
-    ];
-    sort_by_call_order(&tool_calls, &mut items, |r| r.call_id.as_str());
-    let order: Vec<_> = items.iter().map(|r| r.call_id.as_str()).collect();
-    assert_eq!(order, vec!["a", "ghost"]);
 }
 
 // -- extract_json_string tests ------------------------------------------

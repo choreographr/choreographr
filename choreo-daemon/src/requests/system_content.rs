@@ -1,8 +1,8 @@
-//! System-prompt assembly and tool-result collection for the agent loop:
+//! System-prompt assembly and tool-result side effects for the agent loop:
 //! `build_system_content` (the base prompt plus working-dir-gated context
-//! files), `collect_tool_result` (feeding a finished tool into the next-call
-//! accumulator, with its hint paths), and `persist_loaded_skill`. Re-exported
-//! from `requests.rs` via `pub(crate) use system_content::*;`.
+//! files), `apply_tool_result_side_effects` (persisting a finished tool's
+//! loaded skills and subdirectory hints), and `persist_loaded_skill`.
+//! Re-exported from `requests.rs` via `pub(crate) use system_content::*;`.
 //!
 //! `build_system_content` runs once per loop iteration, so the prompt is rebuilt
 //! every turn and newly loaded skills or subdirectory hints reach the model
@@ -11,8 +11,8 @@
 //! gets the base prompt (identity, tool groups, skills, title).
 use crate::context::{self, LoadedSkill, SkillMeta};
 use crate::sessions::SessionState;
-use crate::tools::{ToolOutput, ToolRegistry};
-use choreo_ai_protocols::{ChatToolCall, ToolResultItem};
+use crate::tools::ToolRegistry;
+use choreo_ai_protocols::ChatToolCall;
 use choreo_proto::ContextConfig;
 
 use std::path::{Path, PathBuf};
@@ -173,36 +173,32 @@ pub(crate) fn check_subdirectory_hints(
     }
 }
 
-pub(crate) struct CollectToolResultParams<'a> {
-    pub(crate) tool_results: &'a mut Vec<ToolResultItem>,
+pub(crate) struct ToolResultSideEffectsParams<'a> {
     pub(crate) session: &'a mut SessionState,
     pub(crate) tool_call: &'a ChatToolCall,
-    pub(crate) output: &'a ToolOutput,
     pub(crate) known_hint_paths: &'a mut Vec<PathBuf>,
     pub(crate) pending_hints: &'a mut Vec<String>,
 }
 
-/// Collect tool execution output into the result accumulator, persist any
-/// `load_skill` call to the session, and check for new subdirectory hints.
-/// Called after every tool execution in both the serial and concurrent phases.
-pub(crate) fn collect_tool_result(params: CollectToolResultParams) {
-    let CollectToolResultParams {
-        tool_results,
+/// Apply a finished tool's side effects: persist any `load_skill` call to the
+/// session and check for new subdirectory hints. Called after every tool
+/// execution in both the serial and concurrent phases.
+///
+/// The result itself is already recorded on the session turn
+/// (`SessionState::update_tool_result`), which is the single source the next
+/// request is rebuilt from — there is no separate provider result buffer to
+/// fill here.
+pub(crate) fn apply_tool_result_side_effects(params: ToolResultSideEffectsParams) {
+    let ToolResultSideEffectsParams {
         session,
         tool_call,
-        output,
         known_hint_paths,
         pending_hints,
     } = params;
     trace!(
-        "collecting tool result for call {} (tool: '{}')",
+        "applying tool-result side effects for call {} (tool: '{}')",
         tool_call.id, tool_call.name
     );
-    tool_results.push(ToolResultItem {
-        call_id: tool_call.id.clone(),
-        output: output.content.clone(),
-        caller: tool_call.caller.clone(),
-    });
     persist_loaded_skill(session, &tool_call.name, &tool_call.arguments_json);
     check_subdirectory_hints(
         session.config.working_dir.as_deref(),

@@ -4,20 +4,8 @@ use std::io;
 use crate::openai::{ChatRequestMessage, ChatToolDefinition};
 use crate::retry::{RequestUploadedCallback, RetryCallback};
 use crate::session_routing::CacheAffinity;
-use crate::types::{CallerInfo, ChatTurnResult, StreamEvent};
+use crate::types::{ChatTurnResult, StreamEvent};
 use choreo_proto::InferenceError;
-
-/// A single tool result to feed back into a Responses API turn.
-#[derive(Debug, Clone)]
-pub struct ToolResultItem {
-    /// Id of the tool call this result answers (matches
-    /// [`ChatToolCall::id`](crate::ChatToolCall)).
-    pub call_id: String,
-    /// The tool's output, already serialized to a string for the wire.
-    pub output: String,
-    /// Optional caller attribution (programmatic tool calling).
-    pub caller: Option<CallerInfo>,
-}
 
 /// Holds the common parameters for a chat completion turn.
 pub struct ChatTurnRequest<'a> {
@@ -45,8 +33,6 @@ pub struct ChatTurnRequest<'a> {
     pub cancel_rx: Option<&'a crossbeam_channel::Receiver<()>>,
     /// Response ID from a previous turn (Responses API).
     pub previous_response_id: Option<&'a str>,
-    /// Tool results from previous turn (Responses API).
-    pub tool_results: &'a [ToolResultItem],
     /// Enable programmatic tool calling (Responses API, gpt-5.6+).
     pub programmatic_tool_calling: bool,
     /// Session identity for gateways that route per session (opencode zen/go

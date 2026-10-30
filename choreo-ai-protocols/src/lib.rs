@@ -110,7 +110,7 @@ pub use overrides::ProviderOverrides;
 pub use retry::{RequestCompression, RequestUploadedCallback, RetryCallback};
 pub use session_routing::{CacheAffinity, cache_affinity_downgraded};
 pub use shared::{MaxTokensField, ProviderError, RequestAuth};
-pub use traits::{ChatTurnRequest, ProviderClient, ToolResultItem};
+pub use traits::{ChatTurnRequest, ProviderClient};
 pub use types::{
     CallerInfo, ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };

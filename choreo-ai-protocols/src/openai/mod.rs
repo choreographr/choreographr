@@ -33,7 +33,6 @@ pub use crate::shared::{MaxTokensField, RequestAuth};
 use crate::types::{ChatTurnResult, StreamEvent};
 
 use crate::SocketRegistry;
-use crate::ToolResultItem;
 
 pub(crate) use message::validate_tool_call_arguments;
 pub use message::{
@@ -112,8 +111,6 @@ pub(crate) struct TurnParams<'a> {
     pub route: Option<(&'a str, &'a str)>,
     /// Responses API: the previous turn's response id to chain onto.
     pub previous_response_id: Option<&'a str>,
-    /// Responses API: tool results fed back from the previous turn.
-    pub tool_results: &'a [ToolResultItem],
     /// Responses API: enable the programmatic tool-calling tool (gpt-5.6+).
     pub programmatic_tool_calling: bool,
     /// Per-call output-token cap (see `ChatTurnRequest`): `Some(n)` replaces the
@@ -440,7 +437,6 @@ impl OpenAiClient {
             // per-session sticky routing (see `shared::opencode_gateway_headers`).
             route: Some((params.session_id.as_str(), params.request_id.as_str())),
             previous_response_id: params.previous_response_id,
-            tool_results: params.tool_results,
             programmatic_tool_calling: params.programmatic_tool_calling,
             max_output_tokens_override: params.max_output_tokens_override,
             no_retry: params.no_retry,

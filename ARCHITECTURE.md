@@ -2336,7 +2336,7 @@ documented in-source (`choreo-daemon`'s `requests` module).
 The dispatch and execution machinery (channel wiring, per-tool timeout
 resolution, the wait loops, the streaming forwarder, and per-tool result
 recording) lives in `requests/tool_execution.rs`, and the system-prompt /
-tool-result-collection helpers live in `requests/system_content.rs`; both are
+tool-result side-effect helpers live in `requests/system_content.rs`; both are
 re-exported from `requests.rs`. Each concurrent tool runs on a dedicated
 execution thread, a forwarding thread, and a wait-loop thread — see the
 `requests/tool_execution.rs` module docs for the thread topology and the
@@ -2357,8 +2357,9 @@ batch handles have arrived, so each unfinished call records a deterministic
 (`mark_unexecuted_tool_results`) remains a safety net for wait-loops that die
 before delivering. Tool results are always rendered in the model's original call
 order — placeholders are seeded in call order and filled **in place by
-`call_id`** as each tool streams or finishes, and the accumulator fed to the
-provider is re-sorted back to call order (`sort_by_call_order`) after the batch.
+`call_id`** as each tool streams or finishes, and because the provider request
+is rebuilt from the session turn (which carries the results in that same call
+order) there is no separate accumulator to re-sort.
 A tool thread that panics is caught and reported as a `ToolOutput` with
 `is_error: true` instead of crashing the daemon.
 
@@ -2962,15 +2963,18 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     the provider catalog's per-model `openai_responses` flag and falls back to `default_request_format`.
     Every entry point (`completion`, `completion_stream`, `chat_completion_turn`,
     `chat_completion_turn_streaming`) matches on the resolved format and calls the appropriate
-    request builder. Input/output mapping differs between the two: system messages go into the
-    `input` array as `{role: "system"}` items (rather than the `instructions` field), an
-    assistant turn's tool requests become `function_call` items and their answers
-    `function_call_output` items (the answer names its call by `call_id`, so a history
-    rebuilt from messages — no chained `previous_response_id`, e.g. after a model switch
-    or a restored session — has to replay the calls themselves, not only the outputs),
-    and the `input` is an array of typed items rather than a
-    flat messages list. Multi-turn chaining uses `previous_response_id` to link turns together,
-    while Chat Completions relies on the full message history.
+    request builder. Input/output mapping differs between the two: an assistant turn's tool
+    requests become `function_call` items and their answers `function_call_output` items (the
+    answer names its call by `call_id`, so a history rebuilt from messages — no chained
+    `previous_response_id`, e.g. after a model switch or a restored session — has to replay the
+    calls themselves, not only the outputs), and the `input` is an array of typed items rather
+    than a flat messages list. The Responses body is built from the ONE canonical `messages`
+    history: a chained turn derives its tail (the tool outputs after the last assistant turn)
+    from it and links via `previous_response_id`, while a stateless turn sends the whole list.
+    The standard OpenAI Responses API keeps system messages inline as `{role: "system"}` items;
+    the stateless ChatGPT/Codex dialect hoists the system prompt into the top-level
+    `instructions` field, sets `store: false`, and ignores `previous_response_id`
+    (`ServiceConfig::responses_stateless`). Chat Completions relies on the full message history.
 
     The streaming terminal events wrap the whole `Response` object under `response`:
     `response.completed` and `response.incomplete` carry the id/usage there (`sse::response_object`

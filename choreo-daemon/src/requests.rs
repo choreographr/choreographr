@@ -13,8 +13,7 @@ use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path}
 use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
 use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition};
 use choreo_ai_protocols::{
-    ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, ToolResultItem,
-    model_reasoning_capability,
+    ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, model_reasoning_capability,
 };
 use choreo_ai_protocols::{ProviderProtocol, lookup_provider};
 use choreo_proto::{
@@ -177,33 +176,6 @@ fn estimate_prompt_tokens(
         0
     };
     (encoding, estimated)
-}
-
-/// Re-order tool results to match the model's original call order.
-///
-/// Concurrent completions are collected in arrival order (fast tools first),
-/// so the accumulator fed to the provider on the next call is re-sorted to
-/// match the assistant message's `tool_calls` array: some providers match
-/// tool messages positionally, and the order should be deterministic. Items
-/// whose `call_id` has no matching `tool_call` (e.g. a streaming stub created
-/// before the start event arrived) sink to the end, keeping their relative
-/// order (stable sort). The turn's own `tool_results` never need this — they
-/// are seeded in call order and updated in place by `call_id`, so their
-/// order is always the model's.
-fn sort_by_call_order<T>(
-    tool_calls: &[AssistantToolCallRecord],
-    items: &mut [T],
-    call_id_of: impl Fn(&T) -> &str,
-) {
-    let order: HashMap<&str, usize> = tool_calls
-        .iter()
-        .enumerate()
-        .map(|(i, tc)| (tc.call_id.as_str(), i))
-        .collect();
-    if order.is_empty() {
-        return;
-    }
-    items.sort_by_key(|item| order.get(call_id_of(item)).copied().unwrap_or(usize::MAX));
 }
 
 /// A successful session-config tool mutation, captured in Phase 1 and
@@ -529,7 +501,6 @@ pub(crate) fn run_agent_loop(
     // policies reset to None — the id is meaningless outside Responses-style
     // APIs and must not leak across requests.
     let mut prev_resp_id = initial_prev_resp_id(session, &provider_slug, model);
-    let mut tool_results: Vec<ToolResultItem> = Vec::new();
     let mut known_hint_paths: Vec<PathBuf> = Vec::new();
     let mut pending_hints: Vec<String> = Vec::new();
 
@@ -752,7 +723,6 @@ pub(crate) fn run_agent_loop(
                     on_uploaded: uploaded_cb.clone(),
                     cancel_rx: Some(cancel_rx),
                     previous_response_id: prev_resp_id.as_deref(),
-                    tool_results: &tool_results,
                     programmatic_tool_calling: active_client
                         .supports_programmatic_tool_calling(model),
                     session_id: oc_session_id.clone(),
@@ -918,7 +888,6 @@ pub(crate) fn run_agent_loop(
                     .clone_from(&final_text.response_id);
                 session.config.last_response_id_producer = Some(producer);
                 finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
-                tool_results.clear();
                 return Ok(false);
             }
             Ok(ChatTurnResult::ToolUse(tool_use)) => {
@@ -1014,7 +983,6 @@ pub(crate) fn run_agent_loop(
                 prev_resp_id.clone_from(&tool_use.response_id);
                 session.config.last_response_id.clone_from(&prev_resp_id);
                 session.config.last_response_id_producer = Some(producer);
-                tool_results.clear();
 
                 // Arm the cache warmer for the blocking tool window that
                 // follows: the request just sent is the prefix the next real
@@ -1192,7 +1160,6 @@ pub(crate) fn run_agent_loop(
                         image,
                         ctx,
                         current_turn_id,
-                        tool_results: &mut tool_results,
                         known_hint_paths: &mut known_hint_paths,
                         pending_hints: &mut pending_hints,
                     });
@@ -1397,7 +1364,6 @@ pub(crate) fn run_agent_loop(
                                 image,
                                 ctx,
                                 current_turn_id,
-                                tool_results: &mut tool_results,
                                 known_hint_paths: &mut known_hint_paths,
                                 pending_hints: &mut pending_hints,
                             });
@@ -1530,24 +1496,6 @@ pub(crate) fn run_agent_loop(
                             }
                         }
                     }
-
-                    // ── Phase 2b: Normalize the next-call accumulator ──
-                    //
-                    // The receive loop above processed results in completion
-                    // order so each broadcast hit the TUI the moment its tool
-                    // finished (and streaming chunks flow even earlier). The
-                    // turn's own tool_results never need re-ordering: they
-                    // were seeded in call order before execution and updated
-                    // in place by call_id, so the transcript is always in the
-                    // model's order. The accumulator sent to the provider on
-                    // the next agent-loop iteration should mirror the
-                    // assistant message's tool_calls array, so re-sort it now
-                    // the batch is complete — reusing `tool_call_records` (the
-                    // same ordered list that seeded the placeholders and the
-                    // assistant message) instead of re-reading the turn.
-                    sort_by_call_order(&tool_call_records, &mut tool_results, |r| {
-                        r.call_id.as_str()
-                    });
                 }
 
                 // ── Phase 3: Mirror session-config changes onto the
@@ -1666,13 +1614,6 @@ pub(crate) fn run_agent_loop(
                         },
                     );
                     finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
-                    // The discarded call's results were never recorded, and the
-                    // next turn's assistant message carries no tool_calls, so
-                    // nothing references the accumulator from the previous
-                    // batch — clear it so the retry does not resend a stale
-                    // tool batch that the model has effectively already moved
-                    // past.
-                    tool_results.clear();
                     // Drop the ResponseId chain: the provider's response for
                     // THIS turn was cut off mid-call and its id was never
                     // captured, so chaining the retry onto the pre-truncation

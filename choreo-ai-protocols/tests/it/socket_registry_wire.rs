@@ -54,7 +54,6 @@ fn provider_connection_is_registered_and_shutdown_all_does_not_panic() {
             on_uploaded: None,
             cancel_rx: None,
             previous_response_id: None,
-            tool_results: &[],
             programmatic_tool_calling: false,
             session_id: "42".to_string(),
             request_id: "7".to_string(),

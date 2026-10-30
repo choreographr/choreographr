@@ -8,61 +8,42 @@
 
 use std::io;
 
-use super::super::super::ToolResultItem;
 use super::super::{ChatRequestMessage, endpoint_url, messages_to_responses_input};
-use super::wire::{ResponsesInputItem, ResponsesReasoning, ResponsesRequest, ResponsesTool};
+use super::wire::{ResponsesReasoning, ResponsesRequest, ResponsesTool};
 
 // ── Shared helpers ───────────────────────────────────────────────────────
 
-/// Build the `input` JSON value for a Responses API request, based on
-/// whether this is a follow-up turn carrying tool results or a first turn
-/// built from message history.
+/// Build the `input` JSON value for a Responses API request: the full message
+/// history when there is no chain, or only the post-assistant tail when
+/// `previous_response_id` chains onto a stored response.
 pub(super) fn build_responses_input(
-    tool_results: &[ToolResultItem],
     messages: &[ChatRequestMessage],
     previous_response_id: Option<&str>,
 ) -> Result<Option<serde_json::Value>, super::super::OpenAiError> {
-    if tool_results.is_empty() {
-        // First call in a turn. When chaining onto a previous response
-        // (`previous_response_id` set), the server retains the full
-        // conversation up to that response — resending the whole history
-        // would duplicate every prior turn on top of the chained context
-        // (billing + context-window inflation), so send only the messages
-        // that postdate the last assistant response (in practice the new
-        // user message) plus the freshly built system prompt.
-        let items = if previous_response_id.is_some() {
-            messages_to_responses_input(&chain_input_messages(messages))?
-        } else {
-            // No chain: the full history is the request. Pass `messages` by
-            // reference so a long session is not cloned on every first call.
-            messages_to_responses_input(messages)?
-        };
-        // System messages go into `input` as `{role: "system"}` items.
-        let input_value = if items.is_empty() {
-            serde_json::Value::String(String::new())
-        } else {
-            serde_json::to_value(&items)
-                .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?
-        };
-        Ok(Some(input_value))
+    // A chained turn sends only the messages that postdate the last assistant
+    // response — the server already holds the rest via `previous_response_id`,
+    // and resending it would duplicate every prior turn (billing + context
+    // inflation). A fresh/stateless turn sends the full history. The tool
+    // outputs of a finished tool round are already in `messages` (the session
+    // turn stores them in the model's call order), so the chained tail is
+    // derived here rather than passed in as a separate buffer.
+    let items = if previous_response_id.is_some() {
+        messages_to_responses_input(&chain_input_messages(messages))?
     } else {
-        // Returning tool results from a previous turn: build
-        // function_call_output items.  Both `instructions` and `messages`
-        // are omitted because the Responses API remembers the full
-        // conversation history from the original turn via
-        // `previous_response_id` — only the new tool results are needed.
-        let items: Vec<ResponsesInputItem> = tool_results
-            .iter()
-            .map(|tr| ResponsesInputItem::FunctionCallOutput {
-                call_id: tr.call_id.clone(),
-                output: tr.output.clone(),
-                caller: tr.caller.clone(),
-            })
-            .collect();
-        let input_value = serde_json::to_value(&items)
-            .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
-        Ok(Some(input_value))
-    }
+        // No chain: the full history is the request. Pass `messages` by
+        // reference so a long session is not cloned on every first call.
+        messages_to_responses_input(messages)?
+    };
+    // System messages go into `input` as `{role: "system"}` items; the stateless
+    // ChatGPT/Codex backend hoists them into `instructions` before this runs
+    // (see `split_system_prompt`) so no system item reaches it.
+    let input_value = if items.is_empty() {
+        serde_json::Value::String(String::new())
+    } else {
+        serde_json::to_value(&items)
+            .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?
+    };
+    Ok(Some(input_value))
 }
 
 /// The minimal input for a fresh user turn chained onto a previous response:
@@ -177,14 +158,14 @@ pub(super) fn build_responses_request_body(
     };
     let messages = filtered_messages.as_deref().unwrap_or(params.messages);
     // Stateless providers send the FULL `messages` (already containing every
-    // earlier tool-loop turn), ignoring the chained tool-result tail and the
-    // response id; chained providers send the tail and continue the chain.
-    let (tool_results, previous_response_id) = if stateless {
-        (&[][..], None)
+    // earlier tool-loop turn) with no chain; chained providers continue their
+    // chain, deriving the tool-result tail from `messages` inside the builder.
+    let previous_response_id = if stateless {
+        None
     } else {
-        (params.tool_results, params.previous_response_id)
+        params.previous_response_id
     };
-    let input_value = build_responses_input(tool_results, messages, previous_response_id)?;
+    let input_value = build_responses_input(messages, previous_response_id)?;
 
     let mut responses_tools: Vec<ResponsesTool> =
         params.tools.iter().map(ResponsesTool::from).collect();

@@ -214,7 +214,6 @@ pub(crate) fn responses_request_with_tools(
         on_uploaded,
         cancel_rx,
         route,
-        tool_results,
         no_retry,
         ..
     } = params;
@@ -223,7 +222,6 @@ pub(crate) fn responses_request_with_tools(
     info!(
         model = %model,
         tool_count = tools.len(),
-        tool_result_count = tool_results.len(),
         has_instructions = has_instructions,
         "responses request with tools",
     );
