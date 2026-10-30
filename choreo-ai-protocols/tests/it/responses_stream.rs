@@ -81,6 +81,118 @@ fn stream_turn(
 
 #[test]
 #[ignore = "integration"]
+fn a_streamed_function_call_is_a_tool_use_turn() {
+    // The documented wire shape, in the documented order: the call arrives as a
+    // `function_call` output item — the only event that names the function —
+    // and the argument events name nothing but that item's id. A turn that ran
+    // no tool because the name was never read is the failure this guards.
+    let body = sse(&[
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []}
+        }),
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": ""
+            }
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "sequence_number": 3,
+            "delta": "{\"city\":"
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "sequence_number": 4,
+            "delta": "\"London\"}"
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "sequence_number": 5,
+            "arguments": "{\"city\":\"London\"}"
+        }),
+        serde_json::json!({
+            "type": "response.output_item.done",
+            "output_index": 1,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"London\"}",
+                "status": "completed"
+            }
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_5",
+                "status": "completed",
+                "usage": {"input_tokens": 20, "output_tokens": 12, "total_tokens": 32}
+            }
+        }),
+    ]);
+    let mock = MockProvider::start(vec![(200, "text/event-stream", body)]);
+    let mut events = Vec::new();
+    let result = stream_turn(&mock, &mut events).expect("a function call is a turn");
+    let ChatTurnResult::ToolUse(turn) = result else {
+        panic!("expected ToolUse, got {result:?}");
+    };
+    assert_eq!(turn.tool_calls.len(), 1, "one call: {:?}", turn.tool_calls);
+    assert_eq!(turn.tool_calls[0].id, "call_1");
+    assert_eq!(turn.tool_calls[0].name, "get_weather");
+    assert_eq!(turn.tool_calls[0].arguments_json, r#"{"city":"London"}"#);
+    assert_eq!(turn.response_id.as_deref(), Some("resp_5"));
+}
+
+#[test]
+#[ignore = "integration"]
+fn a_stream_that_never_names_its_call_fails_rather_than_answering_empty() {
+    // The guard against a silent stop: the provider streamed a call's arguments
+    // but never opened the call, and sent no answer text. Nothing can be run or
+    // shown, so the turn fails loudly instead of completing with nothing.
+    let body = sse(&[
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {"id": "rs_1", "type": "reasoning", "summary": []}
+        }),
+        serde_json::json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1",
+            "output_index": 1,
+            "sequence_number": 5,
+            "arguments": "{\"city\":\"London\"}"
+        }),
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {"id": "resp_6", "status": "completed"}
+        }),
+    ]);
+    let mock = MockProvider::start(vec![(200, "text/event-stream", body)]);
+    let mut events = Vec::new();
+    let error = stream_turn(&mock, &mut events).expect_err("an unnameable call is not an answer");
+    assert!(
+        matches!(error, OpenAiError::UnidentifiedToolCalls { count: 1 }),
+        "got {error:?}",
+    );
+}
+
+#[test]
+#[ignore = "integration"]
 fn reasoning_only_stream_is_a_turn_not_an_empty_response() {
     // An encrypted reasoning item and no answer text: billed output, so the
     // turn must be a `FinalText` carrying the artifact — and the id from the

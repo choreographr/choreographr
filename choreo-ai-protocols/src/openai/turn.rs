@@ -27,6 +27,12 @@ pub(super) struct TurnParts {
     pub(super) content: Option<String>,
     /// The turn's tool calls, collected but not yet validated.
     pub(super) tool_calls: Vec<ChatToolCall>,
+    /// How many calls the stream mentioned without ever naming the function, so
+    /// they could not be turned into a [`ChatToolCall`] at all. Such a call is
+    /// unrunnable data the provider still acted on, which is why a turn left
+    /// with nothing else fails instead of reading as an empty answer (see the
+    /// verdict below).
+    pub(super) unnamed_calls: usize,
     /// The turn's display reasoning text.
     pub(super) reasoning: Option<String>,
     /// The opaque round-trip reasoning artifact.
@@ -55,6 +61,7 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
     let TurnParts {
         content,
         mut tool_calls,
+        unnamed_calls,
         reasoning,
         reasoning_artifact,
         produced_reasoning,
@@ -107,6 +114,17 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
             reasoning_artifact,
         }));
     }
+    // A provider can also mention a call it never names (the Responses adapter
+    // reads the function name off the call's output item, so a stream that omits
+    // it has nothing to run). Such a call cannot be executed and cannot be shown,
+    // so a turn left with no text and no calls fails rather than being reported
+    // as an empty answer that hides what the model did — the same reasoning that
+    // refuses to report a truncated call as no output above.
+    if content_is_empty && unnamed_calls > 0 {
+        return Err(super::OpenAiError::UnidentifiedToolCalls {
+            count: unnamed_calls,
+        });
+    }
     // An encrypted-only, unrecognised-only, or over-the-replay-cap reasoning
     // turn has no visible text but IS model output. The question here is what the
     // provider produced, not what this client chose to keep, so it is answered by
@@ -134,6 +152,7 @@ mod tests {
         TurnParts {
             content,
             tool_calls: Vec::new(),
+            unnamed_calls: 0,
             reasoning: None,
             reasoning_artifact: None,
             produced_reasoning: false,
@@ -161,6 +180,54 @@ mod tests {
         })
         .expect("produced reasoning is model output");
         assert!(matches!(turn, ChatTurnResult::FinalText(_)));
+    }
+
+    #[test]
+    fn a_turn_whose_calls_could_not_be_named_fails_instead_of_reading_empty() {
+        // A provider that mentions calls without ever naming the function has
+        // acted, but nothing it produced can be run or shown. Reporting that as
+        // an empty answer hides the call, so the turn fails — and it fails even
+        // when reasoning came with it, because the reasoning is not the answer
+        // the user is waiting for.
+        let err = assemble_turn(TurnParts {
+            unnamed_calls: 2,
+            ..textless_parts(None)
+        })
+        .expect_err("an unnameable call is not an answer");
+        assert!(matches!(
+            err,
+            super::super::OpenAiError::UnidentifiedToolCalls { count: 2 }
+        ));
+
+        let err = assemble_turn(TurnParts {
+            unnamed_calls: 1,
+            produced_reasoning: true,
+            ..textless_parts(None)
+        })
+        .expect_err("reasoning does not stand in for a call that cannot run");
+        assert!(matches!(
+            err,
+            super::super::OpenAiError::UnidentifiedToolCalls { count: 1 }
+        ));
+    }
+
+    #[test]
+    fn a_named_call_outranks_the_calls_that_could_not_be_named() {
+        // One runnable call is a tool-use turn even if the stream also mentioned
+        // calls it could not identify: the loop gets the work it can do, and the
+        // unusable ones were logged by the adapter's accumulator.
+        let turn = assemble_turn(TurnParts {
+            tool_calls: vec![ChatToolCall {
+                id: "call_1".to_string(),
+                name: "get_weather".to_string(),
+                arguments_json: "{}".to_string(),
+                caller: None,
+            }],
+            unnamed_calls: 1,
+            ..textless_parts(None)
+        })
+        .expect("a usable tool call wins");
+        assert!(matches!(turn, ChatTurnResult::ToolUse(_)));
     }
 
     #[test]

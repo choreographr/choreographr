@@ -1,7 +1,8 @@
 //! The streaming Responses API turn with tools.
 //!
-//! Owns the SSE loop, the per-`call_id` tool-call accumulator, and the
-//! streaming reasoning/usage assembly — the streaming counterpart of the
+//! Owns the SSE loop, the per-call tool-call accumulator (a call is assembled
+//! from its `function_call` output item and the argument events that name it),
+//! and the streaming reasoning/usage assembly — the streaming counterpart of the
 //! non-streaming request entry points in [`super`].
 
 use std::collections::HashMap;
@@ -14,27 +15,35 @@ use crate::types::{CallerInfo, ChatToolCall, ChatTurnResult, StreamEvent};
 use choreo_proto::TokenUsage;
 
 use super::super::retry;
-use super::super::{ResponsesStreamEvent, SseReader, parse_responses_stream_event};
+use super::super::{CallRef, ResponsesStreamEvent, SseReader, parse_responses_stream_event};
 use super::body::build_responses_request_body;
 use super::turn::{merge_reasoning_item, responses_items_artifact, responses_usage_to_token_usage};
 use crate::openai::turn::{TurnParts, assemble_turn};
 
-/// Accumulator for Responses API tool call arguments keyed by `call_id`.
-/// Used in `responses_request_streaming_with_tools` to merge delta chunks.
+/// One function call the stream is assembling, held under the identity the
+/// stream named it with (its output item's id, or its call id).
 ///
-/// # Delta-vs-Done semantics
+/// # What each event contributes
 ///
-/// The Responses API sends tool call arguments via two SSE event types:
+/// - `response.output_item.*` ([`ResponsesStreamEvent::FunctionCallItem`]) —
+///   the call's *identity*: the function's name, which no other event on the
+///   wire carries, plus the `call_id` the request echoes back. The item also
+///   carries its own `arguments` copy, complete on `output_item.done`; on
+///   `output_item.added` it is empty.
+/// - `response.function_call_arguments.delta` — a chunk of JSON to **append**
+///   to the accumulator (`arguments.push_str(&delta)`).
+/// - `response.function_call_arguments.done` — the **complete** final arguments
+///   string. When received, `arguments` is **replaced** (not appended),
+///   overwriting any partial accumulation from prior delta events.
 ///
-/// - `FunctionCallArgumentsDelta` — a chunk of JSON to **append** to the
-///   existing arguments accumulator (`arguments.push_str(&delta)`).
-/// - `FunctionCallArgumentsDone` — the **complete** final arguments string.
-///   When received, `arguments` is **replaced** (not appended), overwriting
-///   any partial accumulation from prior delta events.
-///
-/// This matches the `OpenAI` spec: the done event carries the full final
-/// arguments JSON, while delta events carry incremental fragments.
+/// That matches the `OpenAI` spec: the done event carries the full final
+/// arguments JSON, while delta events carry incremental fragments. The item's
+/// own copy is held to the same rule, minus the empty one — see [`AccCalls::absorb`].
 pub(super) struct AccCall {
+    /// The provider's `call_id`; the wire may omit it, in which case the
+    /// request answers the call by whichever identity it did give.
+    pub(super) call_id: Option<String>,
+    /// The function the model asked for, named by the call's output item.
     pub(super) name: Option<String>,
     pub(super) arguments: String,
     /// The provider's `caller` attribution for this call, captured from its
@@ -52,6 +61,7 @@ pub(super) struct AccCall {
 impl AccCall {
     pub(super) fn new(index: u32) -> Self {
         Self {
+            call_id: None,
             name: None,
             arguments: String::new(),
             caller: None,
@@ -60,12 +70,13 @@ impl AccCall {
     }
 }
 
-/// The streamed tool calls of one turn, keyed by `call_id`.
+/// The streamed tool calls of one turn, keyed by the identity the stream named
+/// each call with — its output item's id, falling back to its call id.
 ///
 /// The Responses API assigns no server-side index, so the accumulator mints one
-/// per first-seen `call_id` to keep the model's call order. The map is the
-/// call-count bound: a *new* id past [`MAX_TOOL_CALLS`] is rejected, while a
-/// later delta for an already-known id is always accepted — a full map must not
+/// per first-seen call to keep the model's call order. The map is the call-count
+/// bound: a *new* identity past [`MAX_TOOL_CALLS`] is rejected, while a later
+/// event for an already-known call is always accepted — a full map must not
 /// turn a legal continuation into an error.
 #[derive(Default)]
 pub(super) struct AccCalls {
@@ -74,8 +85,8 @@ pub(super) struct AccCalls {
 }
 
 impl AccCalls {
-    /// The accumulator slot for `call_id`, minting one when this is the first
-    /// time the stream names it.
+    /// The accumulator slot for one call identity, minting one when this is the
+    /// first time the stream names it.
     pub(super) fn entry(
         &mut self,
         call_id: String,
@@ -93,6 +104,27 @@ impl AccCalls {
         }))
     }
 
+    /// The slot one event names, minting it the first time the stream mentions
+    /// the call.
+    ///
+    /// An output-item id keys its own slot, because that is the join the
+    /// documented argument events use. A bare call id is resolved against the
+    /// slots already minted — a stream that sends output items *and* names only
+    /// call ids on its argument events must still land on the call's one slot,
+    /// or the same tool would be run twice — and only keys a new slot when
+    /// nothing claims it.
+    fn slot(&mut self, call: &CallRef) -> Result<&mut AccCall, super::super::OpenAiError> {
+        let key = match call {
+            CallRef::Item(item_id) => item_id.clone(),
+            CallRef::Call(call_id) => self
+                .by_id
+                .iter()
+                .find(|(_, acc)| acc.call_id.as_deref() == Some(call_id.as_str()))
+                .map_or_else(|| call_id.clone(), |(key, _)| key.clone()),
+        };
+        self.entry(key)
+    }
+
     /// The accumulated calls in the model's own order.
     pub(super) fn into_ordered(self) -> Vec<(String, AccCall)> {
         let mut sorted: Vec<(String, AccCall)> = self.by_id.into_iter().collect();
@@ -103,49 +135,60 @@ impl AccCalls {
     /// Apply one call-related stream event to the accumulator.
     ///
     /// The three call events are handled here rather than in the stream loop so
-    /// the accumulation rules (append a delta, replace with `done`, attach the
-    /// attribution) are exercisable without a socket. They differ in how a
-    /// refusal is treated: a refused argument event fails the turn, while a
-    /// refused attribution does not — see the arm below.
+    /// the accumulation rules (append a delta, replace with `done`, name and
+    /// attribute the call from its item) are exercisable without a socket.
     pub(super) fn absorb(
         &mut self,
         event: &ResponsesStreamEvent,
     ) -> Result<(), super::super::OpenAiError> {
         match event {
-            ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta } => {
-                // `call_id` is provided by the trusted API server — no validation
-                // needed; it is used directly as a HashMap key to accumulate deltas
-                // for this specific tool call.
-                self.entry(call_id.clone())?.arguments.push_str(delta);
-            }
-            ResponsesStreamEvent::FunctionCallArgumentsDone {
+            ResponsesStreamEvent::FunctionCallItem {
+                item_id,
                 call_id,
                 name,
                 arguments,
+                caller,
             } => {
-                // `arguments` is the complete final JSON string (not a delta), so
-                // it replaces any accumulated partial value.
-                let entry = self.entry(call_id.clone())?;
-                entry.name = Some(name.clone());
-                entry.arguments.clone_from(arguments);
+                // The item is where a streamed call is identified: the argument
+                // events name nothing but the item they belong to. An item that
+                // names neither id can't be answered by any
+                // `function_call_output`, so there is nothing to accumulate.
+                let Some(call) = CallRef::of(item_id.as_deref(), call_id.as_deref()) else {
+                    return Ok(());
+                };
+                let entry = self.slot(&call)?;
+                if let Some(call_id) = call_id.as_deref() {
+                    entry.call_id = Some(call_id.to_string());
+                }
+                if let Some(name) = name.as_deref() {
+                    entry.name = Some(name.to_string());
+                }
+                // The item carries its own copy of the arguments — complete on
+                // `output_item.done` — so it replaces whatever the deltas built.
+                // The empty copy on `output_item.added` is not a value, and must
+                // not wipe arguments that already arrived.
+                if !arguments.is_empty() {
+                    entry.arguments.clone_from(arguments);
+                }
+                if caller.is_some() {
+                    entry.caller.clone_from(caller);
+                }
                 trace!(
                     tool_name = ?entry.name,
                     args_len = entry.arguments.len(),
-                    "openai responses: function call args done",
+                    "openai responses: function call item",
                 );
             }
-            ResponsesStreamEvent::FunctionCallCaller { call_id, caller } => {
-                // The attribution arrives on the call's `function_call` output
-                // item, independently of the argument events. It is applied
-                // best-effort: an attribution is metadata about a call that is
-                // already legal, so a refused slot (a new id past
-                // `MAX_TOOL_CALLS`, which the accumulator drops anyway) must
-                // never turn a finished call into a failed turn. Nothing else on
-                // the entry is touched, so a late item event cannot clobber
-                // accumulated name or arguments.
-                if let Ok(entry) = self.entry(call_id.clone()) {
-                    entry.caller.clone_from(caller);
-                }
+            ResponsesStreamEvent::FunctionCallArgumentsDelta { call, delta } => {
+                // `call` is provided by the trusted API server — no validation
+                // needed; it is used directly as the accumulator key for this
+                // specific tool call.
+                self.slot(call)?.arguments.push_str(delta);
+            }
+            ResponsesStreamEvent::FunctionCallArgumentsDone { call, arguments } => {
+                // `arguments` is the complete final JSON string (not a delta), so
+                // it replaces any accumulated partial value.
+                self.slot(call)?.arguments.clone_from(arguments);
             }
             // Not a call event: the stream loop routes only the three variants
             // above here.
@@ -154,32 +197,47 @@ impl AccCalls {
         Ok(())
     }
 
-    /// The finished tool calls in the model's own order, dropping (and counting)
-    /// any call whose `arguments.done` never arrived — such a call has no name,
-    /// so its count is logged rather than the call being invented.
-    pub(super) fn into_tool_calls(self) -> Vec<ChatToolCall> {
+    /// The finished tool calls in the model's own order, plus how many calls the
+    /// stream mentioned without ever naming — a call with no function name can't
+    /// be run, so it is counted for the turn's verdict rather than invented.
+    pub(super) fn finish(self) -> FinishedCalls {
         let ordered = self.into_ordered();
-        let named = ordered.len();
-        let tool_calls: Vec<ChatToolCall> = ordered
+        let mentioned = ordered.len();
+        let calls: Vec<ChatToolCall> = ordered
             .into_iter()
-            .filter_map(|(call_id, acc)| {
+            .filter_map(|(identity, acc)| {
                 let name = acc.name.as_deref().filter(|n| !n.is_empty())?;
                 Some(ChatToolCall {
-                    id: call_id,
+                    // The request answers the call by `call_id`; a stream that
+                    // never named one is answered by the identity it did give.
+                    id: acc.call_id.unwrap_or(identity),
                     name: name.to_string(),
                     arguments_json: acc.arguments,
                     caller: acc.caller,
                 })
             })
             .collect();
-        if tool_calls.len() < named {
+        let unnamed = mentioned - calls.len();
+        if unnamed > 0 {
             warn!(
-                dropped = named - tool_calls.len(),
-                "discarded incomplete tool call(s) from provider (no name set)"
+                dropped = unnamed,
+                "the provider mentioned function call(s) without naming them \
+                 (the stream carried no function_call output item)"
             );
         }
-        tool_calls
+        FinishedCalls { calls, unnamed }
     }
+}
+
+/// What one streamed turn's call accumulation produced.
+#[derive(Debug)]
+pub(super) struct FinishedCalls {
+    /// The calls the model made, in its own order.
+    pub(super) calls: Vec<ChatToolCall>,
+    /// How many calls the stream mentioned without naming the function. They
+    /// cannot be run, so the turn has to account for them rather than reporting
+    /// an answer that silently omits them.
+    pub(super) unnamed: usize,
 }
 
 // ── Streaming responses with tools ───────────────────────────────────────
@@ -296,9 +354,9 @@ where
                 merge_reasoning_item(&mut reasoning_items, item);
             }
             Some(
-                event @ (ResponsesStreamEvent::FunctionCallArgumentsDelta { .. }
-                | ResponsesStreamEvent::FunctionCallArgumentsDone { .. }
-                | ResponsesStreamEvent::FunctionCallCaller { .. }),
+                event @ (ResponsesStreamEvent::FunctionCallItem { .. }
+                | ResponsesStreamEvent::FunctionCallArgumentsDelta { .. }
+                | ResponsesStreamEvent::FunctionCallArgumentsDone { .. }),
             ) => acc_calls.absorb(&event)?,
             Some(ResponsesStreamEvent::ResponseCompleted { id, usage }) => {
                 response_id = id;
@@ -396,16 +454,18 @@ where
 
     // The shared assembler owns the tool-call / truncation / empty-response
     // decision tree, so this path and the non-streaming one cannot disagree.
-    // The accumulator drops a call whose `arguments.done` never arrived (it has
-    // no name), with the count logged so an aborted call stays diagnosable.
-    let tool_calls = acc_calls.into_tool_calls();
+    // The accumulator reports a call whose output item never arrived (nothing on
+    // the wire names the function) so the assembler can fail the turn loudly
+    // rather than answer with nothing.
+    let calls = acc_calls.finish();
 
     // The assembler owns the normalization, so the accumulated answer is handed
     // over raw (moved, never copied): `None` says there was no content at all,
     // and trimming plus the empty-content verdict both happen there.
     assemble_turn(TurnParts {
         content: (!full_content.is_empty()).then_some(full_content),
-        tool_calls,
+        tool_calls: calls.calls,
+        unnamed_calls: calls.unnamed,
         reasoning: (!full_reasoning.is_empty()).then_some(full_reasoning),
         reasoning_artifact,
         produced_reasoning,

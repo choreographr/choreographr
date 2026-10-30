@@ -189,26 +189,44 @@ pub(crate) enum ResponsesStreamEvent {
     /// `encrypted_content`, all of which are captured into the round-trip
     /// artifact rather than interpreted here.
     ReasoningItem(serde_json::Value),
-    /// Function call arguments delta
-    FunctionCallArgumentsDelta { call_id: String, delta: String },
-    /// The provider's attribution for a streamed function call, captured from
-    /// the `function_call` output item's `caller`.
+    /// A streamed `function_call` output item (`response.output_item.added` /
+    /// `.done`) — the only place a streamed call's *name* and *call id* appear.
     ///
-    /// A separate event from the argument events on purpose: the item is where
-    /// the attribution arrives, and the arguments arrive under their own
-    /// `response.function_call_arguments.delta` / `.done` names. Keeping them
-    /// apart means a late item event can never clobber accumulated name or
-    /// arguments. `caller` is `None` when the item carries no attribution (or
-    /// one this client cannot read), which is legal — the field is optional on
-    /// the wire and only meaningful for resuming a generated program.
-    FunctionCallCaller {
-        call_id: String,
+    /// The argument events name nothing but the item they belong to, so the
+    /// call is assembled from both: the item brings the identity, the name and
+    /// the `caller` attribution, and the argument events bring the arguments
+    /// (the item carries its own copy, complete on `.done`). `arguments` is
+    /// empty on `.added`. `caller` is `None` when the item carries no
+    /// attribution (or one this client cannot read), which is legal — the
+    /// field is optional on the wire and only meaningful for resuming a
+    /// generated program.
+    FunctionCallItem {
+        /// The item's own `id`, which every argument event of this call repeats
+        /// as `item_id`.
+        item_id: Option<String>,
+        /// The provider's `call_id`, which the rebuilt request echoes on the
+        /// `function_call` and on every `function_call_output` answering it.
+        call_id: Option<String>,
+        /// The function the model asked for.
+        name: Option<String>,
+        /// The item's own copy of the call's arguments JSON: empty on `.added`,
+        /// complete on `.done`.
+        arguments: String,
+        /// The provider's attribution for the call (programmatic tool calling).
         caller: Option<CallerInfo>,
     },
+    /// A chunk of a function call's arguments
+    /// (`response.function_call_arguments.delta`).
+    FunctionCallArgumentsDelta {
+        /// The call the chunk belongs to (see [`CallRef`]).
+        call: CallRef,
+        delta: String,
+    },
     /// Function call arguments are complete
+    /// (`response.function_call_arguments.done`).
     FunctionCallArgumentsDone {
-        call_id: String,
-        name: String,
+        /// The call the completed arguments belong to (see [`CallRef`]).
+        call: CallRef,
         arguments: String,
     },
     /// Reasoning-summary text delta (`response.reasoning_summary_text.delta`).
@@ -254,31 +272,80 @@ pub(crate) enum ResponsesStreamEvent {
     },
 }
 
-/// The attribution a `function_call` output item carries, as a stream event.
+/// How a call-related stream event names the call it belongs to.
 ///
-/// `None` only when the item names no `call_id` (there is nothing to attribute).
-/// The attribution is never interpreted here: the `type` tag and `caller_id` are
-/// lifted off the item so the request can copy them back verbatim, and a
-/// missing attribution rides the event as `caller: None`. A `direct` caller
-/// carries no `caller_id`, which is why the id defaults to empty rather than
-/// failing the parse — the API sends the bare `{"type": "direct"}` for a call
-/// the model made itself.
-fn function_call_caller_event(item: &serde_json::Value) -> Option<ResponsesStreamEvent> {
-    let call_id = item
-        .get("call_id")
-        .and_then(|value| value.as_str())?
-        .to_string();
-    let caller = item.get("caller").and_then(|caller| {
-        let kind = caller.get("type").and_then(|kind| kind.as_str())?;
-        Some(CallerInfo {
-            kind: kind.to_string(),
-            caller_id: caller
-                .get("caller_id")
-                .and_then(|id| id.as_str())
-                .map_or_default(std::string::ToString::to_string),
-        })
-    });
-    Some(ResponsesStreamEvent::FunctionCallCaller { call_id, caller })
+/// The documented `response.function_call_arguments.*` events carry neither the
+/// function's name nor its `call_id`: they name the output item the arguments
+/// are being streamed into (`item_id`), and the item is where the identity
+/// lives. A gateway that relays no output items names the call id instead, so
+/// that shape is read too.
+#[derive(Debug, Clone)]
+pub(crate) enum CallRef {
+    /// The output item's id (`item_id`) — the documented join.
+    Item(String),
+    /// A call id, from a stream that sends no output items.
+    Call(String),
+}
+
+impl CallRef {
+    /// The call two optional wire ids name, preferring the output item (the
+    /// documented join) over the call id.
+    ///
+    /// `None` means neither id was present: the event carries nothing that
+    /// could be attributed to a call.
+    pub(crate) fn of(item_id: Option<&str>, call_id: Option<&str>) -> Option<Self> {
+        let present = |id: Option<&str>| id.filter(|id| !id.is_empty()).map(str::to_owned);
+        present(item_id)
+            .map(Self::Item)
+            .or_else(|| present(call_id).map(Self::Call))
+    }
+}
+
+/// A `function_call` output item, as the stream event the accumulator reads.
+///
+/// Every field is optional here on purpose: a nonconforming item must not fail
+/// the parse of a stream the provider is already billing for. The accumulator
+/// decides what an item with no usable identity means (nothing to attribute).
+fn function_call_item_event(item: &serde_json::Value) -> ResponsesStreamEvent {
+    let text = |key: &str| {
+        item.get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    ResponsesStreamEvent::FunctionCallItem {
+        item_id: text("id"),
+        call_id: text("call_id"),
+        name: text("name"),
+        arguments: text("arguments").unwrap_or_default(),
+        caller: item.get("caller").and_then(caller_of),
+    }
+}
+
+/// The attribution a `function_call` item's `caller` field carries.
+///
+/// `None` only when the value names no `type`. The attribution is never
+/// interpreted here: the `type` tag and `caller_id` are lifted off the item so
+/// the request can copy them back verbatim. A `direct` caller carries no
+/// `caller_id`, which is why the id defaults to empty rather than failing the
+/// parse — the API sends the bare `{"type": "direct"}` for a call the model
+/// made itself.
+fn caller_of(caller: &serde_json::Value) -> Option<CallerInfo> {
+    let kind = caller.get("type").and_then(|kind| kind.as_str())?;
+    Some(CallerInfo {
+        kind: kind.to_string(),
+        caller_id: caller
+            .get("caller_id")
+            .and_then(|id| id.as_str())
+            .map_or_default(std::string::ToString::to_string),
+    })
+}
+
+/// The call a `function_call_arguments.*` event belongs to, or `None` when the
+/// event names no call at all (nothing to attribute, so the stream drops it).
+fn call_ref(payload: &serde_json::Value) -> Option<CallRef> {
+    let id = |key: &str| payload.get(key).and_then(|value| value.as_str());
+    CallRef::of(id("item_id"), id("call_id"))
 }
 
 /// The `response` object a terminal event wraps.
@@ -351,51 +418,51 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             // opaque output item; the raw item JSON (id, summary, and
             // encrypted_content in stateless mode) is captured so the
             // round-trip artifact can be assembled verbatim. A
-            // `function_call` item carries the provider's `caller` attribution,
-            // which the replay has to copy back onto both the call and the
-            // output that answers it (see
+            // `function_call` item is the call itself: it names the function,
+            // the `call_id` the request answers, and the provider's `caller`
+            // attribution, which the replay copies back onto both the call and
+            // the output that answers it (see
             // <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
-            // Every other item type is ignored — its content flows through
-            // dedicated events (output_text, function_call_arguments, ...).
+            // The `function_call_arguments.*` events that carry the call's
+            // arguments name nothing else, so this item is where a streamed
+            // call is identified. Every other item type is ignored — its
+            // content flows through dedicated events (output_text, …).
             let Some(item) = payload.get("item") else {
                 return Ok(None);
             };
             match item.get("type").and_then(|v| v.as_str()) {
                 Some("reasoning") => Ok(Some(ResponsesStreamEvent::ReasoningItem(item.clone()))),
-                Some("function_call") => Ok(function_call_caller_event(item)),
+                Some("function_call") => Ok(Some(function_call_item_event(item))),
                 _ => Ok(None),
             }
         }
         "response.function_call_arguments.delta" => {
-            let call_id = payload
-                .get("call_id")
-                .and_then(|value| value.as_str())
-                .map_or_default(std::string::ToString::to_string);
+            // An event that names no call at all has nothing to attribute, so
+            // it is dropped the same way an unknown event type is.
+            let Some(call) = call_ref(&payload) else {
+                return Ok(None);
+            };
             let delta = payload
                 .get("delta")
                 .and_then(|value| value.as_str())
                 .map_or_default(std::string::ToString::to_string);
             Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDelta {
-                call_id,
+                call,
                 delta,
             }))
         }
         "response.function_call_arguments.done" => {
-            let call_id = payload
-                .get("call_id")
-                .and_then(|value| value.as_str())
-                .map_or_default(std::string::ToString::to_string);
-            let name = payload
-                .get("name")
-                .and_then(|value| value.as_str())
-                .map_or_default(std::string::ToString::to_string);
+            let Some(call) = call_ref(&payload) else {
+                return Ok(None);
+            };
+            // `arguments` is the complete final JSON string, replacing anything
+            // the deltas accumulated.
             let arguments = payload
                 .get("arguments")
                 .and_then(|value| value.as_str())
                 .map_or_default(std::string::ToString::to_string);
             Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
-                call_id,
-                name,
+                call,
                 arguments,
             }))
         }

@@ -204,6 +204,9 @@ impl ChatCompletionsStreamAccumulator {
         assemble_turn(TurnParts {
             content: (!self.full_content.is_empty()).then_some(self.full_content),
             tool_calls,
+            // A chat call carries its own `name` delta, so no call reaches this
+            // point unnameable.
+            unnamed_calls: 0,
             reasoning: reasoning.display,
             reasoning_artifact: reasoning.artifact,
             produced_reasoning: reasoning.produced,

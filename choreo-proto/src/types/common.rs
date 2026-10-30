@@ -380,6 +380,20 @@ pub enum InferenceError {
         /// provider sent (see [`DiscardedToolCall`]).
         discarded: Vec<DiscardedToolCall>,
     },
+    /// The provider streamed tool calls this client could not identify — the
+    /// Responses adapter names a call from its `function_call` output item, and
+    /// a stream that omits it leaves the call without a function to run — while
+    /// the turn carried no visible text either. Terminal for the turn: nothing
+    /// about it can be executed or shown, and reporting it as an empty answer
+    /// would hide the call the model actually made.
+    #[error(
+        "provider streamed {count} tool call(s) with no identifiable function; \
+         they cannot be run"
+    )]
+    UnidentifiedToolCalls {
+        /// How many calls the stream mentioned without naming.
+        count: usize,
+    },
     /// The account's OAuth grant is dead: a refresh was rejected terminally
     /// (`invalid_grant` / `invalid_token` / `refresh_token_reused`) and cannot
     /// be recovered without the user signing in again. Terminal and never
@@ -419,6 +433,7 @@ impl InferenceError {
             InferenceError::Cancelled => "cancelled",
             InferenceError::DeadlineExceeded => "deadline_exceeded",
             InferenceError::TruncatedToolCall { .. } => "truncated_tool_call",
+            InferenceError::UnidentifiedToolCalls { .. } => "unidentified_tool_calls",
             InferenceError::OAuthReloginRequired { .. } => "oauth_relogin_required",
             InferenceError::Io(_) => "other",
         }

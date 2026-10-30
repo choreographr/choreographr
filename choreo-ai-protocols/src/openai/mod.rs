@@ -56,7 +56,7 @@ pub(crate) use sse::SseReader;
 pub(crate) use sse::build_sse_event;
 #[cfg(test)]
 pub(crate) use sse::extract_responses_text_delta;
-pub(crate) use sse::{ResponsesStreamEvent, parse_responses_stream_event};
+pub(crate) use sse::{CallRef, ResponsesStreamEvent, parse_responses_stream_event};
 use wire::ModelListResponse;
 pub(crate) use wire::Usage;
 

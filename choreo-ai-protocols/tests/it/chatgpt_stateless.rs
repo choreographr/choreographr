@@ -160,14 +160,26 @@ fn sse(events: &[serde_json::Value]) -> String {
 /// The first response: one `get_weather` tool call, then completion.
 fn tool_call_stream() -> String {
     sse(&[
+        // The call arrives as its `function_call` output item, which is the only
+        // event that names the function; the argument events that follow name
+        // nothing but this item.
+        serde_json::json!({
+            "type": "response.output_item.added",
+            "output_index": 0,
+            "item": {
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": TOOL_CALL_ID,
+                "name": "get_weather",
+                "arguments": "",
+            },
+        }),
         // The complete arguments string — the done event REPLACES whatever the
         // delta events accumulated, so it is what the accumulator reports.
         serde_json::json!({
             "type": "response.function_call_arguments.done",
             "item_id": "fc_1",
             "output_index": 0,
-            "call_id": TOOL_CALL_ID,
-            "name": "get_weather",
             "arguments": "{}",
         }),
         serde_json::json!({

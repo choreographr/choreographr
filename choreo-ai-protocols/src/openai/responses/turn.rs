@@ -279,6 +279,9 @@ pub(crate) fn responses_response_to_turn(
         // itself moves rather than being copied.
         content: (!full_text.is_empty()).then_some(full_text),
         tool_calls,
+        // A non-streaming item names its own function or fails to deserialize,
+        // so nothing can be left unnamed here.
+        unnamed_calls: 0,
         reasoning: (!full_reasoning.is_empty()).then_some(full_reasoning),
         reasoning_artifact,
         produced_reasoning,

@@ -3063,6 +3063,19 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     discard output the provider billed for, and the streaming path already ignores events it does
     not model.
 
+    **Streamed tool calls are assembled from two events, not one.** A call arrives as a
+    `function_call` **output item** (`response.output_item.added` / `.done`) — the only event
+    that carries the function's `name`, its `call_id`, the provider's `caller` attribution and
+    the item's own copy of the arguments — while `response.function_call_arguments.delta` /
+    `.done` carry the arguments alone and name nothing but that item (`item_id`). Nothing on
+    the argument events names the function, so the accumulator keys a call by its output item
+    (falling back to the call id for a gateway that relays no items), takes the name and
+    identity from the item, appends deltas, and lets `arguments.done` — or the item's complete
+    copy on `output_item.done` — replace the accumulated string. A call the stream mentions
+    without ever naming cannot be run, so a turn left with nothing else fails with
+    `UnidentifiedToolCalls` (metrics label `unidentified_tool_calls`) rather than reporting the
+    empty answer a silently dropped call would look like.
+
     **Programmatic tool calling (Responses API, gpt-5.6+):** When enabled, the Responses
     request body includes a `programmatic_tool_calling` tool with `type: "programmatic_tool_calling"`.
     The model responds with `response.program.code.delta` and `response.program.code.done` events

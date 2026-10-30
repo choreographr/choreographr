@@ -209,15 +209,19 @@ fn parse_responses_stream_event_text_done() {
 
 #[test]
 fn parse_responses_stream_event_function_call_args() {
-    // Delta — use r"..."## so the \" inside doesn't collide with the delimiter.
+    // The documented argument events name only the output item they belong to:
+    // neither the function's name nor its `call_id` is part of the payload.
     let event = parse_responses_stream_event(
-        r#"{"type":"response.function_call_arguments.delta","call_id":"call_1","delta":"{\"city\":"}"#,
+        r#"{"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":1,"sequence_number":7,"delta":"{\"city\":"}"#,
     )
     .expect("parse")
     .expect("event");
     match event {
-        ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta } => {
-            assert_eq!(call_id, "call_1");
+        ResponsesStreamEvent::FunctionCallArgumentsDelta { call, delta } => {
+            assert!(
+                matches!(&call, super::CallRef::Item(id) if id == "fc_1"),
+                "{call:?}"
+            );
             assert_eq!(delta, r#"{"city":"#);
         }
         _ => panic!("expected FunctionCallArgumentsDelta"),
@@ -225,21 +229,48 @@ fn parse_responses_stream_event_function_call_args() {
 
     // Done
     let event = parse_responses_stream_event(
-        r#"{"type":"response.function_call_arguments.done","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"London\"}"}"#,
+        r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","output_index":1,"sequence_number":9,"arguments":"{\"city\":\"London\"}"}"#,
     )
     .expect("parse")
     .expect("event");
     match event {
-        ResponsesStreamEvent::FunctionCallArgumentsDone {
-            call_id,
-            name,
-            arguments,
-        } => {
-            assert_eq!(call_id, "call_1");
-            assert_eq!(name, "get_weather");
+        ResponsesStreamEvent::FunctionCallArgumentsDone { call, arguments } => {
+            assert!(
+                matches!(&call, super::CallRef::Item(id) if id == "fc_1"),
+                "{call:?}"
+            );
             assert_eq!(arguments, r#"{"city":"London"}"#);
         }
         _ => panic!("expected FunctionCallArgumentsDone"),
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_reads_a_function_call_item() {
+    // The item is the only event that names the function, so the parser lifts
+    // the call's identity off it rather than leaving the call unnameable.
+    for event_type in ["response.output_item.added", "response.output_item.done"] {
+        let event = parse_responses_stream_event(&format!(
+            r#"{{"type":"{event_type}","output_index":1,"item":{{"id":"fc_1","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{{\"city\":\"London\"}}","status":"completed"}}}}"#,
+        ))
+        .expect("parse")
+        .expect("event");
+        match event {
+            ResponsesStreamEvent::FunctionCallItem {
+                item_id,
+                call_id,
+                name,
+                arguments,
+                caller,
+            } => {
+                assert_eq!(item_id.as_deref(), Some("fc_1"));
+                assert_eq!(call_id.as_deref(), Some("call_1"));
+                assert_eq!(name.as_deref(), Some("get_weather"));
+                assert_eq!(arguments, r#"{"city":"London"}"#);
+                assert!(caller.is_none());
+            }
+            _ => panic!("expected FunctionCallItem"),
+        }
     }
 }
 
@@ -250,18 +281,17 @@ fn parse_responses_stream_event_captures_a_function_call_caller() {
     // off the item rather than leaving it in the opaque raw JSON.
     for event_type in ["response.output_item.added", "response.output_item.done"] {
         let event = parse_responses_stream_event(&format!(
-            r#"{{"type":"{event_type}","item":{{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{{}}","caller":{{"type":"program","caller_id":"prog_123"}}}}}}"#,
+            r#"{{"type":"{event_type}","item":{{"id":"fc_1","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{{}}","caller":{{"type":"program","caller_id":"prog_123"}}}}}}"#,
         ))
         .expect("parse")
         .expect("event");
         match event {
-            ResponsesStreamEvent::FunctionCallCaller { call_id, caller } => {
-                assert_eq!(call_id, "call_1");
+            ResponsesStreamEvent::FunctionCallItem { caller, .. } => {
                 let caller = caller.expect("a program caller is captured");
                 assert_eq!(caller.kind, "program");
                 assert_eq!(caller.caller_id, "prog_123");
             }
-            _ => panic!("expected FunctionCallCaller"),
+            _ => panic!("expected FunctionCallItem"),
         }
     }
 }
@@ -272,30 +302,96 @@ fn parse_responses_stream_event_tolerates_a_missing_call_caller() {
     // carries no `caller` at all. Both are legal, so the attribution rides the
     // event as `None` rather than failing the parse — a call is still a call.
     let direct = parse_responses_stream_event(
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","caller":{"type":"direct"}}}"#,
+        r#"{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}","caller":{"type":"direct"}}}"#,
     )
     .expect("parse")
     .expect("event");
     match direct {
-        ResponsesStreamEvent::FunctionCallCaller { caller, .. } => {
+        ResponsesStreamEvent::FunctionCallItem { caller, .. } => {
             let caller = caller.expect("a direct caller is still an attribution");
             assert_eq!(caller.kind, "direct");
             assert_eq!(caller.caller_id, "");
         }
-        _ => panic!("expected FunctionCallCaller"),
+        _ => panic!("expected FunctionCallItem"),
     }
 
     let absent = parse_responses_stream_event(
-        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather"}}"#,
+        r#"{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{}"}}"#,
     )
     .expect("parse")
     .expect("event");
     match absent {
-        ResponsesStreamEvent::FunctionCallCaller { call_id, caller } => {
-            assert_eq!(call_id, "call_1");
+        ResponsesStreamEvent::FunctionCallItem {
+            call_id, caller, ..
+        } => {
+            assert_eq!(call_id.as_deref(), Some("call_1"));
             assert!(caller.is_none());
         }
-        _ => panic!("expected FunctionCallCaller"),
+        _ => panic!("expected FunctionCallItem"),
+    }
+}
+
+#[test]
+fn a_function_call_with_a_nonconforming_item_is_still_read() {
+    // A provider that leaves the item's identity or name out must not fail the
+    // parse of a stream it is already billing for; the accumulator decides what
+    // an unidentifiable item means.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.output_item.added","item":{"type":"function_call"}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::FunctionCallItem {
+            item_id,
+            call_id,
+            name,
+            arguments,
+            ..
+        } => {
+            assert!(item_id.is_none());
+            assert!(call_id.is_none());
+            assert!(name.is_none());
+            assert_eq!(arguments, "");
+        }
+        _ => panic!("expected FunctionCallItem"),
+    }
+}
+
+#[test]
+fn an_argument_event_that_names_no_call_is_not_an_event() {
+    // Neither id present: the chunk cannot be attributed to any call, so it is
+    // ignored the way an unknown event type is rather than keying a call that
+    // nothing can ever name.
+    for payload in [
+        r#"{"type":"response.function_call_arguments.delta","delta":"{}"}"#,
+        r#"{"type":"response.function_call_arguments.done","arguments":"{}"}"#,
+    ] {
+        assert!(
+            parse_responses_stream_event(payload)
+                .expect("parse")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn an_argument_event_naming_only_a_call_id_still_resolves() {
+    // A gateway that relays no output items has only the call id to name a call
+    // by, and that has to keep identifying the call it belongs to.
+    let event = parse_responses_stream_event(
+        r#"{"type":"response.function_call_arguments.done","call_id":"call_1","arguments":"{}"}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match event {
+        ResponsesStreamEvent::FunctionCallArgumentsDone { call, .. } => {
+            assert!(
+                matches!(&call, super::CallRef::Call(id) if id == "call_1"),
+                "{call:?}"
+            );
+        }
+        _ => panic!("expected FunctionCallArgumentsDone"),
     }
 }
 

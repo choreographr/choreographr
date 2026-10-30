@@ -181,6 +181,20 @@ pub enum ProviderError {
         /// JSON.
         discarded: Vec<choreo_proto::DiscardedToolCall>,
     },
+    /// The provider streamed one or more tool calls this client could not
+    /// identify — the Responses adapter names a call from its `function_call`
+    /// output item, and such a stream never sent one — while the turn carried
+    /// no visible text either. Nothing about the turn can be run or shown, so
+    /// it fails instead of being reported as an empty answer that hides what
+    /// the model actually did.
+    #[error(
+        "provider streamed {count} tool call(s) with no identifiable function; \
+         they cannot be run"
+    )]
+    UnidentifiedToolCalls {
+        /// How many calls the stream mentioned without naming.
+        count: usize,
+    },
     /// An underlying I/O failure.
     #[error("{0}")]
     Io(#[from] std::io::Error),
@@ -286,6 +300,9 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         ProviderError::DeadlineExceeded => InferenceError::DeadlineExceeded,
         ProviderError::TruncatedToolCall { discarded } => {
             InferenceError::TruncatedToolCall { discarded }
+        }
+        ProviderError::UnidentifiedToolCalls { count } => {
+            InferenceError::UnidentifiedToolCalls { count }
         }
         ProviderError::Io(e) => InferenceError::Io(e),
     }
