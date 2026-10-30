@@ -9,6 +9,11 @@ const DEFAULT_MODEL_LIST_PATH: &str = "/models";
 const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
+/// The catalog slug of the ChatGPT/Codex subscription backend. Its Responses
+/// endpoint is a non-standard dialect — see
+/// [`ServiceConfig::system_prompt_as_instructions`].
+const CODEX_PROVIDER_SLUG: &str = "chatgpt";
+
 // Extra headers for the opencode.ai gateway live in
 // [`crate::shared::opencode_gateway_headers`], applied per request from the
 // turn's real session/request ids (see `ChatTurnRequest`).
@@ -154,6 +159,20 @@ impl ServiceConfig {
     pub fn request_format_for_model(&self, model: &str) -> RequestFormat {
         crate::catalog::model_request_format(&self.provider_slug, model)
             .unwrap_or(self.default_request_format)
+    }
+
+    /// Whether this Responses backend wants the system prompt in the top-level
+    /// `instructions` field rather than a `system`-role item inside `input`.
+    ///
+    /// The ChatGPT/Codex backend (the `chatgpt` provider) rejects a `system`-role
+    /// input item outright (`{"detail":"System messages are not allowed"}`) and
+    /// takes the system prompt in `instructions` instead — the shape every other
+    /// Codex client sends. The standard `OpenAI` Responses API accepts inline
+    /// system items, so it keeps them and sends no `instructions` at all; gating
+    /// on the slug leaves those providers byte-for-byte unchanged.
+    #[must_use]
+    pub fn system_prompt_as_instructions(&self) -> bool {
+        self.provider_slug == CODEX_PROVIDER_SLUG
     }
 
     /// Whether the catalogue records the model as reasoning-capable, i.e.
@@ -550,6 +569,22 @@ mod tests {
         assert!(!config.programmatic_tool_calling_for_model("gpt-4.1"));
         assert!(!config.programmatic_tool_calling_for_model("gpt-5.5"));
         assert!(!config.programmatic_tool_calling_for_model("claude-3-opus"));
+    }
+
+    #[test]
+    fn system_prompt_as_instructions_is_chatgpt_only() {
+        // The Codex backend takes the system prompt in `instructions`...
+        let codex = ServiceConfig {
+            provider_slug: "chatgpt".to_string(),
+            ..Default::default()
+        };
+        assert!(codex.system_prompt_as_instructions());
+        // ...while the standard OpenAI Responses provider keeps it inline.
+        let openai = ServiceConfig {
+            provider_slug: "openai".to_string(),
+            ..Default::default()
+        };
+        assert!(!openai.system_prompt_as_instructions());
     }
 
     #[test]

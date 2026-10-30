@@ -933,6 +933,74 @@ fn build_responses_input_chained_preserves_mid_tail_order() {
     assert_eq!(arr[2]["content"], "turn two");
 }
 
+// ── System prompt → `instructions` (ChatGPT/Codex backend) ────────
+
+/// Build a tool-less Responses body for `provider`/`model` from `messages`,
+/// with the same inert wiring the other body tests use.
+fn body_for(provider: &str, model: &str, messages: &[ChatRequestMessage]) -> serde_json::Value {
+    let config = super::super::ServiceConfig {
+        provider_slug: provider.to_string(),
+        ..Default::default()
+    };
+    let mut no_retry = None;
+    let params = super::super::TurnParams {
+        model,
+        messages,
+        tools: &[],
+        reasoning_effort: None,
+        on_retry: &mut no_retry,
+        on_uploaded: None,
+        cancel_rx: None,
+        route: None,
+        previous_response_id: None,
+        tool_results: &[],
+        programmatic_tool_calling: false,
+        max_output_tokens_override: None,
+        no_retry: false,
+    };
+    build_responses_request_body(&config, &params, false)
+        .expect("body builds")
+        .1
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn chatgpt_backend_hoists_system_prompt_into_instructions() {
+    // The ChatGPT/Codex backend rejects `system`-role input items, so the
+    // system prompt must ride the top-level `instructions` string and never
+    // appear as a `role: "system"` input item.
+    let messages = vec![
+        ChatRequestMessage::simple("system", "be helpful".into()),
+        ChatRequestMessage::simple("user", "hi".into()),
+    ];
+    let body = body_for("chatgpt", "gpt-5.6-luna", &messages);
+    assert_eq!(body["instructions"], "be helpful");
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input.len(), 1, "only the user message remains: {input:?}");
+    assert_eq!(input[0]["role"], "user");
+    assert!(
+        input.iter().all(|item| item["role"] != "system"),
+        "no system-role item may reach the Codex backend: {input:?}"
+    );
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn openai_responses_backend_keeps_the_system_item_and_sends_no_instructions() {
+    // The standard OpenAI Responses API accepts inline system items, so it must
+    // be left byte-for-byte unchanged: a `system` item in `input`, no
+    // `instructions` field.
+    let messages = vec![
+        ChatRequestMessage::simple("system", "be helpful".into()),
+        ChatRequestMessage::simple("user", "hi".into()),
+    ];
+    let body = body_for("openai", "gpt-5.4", &messages);
+    assert!(body.get("instructions").is_none(), "{body}");
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input[0]["role"], "system");
+    assert_eq!(input[0]["content"], "be helpful");
+}
+
 // ── Reasoning extraction tests ────────────────────────────────────
 
 #[test]

@@ -604,11 +604,16 @@
 # Curated list — SEEDED 2026-10 and deliberately provisional: the ChatGPT
 # backend is undocumented and unversioned, so re-verify these ids and their
 # context windows against the Codex CLI at release rather than treating this
-# list as authoritative.
+# list as authoritative. The backend only accepts models newer than gpt-5.5 for
+# a ChatGPT account, so the list is gated to the gpt-5.6 family; anything older
+# (gpt-5.5, gpt-5.4, gpt-5.3-codex, …) is rejected with "not supported when
+# using Codex with a ChatGPT account". A `client_version` model-list call would
+# give the live per-account set, but the curated set avoids that undocumented
+# request.
 [provider.chatgpt]
   display_name = "ChatGPT (Codex subscription)"
   base_url = "https://chatgpt.com/backend-api/codex"
-  default_model = "gpt-5.5"
+  default_model = "gpt-5.6-luna"
 
 # Wire facts verified against the Codex CLI: issuer auth.openai.com, the
 # device-code flow under /deviceauth, a form-encoded code exchange against a
@@ -649,24 +654,6 @@
   context_window = 272000
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
-[provider.chatgpt.models."gpt-5.5"]
-  responses = true
-  context_window = 272000
-[provider.chatgpt.models."gpt-5.4"]
-  responses = true
-  context_window = 272000
-[provider.chatgpt.models."gpt-5.4-mini"]
-  responses = true
-  context_window = 400000
-[provider.chatgpt.models."gpt-5.3-codex"]
-  responses = true
-  context_window = 400000
-[provider.chatgpt.models."gpt-5.3-codex-spark"]
-  responses = true
-  context_window = 400000
-[provider.chatgpt.models."gpt-5.2"]
-  responses = true
-  context_window = 400000
 
 # Custom Anthropic-Compatible (not covered by models.dev; defined wholesale)
 [provider.custom-anthropic]

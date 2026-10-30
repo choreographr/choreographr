@@ -105,6 +105,31 @@ pub(super) fn chain_input_messages(messages: &[ChatRequestMessage]) -> Vec<ChatR
     }
 }
 
+/// Split the system prompt out of a canonical message list for a backend that
+/// forbids `system`-role input items (the ChatGPT/Codex backend).
+///
+/// Returns the joined system-prompt string (for the top-level `instructions`
+/// field) and the remaining messages, with every `system` message removed, so
+/// the input array carries no `role: "system"` item. A blank system prompt
+/// yields `None` rather than an empty `instructions` string.
+fn split_system_prompt(
+    messages: &[ChatRequestMessage],
+) -> (Option<String>, Vec<ChatRequestMessage>) {
+    let mut prompt: Vec<&str> = Vec::new();
+    let mut rest: Vec<ChatRequestMessage> = Vec::with_capacity(messages.len());
+    for msg in messages {
+        if msg.role == "system" {
+            if let Some(content) = msg.content.as_deref().filter(|c| !c.trim().is_empty()) {
+                prompt.push(content);
+            }
+        } else {
+            rest.push(msg.clone());
+        }
+    }
+    let joined = prompt.join("\n\n");
+    ((!joined.is_empty()).then_some(joined), rest)
+}
+
 /// Shared helper: extract the reasoning text from a Responses API
 /// reasoning-summary array.  Each entry may be a plain string or an object
 /// with a `"text"` field.
@@ -138,11 +163,21 @@ pub(super) fn build_responses_request_body(
     let max_output_tokens = params
         .max_output_tokens_override
         .or(config.max_output_tokens_for_model(params.model));
-    let input_value = build_responses_input(
-        params.tool_results,
-        params.messages,
-        params.previous_response_id,
-    )?;
+    // The ChatGPT/Codex backend rejects `system`-role input items and takes the
+    // system prompt in `instructions` instead. Every other Responses provider
+    // keeps the system message inline and sends no `instructions`, so the split
+    // is gated on the provider: `filtered_messages` is what the input array is
+    // built from and `instructions` the joined prompt — both stay `None` (and
+    // the original `messages` is used untouched) for the standard providers.
+    let (instructions, filtered_messages) = if config.system_prompt_as_instructions() {
+        let (prompt, rest) = split_system_prompt(params.messages);
+        (prompt, Some(rest))
+    } else {
+        (None, None)
+    };
+    let messages = filtered_messages.as_deref().unwrap_or(params.messages);
+    let input_value =
+        build_responses_input(params.tool_results, messages, params.previous_response_id)?;
 
     let mut responses_tools: Vec<ResponsesTool> =
         params.tools.iter().map(ResponsesTool::from).collect();
@@ -210,7 +245,7 @@ pub(super) fn build_responses_request_body(
     let body = serde_json::to_value(&ResponsesRequest {
         model: params.model,
         input: input_value,
-        instructions: None,
+        instructions: instructions.as_deref(),
         tools: tools_opt,
         stream,
         max_output_tokens,
@@ -266,4 +301,48 @@ pub(super) fn build_simple_responses_body(
     })
     .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
     Ok((url, body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_hoists_system_prompt_and_drops_system_messages() {
+        let messages = vec![
+            ChatRequestMessage::simple("system", "be helpful".into()),
+            ChatRequestMessage::simple("user", "hi".into()),
+        ];
+        let (prompt, rest) = split_system_prompt(&messages);
+        assert_eq!(prompt.as_deref(), Some("be helpful"));
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].role, "user");
+        assert!(
+            rest.iter().all(|m| m.role != "system"),
+            "no system message survives the split"
+        );
+    }
+
+    #[test]
+    fn split_joins_multiple_system_messages_and_skips_blank() {
+        let messages = vec![
+            ChatRequestMessage::simple("system", "first".into()),
+            ChatRequestMessage::simple("system", "   ".into()),
+            ChatRequestMessage::simple("system", "second".into()),
+            ChatRequestMessage::simple("user", "hi".into()),
+        ];
+        let (prompt, rest) = split_system_prompt(&messages);
+        // Non-blank system prompts joined by a blank line; the blank one dropped.
+        assert_eq!(prompt.as_deref(), Some("first\n\nsecond"));
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].role, "user");
+    }
+
+    #[test]
+    fn split_with_no_system_message_yields_none() {
+        let messages = vec![ChatRequestMessage::simple("user", "hi".into())];
+        let (prompt, rest) = split_system_prompt(&messages);
+        assert!(prompt.is_none());
+        assert_eq!(rest.len(), 1);
+    }
 }
