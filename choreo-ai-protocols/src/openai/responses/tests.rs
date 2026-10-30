@@ -84,8 +84,8 @@ fn responses_body_nests_reasoning_and_omits_it_for_non_reasoning() {
     // Collect the serialized body's keys as a sorted `Vec<String>` so we
     // can assert the EXACT key set — more precise than poking at
     // individual fields, which would be tautological here because
-    // `ResponsesRequest` carries no top-level `reasoning_effort` / `include`
-    // field of its own.
+    // `ResponsesRequest` carries no top-level `reasoning_effort` field of its
+    // own.
     let body_keys = |body: &serde_json::Value| -> Vec<String> {
         let mut keys: Vec<String> = body.as_object().unwrap().keys().cloned().collect();
         keys.sort();
@@ -148,6 +148,7 @@ fn responses_request_serializes_with_store_true() {
         stream: false,
         max_output_tokens: None,
         reasoning: None,
+        include: None,
         store: true,
         previous_response_id: None,
         parallel_tool_calls: None,
@@ -184,6 +185,7 @@ fn responses_request_serializes_with_tools() {
         stream: false,
         max_output_tokens: None,
         reasoning: None,
+        include: None,
         store: false,
         previous_response_id: None,
         parallel_tool_calls: None,
@@ -218,6 +220,7 @@ fn responses_request_serializes_with_programmatic_tool_calling() {
         stream: false,
         max_output_tokens: None,
         reasoning: None,
+        include: None,
         store: false,
         previous_response_id: None,
         parallel_tool_calls: None,
@@ -245,6 +248,7 @@ fn responses_request_omits_optional_fields_when_none() {
         stream: false,
         max_output_tokens: None,
         reasoning: None,
+        include: None,
         store: false,
         previous_response_id: None,
         parallel_tool_calls: None,
@@ -1000,6 +1004,17 @@ fn chatgpt_backend_hoists_system_prompt_into_instructions() {
     assert_eq!(body["instructions"], "be helpful");
     // Stateless: `store` is off (the field is skipped when false).
     assert!(body.get("store").is_none(), "stateless omits store: {body}");
+    // And it asks for the encrypted reasoning payload, the only continuity
+    // channel a transcript-less backend leaves open.
+    assert_eq!(
+        body["include"],
+        json!(["reasoning.encrypted_content"]),
+        "stateless requests encrypted reasoning: {body}"
+    );
+    assert!(
+        body.get("previous_response_id").is_none(),
+        "stateless sends no chain: {body}"
+    );
     let input = body["input"].as_array().expect("input array");
     assert_eq!(input.len(), 1, "only the user message remains: {input:?}");
     assert_eq!(input[0]["role"], "user");
@@ -1023,9 +1038,54 @@ fn openai_responses_backend_keeps_the_system_item_and_sends_no_instructions() {
     assert!(body.get("instructions").is_none(), "{body}");
     // Chained provider still stores.
     assert_eq!(body["store"], true, "{body}");
+    // …and needs no `include`: `previous_response_id` already carries the
+    // reasoning, so asking for the encrypted payload would only add a field
+    // this path never replays.
+    assert!(
+        body.get("include").is_none(),
+        "chained providers request no include: {body}"
+    );
     let input = body["input"].as_array().expect("input array");
     assert_eq!(input[0]["role"], "system");
     assert_eq!(input[0]["content"], "be helpful");
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn chatgpt_stateless_body_replays_captured_reasoning_items() {
+    // Nothing server-side survives a `store: false` request, so the captured
+    // reasoning items are the whole continuity payload: an assistant turn's
+    // `ResponsesItems` artifact must ride `input` verbatim — the opaque
+    // `encrypted_content` included, since that blob is what the provider
+    // decrypts to recover the turn's reasoning — ahead of that turn's message
+    // item, in the provider's own output ordering.
+    let messages = vec![
+        ChatRequestMessage::simple("user", "solve it".into()),
+        ChatRequestMessage {
+            role: "assistant",
+            content: Some("done".into()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
+                br#"[{"type":"reasoning","id":"rs_1","encrypted_content":"eJxT_opaque"}]"#.to_vec(),
+            )),
+        },
+        ChatRequestMessage::simple("user", "and now?".into()),
+    ];
+    let body = body_for("chatgpt", "gpt-5.6-luna", &messages);
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input.len(), 4, "{input:?}");
+    assert_eq!(input[0]["role"], "user");
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["id"], "rs_1");
+    assert_eq!(
+        input[1]["encrypted_content"], "eJxT_opaque",
+        "the encrypted payload is what makes the replay usable: {input:?}"
+    );
+    assert_eq!(input[2]["role"], "assistant");
+    assert_eq!(input[2]["content"], "done");
+    assert_eq!(input[3]["role"], "user");
 }
 
 // ── Reasoning extraction tests ────────────────────────────────────

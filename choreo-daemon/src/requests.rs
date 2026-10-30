@@ -2,8 +2,8 @@ use crate::cache_warm::{CacheWarmingMode, spawn_warmer};
 use crate::context::{self, SkillMeta};
 use crate::providers::InferenceProvider;
 use crate::reasoning::{
-    build_chat_request_messages, initial_prev_resp_id, reasoning_artifact_tokens,
-    warn_on_uncaptured_reasoning,
+    build_chat_request_messages, chains_via_response_id, initial_prev_resp_id,
+    reasoning_artifact_tokens, warn_on_uncaptured_reasoning,
 };
 use crate::sessions::{AssistantResponse, RequestContext, SessionCommand, SessionState};
 use crate::tools::ToolOutput;
@@ -882,11 +882,22 @@ pub(crate) fn run_agent_loop(
                 // invocation only when the same provider+model is still
                 // active — the id is service-bound and must not be replayed
                 // into a different provider).
-                session
-                    .config
-                    .last_response_id
-                    .clone_from(&final_text.response_id);
-                session.config.last_response_id_producer = Some(producer);
+                //
+                // Only a route that actually chains needs this. A provider
+                // whose reasoning passback is not ResponseId has no
+                // `previous_response_id` continuity at all (the stateless
+                // Codex provider replays captured reasoning items instead), so
+                // an id it hands back is a value the next request must ignore:
+                // storing it would only leave a stale chain on disk for a
+                // later provenance match to replay into a service that does
+                // not understand it.
+                if chains_via_response_id(&provider_slug, model) {
+                    session
+                        .config
+                        .last_response_id
+                        .clone_from(&final_text.response_id);
+                    session.config.last_response_id_producer = Some(producer);
+                }
                 finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
                 return Ok(false);
             }
@@ -979,10 +990,18 @@ pub(crate) fn run_agent_loop(
                 // turn, and persist it (+ its producing model) on the session
                 // config so ResponseId-policy providers can chain across user
                 // turns (restored at the top of the next loop invocation only
-                // when the same provider+model is still active).
+                // when the same provider+model is still active). The in-loop
+                // value stays unconditional: it chains the tool-result
+                // follow-up within THIS request, which a chained provider may
+                // want regardless of its cross-turn passback policy (the
+                // stateless body builder simply never sends it). The persisted
+                // copy is the cross-turn chain, so it follows the passback
+                // policy — see the `FinalText` arm above.
                 prev_resp_id.clone_from(&tool_use.response_id);
-                session.config.last_response_id.clone_from(&prev_resp_id);
-                session.config.last_response_id_producer = Some(producer);
+                if chains_via_response_id(&provider_slug, model) {
+                    session.config.last_response_id.clone_from(&prev_resp_id);
+                    session.config.last_response_id_producer = Some(producer);
+                }
 
                 // Arm the cache warmer for the blocking tool window that
                 // follows: the request just sent is the prefix the next real

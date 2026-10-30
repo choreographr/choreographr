@@ -238,6 +238,13 @@ pub(super) fn build_responses_request_body(
         stream,
         max_output_tokens,
         reasoning,
+        // Stateless mode keeps no server-side transcript, so the opaque
+        // encrypted reasoning payload is the only continuity payload available:
+        // ask for it on every reasoning item and replay the captured items into
+        // `input` (the provider's passback policy is `all_turns`). A chained
+        // provider needs none — `previous_response_id` already carries its
+        // reasoning, and an unused `include` would only add a rejected field.
+        include: stateless.then_some(vec!["reasoning.encrypted_content"]),
         // store must be true for `previous_response_id` chaining on the standard
         // Responses API, and is off for the stateless ChatGPT/Codex backend.
         store: !stateless,
@@ -274,6 +281,9 @@ pub(super) fn build_simple_responses_body(
         stream,
         max_output_tokens: None,
         reasoning: None,
+        // A one-shot prompt carries no captured reasoning to replay, so it asks
+        // for no extra output items.
+        include: None,
         // Simple requests are ephemeral — don't persist on the server side.
         store: false,
         previous_response_id: None,

@@ -666,7 +666,12 @@ and re-emits it per provider rules on the next request:
 - **OpenAI / xAI Responses** — reasoning continuity is chained across user
   turns via `previous_response_id` (the server retains the reasoning items in
   the chain; a fresh chained turn sends only the new user message, and opaque
-  reasoning items are re-emitted into `input` on non-chained conversions).
+  reasoning items are re-emitted into `input` on non-chained conversions). The
+  **ChatGPT/Codex** provider is the stateless exception: its backend keeps no
+  transcript and honours no chain, so the request asks for
+  `include: ["reasoning.encrypted_content"]` and every captured reasoning item
+  (encrypted payload included) is replayed into `input` on the next turn
+  instead.
 
 Display-only reasoning (providers/fields that expose no reusable payload) is
 never replayed. Artifacts are model-bound: after a mid-session model switch

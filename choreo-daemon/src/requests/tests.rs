@@ -13,7 +13,8 @@ use crate::providers::test_util::{
     make_truncating_provider_with_slug,
 };
 use crate::reasoning::{
-    build_chat_request_messages, initial_prev_resp_id, warn_on_uncaptured_reasoning,
+    build_chat_request_messages, chains_via_response_id, initial_prev_resp_id,
+    warn_on_uncaptured_reasoning,
 };
 use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolError, ToolExecError, ToolRegistry};
@@ -1223,6 +1224,46 @@ fn builder_response_id_policy_never_attaches_via_message() {
     assert_eq!(assistants[0].reasoning_artifact, None);
 }
 
+/// The preserved Responses reasoning items, with the opaque encrypted payload
+/// a stateless request asks for.
+fn responses_items() -> ReasoningArtifact {
+    ReasoningArtifact::ResponsesItems(
+        br#"[{"type":"reasoning","id":"rs_1","encrypted_content":"eJxT_opaque"}]"#.to_vec(),
+    )
+}
+
+#[test]
+fn builder_stateless_codex_provider_replays_captured_reasoning_items() {
+    // The ChatGPT/Codex Responses backend honours no `previous_response_id` and
+    // stores no transcript, so its models pin `all_turns` in the bundled
+    // overlay: every assistant turn's preserved ResponsesItems artifact must
+    // reach the adapter, which replays it verbatim into `input`. This is the
+    // only reasoning-continuity channel such a request has.
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "solve it",
+        "done",
+        Some(responses_items()),
+        Some(ReasoningProducer {
+            provider_slug: "chatgpt".into(),
+            model: "gpt-5.6-luna".into(),
+        }),
+        vec![],
+    );
+
+    // A plain tool-less turn still replays — `all_turns` is unconditional, and
+    // the tool loop's own turns are tool-involving anyway.
+    let result = build_chat_request_messages(&session, None, "chatgpt", "gpt-5.6-luna", None);
+    let assistants = assistant_messages(&result);
+    assert_eq!(assistants.len(), 1);
+    assert_eq!(
+        assistants[0].reasoning_artifact,
+        Some(responses_items()),
+        "the stateless provider must replay every turn's captured items",
+    );
+}
+
 #[test]
 fn builder_same_model_mismatch_drops_artifact() {
     let mut session = SessionState::empty();
@@ -1297,6 +1338,33 @@ fn builder_undone_turn_artifact_is_skipped() {
 }
 
 // -- prev_resp_id persistence (phase 4c) --------------------------------
+
+#[test]
+fn stateless_chatgpt_neither_persists_nor_restores_a_response_id_chain() {
+    // Persisting a returned chain id (the agent loop's two write sites) and
+    // restoring one (`initial_prev_resp_id`) share this single predicate.
+    assert!(
+        chains_via_response_id("openai", "gpt-5.4"),
+        "the standard Responses API chains via previous_response_id",
+    );
+    assert!(
+        !chains_via_response_id("chatgpt", "gpt-5.6-luna"),
+        "the stateless Codex provider replays reasoning items, it does not chain",
+    );
+
+    // Even with a matching producer recorded, a stateless route restores
+    // nothing: an id it may have handed back means nothing to a later request.
+    let mut session = SessionState::empty();
+    session.config.last_response_id = Some("resp_1".into());
+    session.config.last_response_id_producer = Some(ReasoningProducer {
+        provider_slug: "chatgpt".into(),
+        model: "gpt-5.6-luna".into(),
+    });
+    assert_eq!(
+        initial_prev_resp_id(&session, "chatgpt", "gpt-5.6-luna"),
+        None,
+    );
+}
 
 #[test]
 fn initial_prev_resp_id_response_policy_restores_persisted_id() {

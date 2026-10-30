@@ -1327,6 +1327,23 @@ name, with no name-based heuristic, and overridable per model by the overlay),
 and the `previous_response_id` continuity
 chain.
 
+**Two Responses continuity modes.** The standard `OpenAI` Responses API
+*chains*: `store: true` plus `previous_response_id` keeps the transcript
+server-side, so `ReasoningPassback::ResponseId` replays nothing through the
+message and an assistant turn's artifact never reaches the wire. The stateless
+ChatGPT/Codex dialect cannot chain — it sends `store: false`, ignores
+`previous_response_id`, and expects the full history on every request — so its
+models pin `reasoning_passback = "all_turns"` in the bundled overlay and the
+request asks for `include: ["reasoning.encrypted_content"]`. The adapter captures
+each reasoning item (id, summary, and that opaque encrypted payload) into a
+`ReasoningArtifact::ResponsesItems`, and the next request replays the items
+verbatim into `input`, ahead of the assistant message they belong to, which is
+exactly the ordering the provider emitted them in. Because such a route never
+chains, the daemon neither persists a returned response id nor restores a stored
+one for it (one predicate, `chains_via_response_id`), so an id the stateless
+backend happens to return can never become a stale chain a later request
+replays.
+
 **Which key wins.** The catalog's declared echo field is authoritative and
 outranks the field a payload was *observed* under: `ReasoningArtifact::
 ChatReasoning` records the observation (a hint, used only when the route declares
@@ -1492,7 +1509,7 @@ Currently supports 209 providers (184 from the models.dev base + 25 overlay-only
 > | Provider(s) | Reason deferred |
 > |---|---|
 > | `amazon-bedrock`, `google-vertex`, `azure-foundry`, `azure-openai-responses` | Multi-field credentials (AWS keys/region, GCP service account, Azure resource + key). The daemon's single-API-key credential model cannot represent them yet. |
-> | `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above), and the provider OAuth **sign-in and refresh** flow ships for the `chatgpt` (Codex) and token-sharing `openai` routes (the Codex backend is a non-standard Responses dialect: the system prompt rides the top-level `instructions` field, never a `system`-role input item, and only `gpt-5.6`+ models are accepted for a ChatGPT account); these remaining providers are added through the catalog `oauth` profile and the client-identity table as data. |
+> | `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above), and the provider OAuth **sign-in and refresh** flow ships for the `chatgpt` (Codex) and token-sharing `openai` routes (the Codex backend is a non-standard Responses dialect: the system prompt rides the top-level `instructions` field, never a `system`-role input item, reasoning continuity comes from replaying captured reasoning items into `input` rather than a `previous_response_id` chain, and only `gpt-5.6`+ models are accepted for a ChatGPT account); these remaining providers are added through the catalog `oauth` profile and the client-identity table as data. |
 > | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
 >
 > Adding the multi-field-credential providers requires a credential generalization (a `Fields` credential variant); the OAuth providers are added through the catalog `oauth` profile and the client-identity table, not a code change.
@@ -2973,8 +2990,11 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     from it and links via `previous_response_id`, while a stateless turn sends the whole list.
     The standard OpenAI Responses API keeps system messages inline as `{role: "system"}` items;
     the stateless ChatGPT/Codex dialect hoists the system prompt into the top-level
-    `instructions` field, sets `store: false`, and ignores `previous_response_id`
-    (`ServiceConfig::responses_stateless`). Chat Completions relies on the full message history.
+    `instructions` field, sets `store: false`, ignores `previous_response_id`, and asks for
+    `include: ["reasoning.encrypted_content"]` so captured reasoning items can be replayed
+    into `input` on the next request (`ServiceConfig::responses_stateless`; see Reasoning
+    round-trip for why the replay replaces the chain). Chat Completions relies on the full
+    message history.
 
     The streaming terminal events wrap the whole `Response` object under `response`:
     `response.completed` and `response.incomplete` carry the id/usage there (`sse::response_object`

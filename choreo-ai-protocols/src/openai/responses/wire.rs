@@ -75,6 +75,18 @@ pub(crate) struct ResponsesRequest<'a> {
     pub(crate) max_output_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning: Option<ResponsesReasoning<'a>>,
+    /// Extra output-item kinds the response should carry, from the API's fixed
+    /// `include` enum.
+    ///
+    /// Only `reasoning.encrypted_content` is ever requested, and only by the
+    /// stateless ChatGPT/Codex dialect: with `store: false` the provider keeps
+    /// no server-side transcript, so the opaque encrypted reasoning payload is
+    /// the *only* way to hand captured reasoning back on a later request (see
+    /// [`crate::ReasoningPassback::AllTurns`]). The reasoning summary is
+    /// requested through `reasoning.summary` instead — `include` is a closed
+    /// enum and rejects `reasoning.summary` with a 400.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) include: Option<Vec<&'a str>>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) store: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -566,4 +566,34 @@ mod tests {
             "chatgpt's curated model list is its only model source"
         );
     }
+
+    #[test]
+    fn chatgpt_models_replay_reasoning_instead_of_chaining() {
+        // The Codex backend takes no `previous_response_id` and stores no
+        // transcript, so its models must not resolve to the `ResponseId`
+        // default every other Responses model carries: continuity comes from
+        // replaying the captured reasoning items, which is `all_turns`.
+        assert_ne!(
+            model_reasoning_passback("chatgpt", "gpt-5.6-luna"),
+            ReasoningPassback::ResponseId,
+            "the stateless provider must not chain via a response id",
+        );
+        for model in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let entry = lookup_provider("chatgpt").expect("chatgpt is in the bundled catalog");
+            let model_entry = entry
+                .models
+                .iter()
+                .find(|m| m.model == model)
+                .unwrap_or_else(|| panic!("{model} missing from the chatgpt model list"));
+            assert_eq!(
+                model_entry.reasoning_passback,
+                Some(ReasoningPassback::AllTurns),
+                "{model} must pin the overlay's all_turns passback",
+            );
+            assert_eq!(
+                model_reasoning_passback("chatgpt", model),
+                ReasoningPassback::AllTurns,
+            );
+        }
+    }
 }

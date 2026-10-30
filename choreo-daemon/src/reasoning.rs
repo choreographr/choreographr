@@ -382,6 +382,20 @@ fn turn_is_wire_empty(turn: &Turn) -> bool {
             .is_none_or(|text| text.trim().is_empty())
 }
 
+/// Whether the `(provider_slug, model)` route chains reasoning continuity
+/// through `previous_response_id` — i.e. its resolved passback policy is
+/// [`ReasoningPassback::ResponseId`].
+///
+/// Both halves of the chain consult this one predicate: [`initial_prev_resp_id`]
+/// restores a persisted id only for such a route, and the agent loop persists a
+/// returned id only for one. The stateless ChatGPT/Codex Responses dialect is
+/// the case that needs both: it neither accepts nor honours
+/// `previous_response_id`, so an id it returns would be a persisted value every
+/// later request must ignore.
+pub(crate) fn chains_via_response_id(provider_slug: &str, model: &str) -> bool {
+    model_reasoning_passback(provider_slug, model) == ReasoningPassback::ResponseId
+}
+
 /// Resolve the starting `previous_response_id` for a new agent-loop
 /// invocation. ResponseId-policy providers (OpenAI/xAI Responses) chain
 /// reasoning continuity across user turns, so the id persisted on the session
@@ -408,9 +422,7 @@ pub(crate) fn initial_prev_resp_id(
         .as_ref()
         .map(|p| (p.provider_slug.as_str(), p.model.as_str()))
         == Some((provider_slug, model));
-    if same_producer
-        && model_reasoning_passback(provider_slug, model) == ReasoningPassback::ResponseId
-    {
+    if same_producer && chains_via_response_id(provider_slug, model) {
         session.config.last_response_id.clone()
     } else {
         None
