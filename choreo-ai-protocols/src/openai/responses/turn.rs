@@ -213,6 +213,15 @@ pub(crate) fn responses_response_to_turn(
                 arguments,
                 caller,
             } => {
+                // A non-streaming item is taken at its word, so this path can
+                // never leave a call unnamed: the typed variant REQUIRES
+                // `call_id` and `name`, so an item missing either fails the
+                // deserialization above and surfaces as an `Io` error. That is
+                // why `unnamed_calls` below is zero — `UnidentifiedToolCalls`
+                // is a verdict only the streaming path can reach, where a
+                // single malformed item must not fail a stream the provider is
+                // already billing for, and the accumulator reports what it
+                // could not name instead.
                 tool_calls.push(ChatToolCall {
                     id: call_id,
                     name,

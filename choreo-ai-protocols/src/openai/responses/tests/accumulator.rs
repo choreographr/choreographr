@@ -5,7 +5,7 @@
 
 // Each subject module imports the items it names directly: it lives inside
 // `tests`, so the adapter's own modules are two `super`s up.
-use super::super::stream::{AccCall, AccCalls};
+use super::super::accumulator::{AccCall, AccCalls};
 use crate::CallerInfo;
 use crate::openai::{ResponsesStreamEvent, parse_responses_stream_event};
 use crate::shared::MAX_TOOL_CALLS;
@@ -122,6 +122,96 @@ fn argument_events_naming_only_a_call_id_join_the_item_they_belong_to() {
     assert_eq!(finished.len(), 1, "one call, not two: {finished:?}");
     assert_eq!(finished[0].name, "get_weather");
     assert_eq!(finished[0].arguments_json, r#"{"city":"London"}"#);
+}
+
+#[test]
+fn arguments_naming_only_a_call_id_join_an_item_that_arrives_later() {
+    // Nothing on the wire fixes which of a call's two halves arrives first: an
+    // argument event that names only `call_id` can precede the output item that
+    // names the call. It must still be the SAME call — otherwise the arguments
+    // are stranded on a slot no event ever names (counted as an unnamed call)
+    // while the call that runs is minted, with its own arguments, from the item.
+    //
+    // This is the wrong-order case the documented order never exercises.
+    let mut calls = AccCalls::default();
+    calls
+        .absorb(&event(
+            r#"{"type":"response.function_call_arguments.done","call_id":"call_1","arguments":"{\"city\":\"London\"}"}"#,
+        ))
+        .expect("the arguments open the call under its call id");
+    calls
+        .absorb(&event(
+            r#"{"type":"response.output_item.done","item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"London\"}"}}"#,
+        ))
+        .expect("the item names the call it belongs to");
+
+    let finished = calls.finish();
+    assert_eq!(finished.calls.len(), 1, "one call, not two: {finished:?}");
+    assert_eq!(finished.calls[0].id, "call_1");
+    assert_eq!(finished.calls[0].name, "get_weather");
+    assert_eq!(finished.calls[0].arguments_json, r#"{"city":"London"}"#);
+    assert_eq!(finished.unnamed, 0, "no phantom unnamed call: {finished:?}");
+
+    // The same join with the item carrying no arguments of its own (the shape
+    // `output_item.added` always has): the arguments the stream delivered have
+    // to survive on the call the item names.
+    let mut calls = AccCalls::default();
+    calls
+        .absorb(&event(
+            r#"{"type":"response.function_call_arguments.done","call_id":"call_1","arguments":"{\"city\":\"London\"}"}"#,
+        ))
+        .expect("the arguments open the call under its call id");
+    calls
+        .absorb(&event(ITEM_ADDED))
+        .expect("the item names the call it belongs to");
+
+    let finished = calls.finish();
+    assert_eq!(finished.calls.len(), 1, "one call, not two: {finished:?}");
+    assert_eq!(
+        finished.calls[0].arguments_json, r#"{"city":"London"}"#,
+        "the streamed arguments ride the joined call: {finished:?}"
+    );
+}
+
+#[test]
+fn a_call_named_on_the_arguments_event_is_runnable_without_an_item() {
+    // A lenient gateway may relay no output items at all and put the function's
+    // name on its arguments event, which the documented schema does not carry.
+    // Such a call is still the model asking for a tool, so it has to run rather
+    // than fail the turn as unnameable.
+    let mut calls = AccCalls::default();
+    calls
+        .absorb(&event(
+            r#"{"type":"response.function_call_arguments.done","call_id":"call_1","name":"get_weather","arguments":"{\"city\":\"London\"}"}"#,
+        ))
+        .expect("arguments accumulate");
+
+    let finished = calls.finish();
+    assert_eq!(finished.calls.len(), 1, "a runnable call: {finished:?}");
+    assert_eq!(finished.calls[0].id, "call_1");
+    assert_eq!(finished.calls[0].name, "get_weather");
+    assert_eq!(finished.calls[0].arguments_json, r#"{"city":"London"}"#);
+    assert_eq!(finished.unnamed, 0);
+}
+
+#[test]
+fn an_item_name_is_never_overridden_by_the_arguments_event() {
+    // The fallback name is a fallback: when the item named the function, that is
+    // the stream's own statement of which tool to run, so a disagreeing name on
+    // an arguments event must not be able to redirect the call.
+    let mut calls = AccCalls::default();
+    calls
+        .absorb(&event(ITEM_ADDED))
+        .expect("the item names the call");
+    calls
+        .absorb(&event(
+            r#"{"type":"response.function_call_arguments.done","item_id":"fc_1","name":"something_else","arguments":"{}"}"#,
+        ))
+        .expect("the arguments complete the call");
+
+    let finished = calls.finish().calls;
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0].name, "get_weather");
 }
 
 #[test]

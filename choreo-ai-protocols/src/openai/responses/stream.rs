@@ -1,244 +1,24 @@
 //! The streaming Responses API turn with tools.
 //!
-//! Owns the SSE loop, the per-call tool-call accumulator (a call is assembled
-//! from its `function_call` output item and the argument events that name it),
-//! and the streaming reasoning/usage assembly — the streaming counterpart of the
-//! non-streaming request entry points in [`super`].
+//! Owns the SSE loop and the streaming reasoning/usage assembly — the streaming
+//! counterpart of the non-streaming request entry points in [`super`]. The tool
+//! calls the stream names are assembled by [`super::accumulator`], which this
+//! loop feeds one call event at a time.
 
-use std::collections::HashMap;
 use std::io;
 
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, info, warn};
 
-use crate::shared::{MAX_TOOL_CALLS, RequestAuth};
-use crate::types::{CallerInfo, ChatToolCall, ChatTurnResult, StreamEvent};
+use crate::shared::RequestAuth;
+use crate::types::{ChatTurnResult, StreamEvent};
 use choreo_proto::TokenUsage;
 
 use super::super::retry;
-use super::super::{CallRef, ResponsesStreamEvent, SseReader, parse_responses_stream_event};
+use super::super::{ResponsesStreamEvent, SseReader, parse_responses_stream_event};
+use super::accumulator::AccCalls;
 use super::body::build_responses_request_body;
 use super::turn::{merge_reasoning_item, responses_items_artifact, responses_usage_to_token_usage};
 use crate::openai::turn::{TurnParts, assemble_turn};
-
-/// One function call the stream is assembling, held under the identity the
-/// stream named it with (its output item's id, or its call id).
-///
-/// # What each event contributes
-///
-/// - `response.output_item.*` ([`ResponsesStreamEvent::FunctionCallItem`]) —
-///   the call's *identity*: the function's name, which no other event on the
-///   wire carries, plus the `call_id` the request echoes back. The item also
-///   carries its own `arguments` copy, complete on `output_item.done`; on
-///   `output_item.added` it is empty.
-/// - `response.function_call_arguments.delta` — a chunk of JSON to **append**
-///   to the accumulator (`arguments.push_str(&delta)`).
-/// - `response.function_call_arguments.done` — the **complete** final arguments
-///   string. When received, `arguments` is **replaced** (not appended),
-///   overwriting any partial accumulation from prior delta events.
-///
-/// That matches the `OpenAI` spec: the done event carries the full final
-/// arguments JSON, while delta events carry incremental fragments. The item's
-/// own copy is held to the same rule, minus the empty one — see [`AccCalls::absorb`].
-pub(super) struct AccCall {
-    /// The provider's `call_id`; the wire may omit it, in which case the
-    /// request answers the call by whichever identity it did give.
-    pub(super) call_id: Option<String>,
-    /// The function the model asked for, named by the call's output item.
-    pub(super) name: Option<String>,
-    pub(super) arguments: String,
-    /// The provider's `caller` attribution for this call, captured from its
-    /// `function_call` output item. Kept so the finished call carries it back
-    /// onto the rebuilt request: the API needs the same value on the
-    /// `function_call_output` that answers the call to resume the generated
-    /// program.
-    pub(super) caller: Option<CallerInfo>,
-    /// Monotonically increasing index assigned to this tool call, used to
-    /// preserve insertion order since the Responses API does not provide
-    /// server-side indices like Chat Completions does.
-    pub(super) index: u32,
-}
-
-impl AccCall {
-    pub(super) fn new(index: u32) -> Self {
-        Self {
-            call_id: None,
-            name: None,
-            arguments: String::new(),
-            caller: None,
-            index,
-        }
-    }
-}
-
-/// The streamed tool calls of one turn, keyed by the identity the stream named
-/// each call with — its output item's id, falling back to its call id.
-///
-/// The Responses API assigns no server-side index, so the accumulator mints one
-/// per first-seen call to keep the model's call order. The map is the call-count
-/// bound: a *new* identity past [`MAX_TOOL_CALLS`] is rejected, while a later
-/// event for an already-known call is always accepted — a full map must not
-/// turn a legal continuation into an error.
-#[derive(Default)]
-pub(super) struct AccCalls {
-    by_id: HashMap<String, AccCall>,
-    next_index: u32,
-}
-
-impl AccCalls {
-    /// The accumulator slot for one call identity, minting one when this is the
-    /// first time the stream names it.
-    pub(super) fn entry(
-        &mut self,
-        call_id: String,
-    ) -> Result<&mut AccCall, super::super::OpenAiError> {
-        if !self.by_id.contains_key(&call_id) && self.by_id.len() >= MAX_TOOL_CALLS {
-            return Err(super::super::OpenAiError::Io(io::Error::other(format!(
-                "too many tool calls (max {MAX_TOOL_CALLS})"
-            ))));
-        }
-        let next_index = &mut self.next_index;
-        Ok(self.by_id.entry(call_id).or_insert_with(|| {
-            let index = *next_index;
-            *next_index = next_index.saturating_add(1);
-            AccCall::new(index)
-        }))
-    }
-
-    /// The slot one event names, minting it the first time the stream mentions
-    /// the call.
-    ///
-    /// An output-item id keys its own slot, because that is the join the
-    /// documented argument events use. A bare call id is resolved against the
-    /// slots already minted — a stream that sends output items *and* names only
-    /// call ids on its argument events must still land on the call's one slot,
-    /// or the same tool would be run twice — and only keys a new slot when
-    /// nothing claims it.
-    fn slot(&mut self, call: &CallRef) -> Result<&mut AccCall, super::super::OpenAiError> {
-        let key = match call {
-            CallRef::Item(item_id) => item_id.clone(),
-            CallRef::Call(call_id) => self
-                .by_id
-                .iter()
-                .find(|(_, acc)| acc.call_id.as_deref() == Some(call_id.as_str()))
-                .map_or_else(|| call_id.clone(), |(key, _)| key.clone()),
-        };
-        self.entry(key)
-    }
-
-    /// The accumulated calls in the model's own order.
-    pub(super) fn into_ordered(self) -> Vec<(String, AccCall)> {
-        let mut sorted: Vec<(String, AccCall)> = self.by_id.into_iter().collect();
-        sorted.sort_by_key(|(_, acc)| acc.index);
-        sorted
-    }
-
-    /// Apply one call-related stream event to the accumulator.
-    ///
-    /// The three call events are handled here rather than in the stream loop so
-    /// the accumulation rules (append a delta, replace with `done`, name and
-    /// attribute the call from its item) are exercisable without a socket.
-    pub(super) fn absorb(
-        &mut self,
-        event: &ResponsesStreamEvent,
-    ) -> Result<(), super::super::OpenAiError> {
-        match event {
-            ResponsesStreamEvent::FunctionCallItem {
-                item_id,
-                call_id,
-                name,
-                arguments,
-                caller,
-            } => {
-                // The item is where a streamed call is identified: the argument
-                // events name nothing but the item they belong to. An item that
-                // names neither id can't be answered by any
-                // `function_call_output`, so there is nothing to accumulate.
-                let Some(call) = CallRef::of(item_id.as_deref(), call_id.as_deref()) else {
-                    return Ok(());
-                };
-                let entry = self.slot(&call)?;
-                if let Some(call_id) = call_id.as_deref() {
-                    entry.call_id = Some(call_id.to_string());
-                }
-                if let Some(name) = name.as_deref() {
-                    entry.name = Some(name.to_string());
-                }
-                // The item carries its own copy of the arguments — complete on
-                // `output_item.done` — so it replaces whatever the deltas built.
-                // The empty copy on `output_item.added` is not a value, and must
-                // not wipe arguments that already arrived.
-                if !arguments.is_empty() {
-                    entry.arguments.clone_from(arguments);
-                }
-                if caller.is_some() {
-                    entry.caller.clone_from(caller);
-                }
-                trace!(
-                    tool_name = ?entry.name,
-                    args_len = entry.arguments.len(),
-                    "openai responses: function call item",
-                );
-            }
-            ResponsesStreamEvent::FunctionCallArgumentsDelta { call, delta } => {
-                // `call` is provided by the trusted API server — no validation
-                // needed; it is used directly as the accumulator key for this
-                // specific tool call.
-                self.slot(call)?.arguments.push_str(delta);
-            }
-            ResponsesStreamEvent::FunctionCallArgumentsDone { call, arguments } => {
-                // `arguments` is the complete final JSON string (not a delta), so
-                // it replaces any accumulated partial value.
-                self.slot(call)?.arguments.clone_from(arguments);
-            }
-            // Not a call event: the stream loop routes only the three variants
-            // above here.
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// The finished tool calls in the model's own order, plus how many calls the
-    /// stream mentioned without ever naming — a call with no function name can't
-    /// be run, so it is counted for the turn's verdict rather than invented.
-    pub(super) fn finish(self) -> FinishedCalls {
-        let ordered = self.into_ordered();
-        let mentioned = ordered.len();
-        let calls: Vec<ChatToolCall> = ordered
-            .into_iter()
-            .filter_map(|(identity, acc)| {
-                let name = acc.name.as_deref().filter(|n| !n.is_empty())?;
-                Some(ChatToolCall {
-                    // The request answers the call by `call_id`; a stream that
-                    // never named one is answered by the identity it did give.
-                    id: acc.call_id.unwrap_or(identity),
-                    name: name.to_string(),
-                    arguments_json: acc.arguments,
-                    caller: acc.caller,
-                })
-            })
-            .collect();
-        let unnamed = mentioned - calls.len();
-        if unnamed > 0 {
-            warn!(
-                dropped = unnamed,
-                "the provider mentioned function call(s) without naming them \
-                 (the stream carried no function_call output item)"
-            );
-        }
-        FinishedCalls { calls, unnamed }
-    }
-}
-
-/// What one streamed turn's call accumulation produced.
-#[derive(Debug)]
-pub(super) struct FinishedCalls {
-    /// The calls the model made, in its own order.
-    pub(super) calls: Vec<ChatToolCall>,
-    /// How many calls the stream mentioned without naming the function. They
-    /// cannot be run, so the turn has to account for them rather than reporting
-    /// an answer that silently omits them.
-    pub(super) unnamed: usize,
-}
 
 // ── Streaming responses with tools ───────────────────────────────────────
 
@@ -454,9 +234,9 @@ where
 
     // The shared assembler owns the tool-call / truncation / empty-response
     // decision tree, so this path and the non-streaming one cannot disagree.
-    // The accumulator reports a call whose output item never arrived (nothing on
-    // the wire names the function) so the assembler can fail the turn loudly
-    // rather than answer with nothing.
+    // The accumulator reports a call nothing on the stream ever named — neither
+    // an output item nor the name a gateway may put on the arguments event — so
+    // the assembler can fail the turn loudly rather than answer with nothing.
     let calls = acc_calls.finish();
 
     // The assembler owns the normalization, so the accumulated answer is handed

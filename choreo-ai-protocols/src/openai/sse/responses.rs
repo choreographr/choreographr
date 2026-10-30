@@ -1,176 +1,14 @@
-//! Server-sent-events parsing for the `OpenAI` adapters, plus the typed
-//! Responses event parser.
+//! The Responses API's SSE event vocabulary: one typed event per wire event the
+//! adapter reads.
 //!
-//! [`SseReader`] is deliberately format-agnostic: it yields one `data:` payload
-//! per event and leaves interpretation to the caller (chat completions and the
-//! Responses API read entirely different event vocabularies).
+//! [`parse_responses_stream_event`] is the whole mapping — every other item here
+//! is a piece of it: the [`CallRef`] an argument event names its call with, the
+//! readers for the wrapped `response` object the terminal events carry, and the
+//! `function_call` item reader that lifts a call's identity off its output item.
 
-use std::io::{self, BufReader, Read};
+use std::io;
 
 use crate::CallerInfo;
-
-/// Hard ceiling on one SSE event's accumulated bytes.
-///
-/// The reader sits in front of a remote peer that may be a provider, a gateway,
-/// or a proxy in between, and an event is only delimited by a blank line. Without
-/// a ceiling a peer that never emits one — or one that streams an absurdly long
-/// line — would grow the line and event buffers without bound and let a single
-/// connection exhaust the process's memory. The limit is far above any
-/// legitimate event (the largest is a complete tool-argument string or an
-/// encrypted reasoning item, both themselves capped downstream), so it only ever
-/// trips on malformed or hostile input.
-const MAX_SSE_EVENT_BYTES: usize = 8 * 1024 * 1024;
-
-/// The error returned when one event exceeds [`MAX_SSE_EVENT_BYTES`].
-fn event_too_large(observed: usize) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("sse event exceeds {MAX_SSE_EVENT_BYTES} bytes (saw {observed})"),
-    )
-}
-
-pub(crate) struct SseReader {
-    reader: BufReader<Box<dyn Read + Send>>,
-    pending: Vec<u8>,
-    /// Number of leading `pending` bytes already known to contain no newline.
-    /// Resuming the scan here instead of at the start keeps one large event
-    /// linear in its length rather than quadratic across 4 KiB reads.
-    scanned: usize,
-    event_lines: Vec<String>,
-    /// Running byte total of `event_lines`, checked against the event ceiling
-    /// and reset whenever the event is handed out.
-    event_bytes: usize,
-    finished: bool,
-}
-
-impl SseReader {
-    /// Create an SSE reader from any `Read + Send` source (e.g. an HTTP
-    /// response body).  Events are yielded incrementally as bytes arrive,
-    /// enabling true line-level streaming without preloading the entire
-    /// response into memory.
-    pub(crate) fn from_reader(read: impl Read + Send + 'static) -> Self {
-        Self {
-            reader: BufReader::new(Box::new(read)),
-            pending: Vec::new(),
-            scanned: 0,
-            event_lines: Vec::new(),
-            event_bytes: 0,
-            finished: false,
-        }
-    }
-
-    pub(crate) fn next_event(&mut self) -> io::Result<Option<String>> {
-        if self.finished {
-            return Ok(None);
-        }
-
-        loop {
-            if let Some(event) = self.drain_complete_event()? {
-                return Ok(Some(event));
-            }
-
-            let mut buf = [0u8; 4096];
-            match self.reader.read(&mut buf)? {
-                0 => {
-                    self.finished = true;
-                    if !self.pending.is_empty() {
-                        let line = String::from_utf8(std::mem::take(&mut self.pending))
-                            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                        self.event_lines
-                            .push(line.trim_end_matches('\r').to_string());
-                    }
-                    self.scanned = 0;
-                    return Ok(self.finish_event());
-                }
-                n => {
-                    self.pending
-                        .extend_from_slice(crate::shared::read_slice(&buf, n));
-                    // A peer that never terminates its line must not be able to
-                    // grow the buffer without bound; `event_lines` is checked
-                    // separately as lines are completed below.
-                    if self.pending.len() > MAX_SSE_EVENT_BYTES {
-                        return Err(event_too_large(self.pending.len()));
-                    }
-                }
-            }
-        }
-    }
-
-    fn drain_complete_event(&mut self) -> io::Result<Option<String>> {
-        loop {
-            // Only bytes appended since the last scan can hold the next newline,
-            // so the search resumes at `scanned`. Rescanning the whole buffer on
-            // every 4 KiB read would make one large event quadratic in its
-            // length.
-            let Some(offset) = self
-                .pending
-                .get(self.scanned..)
-                .and_then(|unscanned| unscanned.iter().position(|byte| *byte == b'\n'))
-            else {
-                self.scanned = self.pending.len();
-                return Ok(None);
-            };
-            let line_end = self.scanned + offset;
-            let taken = line_end + 1;
-            let mut line = self.pending.drain(..taken).collect::<Vec<_>>();
-            // The remainder has never been scanned, so the search restarts at
-            // its head.
-            self.scanned = 0;
-            if matches!(line.last(), Some(b'\n')) {
-                line.pop();
-            }
-            if matches!(line.last(), Some(b'\r')) {
-                line.pop();
-            }
-
-            if line.is_empty() {
-                if let Some(event) = build_sse_event(&mut self.event_lines) {
-                    self.event_bytes = 0;
-                    if event == "[DONE]" {
-                        self.finished = true;
-                        return Ok(None);
-                    }
-                    return Ok(Some(event));
-                }
-                self.event_bytes = 0;
-                continue;
-            }
-
-            let line = String::from_utf8(line)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-            self.event_bytes = self.event_bytes.saturating_add(line.len());
-            if self.event_bytes > MAX_SSE_EVENT_BYTES {
-                return Err(event_too_large(self.event_bytes));
-            }
-            self.event_lines.push(line);
-        }
-    }
-
-    fn finish_event(&mut self) -> Option<String> {
-        let event = build_sse_event(&mut self.event_lines)?;
-        self.event_bytes = 0;
-        if event == "[DONE]" {
-            return None;
-        }
-        Some(event)
-    }
-}
-
-pub(crate) fn build_sse_event(event_lines: &mut Vec<String>) -> Option<String> {
-    if event_lines.is_empty() {
-        return None;
-    }
-
-    let data = event_lines
-        .iter()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim_start)
-        .collect::<Vec<_>>()
-        .join("\n");
-    event_lines.clear();
-
-    if data.is_empty() { None } else { Some(data) }
-}
 
 /// All typed events that can appear in a Responses API SSE stream.
 ///
@@ -200,6 +38,10 @@ pub(crate) enum ResponsesStreamEvent {
     /// attribution (or one this client cannot read), which is legal — the
     /// field is optional on the wire and only meaningful for resuming a
     /// generated program.
+    ///
+    /// Two fields of the wire item are deliberately not modelled: `namespace`
+    /// and `async`. Tools are registered by their bare function name, so a
+    /// namespaced call resolves against the bare `name` it carries.
     FunctionCallItem {
         /// The item's own `id`, which every argument event of this call repeats
         /// as `item_id`.
@@ -228,6 +70,14 @@ pub(crate) enum ResponsesStreamEvent {
         /// The call the completed arguments belong to (see [`CallRef`]).
         call: CallRef,
         arguments: String,
+        /// The function the model asked for, when the gateway put it on this
+        /// event.
+        ///
+        /// The documented schema has no such field — the name belongs to the
+        /// call's output item — but a lenient gateway that relays no output
+        /// items may still send it, and without it such a call could never be
+        /// run. It is a **fallback**: an item's name always wins.
+        name: Option<String>,
     },
     /// Reasoning-summary text delta (`response.reasoning_summary_text.delta`).
     ///
@@ -240,7 +90,7 @@ pub(crate) enum ResponsesStreamEvent {
     /// Response is complete with optional id and usage
     ResponseCompleted {
         id: Option<String>,
-        usage: Option<super::Usage>,
+        usage: Option<super::super::Usage>,
     },
     /// Response failed with an error message
     ResponseFailed(String),
@@ -254,7 +104,7 @@ pub(crate) enum ResponsesStreamEvent {
     /// terminal error.
     ResponseIncomplete {
         id: Option<String>,
-        usage: Option<super::Usage>,
+        usage: Option<super::super::Usage>,
         reason: Option<String>,
     },
     /// Program code delta (streaming generated JavaScript)
@@ -371,17 +221,29 @@ fn response_id(response: &serde_json::Value) -> Option<String> {
 ///
 /// If usage is present but unparseable, `None` rather than zeroed — the caller
 /// can then distinguish "no usage data" from invalid data.
-fn response_usage(response: &serde_json::Value) -> Option<super::Usage> {
+fn response_usage(response: &serde_json::Value) -> Option<super::super::Usage> {
     response
         .get("usage")
-        .and_then(|u| serde_json::from_value::<super::Usage>(u.clone()).ok())
+        .and_then(|u| serde_json::from_value::<super::super::Usage>(u.clone()).ok())
 }
 
 /// Parse a single Responses API SSE event data string into a typed event.
 ///
-/// Fields that the spec guarantees (e.g. `call_id`) are required — missing
-/// them is an error rather than a silent default, because a missing
-/// identifier would cause confusing downstream failures.
+/// What is required differs by event, because the events differ in what they can
+/// be attributed to:
+///
+/// - A **`function_call` output item** is read leniently: `id`, `call_id` and
+///   `name` are all optional, because one nonconforming item must not fail the
+///   parse of a stream the provider is already billing for. The accumulator
+///   decides what an item with no usable identity means.
+/// - The **`function_call_arguments.*`** events are attributed by `item_id`,
+///   preferring it over `call_id` (see [`CallRef::of`]); `.done` additionally
+///   reads `name` as a gateway fallback. An argument event naming neither id is
+///   dropped as `Ok(None)` — there is nothing it could be attributed to.
+/// - Some events genuinely cannot be attributed at all without an id, and there
+///   the missing id stays a parse error rather than a silent default:
+///   `response.program.code.done` and `response.program_output.done` require a
+///   `call_id`, which is the only thing that makes the event mean anything.
 ///
 /// Returns `Ok(None)` for unknown event types that should be silently ignored.
 pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<ResponsesStreamEvent>> {
@@ -464,6 +326,13 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             Ok(Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
                 call,
                 arguments,
+                // Off-schema, and only a gateway fallback: the accumulator uses
+                // it for a call no output item ever named.
+                name: payload
+                    .get("name")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned),
             }))
         }
         "response.completed" => {

@@ -11,7 +11,10 @@
 //! - [`input`] — messages → `input` item lowering (shared by both body paths).
 //! - [`body`] — request-body assembly around that lowered input.
 //! - [`turn`] — the reasoning-item artifact and the response → turn conversion.
-//! - [`stream`] — the streaming turn with tools (SSE loop + accumulator).
+//! - [`accumulator`] — assembling a streamed tool call from its output item and
+//!   the argument events that name it.
+//! - [`stream`] — the streaming turn with tools (the SSE loop that feeds the
+//!   accumulator).
 
 use tracing::{debug, info};
 
@@ -21,6 +24,7 @@ use crate::shared::RequestAuth;
 use crate::types::{ChatTurnResult, StreamEvent};
 use std::io;
 
+mod accumulator;
 mod body;
 mod input;
 mod stream;
