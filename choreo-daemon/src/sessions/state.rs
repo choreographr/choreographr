@@ -25,8 +25,15 @@ pub(crate) struct ActiveRequest {
     /// unreachable) disconnect as "proceed without cancellation" rather than
     /// aborting a retry loop.
     pub(crate) cancel_tx: crossbeam_channel::Sender<()>,
-    /// The `turn_id` associated with this request, so that late-joining
-    /// subscribers can route streaming chunks to the correct turn.
+    /// The `turn_id` this request is streaming into *right now*, so that
+    /// late-joining subscribers can route streaming chunks to the correct turn.
+    ///
+    /// Seeded with the run's first turn when the request is accepted and kept
+    /// current by [`handle_broadcast`](super::handle_broadcast), which observes
+    /// the worker's per-iteration `Started` as the tool loop moves on to a new
+    /// turn — a late joiner is handed this value in the synthetic `Started`
+    /// `handle_attach` sends, and a stale value would route its chunks to a turn
+    /// the run has already left.
     pub(crate) turn_id: u32,
 }
 

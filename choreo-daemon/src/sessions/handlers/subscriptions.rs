@@ -209,6 +209,29 @@ pub(in crate::sessions) fn handle_broadcast(
     state: &mut SessionState,
     ctx: &RequestContext,
 ) -> bool {
+    // Track the turn the in-flight request is *currently* streaming.  A single
+    // agent run is a tool loop that appends a turn per iteration, and the
+    // worker re-broadcasts `Started` with the new turn id each time it moves
+    // on; `handle_run_input` seeded `ActiveRequest::turn_id` with the run's
+    // first turn only.  `handle_attach` replays that field to a late joiner as
+    // a synthetic `Started`, so leaving it at the first turn would re-point the
+    // joining client's `stream_id → turn_id` route at a turn the run has
+    // already left — every chunk still to come in the current iteration would
+    // then be appended to that old turn (the user's own prompt turn) instead of
+    // the one being streamed.  This runs on the session thread, the sole owner
+    // of `active_requests`, and the worker's `Started` is enqueued before the
+    // iteration's chunks, so the field is current by construction when an
+    // attach is processed.
+    if let DaemonMessageType::Session {
+        event: SessionEvent::Started {
+            stream_id, turn_id, ..
+        },
+        ..
+    } = message
+        && let Some(active) = state.active_requests.get_mut(stream_id)
+    {
+        active.turn_id = *turn_id;
+    }
     // Broadcast through the main session thread's live subscriber
     // map so that in-flight worker broadcasts respect detach.
     broadcast(&mut state.subscribers, ctx, message);

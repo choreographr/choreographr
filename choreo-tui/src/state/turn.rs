@@ -240,7 +240,14 @@ impl TurnEventHandler for App {
     ) {
         tracing::trace!(%stream_id, %turn_id, %estimated_prompt_tokens, "handle_started");
         let display = self.display_for(session_id);
-        display.view.request_to_turn.insert(stream_id, turn_id);
+        // Route the stream at the turn it is streaming into, refusing a replay
+        // that would send this stream back to an earlier turn (see
+        // [`SessionView::start_request`]): the rest of this handler is
+        // per-request bookkeeping that is only meaningful for the turn actually
+        // being streamed.
+        if !display.view.start_request(stream_id, turn_id) {
+            return;
+        }
         display.active.insert(stream_id);
         display.live_input_estimate = estimated_prompt_tokens;
         display.live_output_tokens = 0;

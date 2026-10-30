@@ -2803,6 +2803,20 @@ merge, and the per-session status/token routing) are documented in-source (see
 `choreo-tui`'s `state` and `connection` modules, `cargo doc -p choreo-tui` /
 `just doc`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
+A client that attaches to a session with a request in flight is replayed a
+synthetic `Started` for that run, so it can route the chunks still to come into
+the right turn (without it those chunks are dropped — the client has no
+`stream_id → turn_id` mapping for a run it never saw begin). One agent run is a
+*tool loop* that appends a turn per iteration — the user's prompt turn first,
+then one turn per model/tool round — so the replay must carry the turn the run
+is streaming into **at that moment**, never the run's first turn. The session
+thread keeps `ActiveRequest::turn_id` current from the worker's per-iteration
+`Started`, and a client refuses to route a stream *backwards*: a `Started`
+naming an earlier turn than the one a `stream_id` is already routed to can only
+be a stale replay, and honouring it would append everything still to come to a
+turn the run has already left — in practice the user's own prompt turn, several
+turns above the one on screen.
+
 ### Streaming response auto-scroll pin
 
 While the assistant response streams, the TUI's history pane follows the newest

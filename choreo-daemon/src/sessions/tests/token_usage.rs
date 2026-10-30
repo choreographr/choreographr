@@ -694,6 +694,75 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
 }
 
 #[test]
+fn attach_mid_run_names_the_turn_being_streamed_now() {
+    // One agent run is a tool loop that appends a turn per iteration, each
+    // announced by its own `Started`.  `handle_run_input` seeds
+    // `ActiveRequest::turn_id` with the run's FIRST turn, so a client attaching
+    // mid-run used to be told to route the stream to that turn — after which
+    // every chunk of the iteration actually in flight was appended to the user's
+    // own prompt turn, several turns above the one on screen.  Attaching must
+    // name the turn the run is streaming into at that moment.
+    let (mut state, ctx) = broadcast_setup();
+    let (cancel_tx, _cancel_rx) = crossbeam_channel::unbounded::<()>();
+    state.active_requests.insert(
+        10,
+        ActiveRequest {
+            cancel_tx,
+            turn_id: 3,
+        },
+    );
+
+    // The worker moves the loop on and re-broadcasts `Started` per iteration.
+    let mut shutdown = false;
+    for turn_id in [4, 5] {
+        process_command(
+            SessionCommand::Broadcast(DaemonMessageType::Session {
+                session_id: Some(1),
+                event: SessionEvent::Started {
+                    stream_id: 10,
+                    turn_id,
+                    estimated_prompt_tokens: 9,
+                },
+            }),
+            &mut state,
+            &mut shutdown,
+            &ctx,
+        );
+    }
+    assert_eq!(
+        state.active_requests.get(&10).map(|active| active.turn_id),
+        Some(5),
+        "the in-flight request must track the turn it is streaming into",
+    );
+
+    // A client attaching now is told the CURRENT turn, not the run's first.
+    let (sub_tx, sub_rx) = test_sink();
+    process_command(
+        SessionCommand::Attach {
+            client_id: cid(42),
+            tx: sub_tx,
+        },
+        &mut state,
+        &mut shutdown,
+        &ctx,
+    );
+    match sub_rx.recv().unwrap().inner {
+        DaemonMessageType::Session {
+            session_id: Some(1),
+            event:
+                SessionEvent::Started {
+                    stream_id: 10,
+                    turn_id: 5,
+                    ..
+                },
+        } => {}
+        other => panic!("expected Started(10, turn=5), got {other:?}"),
+    }
+
+    assert!(!shutdown);
+}
+
+#[test]
 fn attach_without_active_requests_does_not_send_started() {
     let (mut state, ctx) = broadcast_setup();
     // No active_requests — default empty.

@@ -47,6 +47,68 @@ fn handle_started_sets_streaming_turn_index() {
 }
 
 #[test]
+fn handle_started_does_not_route_a_stream_back_to_an_earlier_turn() {
+    // A client that re-attaches mid-run is replayed a `Started` for the run's
+    // in-flight stream.  The route must follow the tool loop forward and never
+    // rewind: honouring a stale replay would append the live iteration's chunks
+    // to the turn the run has already left — in practice the user's own prompt
+    // turn, several turns above the one being streamed.
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 200;
+    insert_turn(&mut app, 10, "user asked", "");
+    insert_turn(&mut app, 20, "user asked again", "");
+    app.rebuild_height_prefix();
+
+    // The run starts on turn 10 and the loop moves on to turn 20.
+    app.handle_started(0, 1, 10, 0);
+    app.handle_started(0, 1, 20, 0);
+    {
+        let display = app.active_display_ref().unwrap();
+        assert_eq!(display.view.request_to_turn.get(&1), Some(&20));
+    }
+
+    // The stale replay arrives after the client re-attached.
+    app.handle_started(0, 1, 10, 0);
+
+    app.handle_request_stream(
+        0,
+        1,
+        choreo_proto::OutputStream::Answer,
+        std::borrow::Cow::Borrowed("live chunk"),
+    );
+
+    let display = app.active_display_ref().unwrap();
+    assert_eq!(
+        display.view.request_to_turn.get(&1),
+        Some(&20),
+        "the stream must stay routed at the turn it is streaming into"
+    );
+    assert_eq!(
+        display
+            .view
+            .turns
+            .get(&20)
+            .unwrap()
+            .assistant_text
+            .as_deref(),
+        Some("live chunk"),
+        "the chunk belongs to the turn being streamed"
+    );
+    assert_eq!(
+        display
+            .view
+            .turns
+            .get(&10)
+            .unwrap()
+            .assistant_text
+            .as_deref(),
+        Some(""),
+        "the turn the run already left must not collect the live chunks"
+    );
+}
+
+#[test]
 fn handle_done_fires_full_rebuild() {
     let mut app = test_app();
     // test_app's default display lives on session 0; treat it as the

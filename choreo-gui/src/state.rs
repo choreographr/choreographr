@@ -97,7 +97,9 @@ impl TurnEventHandler for AppState {
         _estimated_prompt_tokens: u32,
     ) {
         debug!(%stream_id, %turn_id, "stream started");
-        self.session_view.request_to_turn.insert(stream_id, turn_id);
+        // `start_request` (not a raw insert) so a stale replayed `Started` can
+        // never rewind this stream onto a turn the run has already left.
+        self.session_view.start_request(stream_id, turn_id);
     }
 
     fn handle_done(

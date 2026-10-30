@@ -159,6 +159,38 @@ impl SessionView {
         self.turns.get_mut(turn_id)
     }
 
+    /// Record that `stream_id` is streaming into `turn_id`, the turn the
+    /// daemon's agent loop moved on to.
+    ///
+    /// Returns `false` when the event would *rewind* an existing route to an
+    /// earlier turn, and leaves the mapping untouched.  Turn ids are handed out
+    /// monotonically within a session, so a run's turns only ever move forward;
+    /// a rewind can therefore only be a stale replay of an old `Started` (a
+    /// late-joining subscriber is replayed one for the run's in-flight stream),
+    /// and honouring it would steal every chunk still to come back to a turn the
+    /// run has already left — appending them to that turn instead of the one on
+    /// screen.
+    ///
+    /// A repeated `Started` naming the turn already routed to is accepted
+    /// (`true`) and idempotent: the daemon sends the requester both a targeted
+    /// and a broadcast `Started` for the same turn, and a re-attach replays one
+    /// for the stream's current turn.
+    pub fn start_request(&mut self, stream_id: u64, turn_id: u32) -> bool {
+        if let Some(&current) = self.request_to_turn.get(&stream_id)
+            && turn_id < current
+        {
+            tracing::warn!(
+                %stream_id,
+                %turn_id,
+                %current,
+                "ignoring a Started for an earlier turn than this stream is already routed to"
+            );
+            return false;
+        }
+        self.request_to_turn.insert(stream_id, turn_id);
+        true
+    }
+
     /// Route streaming output to the current turn for this request.
     pub fn stream_chunk(&mut self, stream_id: u64, stream: &OutputStream, data: &str) {
         let Some(&turn_id) = self.request_to_turn.get(&stream_id) else {
@@ -766,5 +798,46 @@ mod tests {
             "append path must fill the empty placeholder from the stash"
         );
         assert_eq!(result.content, "output\n");
+    }
+
+    #[test]
+    fn start_request_advances_but_never_rewinds() {
+        // The agent loop moves a run through one turn per iteration, so a
+        // stream's route only ever advances.
+        let mut view = SessionView::new();
+        assert!(view.start_request(7, 1));
+        assert_eq!(view.request_to_turn.get(&7), Some(&1));
+        assert!(view.start_request(7, 2));
+        assert_eq!(view.request_to_turn.get(&7), Some(&2));
+
+        // A repeated `Started` for the current turn (the requester gets a
+        // targeted and a broadcast one) is accepted and changes nothing.
+        assert!(view.start_request(7, 2));
+        assert_eq!(view.request_to_turn.get(&7), Some(&2));
+
+        // A stale replay naming an EARLIER turn — what a late-joining
+        // subscriber used to be handed for an in-flight run — must not steal
+        // the stream back to a turn the run has already left.
+        assert!(!view.start_request(7, 1));
+        assert_eq!(
+            view.request_to_turn.get(&7),
+            Some(&2),
+            "a rewind must leave the live route on the current turn"
+        );
+
+        // Chunks keep landing in the current turn, never the old one.
+        view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
+        view.insert_or_replace(2, turn_with_tool_call("call-2", "sh"));
+        view.stream_chunk(7, &OutputStream::Answer, "streamed");
+        assert!(view.get(1).unwrap().assistant_text.is_none());
+        assert_eq!(
+            view.get(2).unwrap().assistant_text.as_deref(),
+            Some("streamed")
+        );
+
+        // A different stream (a fresh run after the first finished) is
+        // unrelated to the guard: it may name any turn id.
+        assert!(view.start_request(8, 1));
+        assert_eq!(view.request_to_turn.get(&8), Some(&1));
     }
 }
