@@ -62,7 +62,7 @@ fn streaming_response_pins_its_top_at_viewport_top_once() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
     assert_eq!(app.effective_scroll(), 0, "starts following the bottom");
@@ -113,7 +113,7 @@ fn streaming_short_response_never_pins_and_keeps_following() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -143,7 +143,7 @@ fn reasoning_only_streaming_never_pins() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -175,7 +175,7 @@ fn manual_scroll_disarms_an_unpinned_response() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -214,7 +214,7 @@ fn a_noop_manual_scroll_keeps_the_pin_armed() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -252,7 +252,7 @@ fn pinned_response_keeps_its_position_across_a_session_switch() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
     stream_answer(&mut app, 0, 7, &"line\n".repeat(60));
@@ -304,7 +304,7 @@ fn switching_into_a_background_streaming_response_pins_at_once() {
     {
         let display = app.display_for(1);
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     for ch in "line\n".repeat(80).chars() {
         app.handle_request_stream(1, 7, OutputStream::Answer, Cow::Owned(ch.to_string()));
@@ -364,7 +364,7 @@ fn a_new_turn_supersedes_the_pinned_response_and_the_run_ends_pinned_on_it() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -428,7 +428,7 @@ fn a_manual_scroll_after_pinning_drops_the_pin() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
     stream_answer(&mut app, 0, 7, &"line\n".repeat(60));
@@ -453,7 +453,7 @@ fn a_new_turn_after_a_manual_scroll_does_not_release_the_view() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
     stream_answer(&mut app, 0, 7, &"line\n".repeat(60));
@@ -535,7 +535,7 @@ fn a_tool_call_releases_a_pinned_response_and_returns_to_the_bottom() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -575,7 +575,7 @@ fn a_tool_result_chunk_releases_a_pinned_response_and_follows_the_output() {
         display
             .view
             .insert_or_replace(1, turn_with_tool_result("ask", "c1"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -616,7 +616,7 @@ fn an_armed_short_response_that_a_tool_follows_never_pins() {
         display
             .view
             .insert_or_replace(1, turn_with_tool_result("ask", "c1"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -656,7 +656,7 @@ fn a_new_turn_releases_an_armed_response() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, pending_turn("ask"));
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 

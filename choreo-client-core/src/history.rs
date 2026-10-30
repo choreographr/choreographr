@@ -64,8 +64,14 @@ pub struct SessionView {
     /// `turn_id` → Turn. Ordered by key (monotonically assigned by daemon).
     pub turns: BTreeMap<u32, Turn>,
     /// `stream_id` → `turn_id` for streaming chunk routing.
-    /// Inserted on `Started`, removed on `Done`/`Failed`/`Cancelled`.
-    pub request_to_turn: HashMap<u64, u32>,
+    ///
+    /// Advanced by [`Self::start_request`] as the daemon's agent loop moves a
+    /// run on to a new turn, and dropped on `Done`/`Failed`/`Cancelled` (see
+    /// [`Self::finish_request`]). Deliberately private: `start_request` is its
+    /// only writer, because the map must never be rewound to an earlier turn
+    /// without the guard there, so reads go through [`Self::request_turn_id`]
+    /// and [`Self::request_turn`] rather than a raw field access.
+    request_to_turn: HashMap<u64, u32>,
     /// `call_id` → invocation description for tool calls whose start event
     /// (`ToolCallStarted`) arrived before their first streaming chunk created
     /// a stub result.  The description rides on the start event (never on a
@@ -129,7 +135,7 @@ impl SessionView {
     /// only reachable through `request_to_turn`; a request that never
     /// re-broadcasts its final turn would otherwise leak the stash entries.
     pub fn finish_request(&mut self, stream_id: u64) {
-        if let Some(&turn_id) = self.request_to_turn.get(&stream_id) {
+        if let Some(turn_id) = self.request_turn_id(stream_id) {
             self.clear_tool_call_descriptions(turn_id);
         }
         self.request_to_turn.remove(&stream_id);
@@ -146,37 +152,49 @@ impl SessionView {
         self.turns.get_mut(&turn_id)
     }
 
+    /// The turn the streaming `stream_id` is currently routed to, if any.
+    #[must_use]
+    pub fn request_turn_id(&self, stream_id: u64) -> Option<u32> {
+        self.request_to_turn.get(&stream_id).copied()
+    }
+
     /// The turn currently associated with the streaming `stream_id`, if any.
     #[must_use]
     pub fn request_turn(&self, stream_id: u64) -> Option<&Turn> {
-        let turn_id = self.request_to_turn.get(&stream_id)?;
-        self.turns.get(turn_id)
+        self.turns.get(&self.request_turn_id(stream_id)?)
     }
 
     /// The turn associated with `stream_id`, mutable, if any.
     pub fn request_turn_mut(&mut self, stream_id: u64) -> Option<&mut Turn> {
-        let turn_id = self.request_to_turn.get(&stream_id)?;
-        self.turns.get_mut(turn_id)
+        self.turns.get_mut(&self.request_turn_id(stream_id)?)
     }
 
-    /// Record that `stream_id` is streaming into `turn_id`, the turn the
+    /// Record that `stream_id` is now streaming into `turn_id`, the turn the
     /// daemon's agent loop moved on to.
     ///
-    /// Returns `false` when the event would *rewind* an existing route to an
-    /// earlier turn, and leaves the mapping untouched.  Turn ids are handed out
-    /// monotonically within a session, so a run's turns only ever move forward;
-    /// a rewind can therefore only be a stale replay of an old `Started` (a
-    /// late-joining subscriber is replayed one for the run's in-flight stream),
-    /// and honouring it would steal every chunk still to come back to a turn the
-    /// run has already left — appending them to that turn instead of the one on
-    /// screen.
+    /// This is the routing map's **only** writer, and it refuses to *rewind* a
+    /// stream: when `stream_id` is already routed to an earlier-numbered turn
+    /// the call returns `false` and leaves the mapping untouched. Turn ids are
+    /// handed out monotonically within a session and never reused (see
+    /// [`SessionEvent::Started`](choreo_proto::SessionEvent::Started) — the wire
+    /// contract the inference rests on), so a run's turns only ever move forward
+    /// and a rewind can only be a stale replay of an old `Started`; honouring it
+    /// would steal every chunk still to come back to a turn the run has already
+    /// left, appending them to that turn instead of the one on screen.
+    ///
+    /// The daemon is authoritative here — it keeps the live turn current and
+    /// replays that one, so with a healthy daemon a rewind never arrives. The
+    /// guard is defence in depth: it costs one map lookup per `Started` and
+    /// converts a daemon regression or an out-of-order replay from *content
+    /// landing in the wrong turn* into a dropped route change with a warning.
     ///
     /// A repeated `Started` naming the turn already routed to is accepted
     /// (`true`) and idempotent: the daemon sends the requester both a targeted
     /// and a broadcast `Started` for the same turn, and a re-attach replays one
     /// for the stream's current turn.
+    #[must_use = "a rejected Started must not be treated as applied"]
     pub fn start_request(&mut self, stream_id: u64, turn_id: u32) -> bool {
-        if let Some(&current) = self.request_to_turn.get(&stream_id)
+        if let Some(current) = self.request_turn_id(stream_id)
             && turn_id < current
         {
             tracing::warn!(
@@ -193,7 +211,7 @@ impl SessionView {
 
     /// Route streaming output to the current turn for this request.
     pub fn stream_chunk(&mut self, stream_id: u64, stream: &OutputStream, data: &str) {
-        let Some(&turn_id) = self.request_to_turn.get(&stream_id) else {
+        let Some(turn_id) = self.request_turn_id(stream_id) else {
             tracing::warn!(%stream_id, "stream_chunk: unknown request");
             return;
         };
@@ -234,7 +252,7 @@ impl SessionView {
         args: String,
         invocation_description: &str,
     ) {
-        let Some(&turn_id) = self.request_to_turn.get(&stream_id) else {
+        let Some(turn_id) = self.request_turn_id(stream_id) else {
             tracing::warn!(%stream_id, "tool_call_started: unknown request");
             return;
         };
@@ -286,7 +304,7 @@ impl SessionView {
     /// Route a tool result chunk — appends to the matching `ToolResultRecord`.
     /// Creates a stub record if the `ToolCallStarted` event hasn't arrived yet.
     pub fn tool_result_chunk(&mut self, stream_id: u64, call_id: &str, data: &str) {
-        let Some(&turn_id) = self.request_to_turn.get(&stream_id) else {
+        let Some(turn_id) = self.request_turn_id(stream_id) else {
             tracing::warn!(%stream_id, "tool_result_chunk: unknown request");
             return;
         };
@@ -386,7 +404,7 @@ mod tests {
         // of flipping when the real record lands.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "read_file"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         view.tool_result_chunk(7, "call-1", "line one\n");
 
@@ -410,7 +428,7 @@ mod tests {
             image: None,
         });
         view.insert_or_replace(1, turn);
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         view.tool_result_chunk(7, "call-1", "second");
 
@@ -436,7 +454,7 @@ mod tests {
             image: None,
         });
         view.insert_or_replace(1, turn);
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         // A 20-byte chunk only has 10 bytes of headroom: it is cut on a
         // char boundary and the marker appended once.
@@ -471,7 +489,7 @@ mod tests {
         // capped even on the out-of-order stub-creation path.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         let giant = "y".repeat(MAX_STREAMED_TOOL_CONTENT_BYTES + 1000);
         view.tool_result_chunk(7, "call-1", &giant);
@@ -507,7 +525,7 @@ mod tests {
             image: None,
         });
         view.insert_or_replace(1, turn);
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         // A later chunk proves truncation: the marker appears exactly once.
         view.tool_result_chunk(7, "call-1", "more");
@@ -546,7 +564,7 @@ mod tests {
         // expanded.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         view.tool_result_chunk(7, "nope", "data");
 
@@ -564,7 +582,7 @@ mod tests {
         // record.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         // Stub for a call whose tool_call has not landed yet → empty name.
         view.tool_result_chunk(7, "call-2", "data\n");
@@ -585,7 +603,7 @@ mod tests {
         // by the start event must be recovered at stub-creation time.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         view.tool_call_started(
             7,
@@ -618,7 +636,7 @@ mod tests {
         // backfill) so the live header renders once the event lands.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         view.tool_result_chunk(7, "call-2", "output\n");
         assert_eq!(
@@ -650,7 +668,7 @@ mod tests {
         // resolve stub names.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         view.tool_call_started(7, "call-1".into(), "sh".into(), "{}".to_string(), "");
 
@@ -670,7 +688,7 @@ mod tests {
         // bounded by in-flight calls.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
         view.tool_call_started(
             7,
             "call-1".into(),
@@ -706,7 +724,7 @@ mod tests {
         // stays bounded by in-flight calls even then.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
         view.tool_call_started(
             7,
             "call-1".into(),
@@ -736,7 +754,7 @@ mod tests {
         // dropped) and the request→turn mapping is removed.
         let mut view = SessionView::new();
         view.insert_or_replace(1, turn_with_tool_call("call-1", "sh"));
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
         view.tool_call_started(
             7,
             "call-1".into(),
@@ -753,7 +771,7 @@ mod tests {
             "the closing turn's descriptions must be dropped"
         );
         assert!(
-            !view.request_to_turn.contains_key(&7),
+            view.request_turn_id(7).is_none(),
             "the request→turn mapping must be dropped"
         );
 
@@ -779,7 +797,7 @@ mod tests {
             image: None,
         });
         view.insert_or_replace(1, turn);
-        view.request_to_turn.insert(7, 1);
+        assert!(view.start_request(7, 1));
 
         // The start event stashes the description (broadcast before chunks).
         view.tool_call_started(
@@ -806,22 +824,22 @@ mod tests {
         // stream's route only ever advances.
         let mut view = SessionView::new();
         assert!(view.start_request(7, 1));
-        assert_eq!(view.request_to_turn.get(&7), Some(&1));
+        assert_eq!(view.request_turn_id(7), Some(1));
         assert!(view.start_request(7, 2));
-        assert_eq!(view.request_to_turn.get(&7), Some(&2));
+        assert_eq!(view.request_turn_id(7), Some(2));
 
         // A repeated `Started` for the current turn (the requester gets a
         // targeted and a broadcast one) is accepted and changes nothing.
         assert!(view.start_request(7, 2));
-        assert_eq!(view.request_to_turn.get(&7), Some(&2));
+        assert_eq!(view.request_turn_id(7), Some(2));
 
         // A stale replay naming an EARLIER turn — what a late-joining
         // subscriber used to be handed for an in-flight run — must not steal
         // the stream back to a turn the run has already left.
         assert!(!view.start_request(7, 1));
         assert_eq!(
-            view.request_to_turn.get(&7),
-            Some(&2),
+            view.request_turn_id(7),
+            Some(2),
             "a rewind must leave the live route on the current turn"
         );
 
@@ -838,6 +856,6 @@ mod tests {
         // A different stream (a fresh run after the first finished) is
         // unrelated to the guard: it may name any turn id.
         assert!(view.start_request(8, 1));
-        assert_eq!(view.request_to_turn.get(&8), Some(&1));
+        assert_eq!(view.request_turn_id(8), Some(1));
     }
 }

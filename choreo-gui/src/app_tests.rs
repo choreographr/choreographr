@@ -14,11 +14,7 @@ fn app_state_stream_updates_history() {
     dispatch_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
-            event: SessionEvent::Started {
-                stream_id: 7,
-                turn_id: 1,
-                estimated_prompt_tokens: 0,
-            },
+            event: SessionEvent::started(7, 1, 0),
         }),
         &mut state,
     );
@@ -342,6 +338,69 @@ fn keystore_unbound_status_push_auto_binds() {
 // ── Turn cancellation vs failure ──────────────────────────────────────
 
 #[test]
+fn started_never_rewinds_a_stream_to_an_earlier_turn() {
+    let mut state = AppState::new("/tmp/choreographr.sock");
+
+    // A run is a tool loop: the daemon re-sends `Started` as it moves the run on
+    // to a new turn, and the route must follow it forward.
+    for turn_id in [1, 2] {
+        dispatch_daemon_message(
+            DaemonMessage::broadcast(DaemonMessageType::Session {
+                session_id: Some(1),
+                event: SessionEvent::started(7, turn_id, 0),
+            }),
+            &mut state,
+        );
+    }
+    assert_eq!(state.session_view.request_turn_id(7), Some(2));
+
+    // A stale replay naming the run's first turn (what a mid-run attach used to
+    // be handed) must not rewind the route: the chunks still to come belong to
+    // the turn on screen, not the one the run already left.
+    dispatch_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::started(7, 1, 0),
+        }),
+        &mut state,
+    );
+    assert_eq!(
+        state.session_view.request_turn_id(7),
+        Some(2),
+        "a dropped stale replay must leave the live route on the current turn"
+    );
+
+    // And the stream's chunks keep landing in that turn.
+    dispatch_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(1),
+            event: SessionEvent::OutputChunk {
+                stream_id: 7,
+                stream: OutputStream::Answer,
+                data: b"live chunk".to_vec(),
+            },
+        }),
+        &mut state,
+    );
+    assert_eq!(
+        state
+            .session_view
+            .turns
+            .get(&2)
+            .and_then(|t| t.assistant_text.as_deref()),
+        Some("live chunk")
+    );
+    assert!(
+        state
+            .session_view
+            .turns
+            .get(&1)
+            .is_none_or(|t| t.assistant_text.as_deref().is_none_or(str::is_empty)),
+        "the turn the run already left must not collect live chunks"
+    );
+}
+
+#[test]
 fn cancelled_records_no_error_while_failed_does() {
     let mut state = AppState::new("/tmp/choreographr.sock");
 
@@ -349,15 +408,11 @@ fn cancelled_records_no_error_while_failed_does() {
     dispatch_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Session {
             session_id: Some(1),
-            event: SessionEvent::Started {
-                stream_id: 7,
-                turn_id: 1,
-                estimated_prompt_tokens: 0,
-            },
+            event: SessionEvent::started(7, 1, 0),
         }),
         &mut state,
     );
-    assert_eq!(state.session_view.request_to_turn.get(&7), Some(&1));
+    assert_eq!(state.session_view.request_turn_id(7), Some(1));
 
     // A user cancel tears the request down without any `[error]` line.
     dispatch_daemon_message(
@@ -373,7 +428,7 @@ fn cancelled_records_no_error_while_failed_does() {
         state.status_texts
     );
     assert!(
-        !state.session_view.request_to_turn.contains_key(&7),
+        state.session_view.request_turn_id(7).is_none(),
         "the cancelled request must be torn down"
     );
 

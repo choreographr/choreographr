@@ -25,27 +25,44 @@ pub(crate) struct ActiveRequest {
     /// unreachable) disconnect as "proceed without cancellation" rather than
     /// aborting a retry loop.
     pub(crate) cancel_tx: crossbeam_channel::Sender<()>,
-    /// The `turn_id` this request is streaming into *right now*, so that
-    /// late-joining subscribers can route streaming chunks to the correct turn.
+    /// The `turn_id` this request is streaming into *right now*.
     ///
     /// Seeded with the run's first turn when the request is accepted and kept
-    /// current by [`handle_broadcast`](super::handle_broadcast), which observes
-    /// the worker's per-iteration `Started` as the tool loop moves on to a new
-    /// turn — a late joiner is handed this value in the synthetic `Started`
-    /// `handle_attach` sends, and a stale value would route its chunks to a turn
-    /// the run has already left.
+    /// current by [`handle_broadcast`](super::handle_broadcast) from the
+    /// worker's per-iteration `Started` as the tool loop moves on to a new turn.
+    /// [`handle_attach`](super::handle_attach) replays it to a late joiner in a
+    /// synthetic `Started`, so a stale value would route that client's chunks to
+    /// a turn the run has already left.
     pub(crate) turn_id: u32,
-    /// The prompt-token estimate of the iteration this request is streaming, so
-    /// a late joiner's synthetic `Started` carries the live context size rather
-    /// than resetting the readout to zero.
+    /// The prompt-token estimate of the iteration this request is streaming.
     ///
     /// Seeded at `0` when the request is accepted (the worker has not built the
-    /// request, let alone counted it) and kept current by
-    /// [`handle_broadcast`](super::handle_broadcast) from the same per-iteration
-    /// `Started` that keeps [`turn_id`](Self::turn_id) current: the estimate is
-    /// recomputed each iteration as the conversation grows, so the value a
-    /// joiner is handed must be the one for the iteration in flight.
+    /// request, let alone counted it) and kept current from the same
+    /// per-iteration `Started` that keeps [`turn_id`](Self::turn_id) current.
+    /// The estimate is recomputed each iteration as the conversation grows, so a
+    /// joiner must be handed the one for the iteration in flight — a `0` would
+    /// blank its context-size readout until the next iteration began.
     pub(crate) estimated_prompt_tokens: u32,
+}
+
+impl ActiveRequest {
+    /// The `Started` announcing this request's current iteration: what the
+    /// acceptance path broadcasts and what a client attaching mid-run is
+    /// replayed.
+    ///
+    /// Both emitters build the event from the same record, so a run's announced
+    /// state and its replayed state cannot drift apart, and
+    /// [`SessionEvent::started`] keeps the field list in one place.
+    pub(in crate::sessions) fn started_event(
+        &self,
+        session_id: u64,
+        stream_id: u64,
+    ) -> DaemonMessageType {
+        DaemonMessageType::Session {
+            session_id: Some(session_id),
+            event: SessionEvent::started(stream_id, self.turn_id, self.estimated_prompt_tokens),
+        }
+    }
 }
 
 /// A live session's control handles, held by the daemon's session manager.
@@ -262,13 +279,16 @@ impl SessionState {
         snapshot: SessionSnapshot,
         subscribers: HashMap<ClientId, SubscriberSink>,
     ) -> Self {
-        // usize→u32 turn count: a session with 4 billion turns is impossible
-        // in practice (each turn is a full provider round-trip).
-        #[expect(clippy::cast_possible_truncation)]
-        let turn_count = snapshot.turns.len() as u32;
+        // Continue from the highest turn id present, not the turn count: the
+        // worker hands out turn ids from here via `start_turn`, and clients
+        // refuse a `Started` that would move a stream to an earlier turn, so a
+        // duplicate or lower id would leave that run's chunks unroutable. The
+        // load and merge paths derive the counter the same way; see the wire
+        // contract on `SessionEvent::Started`.
+        let next_turn_id = snapshot.turns.keys().next_back().map_or(0, |max| max + 1);
         Self {
             config: snapshot.config,
-            next_turn_id: turn_count,
+            next_turn_id,
             // A restored worker snapshot never accepts runs itself (the main
             // session thread assigns stream ids), so the counter only needs a
             // sentinel-safe starting value here.

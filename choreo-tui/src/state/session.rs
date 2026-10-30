@@ -60,10 +60,11 @@ impl App {
         // contract hold even if a future caller skips the input hand-off.
         self.history_index = None;
         let display = self.display_for(session_id);
-        // Keep the session's live state: `view.turns` and `view.request_to_turn`
-        // (accumulated via the all-activity subscription while the user was
-        // viewing another session), the active-request set, live token
-        // estimates, and per-turn reasoning preferences.  Destroying these on
+        // Keep the session's live state: `view.turns` and the
+        // `stream_id → turn_id` routing map (accumulated via the all-activity
+        // subscription while the user was viewing another session), the
+        // active-request set, live token estimates, and per-turn reasoning
+        // preferences.  Destroying these on
         // switch was the root cause of "switching to a streaming session shows
         // nothing until the next turn": the accumulated content AND the
         // request→turn routing map were wiped exactly when they were needed,

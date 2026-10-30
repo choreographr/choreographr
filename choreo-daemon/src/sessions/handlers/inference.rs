@@ -96,14 +96,18 @@ pub(in crate::sessions) fn handle_run_input(
         );
     }
 
-    let started = DaemonMessageType::Session {
-        session_id: Some(ctx.session_id),
-        event: SessionEvent::Started {
-            stream_id,
-            turn_id: state.next_turn_id,
-            estimated_prompt_tokens: 0,
-        },
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    // Seed the in-flight record with the run's first turn; nothing has counted
+    // the prompt yet, so the estimate starts at 0 and the worker's first
+    // per-iteration `Started` fills it in. The acceptance `Started` is built
+    // from this record, so what every subscriber is told now and what a
+    // mid-run attach is replayed later cannot disagree.
+    let active = ActiveRequest {
+        cancel_tx,
+        turn_id: state.next_turn_id,
+        estimated_prompt_tokens: 0,
     };
+    let started = active.started_event(ctx.session_id, stream_id);
     // Acceptance reply (`id: Some`) to the requester, then the unchanged
     // broadcast (`id: None`) to every subscriber. The requester receives BOTH
     // `Started`s (targeted + broadcast); the client's `handle_started` is
@@ -114,18 +118,7 @@ pub(in crate::sessions) fn handle_run_input(
         target.send(started.clone());
     }
     broadcast(&mut state.subscribers, ctx, &started);
-    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
-    state.active_requests.insert(
-        stream_id,
-        ActiveRequest {
-            cancel_tx,
-            turn_id: state.next_turn_id,
-            // Nothing has counted the prompt yet: this run's first `Started`
-            // (broadcast by the worker once it has built the request) is what
-            // fills the estimate in.
-            estimated_prompt_tokens: 0,
-        },
-    );
+    state.active_requests.insert(stream_id, active);
 
     // Workers don't need their own subscriber map — all broadcasts
     // are routed through SessionCommand::Broadcast to this main
@@ -192,29 +185,21 @@ pub(in crate::sessions) fn handle_run_child_input(
         )));
         return false;
     }
+    // Seed and announce the run's first turn (see `handle_run_input`): the
+    // estimate starts at 0 and the worker's first per-iteration `Started` —
+    // exactly the same path — fills it in.
+    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+    let active = ActiveRequest {
+        cancel_tx,
+        turn_id: state.next_turn_id,
+        estimated_prompt_tokens: 0,
+    };
     broadcast(
         &mut state.subscribers,
         ctx,
-        &DaemonMessageType::Session {
-            session_id: Some(ctx.session_id),
-            event: SessionEvent::Started {
-                stream_id,
-                turn_id: state.next_turn_id,
-                estimated_prompt_tokens: 0,
-            },
-        },
+        &active.started_event(ctx.session_id, stream_id),
     );
-    let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
-    state.active_requests.insert(
-        stream_id,
-        ActiveRequest {
-            cancel_tx,
-            turn_id: state.next_turn_id,
-            // Filled in by the worker's first per-iteration `Started`, exactly
-            // like the `RunInput` path.
-            estimated_prompt_tokens: 0,
-        },
-    );
+    state.active_requests.insert(stream_id, active);
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());
     // See `handle_run_input`: a rebuilt client must share the session's
     // cancellable socket scope.

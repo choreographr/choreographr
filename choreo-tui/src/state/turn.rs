@@ -187,7 +187,7 @@ impl TurnEventHandler for App {
         let display = self.display_for(session_id);
         // Detect the first Answer chunk for this request: the turn has no
         // response text yet, so this chunk begins the response phase.
-        let turn_id = display.view.request_to_turn.get(&stream_id).copied();
+        let turn_id = display.view.request_turn_id(stream_id);
         let first_answer = matches!(stream, OutputStream::Answer)
             && turn_id
                 .and_then(|id| display.view.turns.get(&id))
@@ -392,7 +392,7 @@ impl TurnEventHandler for App {
                 // can target the right turn (the start event may backfill the
                 // stub's name/description — both visible in the rendered
                 // header).
-                let turn_id = display.view.request_to_turn.get(&stream_id).copied();
+                let turn_id = display.view.request_turn_id(stream_id);
                 display.view.tool_call_started(
                     stream_id,
                     call_id,
@@ -427,7 +427,7 @@ impl TurnEventHandler for App {
         // live); bump the turn's content version so a rebuild between chunks
         // recomputes instead of reusing the pre-chunk cached lines — the
         // core fix for "scrollbar moves but results stay stuck".
-        let turn_id = display.view.request_to_turn.get(&stream_id).copied();
+        let turn_id = display.view.request_turn_id(stream_id);
         display.view.tool_result_chunk(stream_id, &call_id, &text);
         if let Some(turn_id) = turn_id {
             display.bump_turn_version(turn_id);

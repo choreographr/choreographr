@@ -650,15 +650,14 @@ pub(crate) fn run_agent_loop(
         // uses the provider-reported usage, not this estimate).
         let (encoding, estimated_prompt_tokens) = estimate_prompt_tokens(model, &messages, &tools);
 
+        // Announce the iteration's turn and its freshly counted prompt, so the
+        // session thread keeps the in-flight record current for any client that
+        // attaches mid-run and so subscribers route the chunks below correctly.
         let _ = ctx
             .cmd_tx
             .send(SessionCommand::Broadcast(DaemonMessageType::Session {
                 session_id: Some(ctx.session_id),
-                event: SessionEvent::Started {
-                    stream_id,
-                    turn_id: current_turn_id,
-                    estimated_prompt_tokens,
-                },
+                event: SessionEvent::started(stream_id, current_turn_id, estimated_prompt_tokens),
             }));
 
         let mut retry_cb: Option<choreo_ai_protocols::openai::RetryCallback> = Some(Box::new({

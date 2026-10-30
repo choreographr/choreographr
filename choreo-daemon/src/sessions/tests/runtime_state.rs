@@ -55,6 +55,30 @@ fn context_cache_survives_snapshot_round_trip() {
     );
 }
 
+// -- worker-snapshot turn counter --------------------------------------
+
+#[test]
+fn from_snapshot_continues_turn_ids_from_the_highest_present() {
+    // A worker hands out turn ids from `next_turn_id` via `start_turn`. Clients
+    // drop a `Started` that would move a stream to an earlier turn (a stale
+    // attach replay), so a worker minting a duplicate or lower id would leave
+    // its chunks unroutable. Derive from the highest id present, not the count:
+    // a sparse history (ids 3 and 7 present) must yield 8, not 2.
+    let mut state = SessionState::empty();
+    for turn_id in [3, 7] {
+        state.turns.insert(turn_id, turn_with_usage(None, false));
+    }
+
+    let restored = SessionState::from_snapshot(state.snapshot(), HashMap::new());
+    assert_eq!(restored.next_turn_id, 8);
+}
+
+#[test]
+fn from_snapshot_of_an_empty_session_starts_at_zero() {
+    let restored = SessionState::from_snapshot(SessionState::empty().snapshot(), HashMap::new());
+    assert_eq!(restored.next_turn_id, 0);
+}
+
 #[test]
 fn shutdown_join_poll_joins_when_finished() {
     // Deterministic: the finish check passes immediately, so the reap

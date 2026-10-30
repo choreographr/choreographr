@@ -2812,11 +2812,18 @@ then one turn per model/tool round — so the replay must carry the turn the run
 is streaming into **at that moment**, never the run's first turn. The session
 thread keeps `ActiveRequest`'s turn id and prompt-token estimate current from the
 worker's per-iteration `Started` (so a joiner's context-size readout resumes at
-the live value instead of a zeroed one), and a client refuses to route a stream
-*backwards*: a `Started` naming an earlier turn than the one a `stream_id` is
-already routed to can only be a stale replay, and honouring it would append
-everything still to come to a turn the run has already left — in practice the
-user's own prompt turn, several turns above the one on screen.
+the live value instead of a zeroed one), and both the acceptance broadcast and
+the replay are built from that one record through `SessionEvent::started`, so a
+field added to the event cannot be announced to subscribers and silently
+defaulted on the replay path. A client additionally refuses to route a stream
+*backwards*: turn ids are per-session monotonic and never reused (a wire
+contract, documented on `SessionEvent::Started`), so a `Started` naming an
+earlier turn than the one a `stream_id` is already routed to can only be a stale
+replay, and honouring it would append everything still to come to a turn the run
+has already left — in practice the user's own prompt turn, several turns above
+the one on screen. The daemon is authoritative and never sends a rewind, so that
+client guard is defence in depth; it is also why every place that mints a turn
+id derives it from the highest id already allocated (never from a turn count).
 
 ### Streaming response auto-scroll pin
 

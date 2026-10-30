@@ -60,7 +60,7 @@ fn reset_for_session_switch_preserves_accumulated_streaming_state() {
         display
             .view
             .insert_or_replace(5, streamed_turn("user q", "partial answer"));
-        display.view.request_to_turn.insert(99, 5);
+        assert!(display.view.start_request(99, 5));
         display.active.insert(99);
         display.live_output_tokens = 42;
         display.reasoning_override.insert(5, true);
@@ -87,8 +87,8 @@ fn reset_for_session_switch_preserves_accumulated_streaming_state() {
         "streamed content must survive the switch"
     );
     assert_eq!(
-        display.view.request_to_turn.get(&99),
-        Some(&5),
+        display.view.request_turn_id(99),
+        Some(5),
         "request→turn routing must survive the switch"
     );
     assert!(
@@ -308,7 +308,7 @@ fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() 
         display
             .view
             .insert_or_replace(5, streamed_turn("user q", "streamed answer so far"));
-        display.view.request_to_turn.insert(99, 5);
+        assert!(display.view.start_request(99, 5));
         display.active.insert(99);
     }
 
@@ -366,7 +366,7 @@ fn handle_session_state_keeps_accumulated_live_turn_over_snapshot_placeholder() 
         Some("finished answer")
     );
     // Request routing and the active set survive the merge.
-    assert_eq!(display.view.request_to_turn.get(&99), Some(&5));
+    assert_eq!(display.view.request_turn_id(99), Some(5));
     assert!(display.active.contains(&99));
 }
 
@@ -387,7 +387,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
     // in-flight request that is about to finish.
     {
         let display = app.display_for(7);
-        display.view.request_to_turn.insert(50, 5);
+        assert!(display.view.start_request(50, 5));
         display.active.insert(50);
     }
 
@@ -437,7 +437,7 @@ fn done_for_background_session_does_not_pollute_attached_display() {
         })
     );
     assert!(!app.display_for(7).active.contains(&50));
-    assert!(!app.display_for(7).view.request_to_turn.contains_key(&50));
+    assert!(app.display_for(7).view.request_turn_id(50).is_none());
 }
 
 #[test]

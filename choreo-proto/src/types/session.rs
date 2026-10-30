@@ -598,14 +598,28 @@ pub enum SessionEvent {
         /// as its targeted reply).
         error: String,
     },
-    /// The daemon accepted a run: it carries the allocated `stream_id` and the
-    /// turn about to be generated, so subscribers can key the stream.
+    /// A run is streaming into a turn: it carries the run's `stream_id` and the
+    /// turn that iteration is producing, so subscribers can key the stream.
+    ///
+    /// The daemon sends this once when it accepts a run and again on **every
+    /// agent-loop iteration**: one run is a tool loop that appends a turn per
+    /// iteration (the user's prompt turn first, then one turn per model/tool
+    /// round), so later occurrences name the turn the run moved on to. A client
+    /// that attaches to a session with a request in flight is replayed a
+    /// synthetic one naming the iteration in flight at that moment.
+    ///
+    /// Both ids are per-session and monotonic — turn ids only ever increase
+    /// (none is ever reused or renumbered), and `stream_id` comes from a
+    /// per-session counter that is never re-issued until a new daemon process
+    /// starts the session. A client may therefore treat a `Started` naming an
+    /// earlier turn than the one it already routes that stream to as a stale
+    /// replay (see `choreo-client-core`'s `SessionView::start_request`).
     Started {
         /// The run's stream id, allocated by the daemon.
         stream_id: u64,
-        /// The id of the turn this run will produce.
+        /// The id of the turn this iteration is streaming into.
         turn_id: u32,
-        /// The daemon's estimate of the run's prompt tokens.
+        /// The daemon's estimate of this iteration's prompt tokens.
         estimated_prompt_tokens: u32,
     },
     /// A tool call has started; carries the call's identity and arguments
@@ -785,6 +799,21 @@ pub enum SessionEvent {
 }
 
 impl SessionEvent {
+    /// Build a [`SessionEvent::Started`] for one agent-loop iteration.
+    ///
+    /// The single place the variant's fields are listed, so a field added to
+    /// it cannot silently default at one of the emitters: the daemon's
+    /// acceptance broadcast, its per-iteration worker broadcast, and the
+    /// synthetic replay a mid-run attach receives all go through here.
+    #[must_use]
+    pub fn started(stream_id: u64, turn_id: u32, estimated_prompt_tokens: u32) -> Self {
+        Self::Started {
+            stream_id,
+            turn_id,
+            estimated_prompt_tokens,
+        }
+    }
+
     /// A stable, payload-free name for the variant, for logging and metrics.
     ///
     /// A `SessionEvent` carries session payload — turn text, tool arguments

@@ -106,8 +106,17 @@ pub trait TurnEventHandler {
         stream: OutputStream,
         data: Cow<'_, str>,
     );
-    /// A request started on `stream_id`, producing turn `turn_id` with the
-    /// given estimated prompt-token count.
+    /// A request started streaming into `turn_id`, with the given estimated
+    /// prompt-token count for that iteration.
+    ///
+    /// The daemon re-sends this once per agent-loop iteration as the run moves
+    /// on to a new turn (`SessionEvent::Started`), so an implementation routes
+    /// `stream_id` at the turn named here rather than pinning it to the first
+    /// one. Turn ids only ever increase within a session, so a name earlier
+    /// than the turn `stream_id` is already routed to is a stale replay (the
+    /// synthetic event a mid-run attach receives) and should be ignored —
+    /// `choreo-client-core`'s `SessionView::start_request` implements exactly
+    /// that guard.
     fn handle_started(
         &mut self,
         session_id: u64,

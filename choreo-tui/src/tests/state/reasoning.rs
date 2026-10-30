@@ -289,7 +289,7 @@ fn first_answer_chunk_auto_collapses_reasoning() {
     };
     let display = app.active_display().unwrap();
     display.view.insert_or_replace(1, turn);
-    display.view.request_to_turn.insert(7, 1);
+    assert!(display.view.start_request(7, 1));
     // The user expanded reasoning during streaming.
     display.reasoning_override.insert(1, true);
 
@@ -326,7 +326,7 @@ fn reasoning_chunk_keeps_expansion_override() {
     };
     let display = app.active_display().unwrap();
     display.view.insert_or_replace(1, turn);
-    display.view.request_to_turn.insert(7, 1);
+    assert!(display.view.start_request(7, 1));
     display.reasoning_override.insert(1, true);
 
     app.handle_request_stream(0, 7, OutputStream::Reasoning, Cow::Borrowed(" more"));

@@ -96,10 +96,12 @@ impl TurnEventHandler for AppState {
         turn_id: u32,
         _estimated_prompt_tokens: u32,
     ) {
-        debug!(%stream_id, %turn_id, "stream started");
         // `start_request` (not a raw insert) so a stale replayed `Started` can
-        // never rewind this stream onto a turn the run has already left.
-        self.session_view.start_request(stream_id, turn_id);
+        // never rewind this stream onto a turn the run has already left. The
+        // route is the only state this handler records, so a rejected replay
+        // needs nothing further — `start_request` logs the drop.
+        let routed = self.session_view.start_request(stream_id, turn_id);
+        debug!(%stream_id, %turn_id, %routed, "stream started");
     }
 
     fn handle_done(

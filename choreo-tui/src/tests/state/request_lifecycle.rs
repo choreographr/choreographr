@@ -33,7 +33,7 @@ fn handle_started_sets_streaming_turn_index() {
         Some(0),
         "should find turn 10 at index 0"
     );
-    assert_eq!(display.view.request_to_turn.get(&1), Some(&10));
+    assert_eq!(display.view.request_turn_id(1), Some(10));
     assert!(display.active.contains(&1));
 
     // Idempotent: the requester sees the targeted `Started` reply AND the
@@ -42,7 +42,7 @@ fn handle_started_sets_streaming_turn_index() {
     app.handle_started(0, 1, 10, 100);
     let display = app.active_display_ref().unwrap();
     assert_eq!(display.streaming_turn_index, Some(0));
-    assert_eq!(display.view.request_to_turn.get(&1), Some(&10));
+    assert_eq!(display.view.request_turn_id(1), Some(10));
     assert!(display.active.contains(&1));
 }
 
@@ -66,7 +66,7 @@ fn handle_started_does_not_route_a_stream_back_to_an_earlier_turn() {
     app.handle_started(0, 1, 20, 41_500);
     {
         let display = app.active_display_ref().unwrap();
-        assert_eq!(display.view.request_to_turn.get(&1), Some(&20));
+        assert_eq!(display.view.request_turn_id(1), Some(20));
         assert_eq!(display.live_input_estimate, 41_500);
     }
 
@@ -83,8 +83,8 @@ fn handle_started_does_not_route_a_stream_back_to_an_earlier_turn() {
 
     let display = app.active_display_ref().unwrap();
     assert_eq!(
-        display.view.request_to_turn.get(&1),
-        Some(&20),
+        display.view.request_turn_id(1),
+        Some(20),
         "the stream must stay routed at the turn it is streaming into"
     );
     assert_eq!(

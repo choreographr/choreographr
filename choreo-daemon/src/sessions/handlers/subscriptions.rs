@@ -72,15 +72,11 @@ pub(in crate::sessions) fn handle_attach(
 
     // Send synthetic Started messages for every active request so the
     // new subscriber can route in-flight streaming chunks to the correct
-    // turn.  The subscriber will then populate its request_to_turn map
-    // and begin accumulating streaming content from this point forward.
-    //
-    // The turn and the prompt-token estimate are the LIVE ones
-    // (`handle_broadcast` keeps both current from the worker's per-iteration
-    // `Started`), not the run's first turn: a run is a tool loop that appends a
-    // turn per iteration, so a stale turn id would route the joining client's
-    // chunks into a turn the run has already left, and a `0` estimate would
-    // blank its context-size readout until the next iteration began.
+    // turn and show the live context size.  The subscriber will then populate
+    // its request_to_turn map and begin accumulating streaming content from
+    // this point forward.  They carry the request's LIVE iteration state
+    // (`ActiveRequest`) — never the run's first turn, and never a zeroed
+    // estimate.
     //
     // These are sent directly to the joining client only — the message
     // is not forwarded through broadcast_activity because the client is
@@ -99,14 +95,7 @@ pub(in crate::sessions) fn handle_attach(
     {
         for (&stream_id, active) in &state.active_requests {
             tx.send_unchecked(
-                &DaemonMessage::broadcast(DaemonMessageType::Session {
-                    session_id: Some(ctx.session_id),
-                    event: SessionEvent::Started {
-                        stream_id,
-                        turn_id: active.turn_id,
-                        estimated_prompt_tokens: active.estimated_prompt_tokens,
-                    },
-                }),
+                &DaemonMessage::broadcast(active.started_event(ctx.session_id, stream_id)),
                 &ctx.global_lag,
             );
         }
@@ -206,31 +195,18 @@ pub(in crate::sessions) fn handle_get_summary(
     false
 }
 
-/// Broadcast a message through the live subscriber map.
-pub(in crate::sessions) fn handle_broadcast(
-    // Borrowed only: the payload is forwarded by reference into
-    // `broadcast` (which wraps it as a broadcast for the daemon-level
-    // activity fan-out and the per-session fan-out); the command variant
-    // still owns the payload.
-    message: &DaemonMessageType,
-    state: &mut SessionState,
-    ctx: &RequestContext,
-) -> bool {
-    // Track the turn the in-flight request is *currently* streaming, and the
-    // prompt-token estimate that goes with it.  A single agent run is a tool loop
-    // that appends a turn per iteration, and the worker re-broadcasts `Started`
-    // (with the new turn id and a freshly counted prompt) each time it moves on;
-    // `handle_run_input` seeded `ActiveRequest::turn_id` with the run's first
-    // turn only.  `handle_attach` replays both fields to a late joiner as a
-    // synthetic `Started`, so leaving `turn_id` at the first turn would
-    // re-point the joining client's `stream_id → turn_id` route at a turn the
-    // run has already left — every chunk still to come in the current iteration
-    // would then be appended to that old turn (the user's own prompt turn)
-    // instead of the one being streamed — and leaving the estimate at `0` would
-    // blank the joiner's context-size readout for the rest of the run.  This
-    // runs on the session thread, the sole owner of `active_requests`, and the
-    // worker's `Started` is enqueued before the iteration's chunks, so both
-    // fields are current by construction when an attach is processed.
+/// Keep an in-flight request's replayed state current from the worker's
+/// per-iteration `Started`.
+///
+/// [`handle_attach`] replays the in-flight request's turn id and prompt-token
+/// estimate to a client joining mid-run —
+/// [`ActiveRequest`](super::ActiveRequest)'s fields — so both must name the
+/// iteration in flight; the field docs there say why. Every worker broadcast
+/// funnels through [`handle_broadcast`], on the session thread that solely owns
+/// `active_requests`, and the worker enqueues its `Started` before the
+/// iteration's chunks — so the record is current by construction whenever an
+/// attach is processed.
+fn track_live_started(message: &DaemonMessageType, state: &mut SessionState) {
     if let DaemonMessageType::Session {
         event:
             SessionEvent::Started {
@@ -246,6 +222,21 @@ pub(in crate::sessions) fn handle_broadcast(
         active.turn_id = *turn_id;
         active.estimated_prompt_tokens = *estimated_prompt_tokens;
     }
+}
+
+/// Broadcast a message through the live subscriber map.
+pub(in crate::sessions) fn handle_broadcast(
+    // Borrowed only: the payload is forwarded by reference into
+    // `broadcast` (which wraps it as a broadcast for the daemon-level
+    // activity fan-out and the per-session fan-out); the command variant
+    // still owns the payload.
+    message: &DaemonMessageType,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    // A worker's `Started` is also the only source of the live iteration state a
+    // mid-run attach is replayed, so record it before fanning the event out.
+    track_live_started(message, state);
     // Broadcast through the main session thread's live subscriber
     // map so that in-flight worker broadcasts respect detach.
     broadcast(&mut state.subscribers, ctx, message);

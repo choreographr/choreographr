@@ -49,7 +49,7 @@ fn streaming_chunk_after_mark_content_changed_stays_fresh_and_incremental() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -143,7 +143,7 @@ fn rebuild_after_disarmed_chunk_serves_fresh_content() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -210,7 +210,7 @@ fn content_version_bumps_on_every_mutating_handler() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 

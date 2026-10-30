@@ -133,7 +133,7 @@ fn streaming_answer_moves_reasoning_header_range() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -203,7 +203,7 @@ fn streaming_tool_result_expanded_grows_collapsed_stays_flat() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 
@@ -344,7 +344,7 @@ fn streaming_answer_reuses_the_incremental_response_cache() {
     {
         let display = app.active_display().unwrap();
         display.view.insert_or_replace(1, turn);
-        display.view.request_to_turn.insert(7, 1);
+        assert!(display.view.start_request(7, 1));
     }
     app.rebuild_height_prefix();
 

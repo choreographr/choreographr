@@ -879,7 +879,7 @@ impl SessionDisplayState {
 
     pub(crate) fn resolve_streaming_turn_index(&mut self, stream_id: u64) {
         if self.streaming_turn_index.is_none()
-            && let Some(&turn_id) = self.view.request_to_turn.get(&stream_id)
+            && let Some(turn_id) = self.view.request_turn_id(stream_id)
         {
             self.streaming_turn_index = self.visible_turn_ids.iter().position(|id| *id == turn_id);
         }
