@@ -5,10 +5,11 @@
 //! The stateless ChatGPT/Codex shape and the standard chaining shape are pinned
 //! side by side here, so a change that alters one without the other fails.
 
-// The suite repeats its parent's imports one level deeper: this module lives
-// inside `tests`, so the adapter is two `super`s up and `openai` three.
+// Each subject module imports the items it names directly: it lives inside
+// `tests`, so the adapter's own modules are two `super`s up and the `openai`
+// parent three.
 use super::super::super::*;
-use super::super::*;
+use super::super::body::{build_responses_request_body, build_simple_responses_body};
 use choreo_proto::ReasoningArtifact;
 use serde_json::json;
 

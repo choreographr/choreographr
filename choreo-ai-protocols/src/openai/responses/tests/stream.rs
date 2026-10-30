@@ -2,9 +2,9 @@
 //! call-count bound the SSE loop relies on, and the attribution a
 //! `function_call` output item carries.
 
-// The suite repeats its parent's imports one level deeper: this module lives
-// inside `tests`, so the adapter is two `super`s up.
-use super::super::*;
+// Each subject module imports the items it names directly: it lives inside
+// `tests`, so the adapter's own modules are two `super`s up.
+use super::super::stream::{AccCall, AccCalls};
 use crate::CallerInfo;
 use crate::openai::{ResponsesStreamEvent, parse_responses_stream_event};
 use crate::shared::MAX_TOOL_CALLS;

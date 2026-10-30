@@ -28,18 +28,10 @@ mod turn;
 mod wire;
 
 use body::{build_responses_request_body, build_simple_responses_body};
-// The caller index is part of the lowering's signature, so the test suite names
-// it directly to pass an empty one.
-#[cfg(test)]
-pub(crate) use input::CallerIndex;
 pub(crate) use input::{SystemPrompt, messages_to_responses_input};
 pub(crate) use stream::responses_request_streaming_with_tools;
 use turn::incomplete_stop;
 pub(crate) use turn::responses_response_to_turn;
-// The item type is named only by the test suite now that the lowering lives in
-// `input` and reaches `wire` directly.
-#[cfg(test)]
-pub(crate) use wire::ResponsesInputItem;
 use wire::{ResponseOutputItem, ResponsesResponse};
 
 // ── Simple (no-tool) responses request ───────────────────────────────────
@@ -278,19 +270,10 @@ pub(crate) fn responses_request_with_tools(
     responses_response_to_turn(payload)
 }
 
-// The suite reaches its subjects through this module, so the moved items are
-// re-exported here for it (`use super::*;` in the tests).
-#[cfg(test)]
-use body::*;
-#[cfg(test)]
-use stream::*;
-#[cfg(test)]
-use turn::*;
-#[cfg(test)]
-use wire::*;
-
-// The test suite lives in a sibling file so the implementation stays
-// readable at a glance; the module path is unchanged, so the moved tests
-// reach their subjects through the same `super` paths.
+// The test suite lives in a sibling file so the implementation stays readable at
+// a glance. Each subject module imports the items it names straight from the
+// sibling module that defines them (or from the `openai` parent), so this
+// adapter's own namespace carries no test-only re-exports that a test build
+// would widen for every other module too.
 #[cfg(test)]
 mod tests;

@@ -2,10 +2,15 @@
 //! output array, the opaque reasoning items captured into a round-trip artifact,
 //! and the `incomplete` classification that decides truncation from refusal.
 
-// The suite repeats its parent's imports one level deeper: this module lives
-// inside `tests`, so the adapter is two `super`s up and `openai` three.
+// Each subject module imports the items it names directly: it lives inside
+// `tests`, so the adapter's own modules are two `super`s up and the `openai`
+// parent three.
 use super::super::super::*;
-use super::super::*;
+use super::super::turn::{
+    extract_reasoning_text, merge_reasoning_item, responses_items_artifact,
+    responses_response_to_turn,
+};
+use super::super::wire::ResponsesResponse;
 use choreo_proto::{ReasoningArtifact, TokenUsage};
 use serde_json::json;
 

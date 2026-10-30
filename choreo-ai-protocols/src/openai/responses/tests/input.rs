@@ -7,10 +7,12 @@
 //! of the message they belong to, `function_call`s ahead of the outputs that
 //! answer them.
 
-// The suite repeats its parent's imports one level deeper: this module lives
-// inside `tests`, so the adapter is two `super`s up and `openai` three.
+// Each subject module imports the items it names directly: it lives inside
+// `tests`, so the adapter's own modules are two `super`s up and the `openai`
+// parent three.
 use super::super::super::*;
-use super::super::*;
+use super::super::body::build_responses_input;
+use super::super::input::{CallerIndex, SystemPrompt, messages_to_responses_input};
 use crate::CallerInfo;
 use crate::openai::reasoning_details::MAX_REASONING_BYTES;
 use choreo_proto::ReasoningArtifact;
