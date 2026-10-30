@@ -116,11 +116,16 @@ impl<W: Write> Backend for WideGlyphSafeBackend<W> {
         // `Terminal::draw`'s flush presents the whole pair at once.  A
         // terminal without mode 2026 simply ignores both sequences.
         self.0.write_all(SYNC_BEGIN.as_bytes())?;
-        self.0.draw(SuppressVs16Continuation {
+        let drawn = self.0.draw(SuppressVs16Continuation {
             inner: content,
             prev: None,
-        })?;
-        self.0.write_all(SYNC_END.as_bytes())
+        });
+        // Emit the end marker even when the cell stream errored: an unterminated
+        // synchronized update would leave the terminal buffering everything
+        // written after it.  `drawn.and(ended)` reports the draw error first when
+        // both fail, so a broken frame still surfaces its cause.
+        let ended = self.0.write_all(SYNC_END.as_bytes());
+        drawn.and(ended)
     }
 
     fn hide_cursor(&mut self) -> io::Result<()> {
