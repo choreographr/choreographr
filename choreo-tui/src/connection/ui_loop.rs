@@ -736,11 +736,18 @@ fn run_ui_loop(
         // command is the same idempotent private-mode set the startup and resume
         // paths enable, and a failed write only costs the recovery — so it is
         // logged and swallowed rather than ending the session.
+        //
+        // Both outcomes log at `info`: this fires at most once per degraded
+        // episode (a click or wheel notch with no motion behind it), and the
+        // line is the only record that the terminal stopped reporting motion —
+        // the state that used to freeze the pointer silently. A session that
+        // shows it is a terminal-side bug worth diagnosing, so it must not need
+        // a raised log level to be seen.
         if app.mouse_tracking_reassert {
             app.mouse_tracking_reassert = false;
             match crossterm::execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)
             {
-                Ok(()) => tracing::debug!("[choreo-tui] re-asserted mouse tracking"),
+                Ok(()) => tracing::info!("[choreo-tui] re-asserted mouse tracking"),
                 Err(error) => {
                     tracing::warn!(%error, "[choreo-tui] could not re-assert mouse tracking");
                 }
