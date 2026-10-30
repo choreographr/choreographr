@@ -10,8 +10,8 @@ const DEFAULT_RESPONSES_PATH: &str = "/responses";
 const DEFAULT_CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
 
 /// The catalog slug of the ChatGPT/Codex subscription backend. Its Responses
-/// endpoint is a non-standard dialect — see
-/// [`ServiceConfig::system_prompt_as_instructions`].
+/// endpoint is a non-standard, stateless dialect — see
+/// [`ServiceConfig::responses_stateless`].
 const CODEX_PROVIDER_SLUG: &str = "chatgpt";
 
 // Extra headers for the opencode.ai gateway live in
@@ -161,17 +161,19 @@ impl ServiceConfig {
             .unwrap_or(self.default_request_format)
     }
 
-    /// Whether this Responses backend wants the system prompt in the top-level
-    /// `instructions` field rather than a `system`-role item inside `input`.
+    /// Whether this Responses backend is the stateless ChatGPT/Codex dialect.
     ///
-    /// The ChatGPT/Codex backend (the `chatgpt` provider) rejects a `system`-role
-    /// input item outright (`{"detail":"System messages are not allowed"}`) and
-    /// takes the system prompt in `instructions` instead — the shape every other
-    /// Codex client sends. The standard `OpenAI` Responses API accepts inline
-    /// system items, so it keeps them and sends no `instructions` at all; gating
-    /// on the slug leaves those providers byte-for-byte unchanged.
+    /// The Codex backend is a non-standard Responses client: it rejects a
+    /// `system`-role input item outright (`{"detail":"System messages are not
+    /// allowed"}`) and takes the system prompt in the top-level `instructions`
+    /// field instead, does not chain via `previous_response_id`, and expects
+    /// `store: false` with the full history on every request — the shape every
+    /// other Codex client sends. The standard `OpenAI` Responses API chains via
+    /// `previous_response_id` with `store: true` and accepts inline system
+    /// items, so gating on this flag leaves those providers byte-for-byte
+    /// unchanged.
     #[must_use]
-    pub fn system_prompt_as_instructions(&self) -> bool {
+    pub fn responses_stateless(&self) -> bool {
         self.provider_slug == CODEX_PROVIDER_SLUG
     }
 
@@ -258,6 +260,13 @@ impl ServiceConfig {
     /// The account-level `programmatic_tool_calling` override takes precedence.
     #[must_use]
     pub fn programmatic_tool_calling_for_model(&self, model: &str) -> bool {
+        // The stateless ChatGPT/Codex backend rejects unknown hosted tools, so
+        // the `programmatic_tool_calling` capability is withheld for it
+        // regardless of the account-level override (enabling it there would
+        // only 400 the request).
+        if self.responses_stateless() {
+            return false;
+        }
         if self.programmatic_tool_calling {
             return true;
         }
@@ -572,19 +581,41 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_as_instructions_is_chatgpt_only() {
-        // The Codex backend takes the system prompt in `instructions`...
+    fn responses_stateless_is_chatgpt_only() {
+        // The Codex backend is the stateless Responses dialect...
         let codex = ServiceConfig {
             provider_slug: "chatgpt".to_string(),
             ..Default::default()
         };
-        assert!(codex.system_prompt_as_instructions());
-        // ...while the standard OpenAI Responses provider keeps it inline.
+        assert!(codex.responses_stateless());
+        // ...while the standard OpenAI Responses provider chains and keeps the
+        // system item inline.
         let openai = ServiceConfig {
             provider_slug: "openai".to_string(),
             ..Default::default()
         };
-        assert!(!openai.system_prompt_as_instructions());
+        assert!(!openai.responses_stateless());
+    }
+
+    #[test]
+    fn programmatic_tool_calling_is_withheld_for_the_stateless_provider() {
+        // Even for a gpt-5.6 model and with the account-level override on, the
+        // Codex backend must not receive the hosted programmatic-tool-calling
+        // tool it rejects.
+        let codex = ServiceConfig {
+            provider_slug: "chatgpt".to_string(),
+            default_request_format: RequestFormat::Responses,
+            programmatic_tool_calling: true,
+            ..Default::default()
+        };
+        assert!(!codex.programmatic_tool_calling_for_model("gpt-5.6-luna"));
+        // The standard OpenAI provider keeps auto-enabling for gpt-5.6.
+        let openai = ServiceConfig {
+            provider_slug: "openai".to_string(),
+            default_request_format: RequestFormat::Responses,
+            ..Default::default()
+        };
+        assert!(openai.programmatic_tool_calling_for_model("gpt-5.6-sol"));
     }
 
     #[test]

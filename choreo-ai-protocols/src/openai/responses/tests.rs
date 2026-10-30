@@ -975,6 +975,8 @@ fn chatgpt_backend_hoists_system_prompt_into_instructions() {
     ];
     let body = body_for("chatgpt", "gpt-5.6-luna", &messages);
     assert_eq!(body["instructions"], "be helpful");
+    // Stateless: `store` is off (the field is skipped when false).
+    assert!(body.get("store").is_none(), "stateless omits store: {body}");
     let input = body["input"].as_array().expect("input array");
     assert_eq!(input.len(), 1, "only the user message remains: {input:?}");
     assert_eq!(input[0]["role"], "user");
@@ -996,6 +998,8 @@ fn openai_responses_backend_keeps_the_system_item_and_sends_no_instructions() {
     ];
     let body = body_for("openai", "gpt-5.4", &messages);
     assert!(body.get("instructions").is_none(), "{body}");
+    // Chained provider still stores.
+    assert_eq!(body["store"], true, "{body}");
     let input = body["input"].as_array().expect("input array");
     assert_eq!(input[0]["role"], "system");
     assert_eq!(input[0]["content"], "be helpful");

@@ -163,25 +163,32 @@ pub(super) fn build_responses_request_body(
     let max_output_tokens = params
         .max_output_tokens_override
         .or(config.max_output_tokens_for_model(params.model));
-    // The ChatGPT/Codex backend rejects `system`-role input items and takes the
-    // system prompt in `instructions` instead. Every other Responses provider
-    // keeps the system message inline and sends no `instructions`, so the split
-    // is gated on the provider: `filtered_messages` is what the input array is
-    // built from and `instructions` the joined prompt — both stay `None` (and
-    // the original `messages` is used untouched) for the standard providers.
-    let (instructions, filtered_messages) = if config.system_prompt_as_instructions() {
+    // The stateless ChatGPT/Codex backend rejects `system`-role input items,
+    // ignores `previous_response_id`, and expects the full history on every
+    // request, so its system prompt is hoisted into `instructions`, the chained
+    // tool tail is not used, and `store` is off. Every other Responses provider
+    // keeps the system message inline, chains its tail, and stores — untouched.
+    let stateless = config.responses_stateless();
+    let (instructions, filtered_messages) = if stateless {
         let (prompt, rest) = split_system_prompt(params.messages);
         (prompt, Some(rest))
     } else {
         (None, None)
     };
     let messages = filtered_messages.as_deref().unwrap_or(params.messages);
-    let input_value =
-        build_responses_input(params.tool_results, messages, params.previous_response_id)?;
+    // Stateless providers send the FULL `messages` (already containing every
+    // earlier tool-loop turn), ignoring the chained tool-result tail and the
+    // response id; chained providers send the tail and continue the chain.
+    let (tool_results, previous_response_id) = if stateless {
+        (&[][..], None)
+    } else {
+        (params.tool_results, params.previous_response_id)
+    };
+    let input_value = build_responses_input(tool_results, messages, previous_response_id)?;
 
     let mut responses_tools: Vec<ResponsesTool> =
         params.tools.iter().map(ResponsesTool::from).collect();
-    if params.programmatic_tool_calling {
+    if params.programmatic_tool_calling && !stateless {
         responses_tools.push(ResponsesTool {
             kind: "programmatic_tool_calling".to_string(),
             name: String::new(),
@@ -250,10 +257,10 @@ pub(super) fn build_responses_request_body(
         stream,
         max_output_tokens,
         reasoning,
-        // store: true is required for previous_response_id to work correctly
-        // and matches the @ai-sdk/openai default behavior.
-        store: true,
-        previous_response_id: params.previous_response_id,
+        // store must be true for `previous_response_id` chaining on the standard
+        // Responses API, and is off for the stateless ChatGPT/Codex backend.
+        store: !stateless,
+        previous_response_id,
         parallel_tool_calls: None,
         tool_choice,
         prompt_cache_key: affinity.prompt_cache_key,
