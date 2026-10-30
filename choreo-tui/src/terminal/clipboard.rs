@@ -27,6 +27,12 @@
 //! kind of terminal it is talking to — which is only possible because the
 //! OSC 5522 *write* half needs no reply.
 //!
+//! OSC 52 is the one piece that cannot be chunked: its whole payload rides in a
+//! single OSC sequence, and many terminals truncate or drop an oversized one
+//! (a limit well below the client's own size cap).  So the plain fallback is
+//! only emitted for a selection within [`MAX_OSC52_BYTES`]; above it the copy
+//! relies solely on the chunked OSC 5522 write, which has no per-sequence limit.
+//!
 //! # Never expect a reply
 //!
 //! A hard rule for this module: never emit a sequence that expects a reply — no
@@ -46,7 +52,8 @@
 //! per-OSC-sequence cap.  It is a **UI-loop latency guard** — 1 MiB of text
 //! becomes well over 4 MB of escape bytes (base64 of the plain text twice, once
 //! per protocol, plus the escaped HTML rendering), all written between two
-//! frames, so a bigger selection would visibly stall the loop.
+//! frames, so a bigger selection would visibly stall the loop.  The tighter
+//! [`MAX_OSC52_BYTES`] bounds the un-chunked OSC 52 fallback on top of this.
 //!
 //! The sequences are framed and written through [`super::osc`] / [`super::write`]
 //! exactly like the other OSC families.  A write is only ever triggered by a
@@ -69,10 +76,27 @@ const OSC5522_CHUNK_BYTES: usize = 4096;
 /// Maximum size (in bytes of text) of a selection written to the clipboard.
 const MAX_CLIPBOARD_BYTES: usize = 1 << 20; // 1 MiB of text
 
+/// Maximum text bytes emitted as a single OSC 52 sequence.
+///
+/// OSC 52 has no chunking — one write carries the whole base64 payload as a
+/// single OSC sequence — so a very large selection becomes one oversized
+/// sequence that many terminals (and multiplexers such as tmux) truncate or drop
+/// outright, well below [`MAX_CLIPBOARD_BYTES`].  Above this threshold the plain
+/// OSC 52 fallback is skipped and the copy relies solely on the chunked OSC 5522
+/// write, which has no per-sequence limit.  The value is a conservative bound on
+/// what the common terminals accept in one OSC 52 write while still covering
+/// ordinary selections.
+const MAX_OSC52_BYTES: usize = 1 << 17; // 128 KiB of text
+
 /// Whether `text` fits under the clipboard size cap.  Split out so the
 /// threshold is unit-testable without writing to a real stdout.
 fn within_clipboard_limit(text: &str) -> bool {
     text.len() <= MAX_CLIPBOARD_BYTES
+}
+
+/// Whether `text` fits the single-sequence OSC 52 fallback cap.
+fn within_osc52_limit(text: &str) -> bool {
+    text.len() <= MAX_OSC52_BYTES
 }
 
 /// Build the OSC 52 sequence that asks the terminal to place `text` on the
@@ -177,8 +201,39 @@ pub(crate) fn rich_payload(text: &str) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// Copy `text` to the system clipboard: OSC 52 (plain text) followed by
-/// OSC 5522 (plain text + HTML) in one write.
+/// Borrow a [`rich_payload`] result as the `(&str, &[u8])` list
+/// [`build_osc5522`] takes, so no caller repeats the re-mapping.
+fn payload_slices<'a>(payload: &'a [(&'static str, Vec<u8>)]) -> Vec<(&'a str, &'a [u8])> {
+    payload
+        .iter()
+        .map(|(mime, bytes)| (*mime, bytes.as_slice()))
+        .collect()
+}
+
+/// Build the complete clipboard byte sequence for `text`, or `None` when the
+/// text exceeds [`MAX_CLIPBOARD_BYTES`].
+///
+/// Both protocols go out in one string so `copy_to_clipboard` can emit them in a
+/// single `write()`: one lock, one flush, so the plain-text and rich writes land
+/// back to back rather than straddling a frame boundary.  Order matters — a
+/// 5522-capable terminal ends up with the richer payload because the later write
+/// replaces the clipboard contents.  The plain OSC 52 fallback is included only
+/// up to [`MAX_OSC52_BYTES`], since that sequence cannot be chunked.
+fn build_clipboard_sequences(text: &str) -> Option<String> {
+    if !within_clipboard_limit(text) {
+        return None;
+    }
+    let rich = rich_payload(text);
+    let mut seq = String::new();
+    if within_osc52_limit(text) {
+        seq.push_str(&build_osc52(text));
+    }
+    seq.push_str(&build_osc5522(&payload_slices(&rich)));
+    Some(seq)
+}
+
+/// Copy `text` to the system clipboard: OSC 52 (plain text, when within
+/// [`MAX_OSC52_BYTES`]) followed by OSC 5522 (plain text + HTML) in one write.
 ///
 /// Returns `true` when the sequences were written; `false` (without writing)
 /// when the text exceeds [`MAX_CLIPBOARD_BYTES`], so the caller can report a
@@ -186,25 +241,16 @@ pub(crate) fn rich_payload(text: &str) -> Vec<(&'static str, Vec<u8>)> {
 /// Errors are swallowed on purpose: an unsupported or denying terminal must
 /// degrade to "nothing happened", never disturb the UI loop.
 pub(crate) fn copy_to_clipboard(text: &str) -> bool {
-    if !within_clipboard_limit(text) {
+    let Some(seq) = build_clipboard_sequences(text) else {
         return false;
-    }
-    // Both protocols go out in one `write()`: one lock, one flush, so the
-    // plain-text and rich writes land back to back rather than straddling a
-    // frame boundary.  Order matters — a 5522-capable terminal ends up with the
-    // richer payload because the later write replaces the clipboard contents.
-    let rich = rich_payload(text);
-    let payloads: Vec<(&str, &[u8])> = rich
-        .iter()
-        .map(|(mime, bytes)| (*mime, bytes.as_slice()))
-        .collect();
-    let mut seq = build_osc52(text);
-    seq.push_str(&build_osc5522(&payloads));
-    // Byte counts only — a selection is user content and never gets logged.
+    };
+    // Byte counts only — a selection is user content and never gets logged.  The
+    // `osc52` flag records whether the plain fallback rode along (it is skipped
+    // above `MAX_OSC52_BYTES`).
     tracing::debug!(
         text_bytes = text.len(),
         sequence_bytes = seq.len(),
-        mime_types = payloads.len(),
+        osc52 = within_osc52_limit(text),
         "[choreo-tui] writing clipboard via OSC 52 + OSC 5522"
     );
     write(&seq);
@@ -275,10 +321,7 @@ mod tests {
         // (a MIME type with no packets would not arrive at all), while the HTML
         // flavor carries the `<pre></pre>` wrapper around nothing.
         let payload = rich_payload("");
-        let payloads: Vec<(&str, &[u8])> = payload
-            .iter()
-            .map(|(mime, bytes)| (*mime, bytes.as_slice()))
-            .collect();
+        let payloads = payload_slices(&payload);
         let html = base64::engine::general_purpose::STANDARD.encode(b"<pre></pre>");
         assert_eq!(
             build_osc5522(&payloads),
@@ -294,10 +337,7 @@ mod tests {
         // "hi" as text/plain, and "<pre>hi</pre>" as text/html — every packet
         // exact, in the documented order, ending with the terminator.
         let payload = rich_payload("hi");
-        let payloads: Vec<(&str, &[u8])> = payload
-            .iter()
-            .map(|(mime, bytes)| (*mime, bytes.as_slice()))
-            .collect();
+        let payloads = payload_slices(&payload);
         let html = base64::engine::general_purpose::STANDARD.encode(b"<pre>hi</pre>");
         assert_eq!(
             build_osc5522(&payloads),
@@ -350,10 +390,7 @@ mod tests {
         // interleave them into a corrupt payload.
         let text = "y".repeat(OSC5522_CHUNK_BYTES + 10); // two chunks
         let payload = rich_payload(&text);
-        let payloads: Vec<(&str, &[u8])> = payload
-            .iter()
-            .map(|(mime, bytes)| (*mime, bytes.as_slice()))
-            .collect();
+        let payloads = payload_slices(&payload);
         let seq = build_osc5522(&payloads);
 
         assert!(seq.starts_with(WRITE));
@@ -421,5 +458,50 @@ mod tests {
         // status; it must happen before any sequence is built or written.
         let oversized = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
         assert!(!copy_to_clipboard(&oversized));
+    }
+
+    #[test]
+    fn osc52_fallback_cap_boundary() {
+        // The OSC 52 fallback has its own, tighter cap than the overall clipboard
+        // limit: it is one un-chunked sequence, so it is dropped above this size.
+        assert!(within_osc52_limit(""));
+        assert!(within_osc52_limit("x".repeat(MAX_OSC52_BYTES).as_str()));
+        assert!(!within_osc52_limit(
+            "x".repeat(MAX_OSC52_BYTES + 1).as_str()
+        ));
+        // The fallback cap is strictly inside the overall clipboard cap.
+        const { assert!(MAX_OSC52_BYTES < MAX_CLIPBOARD_BYTES) };
+    }
+
+    #[test]
+    fn clipboard_sequences_include_osc52_within_its_cap() {
+        // A small selection gets both writes: the plain OSC 52 and the richer
+        // chunked OSC 5522, with OSC 52 first so a 5522 terminal ends up richer.
+        let seq = build_clipboard_sequences("hello").expect("within the size cap");
+        let osc52 = build_osc52("hello");
+        let osc52_at = seq.find(&osc52).expect("OSC 52 present");
+        let osc5522_at = seq.find(WRITE).expect("OSC 5522 present");
+        assert_eq!(osc52_at, 0, "OSC 52 must be written first");
+        assert!(osc52_at < osc5522_at, "OSC 5522 follows OSC 52");
+    }
+
+    #[test]
+    fn clipboard_sequences_skip_osc52_above_its_cap() {
+        // Above the OSC 52 cap the un-chunked fallback is dropped, but the copy
+        // still goes out through the chunked OSC 5522 write.
+        let text = "x".repeat(MAX_OSC52_BYTES + 1);
+        let seq = build_clipboard_sequences(&text).expect("still within the overall cap");
+        assert!(
+            !seq.contains("\x1b]52;"),
+            "OSC 52 must be omitted above its cap"
+        );
+        assert!(seq.starts_with(WRITE), "the OSC 5522 write still goes out");
+    }
+
+    #[test]
+    fn clipboard_sequences_none_above_the_overall_cap() {
+        // Past the overall cap nothing is built at all, so no sequence is written.
+        let oversized = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
+        assert!(build_clipboard_sequences(&oversized).is_none());
     }
 }
