@@ -94,21 +94,11 @@ pub(crate) fn chat_completions_response_to_turn(
         })
         .collect();
 
-    // A tool-call message keeps the provider's raw `content` Option; the
-    // final-text content is trimmed (a blank answer reads as none), and the
-    // empty-response guard keys on that trimmed text.
-    let tool_use_content = choice.message.content;
-    let final_text = tool_use_content
-        .as_deref()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let content_is_empty = final_text.is_empty();
-
+    // The reply's own `content` option rides into the assembler untouched: a
+    // tool-call turn echoes it raw (`Some("")` stays present-and-empty), and a
+    // final answer is trimmed there — this path never normalizes text itself.
     assemble_turn(TurnParts {
-        tool_use_content,
-        final_text,
-        content_is_empty,
+        content: choice.message.content,
         tool_calls,
         reasoning: reasoning.display,
         reasoning_artifact: reasoning.artifact,

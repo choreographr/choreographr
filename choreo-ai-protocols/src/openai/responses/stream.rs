@@ -400,11 +400,11 @@ where
     // no name), with the count logged so an aborted call stays diagnosable.
     let tool_calls = acc_calls.into_tool_calls();
 
-    let content_is_empty = full_content.is_empty();
+    // The assembler owns the normalization, so the accumulated answer is handed
+    // over raw (moved, never copied): `None` says there was no content at all,
+    // and trimming plus the empty-content verdict both happen there.
     assemble_turn(TurnParts {
-        tool_use_content: (!full_content.is_empty()).then(|| full_content.clone()),
-        final_text: full_content,
-        content_is_empty,
+        content: (!full_content.is_empty()).then_some(full_content),
         tool_calls,
         reasoning: (!full_reasoning.is_empty()).then_some(full_reasoning),
         reasoning_artifact,

@@ -197,15 +197,12 @@ impl ChatCompletionsStreamAccumulator {
         let reasoning = self.reasoning.finish();
 
         // The shared assembler owns the tool-call / truncation / empty-response
-        // decision tree (identical to the non-streaming path); a tool-call
-        // message forwards only non-empty content.
-        let tool_use_content = (!self.full_content.is_empty()).then(|| self.full_content.clone());
-        let content_is_empty = self.full_content.is_empty();
+        // decision tree (identical to the non-streaming path); the accumulated
+        // text is handed over raw — it is normalized there, exactly once, so a
+        // streamed answer reads like a non-streaming one.
         let tool_calls = accumulate_tool_calls_from_deltas(self.raw_tool_call_deltas);
         assemble_turn(TurnParts {
-            tool_use_content,
-            final_text: self.full_content,
-            content_is_empty,
+            content: (!self.full_content.is_empty()).then_some(self.full_content),
             tool_calls,
             reasoning: reasoning.display,
             reasoning_artifact: reasoning.artifact,

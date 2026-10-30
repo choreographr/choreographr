@@ -273,11 +273,11 @@ pub(crate) fn responses_response_to_turn(
     // `produced_reasoning` reports; an item the byte cap refused still counts,
     // so it is read from the collected items, not from the surviving artifact.
     let produced_reasoning = !reasoning_items.is_empty() || !full_reasoning.is_empty();
-    let content_is_empty = full_text.is_empty();
     assemble_turn(TurnParts {
-        tool_use_content: (!full_text.is_empty()).then(|| full_text.clone()),
-        final_text: full_text,
-        content_is_empty,
+        // The assembler normalizes: an empty answer is handed over as `None`
+        // (there is no present-but-empty content on this path), and the text
+        // itself moves rather than being copied.
+        content: (!full_text.is_empty()).then_some(full_text),
         tool_calls,
         reasoning: (!full_reasoning.is_empty()).then_some(full_reasoning),
         reasoning_artifact,

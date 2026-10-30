@@ -5,9 +5,9 @@
 //! was truncated, then a genuine final answer — and a final answer that carries
 //! nothing at all is only an empty response when the model also produced no
 //! reasoning. Each adapter's own `turn` module owns how it reads *its* wire
-//! format (finish reasons, `incomplete` details, output-item variants); this
-//! one owns the shared verdict, so the chat-completions and Responses paths
-//! cannot drift apart on it.
+//! format (finish reasons, `incomplete` details, output-item variants); this one
+//! owns the shared verdict — and, with it, the single place a turn's content is
+//! normalized — so the chat-completions and Responses paths cannot drift apart.
 
 use super::validate_tool_call_arguments;
 use crate::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
@@ -19,17 +19,12 @@ use choreo_proto::{ReasoningArtifact, TokenUsage};
 /// (no `too_many_arguments` suppression) and each caller names every part
 /// explicitly.
 pub(super) struct TurnParts {
-    /// Content to attach to a `ToolUse` result (the provider's raw option for
-    /// a non-streaming reply, `None`-when-empty for a streamed one).
-    pub(super) tool_use_content: Option<String>,
-    /// Content to attach to a `FinalText` result (already normalized by the
-    /// caller: trimmed for a non-streaming reply, the accumulated text for a
-    /// streamed one).
-    pub(super) final_text: String,
-    /// Whether the turn's visible content is empty (drives the empty-response
-    /// and truncated-tool-call guards). Separate from `final_text` because the
-    /// two adapters normalize it differently.
-    pub(super) content_is_empty: bool,
+    /// The provider's raw content for this turn, exactly as it arrived: the
+    /// non-streaming chat reply's own `content` option, or the text a stream
+    /// accumulated. Deliberately unnormalized — the assembler owns trimming and
+    /// the empty-content verdict, so an adapter that stores content as it
+    /// arrived cannot disagree with one that buffers a stream.
+    pub(super) content: Option<String>,
     /// The turn's tool calls, collected but not yet validated.
     pub(super) tool_calls: Vec<ChatToolCall>,
     /// The turn's display reasoning text.
@@ -58,9 +53,7 @@ pub(super) struct TurnParts {
 /// visible text is only empty when the provider produced no reasoning either.
 pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::OpenAiError> {
     let TurnParts {
-        tool_use_content,
-        final_text,
-        content_is_empty,
+        content,
         mut tool_calls,
         reasoning,
         reasoning_artifact,
@@ -69,11 +62,23 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
         truncated,
         response_id,
     } = parts;
+    // The one normalization of a turn's content: the final answer is the
+    // provider's raw content trimmed, and "this turn carries no visible text" is
+    // read off that same trimmed text. Doing it here — rather than per adapter —
+    // is what makes a streamed answer read exactly like a non-streaming one, and
+    // what makes a whitespace-only reply count as empty on every path.
+    let final_text = content.as_deref().unwrap_or_default().trim().to_string();
+    let content_is_empty = final_text.is_empty();
     // Truncated / malformed tool calls are dropped here, once, for every path.
     let discarded = validate_tool_call_arguments(&mut tool_calls);
     if !tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
-            content: tool_use_content,
+            // The tool-use arm keeps the RAW content: a tool-call turn's text is
+            // echoed back as the provider sent it. `Some("")` therefore stays
+            // `Some("")` — content that was present and empty is not the same
+            // fact as content that was absent, and only the raw option knows
+            // which one the provider reported.
+            content,
             tool_calls,
             reasoning,
             usage,
@@ -123,12 +128,11 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_turn_with_neither_text_tools_nor_reasoning_is_empty() {
-        let err = assemble_turn(TurnParts {
-            tool_use_content: None,
-            final_text: String::new(),
-            content_is_empty: true,
+    /// The inert parts every case below leaves alone: no tool calls, no
+    /// reasoning, no usage, no chain id.
+    fn textless_parts(content: Option<String>) -> TurnParts {
+        TurnParts {
+            content,
             tool_calls: Vec::new(),
             reasoning: None,
             reasoning_artifact: None,
@@ -136,8 +140,13 @@ mod tests {
             usage: None,
             truncated: false,
             response_id: None,
-        })
-        .expect_err("an all-empty turn is an empty response");
+        }
+    }
+
+    #[test]
+    fn a_turn_with_neither_text_tools_nor_reasoning_is_empty() {
+        let err = assemble_turn(textless_parts(None))
+            .expect_err("an all-empty turn is an empty response");
         assert!(matches!(err, super::super::OpenAiError::EmptyResponse));
     }
 
@@ -147,18 +156,63 @@ mod tests {
         // provider billed output, so the turn is a `FinalText` with no content
         // rather than an empty response.
         let turn = assemble_turn(TurnParts {
-            tool_use_content: None,
-            final_text: String::new(),
-            content_is_empty: true,
-            tool_calls: Vec::new(),
-            reasoning: None,
-            reasoning_artifact: None,
             produced_reasoning: true,
-            usage: None,
-            truncated: false,
-            response_id: None,
+            ..textless_parts(None)
         })
         .expect("produced reasoning is model output");
         assert!(matches!(turn, ChatTurnResult::FinalText(_)));
+    }
+
+    #[test]
+    fn a_padded_answer_is_trimmed_for_the_final_text() {
+        // Normalization happens here and only here, so an adapter never has to
+        // remember it: the answer the caller renders carries no surrounding
+        // whitespace, whichever path produced it.
+        let turn = assemble_turn(textless_parts(Some("  the answer \n".to_string())))
+            .expect("a padded answer is still an answer");
+        match turn {
+            ChatTurnResult::FinalText(result) => assert_eq!(result.content, "the answer"),
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_whitespace_only_answer_is_empty() {
+        // Content that is present but blank is not visible text: the turn is an
+        // empty response (or, with reasoning, a textless final answer) rather
+        // than a `FinalText` whose content reads as blank.
+        let err = assemble_turn(textless_parts(Some("   \n\t".to_string())))
+            .expect_err("a blank answer is not visible text");
+        assert!(matches!(err, super::super::OpenAiError::EmptyResponse));
+        let turn = assemble_turn(TurnParts {
+            produced_reasoning: true,
+            ..textless_parts(Some("   \n\t".to_string()))
+        })
+        .expect("reasoning is still model output");
+        match turn {
+            ChatTurnResult::FinalText(result) => assert_eq!(result.content, ""),
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tool_use_turn_keeps_the_raw_content_option() {
+        // The tool-use arm echoes the provider's raw content, so content that
+        // arrived present-and-empty stays `Some("")` — only the final-text
+        // normalization above trims and empties.
+        let turn = assemble_turn(TurnParts {
+            tool_calls: vec![ChatToolCall {
+                id: "call_1".to_string(),
+                name: "get_weather".to_string(),
+                arguments_json: "{}".to_string(),
+                caller: None,
+            }],
+            ..textless_parts(Some(String::new()))
+        })
+        .expect("a usable tool call wins");
+        match turn {
+            ChatTurnResult::ToolUse(result) => assert_eq!(result.content, Some(String::new())),
+            other => panic!("expected ToolUse, got {other:?}"),
+        }
     }
 }
