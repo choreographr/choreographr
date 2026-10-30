@@ -81,7 +81,7 @@ fn responses_request_serializes_with_store_true() {
         max_output_tokens: None,
         reasoning: None,
         include: None,
-        store: true,
+        store: Some(true),
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
@@ -97,6 +97,33 @@ fn responses_request_serializes_with_store_true() {
     // instructions and tools should be absent
     assert!(value.get("instructions").is_none());
     assert!(value.get("tools").is_none());
+}
+
+#[test]
+fn responses_request_serializes_store_false_explicitly() {
+    // `store` is tri-state: `Some(false)` is an explicit "don't persist" that
+    // must reach the wire, and only `None` omits the field. A backend that
+    // stores by default would otherwise persist a request that asked not to.
+    let req = ResponsesRequest {
+        model: "gpt-4",
+        input: Some(json!("hello")),
+        instructions: None,
+        tools: None,
+        stream: false,
+        max_output_tokens: None,
+        reasoning: None,
+        include: None,
+        store: Some(false),
+        previous_response_id: None,
+        parallel_tool_calls: None,
+        tool_choice: None,
+        prompt_cache_key: None,
+        session_id: None,
+        prompt_cache_retention: None,
+        prompt_cache_options: None,
+    };
+    let value = serde_json::to_value(&req).unwrap();
+    assert_eq!(value["store"], false, "{value}");
 }
 
 #[test]
@@ -118,7 +145,7 @@ fn responses_request_serializes_with_tools() {
         max_output_tokens: None,
         reasoning: None,
         include: None,
-        store: false,
+        store: None,
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
@@ -153,7 +180,7 @@ fn responses_request_serializes_with_programmatic_tool_calling() {
         max_output_tokens: None,
         reasoning: None,
         include: None,
-        store: false,
+        store: None,
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
@@ -181,7 +208,7 @@ fn responses_request_omits_optional_fields_when_none() {
         max_output_tokens: None,
         reasoning: None,
         include: None,
-        store: false,
+        store: None,
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,
@@ -192,13 +219,14 @@ fn responses_request_omits_optional_fields_when_none() {
     };
     let value = serde_json::to_value(&req).unwrap();
     let obj = value.as_object().unwrap();
-    // Only `model` should be present (stream and store are skipped when false)
+    // Only `model` should be present (stream is skipped when false, store when None)
     assert_eq!(obj.len(), 1);
     assert_eq!(value["model"], "gpt-4");
     assert!(obj.get("instructions").is_none());
     assert!(obj.get("previous_response_id").is_none());
     assert!(obj.get("parallel_tool_calls").is_none());
     assert!(obj.get("tool_choice").is_none());
+    assert!(obj.get("store").is_none());
 }
 
 #[test]

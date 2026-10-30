@@ -275,9 +275,11 @@ pub(super) fn build_responses_request_body(
         // `reasoning` object below is: `include` is validated strictly, and a
         // model that does not reason has no reasoning item to return.
         include: (stateless && reasoning_capable).then_some(vec!["reasoning.encrypted_content"]),
-        // store must be true for `previous_response_id` chaining on the standard
-        // Responses API, and is off for the stateless ChatGPT/Codex backend.
-        store: !stateless,
+        // store must be `Some(true)` for `previous_response_id` chaining on the
+        // standard Responses API, and an explicit `Some(false)` for the stateless
+        // ChatGPT/Codex backend: that request must never persist, and an omitted
+        // field would leave the backend's own storing default in force.
+        store: Some(!stateless),
         previous_response_id,
         parallel_tool_calls: None,
         tool_choice,
@@ -314,8 +316,10 @@ pub(super) fn build_simple_responses_body(
         // A one-shot prompt carries no captured reasoning to replay, so it asks
         // for no extra output items.
         include: None,
-        // Simple requests are ephemeral — don't persist on the server side.
-        store: false,
+        // Simple requests are ephemeral — don't persist on the server side, and
+        // say so explicitly (`Some(false)` rather than `None`), so the one-shot
+        // prompt never depends on a backend's storing default.
+        store: Some(false),
         previous_response_id: None,
         parallel_tool_calls: None,
         tool_choice: None,

@@ -84,8 +84,17 @@ pub(crate) struct ResponsesRequest<'a> {
     /// enum and rejects `reasoning.summary` with a 400.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) include: Option<Vec<&'a str>>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) store: bool,
+    /// Whether the provider should keep this response so a later request can
+    /// chain onto it with `previous_response_id`.
+    ///
+    /// Three states, and the distinction matters: `Some(true)` stores the
+    /// transcript, `Some(false)` is an explicit **don't store** that still
+    /// reaches the wire, and `None` omits the field entirely so the backend's
+    /// own default applies. A request that must not persist has to say so —
+    /// omitting the field would accept whatever the backend stores by default,
+    /// which is the opposite of the stateless dialect's contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) store: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) previous_response_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]

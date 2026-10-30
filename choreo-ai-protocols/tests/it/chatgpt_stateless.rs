@@ -366,10 +366,11 @@ fn a_two_iteration_stateless_tool_loop_replays_the_full_history() {
                 .all(|item| item.get("role").and_then(serde_json::Value::as_str) != Some("system")),
             "request {index}: no system-role item may reach the backend: {body}"
         );
-        // `store: false` is the default, so the field is omitted entirely.
-        assert!(
-            body.get("store").is_none(),
-            "request {index}: stateless requests must not store: {body}"
+        // `store: false` is explicit on the wire — the stateless contract is
+        // "persist nothing", which cannot be left to a backend default.
+        assert_eq!(
+            body["store"], false,
+            "request {index}: stateless requests must send store: false: {body}"
         );
         // Nothing chains through a server-side transcript.
         assert!(

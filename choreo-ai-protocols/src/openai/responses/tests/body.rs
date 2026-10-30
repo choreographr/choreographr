@@ -116,8 +116,12 @@ fn chatgpt_backend_hoists_system_prompt_into_instructions() {
     ];
     let body = body_for("chatgpt", "gpt-5.6-luna", &messages);
     assert_eq!(body["instructions"], "be helpful");
-    // Stateless: `store` is off (the field is skipped when false).
-    assert!(body.get("store").is_none(), "stateless omits store: {body}");
+    // Stateless: the request must not persist, and it says so explicitly — an
+    // omitted `store` would leave the backend's own storing default in force.
+    assert_eq!(
+        body["store"], false,
+        "stateless sends store: false explicitly: {body}"
+    );
     // And it asks for the encrypted reasoning payload, the only continuity
     // channel a transcript-less backend leaves open.
     assert_eq!(
@@ -186,7 +190,10 @@ fn chatgpt_stateless_withholds_the_reasoning_include_for_a_non_reasoning_model()
         &[ChatRequestMessage::simple("user", "hi".into())],
     );
     // The stateless request shape is still in force for the provider…
-    assert!(body.get("store").is_none(), "stateless omits store: {body}");
+    assert_eq!(
+        body["store"], false,
+        "stateless sends store: false explicitly: {body}"
+    );
     // …but a model with nothing to reason about is asked for nothing.
     assert!(
         body.get("include").is_none(),
@@ -243,11 +250,11 @@ fn build_simple_responses_body_sets_store_false() {
         ..Default::default()
     };
     let (_url, body) = build_simple_responses_body(&config, "gpt-4", "hello", false).unwrap();
-    // store: false is skipped via skip_serializing_if — the field
-    // is absent rather than explicit false.
-    assert!(
-        body.get("store").is_none(),
-        "store should be absent when false"
+    // An explicit `store: false`, not an omitted field: the one-shot prompt must
+    // not persist, and silence would defer that to the backend's default.
+    assert_eq!(
+        body["store"], false,
+        "the one-shot body carries store: false: {body}"
     );
     assert_eq!(body["model"], "gpt-4");
     assert_eq!(body["input"], "hello");
