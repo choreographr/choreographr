@@ -424,12 +424,13 @@ impl InferenceProvider {
     }
 
     /// The per-session cache-affinity dialect this provider's request bodies
-    /// carry, if any — the catalog dialect folded with the account override,
-    /// BEFORE the process-wide rejection registry. Deferred to the underlying
-    /// client (only the OpenAI-compatible one has the capability; the rest
-    /// answer [`choreo_ai_protocols::CacheAffinity::Off`]). The cache-warming
-    /// gate reads this to tell an intentional hint from one the registry
-    /// withheld for a model that rejected it.
+    /// carry, if any — the catalog dialect folded with the account override and
+    /// less a field the provider's dialect never takes (the stateless Responses
+    /// backend withholds it), BEFORE the process-wide rejection registry.
+    /// Deferred to the underlying client (only the OpenAI-compatible one has the
+    /// capability; the rest answer [`choreo_ai_protocols::CacheAffinity::Off`]).
+    /// The cache-warming gate reads this to tell an intentional hint from one the
+    /// registry withheld for a model that rejected it.
     #[must_use]
     pub fn cache_affinity(&self) -> choreo_ai_protocols::CacheAffinity {
         self.client.cache_affinity()

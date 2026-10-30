@@ -99,7 +99,9 @@ pub struct ServiceConfig {
     /// any (see [`CacheAffinity`]). Defaults to [`CacheAffinity::Off`]; the
     /// daemon sets it from the provider catalog's overlay policy. Consulted for
     /// the chat-turn paths only, and only when the turn carries a real session
-    /// id (the session-less one-shot prompt API sends no hint).
+    /// id (the session-less one-shot prompt API sends no hint). This is the raw
+    /// configured value: read [`Self::configured_cache_affinity`] for the dialect
+    /// a request will actually send.
     pub cache_affinity: CacheAffinity,
 }
 
@@ -317,36 +319,57 @@ impl ServiceConfig {
         }
     }
 
+    /// The cache affinity this provider is *configured* to send: the [`Self::cache_affinity`]
+    /// field, with the stateless-dialect withholding applied.
+    ///
+    /// The stateless Responses dialect is outside the verified prompt-cache
+    /// surface. It documents no affinity body field, and this route resends the
+    /// whole history on every request, so an unverified field would either 400
+    /// the turn or be silently ignored — neither is worth the risk for what is
+    /// only a routing hint on top of the provider's automatic prefix caching.
+    ///
+    /// Withheld here rather than in a body builder so every Responses path
+    /// inherits it, including a per-account `prompt_cache_affinity = true`
+    /// override: "the backend does not take this field" outranks an operator
+    /// forcing it on, exactly as the hosted-tool withholding does in
+    /// [`Self::programmatic_tool_calling_for_model`].
+    ///
+    /// This method is the provider-level resolution both readers share, so they
+    /// cannot disagree: the body builders resolve through
+    /// [`Self::effective_cache_affinity`] (this value, then the per-model
+    /// rejection registry), and `ProviderClient::cache_affinity` reports this
+    /// value directly. The trait method carries no model, so it deliberately
+    /// stops here — the registry is keyed by the exact `(provider, model)` pair
+    /// and only the request-time resolution can consult it.
+    #[must_use]
+    pub fn configured_cache_affinity(&self) -> CacheAffinity {
+        if self.responses_stateless() {
+            CacheAffinity::Off
+        } else {
+            self.cache_affinity
+        }
+    }
+
     /// The cache affinity to actually send for this provider and `model`, after
     /// applying the process-wide rejection registry (see
     /// `session_routing::effective_cache_affinity`).
     ///
-    /// The configured [`Self::cache_affinity`] already folds in the per-account
-    /// override and the catalog dialect; this withholds a hint the provider has
-    /// rejected with a 400 in this process for `model` (the registry is keyed by
-    /// the exact provider+model pair), and never sends one at all on the
-    /// stateless dialect. Provides a slug/config pairing so the body builders
-    /// cannot consult the registry with the wrong slug.
+    /// [`Self::configured_cache_affinity`] already folds in the per-account
+    /// override, the catalog dialect, and the stateless-dialect withholding;
+    /// this withholds a hint the provider has rejected with a 400 in this
+    /// process for `model` (the registry is keyed by the exact provider+model
+    /// pair). Provides a slug/config pairing so the body builders cannot consult
+    /// the registry with the wrong slug.
     #[must_use]
     pub fn effective_cache_affinity(&self, model: &str) -> CacheAffinity {
-        // The stateless dialect is outside the verified prompt-cache surface. It
-        // documents no affinity body field, and this route resends the whole
-        // history on every request, so an unverified field would either 400 the
-        // turn or be silently ignored — neither is worth the risk for what is
-        // only a routing hint on top of the provider's automatic prefix caching.
-        //
-        // Withheld HERE rather than in the body builder so every Responses path
-        // inherits it, including a per-account `prompt_cache_affinity = true`
-        // override: "the backend does not take this field" outranks an operator
-        // forcing it on, exactly as the hosted-tool withholding does in
-        // [`Self::programmatic_tool_calling_for_model`].
-        if self.responses_stateless() {
-            return CacheAffinity::Off;
-        }
+        // Resolve the registry against the provider-level value, never the raw
+        // field: an `Off` short-circuits before the registry lock is taken, so
+        // the withheld stateless dialect (and any provider that never opted in)
+        // pays for no lookup.
         crate::session_routing::effective_cache_affinity(
             &self.provider_slug,
             model,
-            self.cache_affinity,
+            self.configured_cache_affinity(),
         )
     }
 
@@ -781,6 +804,40 @@ mod tests {
             prompt_cache_affinity: Some(true),
             ..Default::default()
         });
+        assert_eq!(
+            openai.effective_cache_affinity("gpt-5.6-sol"),
+            CacheAffinity::PromptCacheKey
+        );
+    }
+
+    #[test]
+    fn configured_cache_affinity_applies_the_stateless_withholding() {
+        // The provider-level resolution both readers share. The stateless dialect
+        // withholds the hint regardless of the configured field (so an account
+        // that forced it on cannot outrank "this backend takes no such field"),
+        // while the standard provider reports the dialect it was configured with.
+        let codex = ServiceConfig {
+            provider_slug: "chatgpt".to_string(),
+            cache_affinity: CacheAffinity::PromptCacheKey,
+            ..Default::default()
+        };
+        assert_eq!(codex.configured_cache_affinity(), CacheAffinity::Off);
+        let openai = ServiceConfig {
+            provider_slug: "openai".to_string(),
+            cache_affinity: CacheAffinity::PromptCacheKey,
+            ..Default::default()
+        };
+        assert_eq!(
+            openai.configured_cache_affinity(),
+            CacheAffinity::PromptCacheKey
+        );
+        // The request-time resolution is unchanged by the split: the stateless
+        // dialect still sends nothing, and the standard provider still sends its
+        // configured dialect for a model that has not rejected it.
+        assert_eq!(
+            codex.effective_cache_affinity("gpt-5.6-luna"),
+            CacheAffinity::Off
+        );
         assert_eq!(
             openai.effective_cache_affinity("gpt-5.6-sol"),
             CacheAffinity::PromptCacheKey

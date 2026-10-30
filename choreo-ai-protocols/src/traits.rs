@@ -64,10 +64,11 @@ pub trait ProviderClient: Debug + Send + Sync {
     /// request bodies, if any.
     ///
     /// This is the *configured* value (the catalog dialect folded with the
-    /// account override) **before** the process-wide rejection registry is
-    /// applied. It answers "did this request intend to send a hint?", which is
-    /// exactly what the cache-warming gate needs to tell an intentional hint
-    /// from one the registry withheld for a model that rejected it. Defaults to
+    /// account override, minus a field the provider's dialect never takes)
+    /// **before** the process-wide rejection registry is applied. It answers
+    /// "did this request intend to send a hint?", which is exactly what the
+    /// cache-warming gate needs to tell an intentional hint from one the registry
+    /// withheld for a model that rejected it. Defaults to
     /// [`CacheAffinity::Off`]; only the OpenAI-compatible client carries the
     /// capability.
     #[must_use]

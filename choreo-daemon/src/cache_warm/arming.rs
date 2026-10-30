@@ -6,9 +6,10 @@
 //! [`WarmHandle`]. Keeping the resolution in one place is what makes the
 //! affinity safety gate correct — the dialect fed to
 //! [`cache_affinity_downgraded`] must be the **same value the request actually
-//! sends** (catalog dialect folded with the account override), so a forced-on
-//! hint that the provider then rejected is detected, and a forced-off hint is
-//! not mistaken for one that will be sent.
+//! sends** (catalog dialect folded with the account override, minus a field the
+//! provider's dialect never takes), so a forced-on hint that the provider then
+//! rejected is detected, and a forced-off hint is not mistaken for one that will
+//! be sent.
 
 use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition};
 use choreo_ai_protocols::{CacheAffinity, cache_affinity_downgraded, model_cost, prompt_cache_ttl};
@@ -28,7 +29,8 @@ pub(crate) struct ToolWindowWarm<'a> {
     /// key's model half).
     pub(crate) model: &'a str,
     /// The affinity the request bodies send: the catalog dialect folded with the
-    /// account override, **before** the rejection registry.
+    /// account override, minus a field the provider's dialect never takes, and
+    /// **before** the rejection registry.
     pub(crate) affinity: CacheAffinity,
     /// Whether the request bodies ask for the model's **long** prompt-cache
     /// tier (see `ProviderClient::extended_cache_retention`), resolved by the

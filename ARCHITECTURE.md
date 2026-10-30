@@ -878,9 +878,15 @@ in `choreo-ai-protocols/src/cache_field_rejection.rs` (see below).
 One provider class is withheld outright: the **stateless Responses dialect**
 (the `chatgpt`/Codex backend) never receives an affinity field, whatever the
 overlay or a per-account `prompt_cache_affinity` override says.
-`ServiceConfig::effective_cache_affinity` folds that in beside the rejection
-registry, the same single-resolution point the hosted-tool withholding uses, so
-no body builder can emit one. The reason is verification, not preference: that
+`ServiceConfig::configured_cache_affinity` folds that in — the provider-level
+resolution both readers share, so `ProviderClient::cache_affinity` (what the
+cache-warming gate is told) and `ServiceConfig::effective_cache_affinity` (what
+the body builders resolve through, adding the rejection registry on top) cannot
+disagree — and it is the same single-resolution point the hosted-tool
+withholding uses, so no body builder can emit one. The trait method carries no
+model, so it deliberately stops at the provider level: the rejection registry is
+keyed by the exact `(provider, model)` pair and only the request-time resolution
+consults it. The reason is verification, not preference: that
 backend documents no affinity field, and an unverified body field either 400s the
 turn or is ignored — while the provider's automatic prefix caching still applies
 to the replayed history without a key. Opting the dialect in later means
@@ -988,8 +994,9 @@ write the next real turn never reads — a coin flip the warmer must not take.
 The gate is deliberately narrow. The arming site delegates to
 `cache_warm::arming` (`arm_for_tool_window`), which resolves the dialect the
 request bodies actually send — `InferenceProvider::cache_affinity`, i.e. the
-catalog dialect folded with the per-account override, the same value the body
-builders use — and asks `session_routing::cache_affinity_downgraded`, which is
+catalog dialect folded with the per-account override and less a field the
+provider's dialect never takes, the same provider-level value the body builders
+start from — and asks `session_routing::cache_affinity_downgraded`, which is
 true only when **both** halves hold: the request *intended* to send a hint (that
 dialect is not `Off`) **and** the effective affinity came back `Off` from the
 rejection registry for that `(provider, model)` pair. Resolving the real

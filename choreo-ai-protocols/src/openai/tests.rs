@@ -879,3 +879,36 @@ fn extended_cache_retention_matches_what_a_request_would_send() {
     );
     assert!(!client().extended_cache_retention("ret-model"));
 }
+
+#[test]
+// `responses_stateless` reads the process-wide catalog, so serialize under the
+// same key as the catalog-swap tests for libtest determinism.
+#[serial_test::serial(catalog)]
+fn client_cache_affinity_reports_what_the_request_sends() {
+    // The daemon's cache-warming gate reads `ProviderClient::cache_affinity` and
+    // documents it as the dialect the request bodies actually send, so the
+    // stateless Responses backend must report `Off` even when the configured
+    // field is set: its bodies withhold the hint outright.
+    let client = |slug: &str| {
+        let registry = crate::SocketRegistry::new();
+        OpenAiClient::new(
+            ServiceConfig {
+                provider_slug: slug.to_string(),
+                cache_affinity: crate::CacheAffinity::PromptCacheKey,
+                ..Default::default()
+            },
+            RequestAuth::api_key("test-key"),
+            &registry,
+        )
+        .expect("client builds")
+    };
+    assert_eq!(
+        client("chatgpt").cache_affinity(),
+        crate::CacheAffinity::Off
+    );
+    // The standard Responses provider keeps the dialect it was configured with.
+    assert_eq!(
+        client("openai").cache_affinity(),
+        crate::CacheAffinity::PromptCacheKey
+    );
+}

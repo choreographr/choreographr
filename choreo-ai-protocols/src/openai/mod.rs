@@ -465,7 +465,10 @@ impl ProviderClient for OpenAiClient {
     }
 
     fn cache_affinity(&self) -> crate::session_routing::CacheAffinity {
-        self.config.cache_affinity
+        // The same provider-level resolution the body builders start from, so
+        // the daemon's cache-warming affinity gate cannot be told a hint is sent
+        // that the request withholds (see `ServiceConfig::configured_cache_affinity`).
+        self.config.configured_cache_affinity()
     }
 
     fn extended_cache_retention(&self, model: &str) -> bool {
