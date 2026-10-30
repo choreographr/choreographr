@@ -13,26 +13,26 @@
 //! is the wire-level counterpart of the daemon's tool loop, which rebuilds the
 //! whole conversation from the session turns on every iteration.
 //!
+//! The mock is the crate's shared [`MockProvider`] in its per-request mode, so
+//! the rejection is a property of the REQUEST rather than of arrival order: a
+//! body the backend would refuse can never be answered as a success, and a
+//! refused request cannot consume the turn a later legal one needs.
+//!
 //! The test binds a real local TCP socket, so per AGENTS.md it lives in
 //! `tests/` and is marked `#[ignore]` (run via `cargo test-integration`).
 
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
 // allow-*-in-tests config only recognizes #[test]-annotated functions —
 // helper fns in this file need this file-level allowance.
-#![expect(clippy::expect_used, clippy::indexing_slicing)]
+#![expect(clippy::expect_used)]
 
 use std::fmt::Write as _;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::Duration;
 
 use choreo_ai_protocols::openai::{
     AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition, OpenAiClient,
     RequestAuth, RequestFormat, ServiceConfig,
 };
+use choreo_ai_protocols::test_utils::{CapturedRequest, MockProvider};
 use choreo_ai_protocols::{ChatTurnRequest, ChatTurnResult, SocketRegistry};
 
 /// The system prompt hoisted into `instructions`.
@@ -55,124 +55,69 @@ const CHAIN_REJECTION: &str = r#"{"detail":"previous_response_id is not supporte
 
 /// A loopback stand-in for the stateless ChatGPT/Codex Responses endpoint.
 ///
-/// Serves one canned response per request, but only after applying the two
-/// rejections the real backend applies — a request the real backend would 400
-/// must never look like a success here, or the test would pass on a body the
-/// provider refuses. Every request body it receives is captured so the test can
-/// assert on what actually went out.
+/// Serves one turn per request, but only after applying the two rejections the
+/// real backend applies — a request the real backend would 400 must never look
+/// like a success here, or the test would pass on a body the provider refuses.
 struct CodexMock {
-    addr: SocketAddr,
-    bodies: Arc<Mutex<Vec<serde_json::Value>>>,
-    /// Set by `Drop` to ask the serve thread to exit. This is the test-only
-    /// single-bit cooperative cancellation flag, the one shared-state pattern
-    /// AGENTS.md sanctions: a channel message cannot interrupt a thread blocked
-    /// in `accept`.
-    shutdown: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    provider: MockProvider,
 }
 
 impl CodexMock {
-    /// Start the backend on an ephemeral loopback port.
     fn start() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind the mock Codex backend");
-        let addr = listener.local_addr().expect("mock backend local addr");
-        let bodies = Arc::new(Mutex::new(Vec::new()));
-        let bodies_thread = Arc::clone(&bodies);
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_thread = Arc::clone(&shutdown);
-
-        let handle = std::thread::spawn(move || {
-            // A blocking accept is all this needs: `Drop` unblocks it by
-            // connecting to the listener once the shutdown flag is set, so there
-            // is no poll interval and no sleep anywhere in the teardown.
-            let mut served: usize = 0;
-            while let Ok((stream, _)) = listener.accept() {
-                if shutdown_thread.load(Ordering::SeqCst) {
-                    break;
-                }
-                if serve(stream, &bodies_thread, served) {
-                    // Only a request the backend ACCEPTED advances the script,
-                    // so a rejected turn cannot silently consume the response
-                    // the next (legal) turn needs.
-                    served = served.saturating_add(1);
-                }
-            }
-        });
-
         Self {
-            addr,
-            bodies,
-            shutdown,
-            handle: Some(handle),
+            provider: MockProvider::start_responding(respond),
         }
     }
 
     /// The API root to point a client at (`…/v1`, matching the default paths).
     fn base_url(&self) -> String {
-        format!("http://{}/v1", self.addr)
+        self.provider.base_url("v1")
     }
 
     /// Every request body the backend received, in arrival order.
     fn bodies(&self) -> Vec<serde_json::Value> {
-        self.bodies
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.provider
+            .requests()
+            .iter()
+            .map(CapturedRequest::body_json)
+            .collect()
     }
 }
 
-impl Drop for CodexMock {
-    fn drop(&mut self) {
-        // Signal the serve thread to stop, then connect once to unblock its
-        // `accept` — the connect both wakes it and is the event it checks the
-        // flag against (it breaks before serving that connection).
-        self.shutdown.store(true, Ordering::SeqCst);
-        let _ = TcpStream::connect(self.addr);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
-/// Serve one accepted connection: read the request, apply the backend's
-/// rejections, then stream the turn `served` schedules. Returns whether the
-/// request was accepted.
-fn serve(mut stream: TcpStream, bodies: &Mutex<Vec<serde_json::Value>>, served: usize) -> bool {
-    // A read timeout is a hang guard, not a synchronisation primitive: a
-    // half-open request must not be able to wedge the serve thread and hold up
-    // `Drop`'s join forever.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let Some((_head, raw_body)) = read_request(&mut stream) else {
-        return false; // client hung up mid-request; nothing to answer
-    };
-    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&raw_body) else {
-        respond(
-            &mut stream,
+/// The backend's verdict on a request: the turn it serves, or the 400 body it
+/// refuses the request with.
+fn respond(request: &CapturedRequest) -> (u16, &'static str, String) {
+    // A body that is not JSON is refused rather than panicking the serve thread.
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&request.body) else {
+        return (
             400,
             "application/json",
-            r#"{"detail":"body is not JSON"}"#,
+            r#"{"detail":"body is not JSON"}"#.to_string(),
         );
-        return false;
     };
-    // Capture before validating: the assertions run on what the client actually
-    // sent, rejected or not.
-    bodies
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(body.clone());
-
     if let Some(rejection) = rejection(&body) {
-        respond(&mut stream, 400, "application/json", rejection);
-        return false;
+        return (400, "application/json", rejection.to_string());
     }
-
-    let turn = if served == 0 {
-        tool_call_stream()
+    // Which turn to serve is a property of the request, not of how many have
+    // arrived: once the conversation answers a tool call, the model's next turn
+    // is the final answer.
+    if answers_a_tool_call(&body) {
+        (200, "text/event-stream", final_text_stream())
     } else {
-        final_text_stream()
-    };
-    respond(&mut stream, 200, "text/event-stream", &turn);
-    true
+        (200, "text/event-stream", tool_call_stream())
+    }
+}
+
+/// Whether the request's `input` carries a tool result — i.e. the conversation
+/// has already made a call the model now has the answer to.
+fn answers_a_tool_call(body: &serde_json::Value) -> bool {
+    body.get("input")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.get("type").and_then(serde_json::Value::as_str) == Some("function_call_output")
+            })
+        })
 }
 
 /// The backend's verdict on a request body: the 400 body it answers with, or
@@ -200,54 +145,6 @@ fn rejection(body: &serde_json::Value) -> Option<&'static str> {
         return Some(CHAIN_REJECTION);
     }
     None
-}
-
-/// Read one HTTP request, returning `(head, body)`.
-///
-/// Only the subset of HTTP/1.1 ureq needs: a request line, headers, and a
-/// `Content-Length`-delimited body.
-fn read_request(stream: &mut TcpStream) -> Option<(String, Vec<u8>)> {
-    let mut buf: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 4096];
-    let head_end = loop {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            return None; // the client hung up before finishing the head
-        }
-        buf.extend_from_slice(&chunk[..read]);
-        if let Some(offset) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-            break offset;
-        }
-    };
-    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-    let body_start = head_end + 4;
-    let content_length = head
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    while buf.len() < body_start + content_length {
-        let read = stream.read(&mut chunk).ok()?;
-        if read == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..read]);
-    }
-    let body = buf.get(body_start..body_start + content_length)?.to_vec();
-    Some((head, body))
-}
-
-/// Write one complete HTTP response and close the connection.
-fn respond(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) {
-    let reason = if status == 200 { "OK" } else { "Bad Request" };
-    let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
-    let _ = stream.flush();
 }
 
 /// Frame an ordered list of SSE `data:` payloads into one response body.

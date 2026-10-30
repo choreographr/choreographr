@@ -18,7 +18,10 @@
 //! reasoning round-trip wire tests in both `choreo-ai-protocols/tests/` and
 //! `choreo-daemon/tests/` — a `TcpListener` serving one canned response per
 //! request and recording every request head/body so tests can assert on the
-//! actual wire.
+//! actual wire. A provider whose reply depends on what it was sent (a backend
+//! that rejects a specific request shape, say) uses
+//! [`MockProvider::start_responding`] instead of a script, so one mock covers
+//! both the permissive and the refusing case.
 
 // Test-only mock-provider infrastructure, compiled solely under the
 // `test-utils` feature (see the module docs above). Clippy's test allowances
@@ -67,6 +70,24 @@ impl CapturedRequest {
     }
 }
 
+/// One HTTP response: `(status, content type, body)`.
+pub type MockResponse = (u16, &'static str, String);
+
+/// A per-request responder: given the request just recorded, the response to
+/// send. Lets a mock model a backend that answers by *what it was asked* (a
+/// 400 for a request shape it refuses, a different turn per conversation
+/// state) instead of by a fixed order.
+pub type MockResponder = dyn Fn(&CapturedRequest) -> MockResponse + Send + Sync;
+
+/// What the serve thread replies with.
+enum Script {
+    /// Serve these responses in order; the last one repeats for any excess
+    /// request.
+    Sequence(Arc<Mutex<VecDeque<MockResponse>>>),
+    /// Decide every response from its own request.
+    PerRequest(Arc<MockResponder>),
+}
+
 /// A tiny scripted HTTP provider: serves one canned response per request, in
 /// order (the last entry repeats for any excess requests), and records every
 /// request so tests can assert on the wire.
@@ -75,17 +96,16 @@ impl CapturedRequest {
 /// head + `Content-Length` body, replies with `Connection: close` (so the
 /// client opens a fresh connection per request), and drops the stream.
 ///
-/// The serve thread runs a non-blocking accept + poll loop so that dropping
-/// the provider (which sets the `shutdown` flag and joins the thread) can
-/// terminate it promptly instead of leaking a permanently blocked `accept`
-/// thread per test.
+/// The serve thread blocks in `accept`; dropping the provider sets the
+/// `shutdown` flag and connects once to wake it, so teardown costs one connect
+/// and never a poll interval or a sleep.
 pub struct MockProvider {
     addr: std::net::SocketAddr,
     captured: Arc<Mutex<Vec<CapturedRequest>>>,
-    /// Set by `Drop` to ask the serve thread to exit its poll loop. This is a
-    /// test-only cooperative cancellation flag (single-bit, no data), the one
-    /// shared-state pattern AGENTS.md sanctions; a channel message could not
-    /// interrupt a thread blocked in `accept`.
+    /// Set by `Drop` to ask the serve thread to exit. This is a test-only
+    /// cooperative cancellation flag (single-bit, no data), the one shared-state
+    /// pattern AGENTS.md sanctions; a channel message could not interrupt a
+    /// thread blocked in `accept`.
     shutdown: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
@@ -99,7 +119,7 @@ impl MockProvider {
     /// Panics if the TCP listener cannot be bound or configured; the mock
     /// provider has no non-panicking fallback.
     #[must_use]
-    pub fn start(responses: Vec<(u16, &'static str, String)>) -> Self {
+    pub fn start(responses: Vec<MockResponse>) -> Self {
         // `start_scripted` with no address to embed — the common shape.
         Self::start_scripted(move |_| responses)
     }
@@ -115,27 +135,51 @@ impl MockProvider {
     /// provider has no non-panicking fallback.
     pub fn start_scripted<F>(make: F) -> Self
     where
-        F: FnOnce(&str) -> Vec<(u16, &'static str, String)>,
+        F: FnOnce(&str) -> Vec<MockResponse>,
     {
         // Bind first so the scripted responses can embed the real address,
         // THEN build them — the serve thread is spawned below, so the script
         // is complete before any traffic arrives.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
-        // Non-blocking so the serve loop can poll `accept` and observe the
-        // shutdown flag instead of blocking forever on a connection that never
-        // arrives.
-        listener.set_nonblocking(true).expect("nonblocking");
-        let addr = listener.local_addr().expect("mock provider local addr");
+        let (listener, addr) = bind_mock_listener();
         let responses = Arc::new(Mutex::new(VecDeque::from(make(&format!("http://{addr}")))));
+        Self::start_with(listener, addr, Script::Sequence(responses))
+    }
+
+    /// Serve whatever `respond` decides for each request, instead of a fixed
+    /// script.
+    ///
+    /// This is how a mock enforces a backend's *rejections*: a request the real
+    /// backend would refuse gets its 4xx here, so a test can never go green on a
+    /// body the provider would have answered with an error. Nothing is consumed
+    /// either, so a rejected request cannot silently eat the response a later
+    /// (legal) request needs — which is why the decision belongs in the
+    /// responder rather than in the order requests happen to arrive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the TCP listener cannot be bound or configured; the mock
+    /// provider has no non-panicking fallback.
+    pub fn start_responding<F>(respond: F) -> Self
+    where
+        F: Fn(&CapturedRequest) -> MockResponse + Send + Sync + 'static,
+    {
+        let (listener, addr) = bind_mock_listener();
+        Self::start_with(listener, addr, Script::PerRequest(Arc::new(respond)))
+    }
+
+    /// Spawn the serve thread for an already-bound listener.
+    fn start_with(listener: TcpListener, addr: std::net::SocketAddr, script: Script) -> Self {
+        let script = Arc::new(script);
         let captured = Arc::new(Mutex::new(Vec::new()));
         let captured_thread = Arc::clone(&captured);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_thread = Arc::clone(&shutdown);
+        let script_thread = Arc::clone(&script);
 
         let handle = std::thread::spawn(move || {
             // Handle one accepted connection: read the request head + body,
-            // record it, and serve the next scripted response. Kept as a
-            // closure so the poll loop below stays readable.
+            // record it, and reply. Kept as a closure so the accept loop below
+            // stays readable.
             let serve_request = |mut stream: std::net::TcpStream| {
                 // A short read timeout keeps the blocking request reads
                 // interruptible: if Drop sets the shutdown flag while a client
@@ -234,19 +278,32 @@ impl MockProvider {
                         body,
                     });
 
-                // Serve the next scripted response (peek when it is the last
-                // one so excess requests still get an answer). The lock is
-                // taken only for this pop/peek — holding it across the
-                // blocking reads above would let an in-flight request stall
-                // `requests()` from the test thread.
-                let (status, content_type, response_body) = {
-                    let mut responses = responses
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if responses.len() > 1 {
-                        responses.pop_front().expect("scripted response")
-                    } else {
-                        responses.front().cloned().expect("scripted response")
+                // Ask the script for this response. The sequence lock is taken
+                // only for the pop/peek — holding it across the blocking reads
+                // above would let an in-flight request stall `requests()` from
+                // the test thread.
+                let (status, content_type, response_body) = match &*script_thread {
+                    Script::Sequence(responses) => {
+                        let mut responses = responses
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if responses.len() > 1 {
+                            responses.pop_front().expect("scripted response")
+                        } else {
+                            responses.front().cloned().expect("scripted response")
+                        }
+                    }
+                    // Decided from the request that was just recorded, so a
+                    // rejected request neither consumes a turn nor perturbs
+                    // the answer a later one gets.
+                    Script::PerRequest(respond) => {
+                        let request = captured_thread
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .last()
+                            .cloned()
+                            .expect("the request just recorded");
+                        respond(&request)
                     }
                 };
                 let reason = if status == 200 { "OK" } else { "Error" };
@@ -261,26 +318,14 @@ impl MockProvider {
                 stream.flush().unwrap_or_default();
             };
 
-            loop {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        // The accepted socket inherits the listener's
-                        // non-blocking mode on some platforms; restore blocking
-                        // so the request reader works.
-                        stream.set_nonblocking(false).expect("stream blocking");
-                        serve_request(stream);
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No pending connection: poll the shutdown flag and
-                        // sleep briefly before trying again, so Drop can
-                        // terminate this thread promptly.
-                        if shutdown_thread.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(2));
-                    }
-                    Err(_) => break, // listener closed
+            // `Drop` wakes this blocking accept with one connect: it is the
+            // event that lets the loop observe the flag, so the connection is
+            // discarded instead of served.
+            while let Ok((stream, _)) = listener.accept() {
+                if shutdown_thread.load(Ordering::SeqCst) {
+                    break;
                 }
+                serve_request(stream);
             }
         });
 
@@ -314,11 +359,30 @@ impl MockProvider {
 
 impl Drop for MockProvider {
     fn drop(&mut self) {
-        // Signal the serve thread to stop polling and join it, so tests do
-        // not leak a blocked accept thread per MockProvider.
+        // Signal the serve thread to stop, then connect once to wake it out of
+        // `accept` — the connect IS the event the loop checks the flag on, so
+        // teardown needs no poll interval and no sleep. A thread already inside
+        // a request finishes it (its reads carry a short timeout) and then
+        // observes the flag on the next accept.
         self.shutdown.store(true, Ordering::SeqCst);
+        let _ = std::net::TcpStream::connect(self.addr);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
     }
+}
+
+/// Bind the mock's loopback listener on an ephemeral port.
+///
+/// `127.0.0.1` (never a wildcard address) so the mock is unreachable from
+/// outside the machine, and port 0 so parallel tests never collide.
+///
+/// # Panics
+///
+/// Panics if the bind fails; a test harness has no way to continue without a
+/// listener.
+fn bind_mock_listener() -> (TcpListener, std::net::SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock provider");
+    let addr = listener.local_addr().expect("mock provider local addr");
+    (listener, addr)
 }
