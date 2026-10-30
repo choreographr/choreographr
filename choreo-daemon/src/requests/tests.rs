@@ -22,7 +22,7 @@ use choreo_ai_protocols::StreamEvent;
 use choreo_ai_protocols::chat_reasoning_echo;
 use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction, chat_wire_messages};
 use choreo_keystore::ServiceCredential;
-use choreo_proto::{ChatReasoningField, ReasoningArtifact};
+use choreo_proto::{ChatReasoningField, ReasoningArtifact, ToolCallCaller};
 use std::sync::mpsc;
 
 /// Protected set for the mirror tests: just "core" (no platform tools
@@ -91,6 +91,7 @@ fn build_chat_request_messages_with_tool_calls() {
         call_id: "call_1".into(),
         name: "ls".into(),
         arguments_json: r#"{"path": "."}"#.into(),
+        caller: None,
     }];
     session.set_assistant_response(
         tid,
@@ -152,6 +153,7 @@ fn session_with_image_result() -> (SessionState, tempfile::NamedTempFile) {
                 call_id: "call_img".into(),
                 name: "read_image".into(),
                 arguments_json: r#"{"path": "/tmp/x.png"}"#.into(),
+                caller: None,
             }],
             ..Default::default()
         },
@@ -248,6 +250,7 @@ fn build_chat_request_messages_vision_model_empty_bytes_places_placeholder() {
                 call_id: "c".into(),
                 name: "read_image".into(),
                 arguments_json: r"{}".into(),
+                caller: None,
             }],
             ..Default::default()
         },
@@ -335,6 +338,7 @@ fn add_image_turn(session: &mut SessionState, user_text: &str, image_path: &str)
                 call_id: format!("call_img_{tid}"),
                 name: "read_image".into(),
                 arguments_json: r#"{"path": "/tmp/x.png"}"#.into(),
+                caller: None,
             }],
             ..Default::default()
         },
@@ -397,6 +401,7 @@ fn record_tool_completion_persists_vision_image_at_emit_time() {
         call_id: "call_img".into(),
         name: "read_image".into(),
         arguments_json: r#"{"path": "/tmp/x.png"}"#.into(),
+        caller: None,
     }];
     session.set_assistant_response(
         turn_id,
@@ -611,6 +616,7 @@ fn tool_call_record(call_id: &str, name: &str) -> AssistantToolCallRecord {
         call_id: call_id.into(),
         name: name.into(),
         arguments_json: "{}".into(),
+        caller: None,
     }
 }
 
@@ -695,6 +701,62 @@ fn wire_json(
         .iter()
         .map(|m| serde_json::to_value(m).expect("serialize wire message"))
         .collect()
+}
+
+#[test]
+fn a_turn_caller_rides_the_rebuilt_assistant_tool_call() {
+    // The Responses API resumes a model-generated program from the `caller` the
+    // `function_call` carried, so a rebuilt history has to re-emit it: the daemon
+    // copies the turn record's attribution onto every tool call it rebuilds,
+    // which is what lets the next request copy it back onto the call and the
+    // output that answers it.
+    let caller = ToolCallCaller {
+        kind: "program".into(),
+        caller_id: "prog_123".into(),
+    };
+    let mut attributed = tool_call_record("call_1", "get_weather");
+    attributed.caller = Some(caller.clone());
+    let unattributed = tool_call_record("call_2", "read_file");
+
+    let mut session = SessionState::empty();
+    add_turn(
+        &mut session,
+        "weather?",
+        "",
+        None,
+        None,
+        vec![attributed, unattributed],
+    );
+
+    let messages = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL, None);
+    let calls = assistant_messages(&messages)[0]
+        .tool_calls
+        .as_ref()
+        .expect("the assistant turn carries its tool calls");
+    assert_eq!(calls.len(), 2);
+    let rebuilt = calls[0]
+        .caller
+        .as_ref()
+        .expect("the attribution rides the rebuilt call");
+    assert_eq!(rebuilt.kind, "program");
+    assert_eq!(rebuilt.caller_id, "prog_123");
+    // A call the provider did not attribute stays unattributed — the field is
+    // not invented.
+    assert!(calls[1].caller.is_none());
+
+    // The chat-completions wire has no `caller` on a tool call, so neither the
+    // attributed nor the bare call gains one there.
+    let wire = wire_json(&messages, TEST_PROVIDER, TEST_MODEL);
+    let assistant_wire = wire
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("the assistant turn rides the wire");
+    for call in assistant_wire["tool_calls"]
+        .as_array()
+        .expect("the assistant turn serializes its tool calls")
+    {
+        assert!(call.get("caller").is_none());
+    }
 }
 
 #[test]
@@ -2673,6 +2735,7 @@ fn estimate_prompt_tokens_counts_tool_call_metadata() {
                 name: "read_file".into(),
                 arguments: r#"{"path": "/etc/hosts"}"#.into(),
             },
+            caller: None,
         }]),
         tool_call_id: None,
         reasoning_artifact: None,

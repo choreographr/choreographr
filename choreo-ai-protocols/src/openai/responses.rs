@@ -28,6 +28,10 @@ mod turn;
 mod wire;
 
 use body::{build_responses_request_body, build_simple_responses_body};
+// The caller index is part of the lowering's signature, so the test suite names
+// it directly to pass an empty one.
+#[cfg(test)]
+pub(crate) use input::CallerIndex;
 pub(crate) use input::{SystemPrompt, messages_to_responses_input};
 pub(crate) use stream::responses_request_streaming_with_tools;
 use turn::incomplete_stop;

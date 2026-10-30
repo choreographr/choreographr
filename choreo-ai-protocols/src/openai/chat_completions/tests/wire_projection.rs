@@ -499,11 +499,39 @@ fn empty_assistant_message_with_tool_calls_survives() {
             name: "sh".into(),
             arguments: "{}".into(),
         },
+        caller: None,
     }]);
     let messages = vec![ChatRequestMessage::simple("user", "q".into()), msg];
     let (roles, dropped) = project(&messages, ChatReasoningEcho::default());
     assert_eq!(roles, vec!["user".to_string(), "assistant".to_string()]);
     assert_eq!(dropped, 0);
+}
+
+#[test]
+fn a_tool_call_caller_never_reaches_the_chat_wire() {
+    // `caller` is a Responses-API attribution for resuming a generated program;
+    // a chat-completions `tool_calls` entry has no such field. A history that
+    // captured one under a Responses model and then switched to a chat route
+    // must not hand the chat provider a field its wire does not define — and a
+    // call with no attribution must not gain a `caller: null` either.
+    let mut attributed = ChatRequestMessage::simple("assistant", String::new());
+    attributed.tool_calls = Some(vec![AssistantToolCall {
+        id: "call_1".into(),
+        kind: "function".into(),
+        function: AssistantToolFunction {
+            name: "sh".into(),
+            arguments: "{}".into(),
+        },
+        caller: Some(crate::CallerInfo {
+            kind: "program".into(),
+            caller_id: "prog_123".into(),
+        }),
+    }]);
+    let body =
+        serde_json::to_value(chat_wire_message(&attributed, ChatReasoningEcho::default())).unwrap();
+    assert_eq!(body["tool_calls"][0]["id"], "call_1");
+    assert_eq!(body["tool_calls"][0]["function"]["name"], "sh");
+    assert!(body["tool_calls"][0].get("caller").is_none());
 }
 
 #[test]

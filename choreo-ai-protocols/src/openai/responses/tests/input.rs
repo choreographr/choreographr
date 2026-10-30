@@ -11,9 +11,19 @@
 // inside `tests`, so the adapter is two `super`s up and `openai` three.
 use super::super::super::*;
 use super::super::*;
+use crate::CallerInfo;
 use crate::openai::reasoning_details::MAX_REASONING_BYTES;
 use choreo_proto::ReasoningArtifact;
 use serde_json::json;
+
+/// An empty call id → attribution index, for a history that carries none.
+///
+/// The index is how a `function_call_output` recovers the attribution of the
+/// call it answers; a history whose calls carry no `caller` (every shape but a
+/// programmatic Responses round) resolves nothing, so no item emits one.
+fn no_callers() -> CallerIndex<'static> {
+    CallerIndex::new()
+}
 
 /// The assistant turn that requests one `get_weather` call, as the daemon
 /// records it in a tool round (content-less, the call in `tool_calls`).
@@ -30,6 +40,7 @@ fn assistant_tool_call() -> ChatRequestMessage {
                 name: "get_weather".to_string(),
                 arguments: "{}".to_string(),
             },
+            caller: None,
         }]),
         reasoning_artifact: None,
     }
@@ -45,6 +56,90 @@ fn tool_result(output: &str) -> ChatRequestMessage {
         tool_calls: None,
         reasoning_artifact: None,
     }
+}
+
+/// The attribution the API puts on a call a model-generated program made.
+fn program_caller() -> CallerInfo {
+    CallerInfo {
+        kind: "program".to_string(),
+        caller_id: "prog_123".to_string(),
+    }
+}
+
+/// [`assistant_tool_call`], attributed to a generated program (programmatic
+/// tool calling), exactly as the response reported it.
+fn assistant_program_tool_call() -> ChatRequestMessage {
+    let mut message = assistant_tool_call();
+    if let Some(calls) = message.tool_calls.as_mut()
+        && let Some(call) = calls.first_mut()
+    {
+        call.caller = Some(program_caller());
+    }
+    message
+}
+
+#[test]
+fn a_rebuilt_history_replays_the_caller_on_the_call_and_its_output() {
+    // The Responses API needs the `caller` copied back onto both the replayed
+    // `function_call` and the `function_call_output` answering it, so the
+    // service can resume the program that generated the call (see
+    // <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
+    // A history rebuilt from messages — no chain — is exactly the case where
+    // both items are sent, so both must carry the identical attribution.
+    let messages = vec![
+        ChatRequestMessage::simple("user", "weather?".into()),
+        assistant_program_tool_call(),
+        tool_result("72F"),
+    ];
+    let result = build_responses_input(&messages, None, SystemPrompt::Inline).unwrap();
+    let value = result.expect("expected Some value");
+    assert_eq!(
+        value,
+        json!([
+            {"type": "message", "role": "user", "content": "weather?"},
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{}",
+                "caller": {"type": "program", "caller_id": "prog_123"},
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "72F",
+                "caller": {"type": "program", "caller_id": "prog_123"},
+            },
+        ])
+    );
+}
+
+#[test]
+fn a_chained_tool_round_attributes_the_output_whose_call_is_not_in_the_tail() {
+    // The chained tail drops the assistant message that carried the call, so the
+    // attribution cannot be read off the messages being lowered — it has to come
+    // from the index built over the FULL history. Without that, the one route
+    // where the field matters most (programmatic tool calling chains through
+    // `previous_response_id`, so every tool round is a tail of outputs) would
+    // send an output with no caller and the service could not resume the
+    // program.
+    let messages = vec![
+        ChatRequestMessage::simple("system", "be helpful".into()),
+        ChatRequestMessage::simple("user", "weather?".into()),
+        assistant_program_tool_call(),
+        tool_result("72F"),
+    ];
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
+    assert_eq!(
+        result.expect("expected Some value"),
+        json!([{
+            "type": "function_call_output",
+            "call_id": "call_1",
+            "output": "72F",
+            "caller": {"type": "program", "caller_id": "prog_123"},
+        }]),
+        "the tail is one attributed output: the call itself stays chained"
+    );
 }
 
 #[test]
@@ -66,14 +161,15 @@ fn hoisted_system_prompt_drops_every_system_message() {
         ChatRequestMessage::simple("user", "hi".into()),
         ChatRequestMessage::simple("system", "injected later".into()),
     ];
-    let hoisted = messages_to_responses_input(messages.iter(), SystemPrompt::Hoisted)
-        .expect("hoisted lowering builds");
+    let hoisted =
+        messages_to_responses_input(messages.iter(), SystemPrompt::Hoisted, &no_callers())
+            .expect("hoisted lowering builds");
     assert_eq!(hoisted.len(), 1, "only the user turn: {hoisted:?}");
     assert_eq!(hoisted[0]["role"], "user");
 
     // The standard API keeps both inline, so the two dialects stay distinguishable
     // at the lowering boundary.
-    let inline = messages_to_responses_input(messages.iter(), SystemPrompt::Inline)
+    let inline = messages_to_responses_input(messages.iter(), SystemPrompt::Inline, &no_callers())
         .expect("inline lowering builds");
     assert_eq!(
         inline.len(),
@@ -291,7 +387,7 @@ fn messages_to_responses_input_reemits_reasoning_items() {
                 .to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers()).unwrap();
     assert_eq!(items.len(), 2);
     assert_eq!(items[0]["type"], "reasoning");
     assert_eq!(items[0]["id"], "re_1");
@@ -318,7 +414,7 @@ fn messages_to_responses_input_reasoning_items_preserve_order() {
                     .to_vec(),
             )),
         };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers()).unwrap();
     assert_eq!(items.len(), 3);
     assert_eq!(items[0]["id"], "re_1");
     assert_eq!(items[1]["id"], "re_2");
@@ -340,7 +436,7 @@ fn a_corrupt_reasoning_artifact_is_dropped_not_fatal() {
         tool_calls: None,
         reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(b"{not json".to_vec())),
     };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers())
         .expect("a corrupt artifact is not fatal");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
@@ -363,7 +459,7 @@ fn an_over_budget_reasoning_artifact_is_not_replayed() {
         tool_calls: None,
         reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(oversized.into_bytes())),
     };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers())
         .expect("an oversized artifact is not fatal");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
@@ -390,7 +486,7 @@ fn a_replay_artifact_drops_non_reasoning_items() {
         tool_calls: None,
         reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(poisoned.to_vec())),
     };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers())
         .expect("a filtered artifact is not fatal");
     assert_eq!(
         items.len(),
@@ -417,7 +513,7 @@ fn a_replay_artifact_with_only_foreign_items_replays_nothing() {
             br#"[{"type":"message","role":"user","content":"hi"}]"#.to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline)
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers())
         .expect("a filtered artifact is not fatal");
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
@@ -428,7 +524,7 @@ fn a_replay_artifact_with_only_foreign_items_replays_nothing() {
 fn messages_to_responses_input_no_artifact_plain_message() {
     // Control: no artifact → plain message item, no reasoning on the wire.
     let msg = ChatRequestMessage::simple("assistant", "plain".into());
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers()).unwrap();
     assert_eq!(items.len(), 1);
     assert_eq!(items[0]["type"], "message");
     assert!(items[0].get("reasoning_content").is_none());
@@ -440,7 +536,7 @@ fn messages_to_responses_input_skips_empty_assistant_content() {
     // A blank assistant turn produces no message item: an empty text item is
     // meaningless and rejects on strict endpoints.
     let msg = ChatRequestMessage::simple("assistant", "  \n ".into());
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers()).unwrap();
     assert!(items.is_empty(), "{items:?}");
 }
 
@@ -458,7 +554,7 @@ fn messages_to_responses_input_keeps_reasoning_items_for_an_empty_turn() {
             br#"[{"type":"reasoning","id":"rs_1","encrypted_content":"eJxT"}]"#.to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers()).unwrap();
     assert_eq!(items.len(), 1, "{items:?}");
     assert_eq!(items[0]["type"], "reasoning");
 }
@@ -480,6 +576,7 @@ fn messages_to_responses_input_replays_the_function_calls_its_outputs_answer() {
                 name: "get_weather".to_string(),
                 arguments: r#"{"city":"London"}"#.to_string(),
             },
+            caller: None,
         }]),
         reasoning_artifact: None,
     };
@@ -491,8 +588,12 @@ fn messages_to_responses_input_replays_the_function_calls_its_outputs_answer() {
         tool_calls: None,
         reasoning_artifact: None,
     };
-    let items =
-        messages_to_responses_input(&[assistant, tool_result], SystemPrompt::Inline).unwrap();
+    let items = messages_to_responses_input(
+        &[assistant, tool_result],
+        SystemPrompt::Inline,
+        &no_callers(),
+    )
+    .unwrap();
     assert_eq!(items.len(), 2, "{items:?}");
     assert_eq!(items[0]["type"], "function_call");
     assert_eq!(items[0]["call_id"], "call_1");
@@ -517,12 +618,13 @@ fn messages_to_responses_input_places_reasoning_before_the_call_it_explains() {
                 name: "lookup".to_string(),
                 arguments: "{}".to_string(),
             },
+            caller: None,
         }]),
         reasoning_artifact: Some(ReasoningArtifact::ResponsesItems(
             br#"[{"type":"reasoning","id":"rs_1"}]"#.to_vec(),
         )),
     };
-    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline).unwrap();
+    let items = messages_to_responses_input(&[msg], SystemPrompt::Inline, &no_callers()).unwrap();
     let kinds: Vec<&str> = items
         .iter()
         .map(|item| item["type"].as_str().unwrap_or_default())

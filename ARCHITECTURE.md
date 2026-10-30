@@ -3046,6 +3046,25 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
     `ServiceConfig::programmatic_tool_calling_for_model()`; account-level override via
     `accounts.toml`'s `programmatic_tool_calling` field.
 
+    Every `function_call` such a route produces carries a **caller attribution** —
+    `{"type": "program", "caller_id": <program call id>}` for a call a model-generated
+    program made, or `{"type": "direct"}` for one the model made itself — and the API
+    resumes the correct program from it, so the value has to be copied **unchanged** onto
+    the `function_call_output` that answers the call
+    (<https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
+    The attribution is carried, never interpreted: the adapter captures it from the
+    response (the item parse when non-streaming, the `function_call` output item's
+    `caller` in the streaming loop), the daemon persists it on the turn as
+    `AssistantToolCallRecord::caller` (a proto-side `ToolCallCaller`, because
+    `choreo-proto` sits below `choreo-ai-protocols` and cannot name its `CallerInfo`),
+    and `build_chat_request_messages` re-emits it onto the rebuilt call. The Responses
+    lowering writes it on both replayed item kinds, resolving the output's attribution
+    through an index built over the **full** message history — a chained tool round sends
+    only the outputs, so the assistant message that holds the call (and with it the
+    attribution) is exactly what the tail drops. The chat-completions projection strips
+    it: that wire has no such field, and a history captured under a Responses model may
+    later be sent to a chat route.
+
 11. **Pluggable providers via `InferenceProvider`** — the provider system supports OpenAI-compatible,
     Anthropic Messages, Google Gemini, and Mistral APIs. Each provider implements the same interface
     (`chat_completion_turn`, `chat_completion_turn_streaming`, `list_models`) and is constructed

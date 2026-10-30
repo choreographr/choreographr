@@ -92,6 +92,7 @@ fn build_message_payloads_tool_call() {
                 name: "get_weather".to_string(),
                 arguments: r#"{"location":"NYC"}"#.to_string(),
             },
+            caller: None,
         }]),
         reasoning_artifact: None,
     }];
@@ -870,6 +871,7 @@ fn build_message_payloads_attaches_thought_signature_to_last_part() {
                 name: "get_weather".to_string(),
                 arguments: r#"{"location":"NYC"}"#.to_string(),
             },
+            caller: None,
         }]),
         reasoning_artifact: Some(ReasoningArtifact::GoogleSignatures(
             br#"["encrypted-sig-1","encrypted-sig-2"]"#.to_vec(),

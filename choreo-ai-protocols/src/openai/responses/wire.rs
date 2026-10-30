@@ -23,7 +23,17 @@ pub(crate) enum ResponsesInputItem {
         content: serde_json::Value,
     },
     #[serde(rename = "function_call_output")]
-    FunctionCallOutput { call_id: String, output: String },
+    FunctionCallOutput {
+        call_id: String,
+        output: String,
+        /// The originating call's attribution, copied byte-for-byte from the
+        /// `caller` the response's `function_call` item carried. The service
+        /// uses this value to resume the correct generated program, so it must
+        /// be identical (see
+        /// <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerInfo>,
+    },
     /// An assistant turn's tool request, replayed when the history is rebuilt
     /// from messages rather than chained through `previous_response_id`.
     ///
@@ -32,14 +42,22 @@ pub(crate) enum ResponsesInputItem {
     /// output whose call was never introduced. `arguments` is the raw JSON
     /// string exactly as the model emitted it (never re-serialized).
     ///
-    /// Neither variant carries a `caller`: programmatic tool calling is withheld
-    /// for the stateless dialect that rebuilds history, and the chained tail
-    /// carries only tool outputs, so no attribution ever rides an input item.
+    /// A `caller` rides **both** the call and the output that answers it: the
+    /// two are one attribution, copied byte-for-byte from the response and
+    /// never interpreted here, because the service needs the same value on the
+    /// output to resume the program that generated the call. `program` items
+    /// are never replayed — programmatic tool calling is withheld on the
+    /// stateless dialect, and its one route chains through
+    /// `previous_response_id`, so a finished tool round carries only outputs.
     #[serde(rename = "function_call")]
     FunctionCall {
         call_id: String,
         name: String,
         arguments: String,
+        /// The call's attribution as the response reported it, replayed
+        /// unchanged (see [`ResponsesInputItem::FunctionCallOutput`]).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        caller: Option<CallerInfo>,
     },
 }
 

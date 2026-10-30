@@ -10,7 +10,7 @@ use std::io;
 use tracing::{debug, info, trace, warn};
 
 use crate::shared::{MAX_TOOL_CALLS, RequestAuth};
-use crate::types::{ChatToolCall, ChatTurnResult, StreamEvent};
+use crate::types::{CallerInfo, ChatToolCall, ChatTurnResult, StreamEvent};
 use choreo_proto::TokenUsage;
 
 use super::super::retry;
@@ -37,6 +37,12 @@ use crate::openai::turn::{TurnParts, assemble_turn};
 pub(super) struct AccCall {
     pub(super) name: Option<String>,
     pub(super) arguments: String,
+    /// The provider's `caller` attribution for this call, captured from its
+    /// `function_call` output item. Kept so the finished call carries it back
+    /// onto the rebuilt request: the API needs the same value on the
+    /// `function_call_output` that answers the call to resume the generated
+    /// program.
+    pub(super) caller: Option<CallerInfo>,
     /// Monotonically increasing index assigned to this tool call, used to
     /// preserve insertion order since the Responses API does not provide
     /// server-side indices like Chat Completions does.
@@ -48,6 +54,7 @@ impl AccCall {
         Self {
             name: None,
             arguments: String::new(),
+            caller: None,
             index,
         }
     }
@@ -91,6 +98,87 @@ impl AccCalls {
         let mut sorted: Vec<(String, AccCall)> = self.by_id.into_iter().collect();
         sorted.sort_by_key(|(_, acc)| acc.index);
         sorted
+    }
+
+    /// Apply one call-related stream event to the accumulator.
+    ///
+    /// The three call events are handled here rather than in the stream loop so
+    /// the accumulation rules (append a delta, replace with `done`, attach the
+    /// attribution) are exercisable without a socket. They differ in how a
+    /// refusal is treated: a refused argument event fails the turn, while a
+    /// refused attribution does not — see the arm below.
+    pub(super) fn absorb(
+        &mut self,
+        event: &ResponsesStreamEvent,
+    ) -> Result<(), super::super::OpenAiError> {
+        match event {
+            ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta } => {
+                // `call_id` is provided by the trusted API server — no validation
+                // needed; it is used directly as a HashMap key to accumulate deltas
+                // for this specific tool call.
+                self.entry(call_id.clone())?.arguments.push_str(delta);
+            }
+            ResponsesStreamEvent::FunctionCallArgumentsDone {
+                call_id,
+                name,
+                arguments,
+            } => {
+                // `arguments` is the complete final JSON string (not a delta), so
+                // it replaces any accumulated partial value.
+                let entry = self.entry(call_id.clone())?;
+                entry.name = Some(name.clone());
+                entry.arguments.clone_from(arguments);
+                trace!(
+                    tool_name = ?entry.name,
+                    args_len = entry.arguments.len(),
+                    "openai responses: function call args done",
+                );
+            }
+            ResponsesStreamEvent::FunctionCallCaller { call_id, caller } => {
+                // The attribution arrives on the call's `function_call` output
+                // item, independently of the argument events. It is applied
+                // best-effort: an attribution is metadata about a call that is
+                // already legal, so a refused slot (a new id past
+                // `MAX_TOOL_CALLS`, which the accumulator drops anyway) must
+                // never turn a finished call into a failed turn. Nothing else on
+                // the entry is touched, so a late item event cannot clobber
+                // accumulated name or arguments.
+                if let Ok(entry) = self.entry(call_id.clone()) {
+                    entry.caller.clone_from(caller);
+                }
+            }
+            // Not a call event: the stream loop routes only the three variants
+            // above here.
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// The finished tool calls in the model's own order, dropping (and counting)
+    /// any call whose `arguments.done` never arrived — such a call has no name,
+    /// so its count is logged rather than the call being invented.
+    pub(super) fn into_tool_calls(self) -> Vec<ChatToolCall> {
+        let ordered = self.into_ordered();
+        let named = ordered.len();
+        let tool_calls: Vec<ChatToolCall> = ordered
+            .into_iter()
+            .filter_map(|(call_id, acc)| {
+                let name = acc.name.as_deref().filter(|n| !n.is_empty())?;
+                Some(ChatToolCall {
+                    id: call_id,
+                    name: name.to_string(),
+                    arguments_json: acc.arguments,
+                    caller: acc.caller,
+                })
+            })
+            .collect();
+        if tool_calls.len() < named {
+            warn!(
+                dropped = named - tool_calls.len(),
+                "discarded incomplete tool call(s) from provider (no name set)"
+            );
+        }
+        tool_calls
     }
 }
 
@@ -207,29 +295,11 @@ where
                 // dedupe replaced.
                 merge_reasoning_item(&mut reasoning_items, item);
             }
-            Some(ResponsesStreamEvent::FunctionCallArgumentsDelta { call_id, delta }) => {
-                // `call_id` is provided by the trusted API server — no validation
-                // needed; it is used directly as a HashMap key to accumulate deltas
-                // for this specific tool call.
-                acc_calls.entry(call_id)?.arguments.push_str(&delta);
-            }
-            Some(ResponsesStreamEvent::FunctionCallArgumentsDone {
-                call_id,
-                name,
-                arguments,
-            }) => {
-                // `call_id` comes from the trusted API server — safe to use as a
-                // HashMap key.  `arguments` is the complete final JSON string
-                // (not a delta), so it replaces any accumulated partial value.
-                let entry = acc_calls.entry(call_id)?;
-                entry.name = Some(name);
-                entry.arguments = arguments;
-                trace!(
-                    tool_name = ?entry.name,
-                    args_len = entry.arguments.len(),
-                    "openai responses: function call args done",
-                );
-            }
+            Some(
+                event @ (ResponsesStreamEvent::FunctionCallArgumentsDelta { .. }
+                | ResponsesStreamEvent::FunctionCallArgumentsDone { .. }
+                | ResponsesStreamEvent::FunctionCallCaller { .. }),
+            ) => acc_calls.absorb(&event)?,
             Some(ResponsesStreamEvent::ResponseCompleted { id, usage }) => {
                 response_id = id;
                 if let Some(u) = usage {
@@ -326,28 +396,9 @@ where
 
     // The shared assembler owns the tool-call / truncation / empty-response
     // decision tree, so this path and the non-streaming one cannot disagree.
-    // A call whose `arguments.done` never arrived has no name and is filtered
-    // out here, with the count logged so an aborted call stays diagnosable.
-    let ordered = acc_calls.into_ordered();
-    let named = ordered.len();
-    let tool_calls: Vec<ChatToolCall> = ordered
-        .into_iter()
-        .filter_map(|(call_id, acc)| {
-            let name = acc.name.as_deref().filter(|n| !n.is_empty())?;
-            Some(ChatToolCall {
-                id: call_id,
-                name: name.to_string(),
-                arguments_json: acc.arguments,
-                caller: None,
-            })
-        })
-        .collect();
-    if tool_calls.len() < named {
-        warn!(
-            dropped = named - tool_calls.len(),
-            "discarded incomplete tool call(s) from provider (no name set)"
-        );
-    }
+    // The accumulator drops a call whose `arguments.done` never arrived (it has
+    // no name), with the count logged so an aborted call stays diagnosable.
+    let tool_calls = acc_calls.into_tool_calls();
 
     let content_is_empty = full_content.is_empty();
     assemble_turn(TurnParts {

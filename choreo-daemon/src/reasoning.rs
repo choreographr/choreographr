@@ -118,6 +118,13 @@ pub fn build_chat_request_messages(
                                 name: tc.name.clone(),
                                 arguments: tc.arguments_json.clone(),
                             },
+                            // Re-emit the provider's attribution so a rebuilt
+                            // Responses history can carry it back on the
+                            // `function_call` item and the output answering it
+                            // (the API resumes the generated program from that
+                            // value). Each adapter decides whether its own wire
+                            // takes it: chat completions has no such field.
+                            caller: tc.caller.as_ref().map(Into::into),
                         })
                         .collect(),
                 )

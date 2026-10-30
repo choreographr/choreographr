@@ -6,12 +6,37 @@
 //! module assembles the surrounding body (tool results, chained tail, reasoning
 //! payload, tool definitions) for both the simple and the tool-carrying paths.
 
+use std::collections::HashMap;
 use std::io;
 
 use super::super::{ChatRequestMessage, SystemPrompt, endpoint_url, messages_to_responses_input};
+use super::input::CallerIndex;
 use super::wire::{ResponsesReasoning, ResponsesRequest, ResponsesTool};
 
 // ── Shared helpers ───────────────────────────────────────────────────────
+
+/// Index every tool call in `messages` by its `call_id` → the attribution the
+/// assistant message that requested it carried.
+///
+/// Built from the FULL history, and always before any chained-tail selection:
+/// a chained tool round sends only the tool outputs, so the assistant message
+/// that carried the call — and with it the `caller` the output has to repeat —
+/// is exactly the message the tail drops. Deriving the index here, off a
+/// borrow of the caller's slice, keeps the lookup allocation-light: one small
+/// map of borrowed ids to borrowed attributions, never a copy of the
+/// conversation.
+fn caller_index(messages: &[ChatRequestMessage]) -> CallerIndex<'_> {
+    messages
+        .iter()
+        .filter_map(|msg| msg.tool_calls.as_ref())
+        .flatten()
+        .filter_map(|call| {
+            call.caller
+                .as_ref()
+                .map(|caller| (call.id.as_str(), caller))
+        })
+        .collect::<HashMap<_, _>>()
+}
 
 /// Build the `input` JSON value for a Responses API request: the full message
 /// history when there is no chain, or only the post-assistant tail when
@@ -30,12 +55,14 @@ pub(super) fn build_responses_input(
     // derived here rather than passed in as a separate buffer. A tail made up
     // only of tool outputs stays output-only — no system item rides it — so it
     // continues the stored response's call/output pairing unbroken (the rule
-    // and its reason live on [`chain_input_messages`]). Both branches borrow:
-    // the whole conversation is never copied to build a body.
+    // and its reason live on [`chain_input_messages`]). Both branches borrow, and
+    // the caller index is derived BEFORE the tail is selected, so the whole
+    // conversation is never copied to build a body.
+    let callers = caller_index(messages);
     let items = if previous_response_id.is_some() {
-        messages_to_responses_input(chain_input_messages(messages), system)?
+        messages_to_responses_input(chain_input_messages(messages), system, &callers)?
     } else {
-        messages_to_responses_input(messages, system)?
+        messages_to_responses_input(messages, system, &callers)?
     };
     // System messages go into `input` as `{role: "system"}` items; the stateless
     // ChatGPT/Codex backend hoists them into `instructions` before this runs

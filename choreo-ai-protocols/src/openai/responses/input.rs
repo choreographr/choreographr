@@ -8,6 +8,7 @@
 //! lowered item by item. The item types themselves live in [`super::wire`]; this
 //! module is the messages→input builder both Responses request builders call.
 
+use std::collections::HashMap;
 use std::io;
 
 use choreo_proto::ReasoningArtifact;
@@ -16,6 +17,7 @@ use tracing::{debug, warn};
 use super::super::reasoning_details::MAX_REASONING_BYTES;
 use super::super::{ChatRequestMessage, OpenAiError};
 use super::wire::ResponsesInputItem;
+use crate::types::CallerInfo;
 
 /// Where a `system` message belongs on the Responses wire.
 ///
@@ -101,14 +103,27 @@ fn reasoning_only(items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
     kept
 }
 
+/// A call id → attribution index, built by the caller from the history it holds.
+///
+/// The `function_call_output` answering a call has no attribution of its own:
+/// the `caller` is provider data that rode the assistant's `function_call`
+/// item. A rebuilt history can be unable to see that item — a chained tool
+/// round sends only the outputs — so the lookup is passed in rather than
+/// derived here, from a slice wide enough to contain the call.
+pub(crate) type CallerIndex<'a> = HashMap<&'a str, &'a CallerInfo>;
+
 /// Convert a `ChatRequestMessage` source to Responses API input format.
 ///
-/// Takes an ITERATOR of borrowed messages rather than a slice: both callers have
-/// to select which messages go out (a chained turn sends only the post-assistant
-/// tail, a stateless one sends the whole history minus the hoisted system
-/// prompt), and neither should have to clone the conversation to do it — an
-/// earlier slice-shaped signature forced a full deep copy of every prior turn
-/// (image bytes included) on every tool-loop iteration.
+/// Takes an ITERATOR of borrowed messages rather than a slice: both callers
+/// have to select which messages go out (a chained turn sends only the
+/// post-assistant tail, a stateless one sends the whole history minus the
+/// hoisted system prompt), and neither should have to clone the conversation to
+/// do it — an earlier slice-shaped signature forced a full deep copy of every
+/// prior turn (image bytes included) on every tool-loop iteration.
+///
+/// `callers` resolves a tool result's attribution by its `call_id`, because the
+/// message being lowered is the OUTPUT and the attribution rode the assistant
+/// call that is not necessarily in this iteration at all (see [`CallerIndex`]).
 ///
 /// `system` decides what happens to `system`-role messages: emitted as
 /// `{role: "system"}` items, or dropped because the caller hoisted them into
@@ -123,6 +138,7 @@ fn reasoning_only(items: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
 pub(crate) fn messages_to_responses_input<'a>(
     messages: impl IntoIterator<Item = &'a ChatRequestMessage>,
     system: SystemPrompt,
+    callers: &CallerIndex<'a>,
 ) -> Result<Vec<serde_json::Value>, OpenAiError> {
     let mut items: Vec<serde_json::Value> = Vec::new();
 
@@ -180,6 +196,10 @@ pub(crate) fn messages_to_responses_input<'a>(
                 // them. They are what every later `function_call_output` calls
                 // back to by `call_id`: a rebuilt history that omitted them
                 // would send an output for a call the API never saw introduced.
+                //
+                // The call's own `caller` rides along verbatim: the service
+                // matches it against the output that answers the call to resume
+                // the generated program.
                 if msg.role == "assistant" {
                     for call in msg.tool_calls.iter().flatten() {
                         items.push(responses_input_item_value(
@@ -187,13 +207,21 @@ pub(crate) fn messages_to_responses_input<'a>(
                                 call_id: call.id.clone(),
                                 name: call.function.name.clone(),
                                 arguments: call.function.arguments.clone(),
+                                caller: call.caller.clone(),
                             },
                         )?);
                     }
                 }
             }
             "tool" => {
-                // Tool results become function_call_output items
+                // Tool results become function_call_output items, each carrying
+                // the attribution of the call it answers. The attribution is
+                // provider data the tool message never holds, so it comes from
+                // the index the caller built over the FULL history: in a chained
+                // tool round the assistant message that carried the call is not
+                // part of this iteration, and dropping the caller there would
+                // leave the service unable to resume the program that made the
+                // call.
                 if let Some(ref call_id) = msg.tool_call_id
                     && let Some(ref content) = msg.content
                 {
@@ -201,6 +229,7 @@ pub(crate) fn messages_to_responses_input<'a>(
                         &ResponsesInputItem::FunctionCallOutput {
                             call_id: call_id.clone(),
                             output: content.clone(),
+                            caller: callers.get(call_id.as_str()).map(|c| (*c).clone()),
                         },
                     )?);
                 }

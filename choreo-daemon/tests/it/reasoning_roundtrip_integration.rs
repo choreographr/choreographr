@@ -48,6 +48,7 @@ fn add_tool_turn(
                 call_id: "call_1".into(),
                 name: "get_weather".into(),
                 arguments_json: r#"{"city":"London"}"#.into(),
+                caller: None,
             }],
             reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
                 field: ChatReasoningField::ReasoningContent,
@@ -284,6 +285,7 @@ fn add_tool_turn_observed(
                 call_id: "call_1".into(),
                 name: "get_weather".into(),
                 arguments_json: r#"{"city":"London"}"#.into(),
+                caller: None,
             }],
             reasoning_artifact: Some(ReasoningArtifact::ChatReasoning {
                 field: observed,
@@ -506,6 +508,7 @@ fn add_artifact_tool_turn(
                 call_id: "call_1".into(),
                 name: "get_weather".into(),
                 arguments_json: r#"{"city":"London"}"#.into(),
+                caller: None,
             }],
             reasoning_artifact: Some(artifact),
             reasoning_producer: Some(ReasoningProducer {
@@ -694,6 +697,7 @@ fn empty_details_route_invents_no_reasoning_key_and_drops_the_empty_message() {
                 call_id: "call_1".into(),
                 name: "get_weather".into(),
                 arguments_json: r#"{"city":"London"}"#.into(),
+                caller: None,
             }],
             reasoning_producer: Some(ReasoningProducer {
                 provider_slug: "openrouter".into(),

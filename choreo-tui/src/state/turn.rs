@@ -696,6 +696,7 @@ mod tests {
             call_id: "call_1".into(),
             name: "read_file".into(),
             arguments_json: "{}".into(),
+            caller: None,
         });
         assert!(turn_has_live_content(&tool, &placeholder));
     }

@@ -556,6 +556,7 @@ fn turn_with_tool_results_round_trip() {
             call_id: "call_1".into(),
             name: "ls".into(),
             arguments_json: "{}".into(),
+            caller: None,
         }],
         token_usage: Some(TokenUsage {
             input_tokens: 10,
@@ -578,6 +579,73 @@ fn turn_with_tool_results_round_trip() {
     let frame = encode_frame(&turn).expect("encode");
     let decoded: Turn = decode_frame(&frame[4..]).expect("decode");
     assert_eq!(decoded, turn);
+}
+
+#[test]
+fn tool_call_caller_round_trips_on_a_persisted_turn() {
+    // The Responses API resumes a model-generated program from the `caller` the
+    // `function_call` carried, so the attribution has to survive the persisted
+    // turn: a rebuilt request copies it back onto the call and the output that
+    // answers it, byte-for-byte.
+    let turn = Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("weather?".into()),
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![AssistantToolCallRecord {
+            call_id: "call_1".into(),
+            name: "get_weather".into(),
+            arguments_json: "{}".into(),
+            caller: Some(ToolCallCaller {
+                kind: "program".into(),
+                caller_id: "prog_123".into(),
+            }),
+        }],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    let frame = encode_frame(&turn).expect("encode");
+    let decoded: Turn = decode_frame(&frame[4..]).expect("decode");
+    assert_eq!(decoded, turn);
+    let caller = decoded.tool_calls[0]
+        .caller
+        .as_ref()
+        .expect("the attribution survives the codec");
+    assert_eq!(caller.kind, "program");
+    assert_eq!(caller.caller_id, "prog_123");
+}
+
+#[test]
+fn a_turn_persisted_without_a_caller_deserializes_to_none() {
+    // `caller` is an additive `#[serde(default)]` field, so a turn written
+    // before the attribution existed still decodes — with no caller rather than
+    // a decode error that would make the whole session unreadable.
+    let json = r#"{"created_at":0,"undone":false,"error":null,"user_text":null,"assistant_text":null,"assistant_reasoning":null,"tool_calls":[{"call_id":"call_1","name":"ls","arguments_json":"{}"}],"token_usage":null,"tool_results":[],"displayed_images":[]}"#;
+    let turn: Turn = serde_json::from_str(json).unwrap();
+    assert_eq!(turn.tool_calls.len(), 1);
+    assert!(turn.tool_calls[0].caller.is_none());
+}
+
+#[test]
+fn a_direct_caller_keeps_its_wire_shape() {
+    // A `direct` caller names no program, so the empty id is not serialized: the
+    // attribution then reads exactly as the provider wrote it instead of gaining
+    // a `caller_id` the API never sent.
+    let direct = ToolCallCaller {
+        kind: "direct".into(),
+        caller_id: String::new(),
+    };
+    assert_eq!(
+        serde_json::to_value(&direct).unwrap(),
+        serde_json::json!({"type": "direct"})
+    );
+    let decoded: ToolCallCaller = serde_json::from_str(r#"{"type":"direct"}"#).unwrap();
+    assert_eq!(decoded, direct);
 }
 
 // ── TokenUsage tests ──────────────────────────────────────────────────

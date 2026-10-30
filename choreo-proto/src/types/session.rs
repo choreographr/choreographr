@@ -23,7 +23,8 @@ pub struct DisplayedImageRecord {
 }
 
 /// One assistant tool call recorded on a turn: the provider's call id, the tool
-/// name, and the raw JSON arguments the model produced.
+/// name, the raw JSON arguments the model produced, and the provider's caller
+/// attribution for the call.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AssistantToolCallRecord {
     /// The provider-assigned call id, echoed back on the matching tool result.
@@ -32,6 +33,42 @@ pub struct AssistantToolCallRecord {
     pub name: String,
     /// The JSON-encoded arguments the model produced for the call.
     pub arguments_json: String,
+    /// The provider's attribution for the call, when it sent one, kept so a
+    /// rebuilt request can copy it back onto both the `function_call` item and
+    /// the `function_call_output` that answers it (see [`ToolCallCaller`]).
+    /// An additive, `#[serde(default)]` field so an old persisted turn
+    /// deserializes with `None` — the same backward-compatibility path
+    /// [`ToolResultRecord::image`] takes.
+    #[serde(default)]
+    pub caller: Option<ToolCallCaller>,
+}
+
+/// How a provider attributes a tool call it generated: the call was made
+/// directly by the model, or by a program the model wrote (programmatic tool
+/// calling).
+///
+/// This is the same fact the adapters' wire-side caller carries, and it lives
+/// here for two reasons. `choreo-proto` is the lower layer and cannot depend on
+/// `choreo-ai-protocols`, so the persisted turn cannot name the adapter type;
+/// and the attribution has to survive on a persisted turn at all, because the
+/// Responses API requires it copied back onto the `function_call_output` that
+/// answers the call to resume the correct generated program (see
+/// <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
+/// The daemon never interprets it: it only carries the value from the response
+/// to the next request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolCallCaller {
+    /// The caller kind tag as the provider spelled it on the wire (`program`
+    /// for a model-written program, `direct` for the model itself).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Provider-assigned identifier of the program that made the call, empty
+    /// for a `direct` caller (which has no program to resume). The empty value
+    /// is dropped from the serialized form so the attribution round-trips
+    /// exactly as the provider sent it rather than gaining an empty
+    /// `caller_id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub caller_id: String,
 }
 
 /// One tool result recorded on a turn: the matching call id, the tool name, the

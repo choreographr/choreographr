@@ -63,6 +63,9 @@ fn assistant_message_from_tool_use(tool_use: &ChatAssistantToolUse) -> ChatReque
                 name: tc.name.clone(),
                 arguments: tc.arguments_json.clone(),
             },
+            // The daemon carries the provider's attribution onto the rebuilt
+            // message, so the round-trip test must too.
+            caller: tc.caller.clone(),
         })
         .collect();
     ChatRequestMessage {

@@ -28,16 +28,19 @@ fn seed_then_update_tool_results_preserves_call_order() {
             call_id: "a".into(),
             name: "read_file".into(),
             arguments_json: "{}".into(),
+            caller: None,
         },
         AssistantToolCallRecord {
             call_id: "b".into(),
             name: "grep".into(),
             arguments_json: "{}".into(),
+            caller: None,
         },
         AssistantToolCallRecord {
             call_id: "c".into(),
             name: "sh".into(),
             arguments_json: "{}".into(),
+            caller: None,
         },
     ];
     state.seed_tool_results(
@@ -169,6 +172,7 @@ fn update_tool_result_sets_all_record_fields_from_output() {
         call_id: "a".into(),
         name: "read_image".into(),
         arguments_json: "{}".into(),
+        caller: None,
     }];
     state.seed_tool_results(tid, &calls, &[String::new()]);
 
@@ -213,16 +217,19 @@ fn mark_unexecuted_tool_results_marks_only_unexecuted() {
             call_id: "a".into(),
             name: "read_file".into(),
             arguments_json: "{}".into(),
+            caller: None,
         },
         AssistantToolCallRecord {
             call_id: "b".into(),
             name: "grep".into(),
             arguments_json: "{}".into(),
+            caller: None,
         },
         AssistantToolCallRecord {
             call_id: "c".into(),
             name: "sh".into(),
             arguments_json: "{}".into(),
+            caller: None,
         },
     ];
     state.seed_tool_results(tid, &calls, &[String::new(), String::new(), String::new()]);
@@ -261,6 +268,7 @@ fn mark_unexecuted_tool_results_preserves_recorded_error_results() {
         call_id: "a".into(),
         name: "sh".into(),
         arguments_json: "{}".into(),
+        caller: None,
     }];
     state.seed_tool_results(tid, &calls, &[String::new(), String::new(), String::new()]);
     state.update_tool_result(

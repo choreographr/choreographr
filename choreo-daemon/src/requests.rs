@@ -923,6 +923,11 @@ pub(crate) fn run_agent_loop(
                         call_id: tc.id.clone(),
                         name: tc.name.clone(),
                         arguments_json: tc.arguments_json.clone(),
+                        // The provider's caller attribution rides the turn so a
+                        // rebuilt request can copy it back onto the call and the
+                        // output that answers it; without it the API cannot
+                        // resume the program that generated the call.
+                        caller: tc.caller.as_ref().map(Into::into),
                     })
                     .collect();
                 // Invocation descriptions for the same calls, in the same

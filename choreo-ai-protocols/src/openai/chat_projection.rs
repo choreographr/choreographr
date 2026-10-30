@@ -14,8 +14,8 @@
 //! the artifact capture/normalization rules lives in
 //! [`super::reasoning_details`]; this module only projects what was captured.
 
-use super::ChatRequestMessage;
 use super::reasoning_details::{MAX_REASONING_BYTES, details_display_text, details_wire_value};
+use super::{AssistantToolCall, ChatRequestMessage};
 use crate::catalog::ChatReasoningEcho;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact};
 use serde::Serialize;
@@ -467,7 +467,7 @@ impl Serialize for ChatWireMessage<'_> {
             msg.serialize_field("tool_call_id", tool_call_id)?;
         }
         if let Some(tool_calls) = &self.message.tool_calls {
-            msg.serialize_field("tool_calls", tool_calls)?;
+            msg.serialize_field("tool_calls", &ChatWireToolCalls(tool_calls))?;
         }
         if let Some(reasoning) = &self.reasoning {
             match reasoning {
@@ -478,6 +478,45 @@ impl Serialize for ChatWireMessage<'_> {
             }
         }
         msg.end()
+    }
+}
+
+/// The `tool_calls` array of an assistant chat message, with each call's
+/// provider attribution removed.
+///
+/// `caller` is a Responses-API concept: it names the program that generated a
+/// call so the service can resume it. A Chat Completions `tool_calls` entry has
+/// no such field, so the projection strips it — a session that captured an
+/// attribution under a Responses model and later sent the same history to a
+/// chat provider must not hand that provider a field its wire does not define.
+struct ChatWireToolCalls<'a>(&'a [AssistantToolCall]);
+
+impl Serialize for ChatWireToolCalls<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+
+        let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
+        for call in self.0 {
+            seq.serialize_element(&ChatWireToolCall(call))?;
+        }
+        seq.end()
+    }
+}
+
+/// One chat-completions `tool_calls` entry: exactly `id`, `type`, and
+/// `function`, so the attribution of [`ChatWireToolCalls`]'s source call cannot
+/// leak onto this wire.
+struct ChatWireToolCall<'a>(&'a AssistantToolCall);
+
+impl Serialize for ChatWireToolCall<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let mut call = serializer.serialize_struct("ChatWireToolCall", 3)?;
+        call.serialize_field("id", &self.0.id)?;
+        call.serialize_field("type", &self.0.kind)?;
+        call.serialize_field("function", &self.0.function)?;
+        call.end()
     }
 }
 

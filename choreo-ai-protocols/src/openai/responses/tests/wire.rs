@@ -9,6 +9,7 @@
 // inside `tests`, so the adapter is two `super`s up and `openai` three.
 use super::super::super::*;
 use super::super::*;
+use crate::CallerInfo;
 use serde_json::json;
 
 #[test]
@@ -61,13 +62,72 @@ fn responses_input_item_function_call_output_serializes() {
     let item = ResponsesInputItem::FunctionCallOutput {
         call_id: "call_1".to_string(),
         output: "result".to_string(),
+        caller: None,
     };
     let value = serde_json::to_value(&item).unwrap();
     assert_eq!(value["type"], "function_call_output");
     assert_eq!(value["call_id"], "call_1");
     assert_eq!(value["output"], "result");
-    // No attribution field: an input item never carries a `caller`.
+    // No attribution on this call: the field is omitted outright, never sent as
+    // a null the API would have to interpret.
     assert!(value.get("caller").is_none());
+}
+
+#[test]
+fn a_program_caller_serializes_on_both_item_kinds() {
+    // The Responses API needs the `caller` copied back verbatim onto both the
+    // replayed `function_call` and the `function_call_output` that answers it,
+    // so the service can resume the program that generated the call (see
+    // <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
+    let caller = CallerInfo {
+        kind: "program".to_string(),
+        caller_id: "prog_123".to_string(),
+    };
+    let call = ResponsesInputItem::FunctionCall {
+        call_id: "call_1".to_string(),
+        name: "get_weather".to_string(),
+        arguments: "{}".to_string(),
+        caller: Some(caller.clone()),
+    };
+    let output = ResponsesInputItem::FunctionCallOutput {
+        call_id: "call_1".to_string(),
+        output: "72F".to_string(),
+        caller: Some(caller),
+    };
+    let call = serde_json::to_value(&call).unwrap();
+    let output = serde_json::to_value(&output).unwrap();
+    assert_eq!(
+        call["caller"],
+        json!({"type": "program", "caller_id": "prog_123"})
+    );
+    assert_eq!(
+        output["caller"],
+        json!({"type": "program", "caller_id": "prog_123"})
+    );
+}
+
+#[test]
+fn no_caller_means_no_caller_field_on_either_item_kind() {
+    // A history with no attribution must not send the field at all: an empty
+    // `caller` object would be a value the API has to interpret.
+    let call = ResponsesInputItem::FunctionCall {
+        call_id: "call_1".to_string(),
+        name: "get_weather".to_string(),
+        arguments: "{}".to_string(),
+        caller: None,
+    };
+    let output = ResponsesInputItem::FunctionCallOutput {
+        call_id: "call_1".to_string(),
+        output: "72F".to_string(),
+        caller: None,
+    };
+    assert!(serde_json::to_value(&call).unwrap().get("caller").is_none());
+    assert!(
+        serde_json::to_value(&output)
+            .unwrap()
+            .get("caller")
+            .is_none()
+    );
 }
 
 #[test]

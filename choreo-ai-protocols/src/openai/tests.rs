@@ -244,6 +244,62 @@ fn parse_responses_stream_event_function_call_args() {
 }
 
 #[test]
+fn parse_responses_stream_event_captures_a_function_call_caller() {
+    // The `caller` the API puts on a `function_call` output item is what the
+    // replay copies back onto the call and its output, so the parser lifts it
+    // off the item rather than leaving it in the opaque raw JSON.
+    for event_type in ["response.output_item.added", "response.output_item.done"] {
+        let event = parse_responses_stream_event(&format!(
+            r#"{{"type":"{event_type}","item":{{"type":"function_call","call_id":"call_1","name":"get_weather","arguments":"{{}}","caller":{{"type":"program","caller_id":"prog_123"}}}}}}"#,
+        ))
+        .expect("parse")
+        .expect("event");
+        match event {
+            ResponsesStreamEvent::FunctionCallCaller { call_id, caller } => {
+                assert_eq!(call_id, "call_1");
+                let caller = caller.expect("a program caller is captured");
+                assert_eq!(caller.kind, "program");
+                assert_eq!(caller.caller_id, "prog_123");
+            }
+            _ => panic!("expected FunctionCallCaller"),
+        }
+    }
+}
+
+#[test]
+fn parse_responses_stream_event_tolerates_a_missing_call_caller() {
+    // A `direct` caller names no program, and an un-attributed function call
+    // carries no `caller` at all. Both are legal, so the attribution rides the
+    // event as `None` rather than failing the parse — a call is still a call.
+    let direct = parse_responses_stream_event(
+        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","caller":{"type":"direct"}}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match direct {
+        ResponsesStreamEvent::FunctionCallCaller { caller, .. } => {
+            let caller = caller.expect("a direct caller is still an attribution");
+            assert_eq!(caller.kind, "direct");
+            assert_eq!(caller.caller_id, "");
+        }
+        _ => panic!("expected FunctionCallCaller"),
+    }
+
+    let absent = parse_responses_stream_event(
+        r#"{"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"get_weather"}}"#,
+    )
+    .expect("parse")
+    .expect("event");
+    match absent {
+        ResponsesStreamEvent::FunctionCallCaller { call_id, caller } => {
+            assert_eq!(call_id, "call_1");
+            assert!(caller.is_none());
+        }
+        _ => panic!("expected FunctionCallCaller"),
+    }
+}
+
+#[test]
 fn parse_responses_stream_event_completed_with_usage() {
     let event = parse_responses_stream_event(
         r#"{"type":"response.completed","usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}"#,

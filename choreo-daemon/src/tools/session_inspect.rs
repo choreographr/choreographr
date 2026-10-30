@@ -776,6 +776,7 @@ mod tests {
                 call_id: call_id.into(),
                 name: tool_name.into(),
                 arguments_json: "{}".into(),
+                caller: None,
             }],
             token_usage: None,
             tool_results: Vec::new(),

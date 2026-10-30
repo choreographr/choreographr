@@ -13,6 +13,7 @@ fn render_turn_lines_tool_calls() {
             call_id: "call1".into(),
             name: "read_file".into(),
             arguments_json: r#"{"path":"/tmp/x"}"#.into(),
+            caller: None,
         }],
         token_usage: None,
         tool_results: vec![],

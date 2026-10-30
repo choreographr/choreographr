@@ -582,6 +582,7 @@ fn build_message_payloads_reemits_thinking_blocks_verbatim() {
                 name: "get_weather".to_string(),
                 arguments: r#"{"city":"London"}"#.to_string(),
             },
+            caller: None,
         }]),
         reasoning_artifact: Some(ReasoningArtifact::AnthropicThinking(
             br#"[{"type":"thinking","thinking":"Let me analyze.","signature":"sig_abc"},{"type":"redacted_thinking","data":"eJxT_opaque"}]"#

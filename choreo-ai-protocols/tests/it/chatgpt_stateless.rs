@@ -247,6 +247,7 @@ fn assistant_tool_call_message(call: &choreo_ai_protocols::ChatToolCall) -> Chat
                 name: call.name.clone(),
                 arguments: call.arguments_json.clone(),
             },
+            caller: call.caller.clone(),
         }]),
         reasoning_artifact: None,
     }

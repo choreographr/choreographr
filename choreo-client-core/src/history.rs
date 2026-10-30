@@ -242,6 +242,11 @@ impl SessionView {
                 call_id,
                 name,
                 arguments_json: args,
+                // A client-side display turn built from events carries no
+                // attribution: `caller` is provider data the daemon owns and
+                // replays from the persisted turn, never something this view
+                // reconstructs.
+                caller: None,
             });
         }
     }
@@ -330,6 +335,7 @@ mod tests {
                 call_id: call_id.into(),
                 name: name.into(),
                 arguments_json: "{}".into(),
+                caller: None,
             }],
             token_usage: None,
             tool_results: vec![],

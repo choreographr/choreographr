@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use super::AllowedCaller;
+use crate::CallerInfo;
 
 /// A tool definition advertised to an OpenAI-compatible provider.
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +58,16 @@ pub struct AssistantToolCall {
     pub kind: String,
     /// The function the model called.
     pub function: AssistantToolFunction,
+    /// The provider's attribution for the call, when it sent one (programmatic
+    /// tool calling: `<https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>`).
+    ///
+    /// This is the canonical message type, so the field lives here for the
+    /// adapters to lower into their own wire shapes; it is deliberately
+    /// skipped when absent, because a chat-completions `tool_calls` entry has
+    /// no such field and must never gain one from a message that carries no
+    /// attribution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<CallerInfo>,
 }
 
 /// The function half of an [`AssistantToolCall`]: name plus the raw argument

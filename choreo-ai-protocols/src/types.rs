@@ -2,6 +2,14 @@ use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 /// Information about the caller that initiated a tool call.
 /// Stored alongside tool call records for auditing/filtering.
+///
+/// This is the wire-side shape of the attribution: a Responses API
+/// `function_call` item carries it verbatim, and the answer to that call must
+/// copy it back unchanged (see
+/// <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
+/// Its persisted counterpart is [`choreo_proto::ToolCallCaller`] — the same fact
+/// at the layer below, which cannot name this type because the dependency runs
+/// the other way.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallerInfo {
     /// The caller kind tag (`"direct"` or `"programmatic"`), serialized as
@@ -9,8 +17,30 @@ pub struct CallerInfo {
     #[serde(rename = "type")]
     pub kind: String,
     /// Provider-assigned identifier of the caller the tool call originated
-    /// from.
+    /// from. A `direct` caller carries none, so an absent value deserializes
+    /// empty and an empty value is not serialized: the attribution then
+    /// round-trips as the bare `{"type": "direct"}` the provider sent instead
+    /// of gaining an empty `caller_id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub caller_id: String,
+}
+
+impl From<&CallerInfo> for choreo_proto::ToolCallCaller {
+    fn from(caller: &CallerInfo) -> Self {
+        choreo_proto::ToolCallCaller {
+            kind: caller.kind.clone(),
+            caller_id: caller.caller_id.clone(),
+        }
+    }
+}
+
+impl From<&choreo_proto::ToolCallCaller> for CallerInfo {
+    fn from(caller: &choreo_proto::ToolCallCaller) -> Self {
+        CallerInfo {
+            kind: caller.kind.clone(),
+            caller_id: caller.caller_id.clone(),
+        }
+    }
 }
 
 /// One tool call the assistant requested in a completed turn.

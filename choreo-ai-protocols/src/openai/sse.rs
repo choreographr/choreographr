@@ -7,6 +7,8 @@
 
 use std::io::{self, BufReader, Read};
 
+use crate::CallerInfo;
+
 /// Hard ceiling on one SSE event's accumulated bytes.
 ///
 /// The reader sits in front of a remote peer that may be a provider, a gateway,
@@ -189,6 +191,20 @@ pub(crate) enum ResponsesStreamEvent {
     ReasoningItem(serde_json::Value),
     /// Function call arguments delta
     FunctionCallArgumentsDelta { call_id: String, delta: String },
+    /// The provider's attribution for a streamed function call, captured from
+    /// the `function_call` output item's `caller`.
+    ///
+    /// A separate event from the argument events on purpose: the item is where
+    /// the attribution arrives, and the arguments arrive under their own
+    /// `response.function_call_arguments.delta` / `.done` names. Keeping them
+    /// apart means a late item event can never clobber accumulated name or
+    /// arguments. `caller` is `None` when the item carries no attribution (or
+    /// one this client cannot read), which is legal — the field is optional on
+    /// the wire and only meaningful for resuming a generated program.
+    FunctionCallCaller {
+        call_id: String,
+        caller: Option<CallerInfo>,
+    },
     /// Function call arguments are complete
     FunctionCallArgumentsDone {
         call_id: String,
@@ -236,6 +252,33 @@ pub(crate) enum ResponsesStreamEvent {
         result: String,
         status: String,
     },
+}
+
+/// The attribution a `function_call` output item carries, as a stream event.
+///
+/// `None` only when the item names no `call_id` (there is nothing to attribute).
+/// The attribution is never interpreted here: the `type` tag and `caller_id` are
+/// lifted off the item so the request can copy them back verbatim, and a
+/// missing attribution rides the event as `caller: None`. A `direct` caller
+/// carries no `caller_id`, which is why the id defaults to empty rather than
+/// failing the parse — the API sends the bare `{"type": "direct"}` for a call
+/// the model made itself.
+fn function_call_caller_event(item: &serde_json::Value) -> Option<ResponsesStreamEvent> {
+    let call_id = item
+        .get("call_id")
+        .and_then(|value| value.as_str())?
+        .to_string();
+    let caller = item.get("caller").and_then(|caller| {
+        let kind = caller.get("type").and_then(|kind| kind.as_str())?;
+        Some(CallerInfo {
+            kind: kind.to_string(),
+            caller_id: caller
+                .get("caller_id")
+                .and_then(|id| id.as_str())
+                .map_or_default(std::string::ToString::to_string),
+        })
+    });
+    Some(ResponsesStreamEvent::FunctionCallCaller { call_id, caller })
 }
 
 /// The `response` object a terminal event wraps.
@@ -304,20 +347,23 @@ pub(crate) fn parse_responses_stream_event(data: &str) -> io::Result<Option<Resp
             Ok(None)
         }
         "response.output_item.added" | "response.output_item.done" => {
-            // Reasoning items arrive as opaque output items. Capture the raw
-            // item JSON (id, summary, and encrypted_content in stateless
-            // mode) so the round-trip artifact can be assembled verbatim.
-            // Other item types are ignored — their content flows through
+            // Two item kinds are read here. A `reasoning` item arrives as an
+            // opaque output item; the raw item JSON (id, summary, and
+            // encrypted_content in stateless mode) is captured so the
+            // round-trip artifact can be assembled verbatim. A
+            // `function_call` item carries the provider's `caller` attribution,
+            // which the replay has to copy back onto both the call and the
+            // output that answers it (see
+            // <https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
+            // Every other item type is ignored — its content flows through
             // dedicated events (output_text, function_call_arguments, ...).
-            let item = payload.get("item").cloned();
-            if let Some(item) = item {
-                if item.get("type").and_then(|v| v.as_str()) == Some("reasoning") {
-                    Ok(Some(ResponsesStreamEvent::ReasoningItem(item)))
-                } else {
-                    Ok(None)
-                }
-            } else {
-                Ok(None)
+            let Some(item) = payload.get("item") else {
+                return Ok(None);
+            };
+            match item.get("type").and_then(|v| v.as_str()) {
+                Some("reasoning") => Ok(Some(ResponsesStreamEvent::ReasoningItem(item.clone()))),
+                Some("function_call") => Ok(function_call_caller_event(item)),
+                _ => Ok(None),
             }
         }
         "response.function_call_arguments.delta" => {

@@ -156,6 +156,7 @@ fn sample_turn(
             call_id: "call_1".to_string(),
             name: "ls".to_string(),
             arguments_json: "{}".to_string(),
+            caller: None,
         }],
         token_usage: Some(TokenUsage {
             input_tokens: 10,
@@ -391,6 +392,7 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
                     call_id: format!("call_{i}"),
                     name: "sh".into(),
                     arguments_json: format!(r#"{{"command":"echo step {i}"}}"#),
+                    caller: None,
                 })
                 .collect(),
             token_usage: Some(TokenUsage {
