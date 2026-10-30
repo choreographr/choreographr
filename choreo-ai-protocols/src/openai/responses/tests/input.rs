@@ -91,8 +91,8 @@ fn a_rebuilt_history_replays_the_caller_on_the_call_and_its_output() {
         assistant_program_tool_call(),
         tool_result("72F"),
     ];
-    let result = build_responses_input(&messages, None, SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value =
+        build_responses_input(&messages, None, SystemPrompt::Inline).expect("the input lowers");
     assert_eq!(
         value,
         json!([
@@ -129,9 +129,10 @@ fn a_chained_tool_round_attributes_the_output_whose_call_is_not_in_the_tail() {
         assistant_program_tool_call(),
         tool_result("72F"),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
+    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     assert_eq!(
-        result.expect("expected Some value"),
+        result,
         json!([{
             "type": "function_call_output",
             "call_id": "call_1",
@@ -144,8 +145,7 @@ fn a_chained_tool_round_attributes_the_output_whose_call_is_not_in_the_tail() {
 
 #[test]
 fn build_responses_input_empty_is_an_empty_items_array() {
-    let result = build_responses_input(&[], None, SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&[], None, SystemPrompt::Inline).expect("the input lowers");
     // No items is an empty array, never an empty string: a string `input` would
     // ask the server to expand into one empty-text user message.
     assert_eq!(value, json!([]));
@@ -191,8 +191,8 @@ fn build_responses_input_chained_tail_carries_tool_outputs_from_messages() {
         assistant_tool_call(),
         tool_result("72F"),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     let arr = value.as_array().unwrap();
     // Only the tool output after the last assistant message rides the chain.
     assert_eq!(arr.len(), 1, "{arr:?}");
@@ -215,8 +215,8 @@ fn build_responses_input_chained_tool_round_sends_only_the_tool_outputs() {
         assistant_tool_call(),
         tool_result("72F"),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     assert_eq!(
         value,
         json!([{"type": "function_call_output", "call_id": "call_1", "output": "72F"}]),
@@ -236,8 +236,8 @@ fn build_responses_input_chained_mixed_tail_keeps_the_system_prompt() {
         tool_result("72F"),
         ChatRequestMessage::simple("user", "and tomorrow?".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     assert_eq!(
         value,
         json!([
@@ -255,8 +255,8 @@ fn build_responses_input_with_messages() {
         ChatRequestMessage::simple("user", "hello".into()),
         ChatRequestMessage::simple("assistant", "hi there".into()),
     ];
-    let result = build_responses_input(&messages, None, SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value =
+        build_responses_input(&messages, None, SystemPrompt::Inline).expect("the input lowers");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["role"], "user");
@@ -277,8 +277,8 @@ fn build_responses_input_chained_turn_sends_only_trailing_messages() {
         ChatRequestMessage::simple("assistant", "old answer".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     let arr = value.as_array().unwrap();
     // system + the new user message only — the old turns are chained
     // server-side and must not be replayed.
@@ -299,8 +299,8 @@ fn build_responses_input_chained_turn_keeps_system_prompt() {
         ChatRequestMessage::simple("user", "turn one".into()),
         ChatRequestMessage::simple("assistant", "answer".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["role"], "system");
@@ -315,8 +315,8 @@ fn build_responses_input_chained_without_assistant_keeps_all() {
         ChatRequestMessage::simple("user", "hello".into()),
         ChatRequestMessage::simple("user", "again".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
 }
@@ -334,8 +334,8 @@ fn build_responses_input_chained_keeps_only_newest_system_message() {
         ChatRequestMessage::simple("system", "new system".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0]["role"], "system");
@@ -359,8 +359,8 @@ fn build_responses_input_chained_preserves_mid_tail_order() {
         ChatRequestMessage::simple("system", "late system".into()),
         ChatRequestMessage::simple("user", "turn two".into()),
     ];
-    let result = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline).unwrap();
-    let value = result.expect("expected Some value");
+    let value = build_responses_input(&messages, Some("resp_1"), SystemPrompt::Inline)
+        .expect("the input lowers");
     let arr = value.as_array().unwrap();
     assert_eq!(arr.len(), 3);
     assert_eq!(arr[0]["role"], "user");

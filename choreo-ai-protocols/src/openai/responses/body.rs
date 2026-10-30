@@ -41,11 +41,15 @@ fn caller_index(messages: &[ChatRequestMessage]) -> CallerIndex<'_> {
 /// Build the `input` JSON value for a Responses API request: the full message
 /// history when there is no chain, or only the post-assistant tail when
 /// `previous_response_id` chains onto a stored response.
+///
+/// Every turn has an `input` value — an empty history lowers to an empty item
+/// array — so the value is returned directly. Only the *simple* (one-shot)
+/// body path ever sends a non-array `input`, and it builds that shape itself.
 pub(super) fn build_responses_input(
     messages: &[ChatRequestMessage],
     previous_response_id: Option<&str>,
     system: SystemPrompt,
-) -> Result<Option<serde_json::Value>, super::super::OpenAiError> {
+) -> Result<serde_json::Value, super::super::OpenAiError> {
     // A chained turn sends only the messages that postdate the last assistant
     // response — the server already holds the rest via `previous_response_id`,
     // and resending it would duplicate every prior turn (billing + context
@@ -71,9 +75,7 @@ pub(super) fn build_responses_input(
     // Nothing to send is an EMPTY ITEMS ARRAY, not an empty string: `input` is an
     // array of typed items here, so `[]` is the honest degenerate shape. A `""`
     // would instead be a request to send one empty-text user message.
-    let input_value = serde_json::to_value(&items)
-        .map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))?;
-    Ok(Some(input_value))
+    serde_json::to_value(&items).map_err(|e| super::super::OpenAiError::Io(io::Error::other(e)))
 }
 
 /// The minimal input for a turn chained onto a previous response: the newest
@@ -214,7 +216,13 @@ pub(super) fn build_responses_request_body(
     } else {
         params.previous_response_id
     };
-    let input_value = build_responses_input(params.messages, previous_response_id, system)?;
+    // The lowered items are always an array, so the request's `Option` wrapper
+    // exists only to model the one-shot path's string `input`.
+    let input_value = Some(build_responses_input(
+        params.messages,
+        previous_response_id,
+        system,
+    )?);
 
     let mut responses_tools: Vec<ResponsesTool> =
         params.tools.iter().map(ResponsesTool::from).collect();
