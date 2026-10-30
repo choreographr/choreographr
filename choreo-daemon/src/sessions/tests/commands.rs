@@ -216,13 +216,9 @@ fn unload_tools_rejects_unknown_group() {
 fn cancel_sends_through_channel() {
     let (cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
     let (mut state, ctx) = broadcast_setup();
-    state.active_requests.insert(
-        1,
-        ActiveRequest {
-            cancel_tx,
-            turn_id: 1,
-        },
-    );
+    state
+        .active_requests
+        .insert(1, active_request(cancel_tx, 1));
 
     let mut shutdown = false;
     process_command(
@@ -241,20 +237,12 @@ fn shutdown_cancels_all_active_requests() {
     let (cancel_tx1, cancel_rx1) = crossbeam_channel::unbounded::<()>();
     let (cancel_tx2, cancel_rx2) = crossbeam_channel::unbounded::<()>();
     let (mut state, ctx) = broadcast_setup();
-    state.active_requests.insert(
-        1,
-        ActiveRequest {
-            cancel_tx: cancel_tx1,
-            turn_id: 1,
-        },
-    );
-    state.active_requests.insert(
-        2,
-        ActiveRequest {
-            cancel_tx: cancel_tx2,
-            turn_id: 2,
-        },
-    );
+    state
+        .active_requests
+        .insert(1, active_request(cancel_tx1, 1));
+    state
+        .active_requests
+        .insert(2, active_request(cancel_tx2, 2));
 
     let mut shutdown = false;
     process_command(SessionCommand::Shutdown, &mut state, &mut shutdown, &ctx);

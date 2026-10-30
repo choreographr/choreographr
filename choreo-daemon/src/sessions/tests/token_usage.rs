@@ -628,20 +628,12 @@ fn attach_with_active_requests_sends_started_to_new_subscriber() {
     // Populate active requests as if a request is in flight.
     let (cancel_tx1, _cancel_rx1) = crossbeam_channel::unbounded::<()>();
     let (cancel_tx2, _cancel_rx2) = crossbeam_channel::unbounded::<()>();
-    state.active_requests.insert(
-        10,
-        ActiveRequest {
-            cancel_tx: cancel_tx1,
-            turn_id: 3,
-        },
-    );
-    state.active_requests.insert(
-        20,
-        ActiveRequest {
-            cancel_tx: cancel_tx2,
-            turn_id: 7,
-        },
-    );
+    state
+        .active_requests
+        .insert(10, active_request(cancel_tx1, 3));
+    state
+        .active_requests
+        .insert(20, active_request(cancel_tx2, 7));
 
     let (sub_tx, sub_rx) = test_sink();
     let mut shutdown = false;
@@ -701,27 +693,25 @@ fn attach_mid_run_names_the_turn_being_streamed_now() {
     // mid-run used to be told to route the stream to that turn — after which
     // every chunk of the iteration actually in flight was appended to the user's
     // own prompt turn, several turns above the one on screen.  Attaching must
-    // name the turn the run is streaming into at that moment.
+    // name the turn the run is streaming into at that moment, with the prompt
+    // estimate counted for that same iteration.
     let (mut state, ctx) = broadcast_setup();
     let (cancel_tx, _cancel_rx) = crossbeam_channel::unbounded::<()>();
-    state.active_requests.insert(
-        10,
-        ActiveRequest {
-            cancel_tx,
-            turn_id: 3,
-        },
-    );
+    state
+        .active_requests
+        .insert(10, active_request(cancel_tx, 3));
 
-    // The worker moves the loop on and re-broadcasts `Started` per iteration.
+    // The worker moves the loop on and re-broadcasts `Started` per iteration,
+    // each with the prompt size it just counted for that iteration.
     let mut shutdown = false;
-    for turn_id in [4, 5] {
+    for (turn_id, estimated_prompt_tokens) in [(4, 40_000), (5, 41_500)] {
         process_command(
             SessionCommand::Broadcast(DaemonMessageType::Session {
                 session_id: Some(1),
                 event: SessionEvent::Started {
                     stream_id: 10,
                     turn_id,
-                    estimated_prompt_tokens: 9,
+                    estimated_prompt_tokens,
                 },
             }),
             &mut state,
@@ -729,13 +719,18 @@ fn attach_mid_run_names_the_turn_being_streamed_now() {
             &ctx,
         );
     }
+    let active = state.active_requests.get(&10).expect("still in flight");
     assert_eq!(
-        state.active_requests.get(&10).map(|active| active.turn_id),
-        Some(5),
+        active.turn_id, 5,
         "the in-flight request must track the turn it is streaming into",
     );
+    assert_eq!(
+        active.estimated_prompt_tokens, 41_500,
+        "…and carry that iteration's prompt size, not the rejected-at-accept 0",
+    );
 
-    // A client attaching now is told the CURRENT turn, not the run's first.
+    // A client attaching now is told the CURRENT turn and its estimate, not the
+    // run's first turn and a zeroed readout.
     let (sub_tx, sub_rx) = test_sink();
     process_command(
         SessionCommand::Attach {
@@ -753,10 +748,10 @@ fn attach_mid_run_names_the_turn_being_streamed_now() {
                 SessionEvent::Started {
                     stream_id: 10,
                     turn_id: 5,
-                    ..
+                    estimated_prompt_tokens: 41_500,
                 },
         } => {}
-        other => panic!("expected Started(10, turn=5), got {other:?}"),
+        other => panic!("expected Started(10, turn=5, est=41_500), got {other:?}"),
     }
 
     assert!(!shutdown);

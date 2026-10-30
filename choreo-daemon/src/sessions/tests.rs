@@ -21,6 +21,18 @@ fn cid(n: u32) -> ClientId {
     ClientId::from_raw(n)
 }
 
+/// An in-flight request fixture: the cancel channel plus the turn the run is
+/// streaming into (and its prompt estimate), which is the pair `handle_attach`
+/// replays to a late joiner.  Tests that only care about cancellation leave the
+/// estimate at `0`, the value a freshly accepted request carries.
+fn active_request(cancel_tx: crossbeam_channel::Sender<()>, turn_id: u32) -> ActiveRequest {
+    ActiveRequest {
+        cancel_tx,
+        turn_id,
+        estimated_prompt_tokens: 0,
+    }
+}
+
 /// A turn for the context-size tests: `usage` is the provider-reported prompt
 /// size (`None` models a cancelled / user-only / usage-less-provider turn),
 /// and `undone` marks it as hidden by a prior undo.

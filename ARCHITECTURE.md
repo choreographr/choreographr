@@ -2810,12 +2810,13 @@ the right turn (without it those chunks are dropped — the client has no
 *tool loop* that appends a turn per iteration — the user's prompt turn first,
 then one turn per model/tool round — so the replay must carry the turn the run
 is streaming into **at that moment**, never the run's first turn. The session
-thread keeps `ActiveRequest::turn_id` current from the worker's per-iteration
-`Started`, and a client refuses to route a stream *backwards*: a `Started`
-naming an earlier turn than the one a `stream_id` is already routed to can only
-be a stale replay, and honouring it would append everything still to come to a
-turn the run has already left — in practice the user's own prompt turn, several
-turns above the one on screen.
+thread keeps `ActiveRequest`'s turn id and prompt-token estimate current from the
+worker's per-iteration `Started` (so a joiner's context-size readout resumes at
+the live value instead of a zeroed one), and a client refuses to route a stream
+*backwards*: a `Started` naming an earlier turn than the one a `stream_id` is
+already routed to can only be a stale replay, and honouring it would append
+everything still to come to a turn the run has already left — in practice the
+user's own prompt turn, several turns above the one on screen.
 
 ### Streaming response auto-scroll pin
 

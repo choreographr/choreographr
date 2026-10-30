@@ -35,6 +35,17 @@ pub(crate) struct ActiveRequest {
     /// `handle_attach` sends, and a stale value would route its chunks to a turn
     /// the run has already left.
     pub(crate) turn_id: u32,
+    /// The prompt-token estimate of the iteration this request is streaming, so
+    /// a late joiner's synthetic `Started` carries the live context size rather
+    /// than resetting the readout to zero.
+    ///
+    /// Seeded at `0` when the request is accepted (the worker has not built the
+    /// request, let alone counted it) and kept current by
+    /// [`handle_broadcast`](super::handle_broadcast) from the same per-iteration
+    /// `Started` that keeps [`turn_id`](Self::turn_id) current: the estimate is
+    /// recomputed each iteration as the conversation grows, so the value a
+    /// joiner is handed must be the one for the iteration in flight.
+    pub(crate) estimated_prompt_tokens: u32,
 }
 
 /// A live session's control handles, held by the daemon's session manager.

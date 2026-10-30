@@ -120,6 +120,10 @@ pub(in crate::sessions) fn handle_run_input(
         ActiveRequest {
             cancel_tx,
             turn_id: state.next_turn_id,
+            // Nothing has counted the prompt yet: this run's first `Started`
+            // (broadcast by the worker once it has built the request) is what
+            // fills the estimate in.
+            estimated_prompt_tokens: 0,
         },
     );
 
@@ -206,6 +210,9 @@ pub(in crate::sessions) fn handle_run_child_input(
         ActiveRequest {
             cancel_tx,
             turn_id: state.next_turn_id,
+            // Filled in by the worker's first per-iteration `Started`, exactly
+            // like the `RunInput` path.
+            estimated_prompt_tokens: 0,
         },
     );
     let mut worker_session = SessionState::from_snapshot(state.snapshot(), HashMap::new());

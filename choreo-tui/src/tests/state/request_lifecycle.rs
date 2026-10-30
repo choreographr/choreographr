@@ -60,15 +60,18 @@ fn handle_started_does_not_route_a_stream_back_to_an_earlier_turn() {
     insert_turn(&mut app, 20, "user asked again", "");
     app.rebuild_height_prefix();
 
-    // The run starts on turn 10 and the loop moves on to turn 20.
-    app.handle_started(0, 1, 10, 0);
-    app.handle_started(0, 1, 20, 0);
+    // The run starts on turn 10 and the loop moves on to turn 20, each
+    // iteration carrying its own prompt-token estimate.
+    app.handle_started(0, 1, 10, 40_000);
+    app.handle_started(0, 1, 20, 41_500);
     {
         let display = app.active_display_ref().unwrap();
         assert_eq!(display.view.request_to_turn.get(&1), Some(&20));
+        assert_eq!(display.live_input_estimate, 41_500);
     }
 
-    // The stale replay arrives after the client re-attached.
+    // The stale replay arrives after the client re-attached — with the zeroed
+    // estimate such a replayed `Started` used to carry.
     app.handle_started(0, 1, 10, 0);
 
     app.handle_request_stream(
@@ -83,6 +86,10 @@ fn handle_started_does_not_route_a_stream_back_to_an_earlier_turn() {
         display.view.request_to_turn.get(&1),
         Some(&20),
         "the stream must stay routed at the turn it is streaming into"
+    );
+    assert_eq!(
+        display.live_input_estimate, 41_500,
+        "a dropped stale replay must not blank the live prompt-size readout"
     );
     assert_eq!(
         display

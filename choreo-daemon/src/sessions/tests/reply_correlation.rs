@@ -214,13 +214,9 @@ fn undo_refused_while_session_not_idle() {
     // history — rather than race the merge.
     let (mut state, ctx) = broadcast_setup();
     let (cancel_tx, _cancel_rx) = crossbeam_channel::unbounded::<()>();
-    state.active_requests.insert(
-        7,
-        ActiveRequest {
-            cancel_tx,
-            turn_id: 0,
-        },
-    );
+    state
+        .active_requests
+        .insert(7, active_request(cancel_tx, 0));
     let before = state.turns.clone();
     let (sink, rx) = test_sink();
     state.subscribers.insert(cid(10), sink.clone());
@@ -250,13 +246,9 @@ fn undo_refused_while_session_not_idle() {
 fn redo_refused_while_session_not_idle() {
     let (mut state, ctx) = broadcast_setup();
     let (cancel_tx, _cancel_rx) = crossbeam_channel::unbounded::<()>();
-    state.active_requests.insert(
-        8,
-        ActiveRequest {
-            cancel_tx,
-            turn_id: 0,
-        },
-    );
+    state
+        .active_requests
+        .insert(8, active_request(cancel_tx, 0));
     // A redoable batch exists (turn 0 hidden), but the session is busy.
     state.turns.get_mut(&0).expect("seeded turn").undone = true;
     state.redo_stack.push(vec![0]);
