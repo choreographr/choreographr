@@ -72,6 +72,16 @@
 #                                # lost (see the `chatgpt` block below).
 #
 #   [provider.<slug>.models."<model>"]
+#   canonical_model_id = "<lab-provider>/<model>"
+#                                # The models.dev identity this offering is a
+#                                # resale of, when this provider's id is not the
+#                                # one models.dev describes. Used ONLY to borrow
+#                                # portable facts (context window, output
+#                                # ceiling) the offering does not record itself —
+#                                # an exact value on the offering always wins.
+#                                # Never alters the id sent to the provider, and
+#                                # never inferred from a matching name: set it
+#                                # only when the offering really is that model.
 #   context_window = 123456
 #   reasoning_supported = true
 #   reasoning_levels = ["off", "high", "max"]
@@ -651,6 +661,7 @@
   device_token_path = "/deviceauth/token"
 
 [provider.chatgpt.models."gpt-5.6-sol"]
+  canonical_model_id = "openai/gpt-5.6-sol"
   responses = true
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
@@ -661,11 +672,13 @@
   # turn has an opaque payload to hand back.
   reasoning_passback = "all_turns"
 [provider.chatgpt.models."gpt-5.6-terra"]
+  canonical_model_id = "openai/gpt-5.6-terra"
   responses = true
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]
   reasoning_passback = "all_turns"
 [provider.chatgpt.models."gpt-5.6-luna"]
+  canonical_model_id = "openai/gpt-5.6-luna"
   responses = true
   reasoning_supported = true
   reasoning_levels = ["off", "low", "medium", "high", "xhigh"]

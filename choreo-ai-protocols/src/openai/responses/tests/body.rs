@@ -116,6 +116,8 @@ fn chatgpt_backend_hoists_system_prompt_into_instructions() {
         ChatRequestMessage::simple("user", "hi".into()),
     ];
     let body = body_for("chatgpt", "gpt-5.6-luna", &messages);
+    // Canonical metadata is lookup-only: the provider receives its exact route id.
+    assert_eq!(body["model"], "gpt-5.6-luna");
     assert_eq!(body["instructions"], "be helpful");
     // Stateless: the request must not persist, and it says so explicitly — an
     // omitted `store` would leave the backend's own storing default in force.

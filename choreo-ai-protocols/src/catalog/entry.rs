@@ -101,6 +101,13 @@ pub struct ModelEntry {
     pub model: String,
     /// Context window in tokens; `0` means unknown.
     pub context_window: u32,
+    /// Explicit portable model identity (`provider/model`) for metadata facts.
+    ///
+    /// This never changes [`Self::model`], which remains the exact identifier
+    /// sent to the provider. Lookups use it only after the offering has no
+    /// local portable fact; no identifier similarity is inferred.
+    #[serde(default)]
+    pub canonical_model_id: Option<String>,
     /// Whether this model supports reasoning/thinking at all.
     /// Applicable across all protocols — `OpenAi`, `AnthropicMessages`,
     /// and `GoogleGenerativeAi` all use this flag to enable/disable
@@ -231,6 +238,7 @@ impl Default for ModelEntry {
         Self {
             model: String::new(),
             context_window: 0,
+            canonical_model_id: None,
             reasoning_supported: false,
             openai_reasoning_levels: Vec::new(),
             openai_responses: false,

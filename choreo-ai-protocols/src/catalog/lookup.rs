@@ -13,6 +13,13 @@
 //! (conservative `None` vs permissive `true` defaults) stay in each resolver, so
 //! the doc comments and defaults remain the single source of truth for that
 //! behavior.
+//!
+//! Portable facts — the model's own capacities, which survive being resold by
+//! another provider (context window, output ceiling) — resolve through
+//! [`with_portable_model_fact`] instead, so an offering can inherit them from an
+//! explicitly declared canonical identity. Everything a *route* decides (wire
+//! protocol, request format, reasoning echo/passback, modality gates) stays
+//! exact-match only.
 
 use tracing::trace;
 
@@ -73,6 +80,79 @@ fn with_model_fact<T>(
         model = %model,
         found = fact.is_some(),
         "model fact lookup"
+    );
+    fact
+}
+
+/// Split an explicit `provider/model` metadata link into its two segments.
+///
+/// Both segments must be non-empty, so a malformed or half-written link
+/// resolves to "no link" instead of quietly matching the provider/model of the
+/// same name. Only the FIRST separator is significant: a model id may itself
+/// contain `/` (e.g. `openai/gpt-oss-120b` under another lab), so the tail is
+/// kept whole rather than being split again.
+fn parse_canonical_link(link: &str) -> Option<(&str, &str)> {
+    let (provider, model) = link.split_once('/')?;
+    (!provider.is_empty() && !model.is_empty()).then_some((provider, model))
+}
+
+/// Sibling of [`with_model_fact`] for a **portable** fact: one that describes the
+/// underlying model rather than this provider's offering of it.
+///
+/// The selected offering always wins, so a curated local value is never
+/// displaced. Only when the offering has no value of its own (`f` returns
+/// `None`) may its explicit [`ModelEntry::canonical_model_id`] link supply the
+/// same fact from that `provider/model` record.
+///
+/// The link is the ONLY way to cross a provider boundary: there is no fallback
+/// on a matching model string, a stripped provider prefix, a date suffix, or any
+/// other similarity, and it is followed at most one hop (the canonical record's
+/// own link is never chased). A provider-facing model id is a wire contract,
+/// while canonical identity is a separately curated fact — inferring one from
+/// the other would attribute another offering's limits to this one.
+///
+/// Returns `None` when the provider slug or the model slug does not match any
+/// catalog entry, or when neither record carries the fact.
+fn with_portable_model_fact<T>(
+    provider_slug: &str,
+    model: &str,
+    f: impl Fn(&ModelEntry) -> Option<T>,
+) -> Option<T> {
+    // Held for the whole resolution: both the selected and the canonical walk
+    // read the same snapshot, so a concurrent swap cannot mix two revisions.
+    let catalog = PROVIDER_CATALOG.load();
+    let find = |slug: &str, model: &str| {
+        catalog
+            .iter()
+            .find(|provider| provider.slug == slug)?
+            .models
+            .iter()
+            .find(|entry| entry.model == model)
+    };
+
+    let (fact, canonical_hit) = match find(provider_slug, model) {
+        Some(selected) => match f(selected) {
+            Some(fact) => (Some(fact), false),
+            None => match selected
+                .canonical_model_id
+                .as_deref()
+                .and_then(parse_canonical_link)
+            {
+                Some((slug, canonical_model)) => (find(slug, canonical_model).and_then(&f), true),
+                None => (None, false),
+            },
+        },
+        None => (None, false),
+    };
+    // Trace the miss as well as the hit, and say which record answered: a
+    // catalog gap or an unexpected canonical hop is exactly what is worth seeing
+    // when diagnosing a surprising limit in the UI.
+    trace!(
+        provider = %provider_slug,
+        model = %model,
+        found = fact.is_some(),
+        via_canonical = canonical_hit,
+        "portable model fact lookup"
     );
     fact
 }
@@ -190,25 +270,29 @@ pub fn cache_retention(provider_slug: &str, model: &str) -> CacheRetentionDialec
 
 /// Look up the context window for a model on a given provider.
 /// Matches the model slug exactly against known entries.
-/// Returns `None` if no entry matches, the provider is unknown, or the
-/// entry has no known window (`context_window == 0`, e.g. a model whose
-/// window was never recorded — callers then fall back to the client config).
+/// The selected offering's nonzero value wins. If it has no value, its explicit
+/// `canonical_model_id` may supply this portable capacity fact; no identifier
+/// similarity is inferred. Returns `None` if neither record has a known window.
 #[must_use]
 pub fn lookup_context_window(provider_slug: &str, model: &str) -> Option<u32> {
-    // `0` is the "unknown" sentinel shared with `max_output_tokens`; map it
-    // back to `None` so callers keep their config fallback.
-    with_model_fact(provider_slug, model, |m| m.context_window).and_then(|w| (w != 0).then_some(w))
+    // `0` means the selected offering has no fact, so its explicit canonical
+    // identity may supply this provider-independent capacity value.
+    with_portable_model_fact(provider_slug, model, |m| {
+        (m.context_window != 0).then_some(m.context_window)
+    })
 }
 
 /// Look up the maximum output tokens for a model on a given provider,
-/// mirroring [`lookup_context_window`]: `None` for an unknown provider or
-/// model, and `None` for a recorded `0` (models.dev omits `limit.output`
-/// when it has no fact — 0 means unknown, exactly like `context_window`).
+/// mirroring [`lookup_context_window`]: the exact offering wins, then its
+/// explicit canonical identity may supply this portable capacity fact. `0` is
+/// unknown because models.dev omits `limit.output` when it has no fact.
 #[must_use]
 pub fn lookup_max_output_tokens(provider_slug: &str, model: &str) -> Option<u32> {
-    // Same 0-is-unknown convention as the context window: 0 maps to `None`.
-    with_model_fact(provider_slug, model, |m| m.max_output_tokens)
-        .and_then(|t| (t != 0).then_some(t))
+    // Same 0-is-unknown convention as the context window: only an explicit
+    // canonical identity may supply the missing portable capacity fact.
+    with_portable_model_fact(provider_slug, model, |m| {
+        (m.max_output_tokens != 0).then_some(m.max_output_tokens)
+    })
 }
 
 /// Whether the model on the given provider accepts the `temperature`

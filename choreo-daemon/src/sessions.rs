@@ -376,10 +376,10 @@ pub fn session_main(
         ..SessionState::empty()
     };
 
-    // Re-resolve context window from the catalog when loading an existing
-    // session whose stored context_window is None (e.g. sessions created
-    // before a model was added to the catalog).
-    state.resolve_context_window_if_missing(ctx);
+    // Refresh the catalog-derived context window: a persisted value is a cache
+    // of an earlier catalog revision, so it is re-derived here rather than
+    // trusted. An account/client override still wins through the provider.
+    state.refresh_context_window(ctx);
 
     match db::read_turns(&ctx.db, ctx.session_id) {
         Ok(turns) => {

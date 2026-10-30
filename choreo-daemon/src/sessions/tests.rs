@@ -495,6 +495,68 @@ fn slug_keyed_catalog_facts_resolve_without_a_live_provider() {
 }
 
 #[test]
+#[serial_test::serial(catalog)]
+fn refresh_context_window_replaces_stale_catalog_metadata() {
+    let db = test_db();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 9,
+        db,
+        tool_registry: ToolRegistry::new().build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: LagLimits::default(),
+        global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+    let mut state = SessionState::empty();
+    state.config.selected_model = Some("gpt-5.6-luna".into());
+    state.provider_slug = Some("chatgpt".into());
+    // Persisted session summaries may carry catalog-derived values from an
+    // earlier catalog revision. They are refreshed rather than treated as user
+    // configuration, while a live account override remains provider-owned.
+    state.config.context_window = Some(272_000);
+
+    state.refresh_context_window(&ctx);
+
+    assert_eq!(state.config.context_window, Some(1_050_000));
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn refresh_context_window_keeps_a_stored_value_it_cannot_re_derive() {
+    let db = test_db();
+    let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
+    let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded();
+    let ctx = RequestContext {
+        cmd_tx,
+        session_id: 9,
+        db,
+        tool_registry: ToolRegistry::new().build().into_shared(),
+        daemon_tx,
+        max_turns: 0,
+        lag_limits: LagLimits::default(),
+        global_lag: Arc::new(AtomicUsize::new(0)),
+        substrate_credential: None,
+        warm_policy: crate::cache_warm::WarmPolicy::default(),
+    };
+    let mut state = SessionState::empty();
+    // A locked daemon has no client and no bound account, so the catalog cannot
+    // answer for this model yet. The stored value must survive: blanking it
+    // would report a known limit as unknown until the next request rebuilt the
+    // provider, and refreshing never invents a value either.
+    state.config.selected_model = Some("model-from-a-config-override".into());
+    state.config.context_window = Some(200_000);
+
+    state.refresh_context_window(&ctx);
+
+    assert_eq!(state.config.context_window, Some(200_000));
+}
+
+#[test]
 fn set_provider_slug_command_updates_and_clears_recorded_slug() {
     // The daemon's accounts-reload path pushes the account's (non-secret)
     // provider slug here; the handler records it, and `None` (account removed)

@@ -233,31 +233,43 @@ impl SessionState {
         }
     }
 
-    /// Re-resolve context window from the catalog when the stored value
-    /// is `None` (e.g. sessions created before a model was added to the
-    /// catalog, or after the provider was lazily resolved on unlock).
-    pub(in crate::sessions) fn resolve_context_window_if_missing(&mut self, ctx: &RequestContext) {
-        if self.config.context_window.is_some() {
-            return;
-        }
+    /// Refresh the derived context window from the current provider/config and
+    /// catalog. Session metadata is a cache, not an override: refreshing it at
+    /// session start and provider resolution lets catalog corrections replace a
+    /// stale persisted value. [`InferenceProvider::resolve_context_window`]
+    /// still gives account/client configuration its documented higher priority.
+    ///
+    /// An unresolvable window leaves the stored value untouched rather than
+    /// clearing it: a locked daemon or an unbound account simply cannot answer
+    /// yet, and blanking a previously resolved limit would turn a correct
+    /// display into an unknown one until the next request.
+    pub(in crate::sessions) fn refresh_context_window(&mut self, ctx: &RequestContext) {
         let Some(model) = &self.config.selected_model else {
             return;
         };
-        if let Some(cw) = self.resolve_context_window_for_model(model) {
-            debug!(
-                "session {}: re-resolved context_window={} for model={}",
-                ctx.session_id, cw, model
-            );
-            self.config.context_window = Some(cw);
-            broadcast(
-                &mut self.subscribers,
-                ctx,
-                &DaemonMessageType::Session {
-                    session_id: Some(ctx.session_id),
-                    event: SessionEvent::ContextWindowResolved { context_window: cw },
-                },
-            );
+        let Some(resolved) = self.resolve_context_window_for_model(model) else {
+            return;
+        };
+        if self.config.context_window == Some(resolved) {
+            return;
         }
+        self.config.context_window = Some(resolved);
+        debug!(
+            session_id = ctx.session_id,
+            context_window = resolved,
+            model = %model,
+            "refreshed derived context window",
+        );
+        broadcast(
+            &mut self.subscribers,
+            ctx,
+            &DaemonMessageType::Session {
+                session_id: Some(ctx.session_id),
+                event: SessionEvent::ContextWindowResolved {
+                    context_window: resolved,
+                },
+            },
+        );
     }
 
     pub(in crate::sessions) fn snapshot(&self) -> SessionSnapshot {

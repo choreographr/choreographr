@@ -70,6 +70,10 @@ struct RawModel {
     /// protocol defaults at lookup time.
     #[serde(default)]
     reasoning_options: Vec<ReasoningOption>,
+    /// Canonical portable model identity (`provider/model`) for factual metadata.
+    /// Absent means this offering has no explicitly declared cross-provider link.
+    #[serde(default)]
+    canonical_model_id: Option<String>,
     /// Token limits; `limit.context` becomes the model's `context_window`
     /// (`0` = unknown, as today). Absent → 0.
     #[serde(default)]
@@ -290,6 +294,9 @@ fn normalize_provider(slug: String, raw: RawProvider) -> ProviderEntry {
             ModelEntry {
                 model,
                 context_window: m.limit.as_ref().map_or(0, |l| l.context),
+                // Preserve models.dev's explicit identity exactly. It is only a
+                // metadata fallback link; `model` remains the provider wire id.
+                canonical_model_id: m.canonical_model_id,
                 reasoning_supported: m.reasoning,
                 openai_reasoning_levels: effort_levels(&m.reasoning_options),
                 openai_responses,
@@ -484,6 +491,7 @@ mod tests {
             "api": "https://chatty.example/v1",
             "models": {
                 "chatty-1": {
+                    "canonical_model_id": "openai/chatty-1",
                     "reasoning": false,
                     "limit": {"context": 8192, "output": 4096}
                 }
@@ -605,6 +613,15 @@ mod tests {
         assert_eq!(
             catalog[4].models[0].openai_reasoning_levels,
             [] as [String; 0]
+        );
+    }
+
+    #[test]
+    fn preserves_explicit_canonical_model_identity() {
+        let catalog = normalize_modelsdev(SNAPSHOT);
+        assert_eq!(
+            catalog[4].models[0].canonical_model_id.as_deref(),
+            Some("openai/chatty-1")
         );
     }
 

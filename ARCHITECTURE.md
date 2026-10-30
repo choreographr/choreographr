@@ -616,6 +616,46 @@ daemon) are documented in-source (the `catalog` module and
 `catalog/models-overlay.toml`), held complete by the `#![warn(missing_docs)]` +
 `doc-check` gate.
 
+#### Two model identities: wire id versus canonical metadata link
+
+A catalog model entry carries **two** identifiers, and they answer different
+questions. `model` is the *wire id*: the exact string sent to the provider, and
+the only thing the overlay's uncategorized `[provider.<slug>.models."<id>"]`
+key matches. `canonical_model_id` (optional, `provider/model`) is a *metadata
+link* — the models.dev `canonical_model_id` fact, or an overlay assignment for an
+entry models.dev does not describe as that provider (the `chatgpt` provider is
+overlay-only, so its GPT-5.6 entries name `openai/gpt-5.6-…` explicitly).
+
+The split exists because the same model is resold by many providers under
+provider-specific ids, several of which models.dev does not list at all. Without
+the link such an offering has no portable capacity facts, so a context window the
+models.dev catalog records for the canonical model reads as unknown. With it, the
+facts are shared without duplicating (and later drifting from) the upstream
+numbers in the overlay.
+
+Lookup precedence for a **portable fact** — a property of the model that survives
+being resold: the context window and the maximum-output ceiling — is: the selected
+offering's own value, else its explicit `canonical_model_id` target's value, else
+unknown. The link is followed **at most one hop**, parsed strictly as
+two non-empty `/`-separated segments (the tail may itself contain `/`, for a
+resold `lab/model` id), and it is resolved against the live catalog rather than
+copied, so a models.dev refresh reaches every offering that names that model.
+
+Everything a **route** decides stays exact-match only, because it is a property
+of the provider's offering rather than of the model: wire protocol, request
+format, endpoint, auth, the max-tokens field, reasoning echo/passback, and the
+modality gates. Canonical identity is therefore *never* inferred from a matching
+model string, a stripped provider prefix, a date suffix, or any other similarity —
+a resold offering can carry different limits, and the wire id is a contract, not
+a name to normalize.
+
+The resolved window is session metadata, not user configuration: it is
+re-resolved at session load, on model/account selection, and on the first request
+after unlock, so a catalog correction replaces a stale persisted value. An
+unresolvable window leaves the stored value intact instead of clearing it, and a
+live provider's account/client `context_window` override still outranks the
+catalog.
+
 ### Provider auth: grant versus request material
 
 Provider authentication is a **two-layer** model, split so the durable grant

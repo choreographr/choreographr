@@ -689,6 +689,174 @@ fn chat_reasoning_echo_never_applies_to_responses_models() {
     crate::catalog::replace_catalog(bundled.to_vec());
 }
 
+/// Clone `base` under a new slug with a replacement model list — the cheapest
+/// way to build a multi-provider synthetic catalog in these tests.
+fn derive_provider(base: &ProviderEntry, slug: &str, models: Vec<ModelEntry>) -> ProviderEntry {
+    let mut provider = base.clone();
+    provider.slug = slug.to_string();
+    provider.default_model = models.first().map_or_default(|model| model.model.clone());
+    provider.models = models;
+    provider
+}
+
+/// An offering that records no capacity fact of its own and only (optionally)
+/// declares a canonical metadata link.
+fn linked(model: &str, canonical: Option<&str>) -> ModelEntry {
+    ModelEntry {
+        model: model.to_string(),
+        canonical_model_id: canonical.map(str::to_string),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn canonical_link_requires_two_non_empty_segments() {
+    // A half-written link must read as "no link", never as "same-named model on
+    // this provider" or as an empty slug that happens to match.
+    assert_eq!(
+        parse_canonical_link("openai/gpt-5.6-luna"),
+        Some(("openai", "gpt-5.6-luna"))
+    );
+    assert_eq!(
+        parse_canonical_link("nope/gpt-5.6-luna"),
+        Some(("nope", "gpt-5.6-luna"))
+    );
+    assert_eq!(parse_canonical_link("gpt-5.6-luna"), None);
+    assert_eq!(parse_canonical_link("/gpt-5.6-luna"), None);
+    assert_eq!(parse_canonical_link("openai/"), None);
+    assert_eq!(parse_canonical_link("/"), None);
+    assert_eq!(parse_canonical_link(""), None);
+    // The provider segment ends at the FIRST separator: a model id that itself
+    // carries a path (a resold `lab/model` id) is kept whole.
+    assert_eq!(
+        parse_canonical_link("tanzu/openai/gpt-oss-120b"),
+        Some(("tanzu", "openai/gpt-oss-120b"))
+    );
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn canonical_link_is_exact_and_single_hop() {
+    let _restore = RestoreBundledOnDrop;
+
+    // Three synthetic providers: an alias pointing at a middle offering, which
+    // itself points at the record holding the real capacity. A canonical link
+    // is a curated fact naming ONE record, so the chain stops after the first
+    // hop — chasing it further would let a stale intermediate link silently
+    // attribute an unrelated model's limits.
+    let base = tiny_catalog().remove(0);
+    // `tiny-test/tiny-model` carries context_window 4096 and max output 1024.
+    let mut catalog = vec![base.clone()];
+    catalog.push(derive_provider(
+        &base,
+        "alias-co",
+        vec![
+            // Direct link: resolves.
+            linked("direct-1", Some("tiny-test/tiny-model")),
+            // One hop through a link-only middle record: does NOT resolve.
+            linked("chained-1", Some("middle-co/mid-1")),
+            // Exact-match only: a prefix of a real model id is not a match.
+            linked("prefix-1", Some("tiny-test/tiny")),
+            // Unknown target provider.
+            linked("nowhere-1", Some("nowhere-co/tiny-model")),
+            // Malformed link shapes all mean "no link".
+            linked("sloppy-1", Some("tiny-test")),
+            linked("sloppy-2", Some("/tiny-model")),
+            linked("sloppy-3", Some("tiny-test/")),
+        ],
+    ));
+    catalog.push(derive_provider(
+        &base,
+        "middle-co",
+        vec![linked("mid-1", Some("tiny-test/tiny-model"))],
+    ));
+    crate::catalog::replace_catalog(catalog);
+
+    assert_eq!(
+        lookup_context_window("alias-co", "direct-1"),
+        Some(4096),
+        "a direct canonical link supplies the offering's capacity fact"
+    );
+    assert_eq!(lookup_max_output_tokens("alias-co", "direct-1"), Some(1024));
+    for unresolved in [
+        "chained-1",
+        "prefix-1",
+        "nowhere-1",
+        "sloppy-1",
+        "sloppy-2",
+        "sloppy-3",
+    ] {
+        assert_eq!(
+            lookup_context_window("alias-co", unresolved),
+            None,
+            "{unresolved} must not borrow another record's capacity"
+        );
+        assert_eq!(lookup_max_output_tokens("alias-co", unresolved), None);
+    }
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn portable_capacity_facts_use_only_explicit_canonical_identity() {
+    let _restore = RestoreBundledOnDrop;
+    // The ChatGPT offering has no local limits. Its explicit overlay link reads
+    // OpenAI's portable capacity facts without changing the request model id.
+    for model in ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra"] {
+        assert_eq!(
+            lookup_context_window("chatgpt", model),
+            Some(1_050_000),
+            "{model} context window comes from its canonical OpenAI record"
+        );
+        assert_eq!(
+            lookup_max_output_tokens("chatgpt", model),
+            Some(128_000),
+            "{model} output ceiling comes from its canonical OpenAI record"
+        );
+    }
+
+    let mut catalog = catalog_snapshot().to_vec();
+    let chatgpt = catalog
+        .iter_mut()
+        .find(|provider| provider.slug == "chatgpt")
+        .expect("bundled ChatGPT provider");
+    let luna = chatgpt
+        .models
+        .iter_mut()
+        .find(|model| model.model == "gpt-5.6-luna")
+        .expect("bundled Luna offering");
+    // A known exact fact wins over canonical metadata.
+    luna.context_window = 42_000;
+    luna.max_output_tokens = 4_000;
+    crate::catalog::replace_catalog(catalog.clone());
+    assert_eq!(
+        lookup_context_window("chatgpt", "gpt-5.6-luna"),
+        Some(42_000)
+    );
+    assert_eq!(
+        lookup_max_output_tokens("chatgpt", "gpt-5.6-luna"),
+        Some(4_000)
+    );
+
+    // Clearing the explicit link proves a matching model string alone cannot
+    // cross provider boundaries.
+    let luna = catalog
+        .iter_mut()
+        .find(|provider| provider.slug == "chatgpt")
+        .and_then(|provider| {
+            provider
+                .models
+                .iter_mut()
+                .find(|model| model.model == "gpt-5.6-luna")
+        })
+        .expect("bundled Luna offering");
+    luna.context_window = 0;
+    luna.max_output_tokens = 0;
+    luna.canonical_model_id = None;
+    crate::catalog::replace_catalog(catalog);
+    assert_eq!(lookup_context_window("chatgpt", "gpt-5.6-luna"), None);
+    assert_eq!(lookup_max_output_tokens("chatgpt", "gpt-5.6-luna"), None);
+}
+
 #[test]
 #[serial_test::serial(catalog)]
 fn lookup_max_output_tokens_mirrors_context_window() {

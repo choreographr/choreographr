@@ -341,6 +341,19 @@ fn u32_len(n: i64) -> u32 {
 fn apply_model_overlay(model: &mut ModelEntry, table: &toml::Table) {
     for (key, value) in table {
         match key.as_str() {
+            // Portable metadata may be shared only through this explicit link.
+            // Do not derive it from matching model names: a provider-facing id is
+            // a wire contract, while canonical identity is a separately curated fact.
+            "canonical_model_id" => {
+                if let Some(id) = value.as_str() {
+                    model.canonical_model_id = Some(id.to_string());
+                } else {
+                    warn!(
+                        model = %model.model,
+                        "overlay: canonical_model_id is not a string; skipping",
+                    );
+                }
+            }
             "context_window" => {
                 if let Some(n) = value.as_integer() {
                     model.context_window = u32_len(n);

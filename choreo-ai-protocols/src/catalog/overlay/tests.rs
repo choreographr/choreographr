@@ -92,6 +92,26 @@ max_tokens_field = "max_tokens"
 }
 
 #[test]
+fn overlay_assigns_canonical_model_identity() {
+    let merged = merge_overlay(
+        &base(),
+        r#"
+[provider.acme.models."acme-lite"]
+canonical_model_id = "origin/canonical-lite"
+"#,
+    );
+    let model = merged[0]
+        .models
+        .iter()
+        .find(|model| model.model == "acme-lite")
+        .expect("base model exists");
+    assert_eq!(
+        model.canonical_model_id.as_deref(),
+        Some("origin/canonical-lite")
+    );
+}
+
+#[test]
 fn overlay_reasoning_echo_field_declares_the_wire_key() {
     // The expressive form: the overlay names the exact field replayed
     // reasoning is shaped as, and it lands on the model entry as a field

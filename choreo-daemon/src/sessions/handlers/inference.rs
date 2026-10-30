@@ -59,9 +59,10 @@ pub(in crate::sessions) fn handle_run_input(
             );
         }
     };
-    // Re-resolve context window now that a provider is available (e.g. the
-    // first request after unlocking the daemon).
-    state.resolve_context_window_if_missing(ctx);
+    // Refresh the context window now that a provider is available (the first
+    // request after unlocking, or after an account edit), so a catalog or
+    // account override that could not be resolved earlier takes effect.
+    state.refresh_context_window(ctx);
     let model = match &state.config.selected_model {
         Some(m) => m.clone(),
         None => {
