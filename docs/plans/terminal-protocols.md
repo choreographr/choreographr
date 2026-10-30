@@ -13,9 +13,11 @@ features `choreo-tui` could adopt.
 
 > **TL;DR.** The output side is done: the client already emits OSC 9;4 progress,
 > OSC 7501 program status (now with `kind`/`progress` and a `login` auth record),
-> OSC 52 + OSC 5522 clipboard writes, OSC 2 title, OSC 22 pointer shape, the Kitty
-> keyboard protocol, synchronized output (mode 2026) and Kitty graphics. What is
-> left splits into two kinds of work. **Phases 0-3** all need one missing
+> OSC 52 clipboard writes, OSC 2 title, OSC 22 pointer shape, the Kitty
+> keyboard protocol, synchronized output (mode 2026) and Kitty graphics. (The
+> richer OSC 5522 clipboard write is held back until Phase 0: the terminal answers
+> every 5522 *write* with a `status=` reply, and an unconsumed reply is typed into
+> the prompt — see §2.1.) What is left splits into two kinds of work. **Phases 0-3** all need one missing
 > capability — *reading the terminal's replies* — which crossterm's input parser
 > currently swallows; Phase 0 builds that and the rest are small on top of it.
 > **Phases 4-6** need no input-path work at all and can land in any order:
@@ -57,7 +59,7 @@ and every phase below must preserve:
 |---|---|---|
 | OSC 9;4 progress | `terminal/progress.rs` | root record; capability probe is env-based (`anstyle-progress`) |
 | OSC 7501 status | `terminal/status.rs` | child records; `state`/`app`/`id`/`kind`/`progress`/`title`/`msg` |
-| OSC 52 + OSC 5522 clipboard | `terminal/clipboard.rs` | plain + `<pre>` HTML, 4096-byte wdata chunks, 1 MiB cap |
+| OSC 52 clipboard | `terminal/clipboard.rs` | plain text, 1 MiB cap; the richer OSC 5522 write waits for Phase 0 |
 | OSC 2 title, OSC 22 pointer | `terminal/title.rs`, `terminal/pointer.rs` | both deduped on `App` |
 | Mode 2026 | `backend.rs` | markers bracket each frame's cell stream |
 | Kitty keyboard, bracketed paste, mouse | `connection/` | via crossterm |
@@ -82,9 +84,13 @@ stream with no notion of "this is a reply, not input":
   parser produces `Alt+]` followed by **each remaining byte as an individual key
   event**. An unconsumed OSC reply is therefore *typed into the user's prompt*.
 
-That second behaviour is why today's terminal layer is strictly output-only, and
-why the OSC 5522 implementation deliberately skips the `status=DONE` reply rather
-than ignore it. Any phase that adds a query before Phase 0 is a data-loss bug.
+That second behaviour is why today's terminal layer is strictly output-only. It
+is also why the richer OSC 5522 clipboard write is **not** emitted yet: the spec
+answers every `type=write` with a `type=write:status=DONE` (or an error code)
+packet, so a 5522 write elicits exactly the kind of reply the parser types into
+the prompt. An OSC 52 *write*, by contrast, is never answered, so it is safe. Any
+phase that adds a query — or another answered sequence like 5522 — before Phase 0
+is a data-loss bug.
 
 ### 2.2 The mechanism
 

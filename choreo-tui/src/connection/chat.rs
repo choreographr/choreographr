@@ -224,7 +224,7 @@ pub(super) fn handle_chat_event(
                 if clipboard::copy_to_clipboard(&text) {
                     tracing::info!(
                         bytes = text.len(),
-                        "[choreo-tui] copied selection to clipboard via OSC 52 + OSC 5522"
+                        "[choreo-tui] copied selection to clipboard via OSC 52"
                     );
                     app.set_status("Selection copied to clipboard.".to_string());
                 } else {
