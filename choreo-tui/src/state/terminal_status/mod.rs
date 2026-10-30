@@ -10,6 +10,8 @@
 //! The `App` fields this module reads (`term_status_override`,
 //! `attached_status`, `session_mgr`, …) stay on the struct in `state/`.
 
+use std::collections::HashMap;
+
 use choreo_proto::SessionStatus;
 
 use super::App;
@@ -50,12 +52,23 @@ impl App {
     /// background session with no outcome is omitted so a stale `working`
     /// record is cleared.
     pub(crate) fn desired_status_records(&self) -> Vec<(RecordKey, String)> {
+        // One pass over the session list builds an id→title map, so the per-session
+        // record builders below do not each rescan the list (which made publishing
+        // O(n^2) in the session count).
+        let titles: HashMap<u64, &str> = self
+            .session_mgr
+            .all
+            .iter()
+            .filter_map(|s| s.title.as_deref().map(|title| (s.session_id, title)))
+            .collect();
+        let title_of = |id: u64| titles.get(&id).copied();
+
         let mut desired: Vec<(RecordKey, String)> = Vec::new();
         if let Some(login) = self.login_status_record() {
             desired.push((RecordKey::Login, login));
         }
         if let Some(id) = self.attached_session_id {
-            desired.push(self.status_record(id, self.attached_status.as_ref()));
+            desired.push(self.status_record(id, self.attached_status.as_ref(), title_of(id)));
         }
         for summary in &self.session_mgr.all {
             let id = summary.session_id;
@@ -65,7 +78,7 @@ impl App {
             if !summary.status.is_active() && !self.term_status_override.contains_key(&id) {
                 continue;
             }
-            desired.push(self.status_record(id, Some(&summary.status)));
+            desired.push(self.status_record(id, Some(&summary.status), title_of(id)));
         }
         desired
     }
@@ -96,12 +109,17 @@ impl App {
 
     /// Build the OSC 7501 child record for `id`, given its live status (the
     /// attached session passes `attached_status`; a background session passes
-    /// its summary status). A persisted terminal outcome
-    /// (`term_status_override`) wins over the live state and suppresses the
-    /// tool `msg` — a finished/cancelled turn has no tool to name. `progress`
+    /// its summary status) and its already-resolved `title`. A persisted terminal
+    /// outcome (`term_status_override`) wins over the live state and suppresses
+    /// the tool `msg` — a finished/cancelled turn has no tool to name. `progress`
     /// comes from the LIVE status only: an outcome is not "in progress", and a
     /// state that is not `working` drops the key when the record is framed.
-    fn status_record(&self, id: u64, live: Option<&SessionStatus>) -> (RecordKey, String) {
+    fn status_record(
+        &self,
+        id: u64,
+        live: Option<&SessionStatus>,
+        title: Option<&str>,
+    ) -> (RecordKey, String) {
         let override_state = self.term_status_override.get(&id).copied();
         let state = override_state
             .or_else(|| live.map(terminal::status::state_for))
@@ -112,7 +130,6 @@ impl App {
             live.and_then(tool_call_name)
         };
         let progress = live.and_then(terminal::status::progress_for);
-        let title = self.session_title(id);
         let key = RecordKey::Session(id);
         let protocol_id = key.protocol_id();
         let record = StatusRecord {

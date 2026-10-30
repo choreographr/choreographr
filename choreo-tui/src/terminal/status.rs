@@ -49,8 +49,9 @@ const MAX_TITLE_BYTES: usize = 192;
 const MAX_MSG_BYTES: usize = 2048;
 
 /// The `id` of the login flow's record. The spec's id grammar is
-/// `[A-Za-z0-9_.+-]{1,32}` per dot-separated segment, so a bare `login` is a
-/// valid id and cannot collide with a session record (whose id is numeric).
+/// `segment ("/" segment)*` with `segment := [A-Za-z0-9_.+-]{1,32}`, so a bare
+/// `login` is a single valid segment and cannot collide with a session record
+/// (whose id is that session's numeric id).
 const LOGIN_ID: &str = "login";
 
 /// How a `blocked` record is waiting on the user.
