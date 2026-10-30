@@ -27,6 +27,10 @@ pub(super) fn handle_model_selector_event(
             if key.code == KeyCode::Esc {
                 tracing::debug!("[choreo-tui] model selector dismissed");
                 app.model_selector.close();
+                if app.mandatory_model_selection {
+                    app.set_page(crate::state::Page::AIProviders);
+                    app.pending.send(client_tx, ClientMessageType::ListAccounts);
+                }
                 return Ok(());
             }
             // Enter selects the highlighted model (if any) and closes.  An

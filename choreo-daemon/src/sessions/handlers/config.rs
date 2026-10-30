@@ -417,6 +417,12 @@ pub(in crate::sessions) fn handle_set_account(
     let switching = state.config.account_name.as_deref() != Some(name.as_str());
     if switching {
         state.provider = None;
+        // Account identity changes invalidate every model-dependent preference;
+        // retaining any of them would let a client submit an old model under
+        // the new account before it has made a deliberate selection.
+        state.config.selected_model = None;
+        state.config.reasoning_effort = None;
+        state.config.context_window = None;
     }
 
     // Try to resolve the account config + API key from the daemon; the client
@@ -449,16 +455,11 @@ pub(in crate::sessions) fn handle_set_account(
     if let Some(provider) = new_provider {
         state.provider = Some(provider);
     }
-    // Re-resolve the context window after an account switch: a pure catalog
-    // read keyed by the recorded slug, so it works even when no client could
-    // be built (locked keystore) — the client-config override still wins when a
-    // client exists (see `resolve_context_window_for_model`).
-    if switching && let Some(model) = &state.config.selected_model {
+    // A same-account update keeps the selected model and refreshes its context.
+    // A switched account cleared the model above, so it must not resolve old
+    // model metadata before the user selects a model for the new account.
+    if !switching && let Some(model) = &state.config.selected_model {
         let cw = state.resolve_context_window_for_model(model);
-        debug!(
-            "session {}: re-resolved context_window={:?} after account change for model={}",
-            ctx.session_id, cw, model
-        );
         state.config.context_window = cw;
         if let Some(cw) = cw {
             broadcast(

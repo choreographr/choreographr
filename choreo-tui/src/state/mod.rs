@@ -409,6 +409,8 @@ pub(crate) struct App {
     /// confirms the key, and then the model picker opened once the selection
     /// lands. `None` outside that chain (see [`SetupFollow`]).
     pub(crate) setup_follow: Option<SetupFollow>,
+    /// A switched account must complete model selection before chat resumes.
+    pub(crate) mandatory_model_selection: bool,
     /// The active OAuth login modal, when a `/login` flow is running. Holds the
     /// worker session; dropped (which cancels) when the flow ends or the user
     /// cancels.
@@ -513,6 +515,7 @@ impl App {
             active_session_id: None,
             connection_addr: socket_path(),
             setup_follow: None,
+            mandatory_model_selection: false,
             login: None,
             oauth_providers: Vec::new(),
             oauth_providers_fetched: false,
@@ -783,6 +786,9 @@ impl App {
     /// See [`Self::attached_is_busy`] for the idle signal every client-side
     /// guard shares.
     pub(crate) fn new_turn_rejection(&self) -> Option<&'static str> {
+        if self.mandatory_model_selection {
+            return Some("choose a model for the selected account before prompting.");
+        }
         // Idle guard: a new turn can only begin from an idle (`Inactive`)
         // session.  See `SessionStatus::is_idle` for why `Sleeping` counts as
         // busy too.  `None` (no status known yet) fails open.

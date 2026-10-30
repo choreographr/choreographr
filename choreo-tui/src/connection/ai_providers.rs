@@ -21,6 +21,20 @@ pub(super) fn handle_ai_providers_event(
     }
 }
 
+fn select_account(
+    app: &mut App,
+    client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    name: String,
+) {
+    let switching = app.attached_account_slug.as_deref() != Some(name.as_str());
+    if switching {
+        app.mandatory_model_selection = true;
+    }
+    tracing::debug!(%name, switching, "selecting account for the active session");
+    app.pending
+        .send(client_tx, ClientMessageType::SetSessionAccount { name });
+    app.set_page(Page::Chat);
+}
 #[expect(clippy::unnecessary_wraps)]
 fn handle_ai_providers_list_key(
     key: crossterm::event::KeyEvent,
@@ -75,15 +89,7 @@ fn handle_ai_providers_list_key(
             if let Some(sel) = app.ai_providers.selection
                 && let Some(account) = app.ai_providers.accounts.get(sel)
             {
-                let name = account.name.clone();
-                // Send before flipping pages: if the send fails (broken
-                // pipe), the error propagates and the user stays on the
-                // accounts page instead of being stranded on Chat with an
-                // un-sent selection.
-                tracing::debug!(name, "selecting account for the active session");
-                app.pending
-                    .send(client_tx, ClientMessageType::SetSessionAccount { name });
-                app.set_page(Page::Chat);
+                select_account(app, client_tx, account.name.clone());
             }
         }
 
@@ -164,14 +170,7 @@ fn handle_ai_providers_list_mouse(
             // current selection (the Enter handler reads `selection`).
             app.ai_providers.selection = Some(idx);
             if let Some(account) = app.ai_providers.accounts.get(idx) {
-                let name = account.name.clone();
-                // Send before flipping pages (mirrors Enter): a broken pipe
-                // leaves the user on the accounts page, not stranded on Chat
-                // with an un-sent selection.
-                tracing::debug!(name, "selecting account via click");
-                app.pending
-                    .send(client_tx, ClientMessageType::SetSessionAccount { name });
-                app.set_page(Page::Chat);
+                select_account(app, client_tx, account.name.clone());
             }
             Ok(())
         },

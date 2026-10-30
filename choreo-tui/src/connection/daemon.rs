@@ -369,6 +369,9 @@ pub(crate) fn handle_daemon_message(
             let reported = *session_id;
             if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.handle_model_selected(session_id, model, reasoning_capability.clone());
+                if app.attached_session_id == Some(session_id) {
+                    app.mandatory_model_selection = false;
+                }
             }) {
                 // Background session: the per-session display was already
                 // updated above; stop here so the generic dispatch's
@@ -409,6 +412,9 @@ pub(crate) fn handle_daemon_message(
                     "suppressing status feedback for background session's model selection failure",
                 );
                 return Ok(());
+            }
+            if app.mandatory_model_selection && *session_id == app.attached_session_id {
+                super::command::open_model_selector(app, client_tx)?;
             }
             // Attached session (or a targeted/connection-level reply): fall
             // through so the generic dispatch writes the `[daemon] failed
@@ -494,6 +500,12 @@ pub(crate) fn handle_daemon_message(
             let reported = *session_id;
             if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.handle_session_account_set(session_id, account);
+                if app.attached_session_id == Some(session_id) && app.mandatory_model_selection {
+                    let display = app.display_for(session_id);
+                    display.selected_model = None;
+                    display.reasoning_effort = None;
+                    display.context_window = None;
+                }
             }) {
                 // Background session: the per-session display was already
                 // updated above; stop here so the generic dispatch's
@@ -509,6 +521,9 @@ pub(crate) fn handle_daemon_message(
             // First-run follow-through, second stage: the account picked up
             // from a just-saved key is now on the attached session, so open
             // the model picker — the last step before the user can chat.
+            if *session_id == app.attached_session_id && app.mandatory_model_selection {
+                super::command::open_model_selector(app, client_tx)?;
+            }
             if *session_id == app.attached_session_id
                 && app.setup_follow == Some(SetupFollow::AwaitAccountSet(account.clone()))
             {
