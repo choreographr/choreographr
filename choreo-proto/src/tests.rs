@@ -1114,6 +1114,9 @@ fn approx_wire_size_reply_is_at_least_broadcast() {
 
 #[test]
 fn inference_error_metric_labels_are_stable() {
+    // One assertion per `InferenceError` variant, in declaration order. The list
+    // is hand-maintained: a new variant must gain its assertion here, or its
+    // label ships unasserted and a rename can reach dashboards unnoticed.
     assert_eq!(
         InferenceError::Unauthorized {
             status: 401,
@@ -1159,6 +1162,14 @@ fn inference_error_metric_labels_are_stable() {
         InferenceError::ContentFiltered { detail: "x".into() }.metric_label(),
         "content_filtered"
     );
+    assert_eq!(
+        InferenceError::ContextWindowExceeded { detail: "x".into() }.metric_label(),
+        "context_window_exceeded"
+    );
+    assert_eq!(
+        InferenceError::Unsupported { detail: "x".into() }.metric_label(),
+        "unsupported"
+    );
     assert_eq!(InferenceError::Cancelled.metric_label(), "cancelled");
     assert_eq!(
         InferenceError::DeadlineExceeded.metric_label(),
@@ -1173,6 +1184,10 @@ fn inference_error_metric_labels_are_stable() {
         }
         .metric_label(),
         "truncated_tool_call"
+    );
+    assert_eq!(
+        InferenceError::UnidentifiedToolCalls { count: 1 }.metric_label(),
+        "unidentified_tool_calls"
     );
     assert_eq!(
         InferenceError::OAuthReloginRequired { detail: "x".into() }.metric_label(),
@@ -1221,9 +1236,13 @@ fn discarded_tool_call_display_is_bounded() {
 
 #[test]
 fn inference_error_metric_labels_are_distinct() {
-    // Every variant must map to a unique label. Collisions would silently
-    // merge distinct error classes in the Prometheus counters, hiding real
-    // failure modes behind a single `error_type` value.
+    // Every `InferenceError` variant must map to a unique label, so the set
+    // built below has exactly one entry per variant: this asserts the labels are
+    // pairwise distinct AND that the list covers every variant. Collisions would
+    // silently merge distinct error classes in the Prometheus counters, hiding
+    // real failure modes behind a single `error_type` value. The list is
+    // hand-maintained — a new variant must be added here (and the expected count
+    // raised), or a collision it introduces goes unguarded.
     let labels: HashSet<&str> = [
         InferenceError::Unauthorized {
             status: 401,
@@ -1249,9 +1268,12 @@ fn inference_error_metric_labels_are_distinct() {
         InferenceError::EmptyResponse.metric_label(),
         InferenceError::NotReady { detail: "x".into() }.metric_label(),
         InferenceError::ContentFiltered { detail: "x".into() }.metric_label(),
+        InferenceError::ContextWindowExceeded { detail: "x".into() }.metric_label(),
+        InferenceError::Unsupported { detail: "x".into() }.metric_label(),
         InferenceError::Cancelled.metric_label(),
         InferenceError::DeadlineExceeded.metric_label(),
         InferenceError::TruncatedToolCall { discarded: vec![] }.metric_label(),
+        InferenceError::UnidentifiedToolCalls { count: 1 }.metric_label(),
         InferenceError::OAuthReloginRequired { detail: "x".into() }.metric_label(),
         InferenceError::Io(std::io::Error::other("oops")).metric_label(),
     ]
@@ -1259,7 +1281,7 @@ fn inference_error_metric_labels_are_distinct() {
     .collect();
     assert_eq!(
         labels.len(),
-        12,
-        "each InferenceError variant must have a distinct metric label"
+        15,
+        "every InferenceError variant must be listed with a distinct metric label"
     );
 }
