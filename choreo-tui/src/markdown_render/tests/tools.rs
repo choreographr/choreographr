@@ -225,6 +225,20 @@ fn tool_result_default_collapsed_quiet_and_error_rules() {
     assert!(!tool_result_default_collapsed(&mk("read_file", true)));
     assert!(!tool_result_default_collapsed(&mk("sh", true)));
     assert!(!tool_result_default_collapsed(&mk("http_request", true)));
+    // Every MCP tool name (`mcp__<slug>__<tool>`) defaults collapsed,
+    // regardless of which server or tool it came from.
+    assert!(tool_result_default_collapsed(&mk(
+        "mcp__github__search_issues",
+        false
+    )));
+    assert!(tool_result_default_collapsed(&mk("mcp__srv__noop", false)));
+    // ... but an MCP error result is still expanded, like any other error.
+    assert!(!tool_result_default_collapsed(&mk(
+        "mcp__github__search_issues",
+        true
+    )));
+    // A name merely *containing* the prefix is not an MCP tool.
+    assert!(!tool_result_default_collapsed(&mk("not_mcp__x__y", false)));
 }
 
 #[test]

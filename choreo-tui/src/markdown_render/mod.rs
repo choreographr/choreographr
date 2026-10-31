@@ -293,14 +293,30 @@ const QUIET_TOOLS: &[&str] = &[
     "exec",
 ];
 
+/// Prefix of every MCP tool name, built as `mcp__<slug>__<tool>` by the
+/// `choreo-mcp` naming module.
+///
+/// `choreo-tui` does not depend on `choreo-mcp` (the name arrives over the
+/// wire as an opaque string), so the prefix is restated here rather than
+/// imported.  It is the discriminator for "this result came from an MCP
+/// server": MCP results are third-party payloads of unknown size and shape,
+/// so they all share one collapse default regardless of which server or tool
+/// produced them.
+const MCP_TOOL_NAME_PREFIX: &str = "mcp__";
+
 /// Whether a tool result should default to collapsed in the TUI.
 ///
 /// Quiet tools default to collapsed so the header (triangle + invocation
 /// description) is the primary view; clicking the triangle reveals the
-/// verbatim body.  Error results are never quiet — the error message is
-/// the point — and remain expanded by default.
+/// verbatim body.  Every MCP tool does too — an MCP server's output is
+/// arbitrary third-party payload whose size and relevance the TUI cannot
+/// predict, so it is never expanded unasked.  Error results are never quiet —
+/// the error message is the point — and remain expanded by default.
 pub(crate) fn tool_result_default_collapsed(record: &ToolResultRecord) -> bool {
-    !record.is_error && QUIET_TOOLS.contains(&record.name.as_str())
+    if record.is_error {
+        return false;
+    }
+    record.name.starts_with(MCP_TOOL_NAME_PREFIX) || QUIET_TOOLS.contains(&record.name.as_str())
 }
 
 /// Whether a turn's reasoning section should be shown expanded by default.
