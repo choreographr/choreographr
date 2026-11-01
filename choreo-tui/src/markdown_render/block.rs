@@ -151,7 +151,7 @@ pub(crate) fn render_markdown_block(
             start,
             items,
         } => {
-            // List layout (the shared marker column, the tight/spaced decision,
+            // List layout (the shared marker column, the per-pair item spacing,
             // and the delimited-list margins) lives in `list.rs`.
             let (list_lines, list_joins, list_chrome) =
                 render_list(*ordered, *start, items, indent, width, heading_shift);

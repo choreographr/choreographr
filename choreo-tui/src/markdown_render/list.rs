@@ -1,5 +1,5 @@
 //! Ordered and unordered list layout: the shared marker column, per-item
-//! rendering, the tight/spaced decision, and the delimited-list margins.
+//! rendering, the per-pair item spacing, and the delimited-list margins.
 
 use super::{
     Line, LineChrome, LineJoin, ListItem, Span, Style, display_width, ensure_blank_line_joined,
@@ -25,19 +25,24 @@ pub(crate) fn render_list(
     heading_shift: usize,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     // Build the list into its own buffers: every item is rendered before any
-    // output is emitted, so the whole list's spacing can be decided as a unit
-    // (see the tight/spaced decision below).
+    // output is emitted, so each item's row count is known when its pair is
+    // laid out.
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut joins: Vec<LineJoin> = Vec::new();
     let mut chrome: Vec<LineChrome> = Vec::new();
 
-    // Render every item into its own buffer first so the whole list's
-    // spacing can be decided as a unit: if the *majority* of items wrap
-    // to more than one visual line, every item pair gets a blank line
-    // (paragraph-style); otherwise the list renders tight with no gaps
-    // between items.  A uniform rhythm per list reads better than the
-    // old per-item spacing (where one long item created a single
-    // lopsided gap in an otherwise tight list).
+    // The vertical rhythm is decided per item *pair*: a blank row
+    // separates two items when either of them renders to more than one row
+    // (its own text wrapping, or a nested block it carries).  Keying on the
+    // pair makes the spacing a one-way gate under streaming — an item's row
+    // count only grows as its text arrives, and the item before it is final
+    // by the time the next marker appears — so a gap can appear once and
+    // never disappear.  A list-wide rule cannot promise that: a mode chosen
+    // from a ratio of multi-row to total items is re-decided by every newly
+    // streamed item, so a long list visibly flips between spaced and tight as
+    // the ratio crosses the threshold.  Pair keying also keeps the cost
+    // proportional to the multi-row items themselves rather than blanking out
+    // an entire long list because two of its items wrapped.
     //
     // The list shares a single indentation unit: the width of the
     // *widest* item number plus the fixed ". " suffix for an ordered list
@@ -97,18 +102,23 @@ pub(crate) fn render_list(
         rendered_items.push((marker, rendered, rendered_joins, rendered_chrome));
     }
 
-    // Strict majority: more than half of the items must be multi-line
-    // for the list to be spaced out.  A tie (e.g. 2 items, 1 wrapping)
-    // stays tight because 1 * 2 == 2 is not > 2.
-    let multi_line_count = rendered_items
-        .iter()
-        .filter(|(_, rendered, _, _)| rendered.len() > 1)
-        .count();
-    let spaced = multi_line_count * 2 > items.len();
-
+    // Whether the previously emitted item spanned more than one row; decides
+    // the blank between it and the item about to be emitted.
+    let mut previous_multi_line = false;
     for (index, (marker, rendered, rendered_joins, rendered_chrome)) in
         rendered_items.into_iter().enumerate()
     {
+        // `rendered` is consumed below, so read the row count first.  An item
+        // is multi-line whenever it renders to more than one row, which covers
+        // both its own text wrapping and a nested list/fence/table inside it.
+        let is_multi_line = rendered.len() > 1;
+        // A blank row separates this pair when either side is multi-line.
+        // `ensure_blank_line_joined` keeps consecutive blanks collapsed into
+        // one, so a multi-row item that ends with a nested list (whose own
+        // after-margin is already emitted) does not gain a second blank here.
+        if index > 0 && (previous_multi_line || is_multi_line) {
+            ensure_blank_line_joined(&mut lines, &mut joins, &mut chrome);
+        }
         // All continuation lines align under the widest marker so wrapped
         // text lines up across the whole list.
         let continuation_indent = indent + max_marker_width;
@@ -162,13 +172,8 @@ pub(crate) fn render_list(
             chrome.push(row_chrome);
         }
 
-        // Blank line between items only when the list is spaced out as
-        // a whole (majority of items wrap).  Uses ensure_blank_line so
-        // consecutive blanks collapse into one (e.g. when a spaced
-        // item ends with a nested list that already produced a blank).
-        if index + 1 < items.len() && spaced {
-            ensure_blank_line_joined(&mut lines, &mut joins, &mut chrome);
-        }
+        // The next pair's spacing decision starts from this item's row count.
+        previous_multi_line = is_multi_line;
     }
 
     // A list is delimited: emit a collapsing blank line after its

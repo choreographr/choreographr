@@ -323,29 +323,124 @@ fn list_items_compact_when_single_line() {
 }
 
 #[test]
-fn list_stays_tight_when_minority_wraps() {
-    // A single wrapping item in a two-item list is not a majority, so the
-    // list stays tight: no blank line between the items.
+fn multi_line_item_gaps_against_its_neighbour() {
+    // One wrapping item next to a short one: the pair is separated, so the
+    // wrapped item's second row never reads as a continuation of the next
+    // bullet.  No list-wide mode is involved — the gap follows the one
+    // multi-row item.
     let long = "a".repeat(60);
     let md = format!("- {long}\n- short");
     let result = markdown_lines(&md, 40);
-    // The long item wraps to multiple visual lines, but it is only 1 of 2
-    // items (1 * 2 is not > 2), so no blank line before "• short".
     let short_idx = result.iter().position(|l| l.to_string().contains("short"));
     assert!(short_idx.is_some(), "second item should appear");
     let idx = short_idx.unwrap();
     assert!(
-        idx >= 1 && result[idx - 1].width() > 0,
-        "expected no blank line before '• short' (minority wraps), got lines[{}]='{}'",
+        idx >= 1 && result[idx - 1].width() == 0,
+        "expected a blank line before '• short' (its neighbour wraps), got lines[{}]='{}'",
         idx - 1,
         result[idx - 1]
     );
 }
 
 #[test]
-fn list_spaces_all_items_when_majority_wraps() {
-    // Two of three items wrap at this width — a majority — so every item
-    // pair is separated by a blank line, including before the short one.
+fn single_line_items_stay_tight_regardless_of_list_length() {
+    // A list of only single-row items has no multi-row pair, so nothing is
+    // separated however long the list gets.
+    let md = (1..=12)
+        .map(|n| format!("- item {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let result = markdown_lines(&md, 40);
+    let blank_rows = result.iter().filter(|l| l.width() == 0).count();
+    assert_eq!(blank_rows, 0, "no blanks inside an all-single-row list");
+}
+
+#[test]
+fn gap_rhythm_follows_each_multi_line_item() {
+    // Two wrapped items in a four-item list: a gap sits on *every* pair that
+    // touches a wrapped item — before and after each of them — and the run of
+    // short items at the end stays tight.  This is the pair rule stated
+    // directly: gap iff either side renders more than one row.
+    let long = "c".repeat(60);
+    let md = format!("- {long}\n- {long}\n- short1\n- short2");
+    let result = markdown_lines(&md, 40);
+    let text: Vec<String> = result.iter().map(ToString::to_string).collect();
+    let blank_before = |needle: &str| -> bool {
+        let idx = text
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} should appear"));
+        idx >= 1 && text[idx - 1].trim().is_empty()
+    };
+    assert!(!blank_before("• ccc"), "first item has no predecessor");
+    assert!(blank_before("short1"), "gap after the second wrapped item");
+    assert!(
+        !blank_before("short2"),
+        "two short items stay tight\n{}",
+        text.join("\n")
+    );
+    // No consecutive blank rows anywhere.
+    let has_double_blank = result
+        .array_windows::<2>()
+        .any(|w| w[0].width() == 0 && w[1].width() == 0);
+    assert!(!has_double_blank, "no two consecutive blank lines");
+}
+
+#[test]
+fn long_list_with_two_wrapped_items_gaps_only_around_them() {
+    // The cost of the pair rule: a long list that happens to contain two
+    // wrapped items gains a handful of blank rows (two pairs per wrapped
+    // item, minus the shared one between adjacent wrapped items), not a blank
+    // between every one of its items.
+    let long = "d".repeat(60);
+    let mut items = Vec::new();
+    for n in 1..=20 {
+        if n == 5 || n == 6 {
+            items.push(format!("- {long}"));
+        } else {
+            items.push(format!("- item {n}"));
+        }
+    }
+    let result = markdown_lines(&items.join("\n"), 40);
+    let blank_rows = result.iter().filter(|l| l.width() == 0).count();
+    assert_eq!(
+        blank_rows, 3,
+        "a 20-item list with two adjacent wrapped items needs 3 blanks, not 19"
+    );
+}
+
+#[test]
+fn wrapped_items_keep_their_gaps_as_more_items_arrive() {
+    // The one-way gate, stated as the streaming bug it fixes: a list whose
+    // wrapped items stop being a *majority* as short items arrive must not
+    // have its blank rows taken away again.  Under a ratio rule the first
+    // three items (2 wrapped of 3) are spaced and the fourth drops it back to
+    // tight; under the pair rule no prefix ever loses a blank row it had.
+    let long = "a".repeat(60);
+    let md = format!("- {long}\n- {long}\n- short\n- short\n- short\n");
+    // Drive the real streaming path: one incremental renderer fed every
+    // growing prefix, exactly as the turn stream does.
+    let mut incremental = IncrementalMarkdown::new();
+    let mut previous: Option<usize> = None;
+    for end in (1..=md.len()).filter(|&e| md.is_char_boundary(e)) {
+        let prefix = md.get(..end).expect("prefix end is a char boundary");
+        let (lines, _, _) = incremental.render(prefix, 40);
+        let blank_rows = lines.iter().filter(|l| l.width() == 0).count();
+        if let Some(previous) = previous {
+            assert!(
+                blank_rows >= previous,
+                "blank rows shrank from {previous} to {blank_rows} at prefix {prefix:?}"
+            );
+        }
+        previous = Some(blank_rows);
+    }
+}
+
+#[test]
+fn wrapped_items_separate_from_both_neighbours() {
+    // A wrapped item is separated from the short item on either side of it,
+    // so every pair in this list touches a wrapped item and all of them are
+    // separated — including the pair before the short middle item.
     let long = "a".repeat(60);
     let md = format!("- {long}\n- short\n- {long}");
     let result = markdown_lines(&md, 40);
@@ -360,7 +455,7 @@ fn list_spaces_all_items_when_majority_wraps() {
     let idx = short_idx.unwrap();
     assert!(
         idx >= 1 && result[idx - 1].width() == 0,
-        "expected blank line before '• short' (majority wraps), got lines[{}]='{}'",
+        "expected blank line before '• short' (both neighbours wrap), got lines[{}]='{}'",
         idx - 1,
         result[idx - 1]
     );
@@ -375,7 +470,7 @@ fn list_spaces_all_items_when_majority_wraps() {
 }
 
 #[test]
-fn ordered_list_spaces_all_items_when_majority_wraps() {
+fn ordered_list_gaps_wrapped_items() {
     let long = "b".repeat(60);
     let md = format!("1. {long}\n2. short\n3. {long}");
     let result = markdown_lines(&md, 40);
@@ -384,33 +479,15 @@ fn ordered_list_spaces_all_items_when_majority_wraps() {
     let idx = idx.unwrap();
     assert!(
         idx >= 1 && result[idx - 1].width() == 0,
-        "expected blank line before '2. short' (majority wraps), got lines[{}]='{}'",
+        "expected blank line before '2. short' (both neighbours wrap), got lines[{}]='{}'",
         idx - 1,
         result[idx - 1]
     );
 }
 
 #[test]
-fn even_split_stays_tight() {
-    // Four items, exactly two wrap: half is not a majority (> half), so
-    // the list stays tight.
-    let long = "c".repeat(60);
-    let md = format!("- {long}\n- {long}\n- short1\n- short2");
-    let result = markdown_lines(&md, 40);
-    let blank_lines: Vec<bool> = result
-        .array_windows::<2>()
-        .map(|w| w[0].width() == 0 && w[1].width() > 0)
-        .collect();
-    assert_eq!(
-        blank_lines.iter().filter(|&&b| b).count(),
-        0,
-        "an even 2:2 wrap split is not a majority, so no blank lines between items"
-    );
-}
-
-#[test]
 fn list_has_blank_line_before_and_after() {
-    // Regardless of tight/spaced, the list is separated from surrounding
+    // Whatever the pair spacing, the list is separated from surrounding
     // paragraphs by a blank line on each side.
     let md = "before\n- one\n- two\n- three\n\nafter";
     let result = markdown_lines(md, 80);
@@ -428,8 +505,9 @@ fn list_has_blank_line_before_and_after() {
 #[test]
 fn nested_list_makes_own_spacing_decision() {
     // The outer list has 3 items, two of which contain a nested list
-    // (multi-line) — a majority — so outer items are spaced apart.
-    // The inner lists are all single-line items, so they stay compact.
+    // (multi-line): every outer pair touches one of them, so outer items
+    // are separated.  The inner lists are all single-line items, so they
+    // stay compact.
     let md = "- outer a\n  - inner\n  - inner2\n- outer b\n  - inner\n  - inner2\n- outer c";
     let result = markdown_lines(md, 80);
     let whole: String = result
@@ -447,7 +525,7 @@ fn nested_list_makes_own_spacing_decision() {
         i >= 1 && result[i - 1].width() > 0,
         "inner items should be compact (no blank before inner2)"
     );
-    // Outer items spaced: blank line before "• outer b".  The blank is
+    // Outer items separated: blank line before "• outer b".  The blank is
     // the nested list's after-margin rendered as an indented
     // whitespace-only line, so it is visually blank but has nonzero
     // width.
@@ -475,11 +553,12 @@ fn nested_list_makes_own_spacing_decision() {
 
 #[test]
 fn nested_list_gets_blank_line_before_next_item() {
-    // A tight ordered list where one item contains a nested bullet list:
-    // the next sibling's marker must not run directly against the nested
-    // list's last line (the originally reported bug).  Every list is
-    // delimited by a collapsing margin after it, so the boundary after
-    // the nested list is separated while single-line items stay tight.
+    // An ordered list where one item contains a nested bullet list: the next
+    // sibling's marker must not run directly against the nested list's last
+    // line (the originally reported bug).  Every list is delimited by a
+    // collapsing margin after it, and the item that carries the nested list is
+    // itself multi-row, so that item is separated from its neighbours on both
+    // sides while the single-row items around it stay tight.
     // Raw string so the bullet indentation survives into the parser.
     let md = r"1. What the model is (context for sizing)
 2. The fundamental requirement: ~150-600 GB of memory depending on quantization
@@ -507,16 +586,27 @@ fn nested_list_gets_blank_line_before_next_item() {
         idx4 - 1,
         text[idx4 - 1]
     );
-    // Items 2 and 3 stay tight — the margin delimits the list, it does
-    // not space out the items themselves.
+    // Items 1 and 2 are both single-row, so they stay tight against each
+    // other — the nested list does not spread spacing through the whole list.
+    let idx2 = text
+        .iter()
+        .position(|l| l.contains("2. The fundamental"))
+        .unwrap();
+    assert_eq!(
+        text[idx2 - 1],
+        "1. What the model is (context for sizing)",
+        "single-row items stay tight\n{whole}"
+    );
+    // Item 3 carries the nested list, so it is multi-row and gets a blank
+    // before it; the single blank before item 4 is the nested list's own
+    // after-margin, collapsed with the pair gap rather than stacked on it.
     let idx3 = text
         .iter()
         .position(|l| l.contains("3. Options table:"))
         .unwrap();
-    assert_eq!(
-        text[idx3 - 1],
-        "2. The fundamental requirement: ~150-600 GB of memory depending on quantization",
-        "items 2 and 3 should stay tight\n{whole}"
+    assert!(
+        idx3 >= 1 && text[idx3 - 1].trim().is_empty(),
+        "expected a blank line before '3. Options table:' (item is multi-row)\n{whole}"
     );
     // No trailing blank line: the list margin at the end of the document
     // is stripped by markdown_lines.
@@ -547,9 +637,9 @@ fn ordered_list_items_compact_when_single_line() {
 }
 
 #[test]
-fn spaced_list_nested_list_single_blank_between_items() {
-    // A spaced outer list (majority of items wrap) where an item contains
-    // a nested list: the nested list's after-margin is an indented
+fn wrapped_item_with_nested_list_single_blank_before_next() {
+    // An outer list whose items wrap, where one item contains a nested
+    // list: the nested list's after-margin is an indented
     // whitespace-only line, and the between-item margin must collapse
     // into it — exactly one blank row, not two.  This is the reported
     // regression: the old ensure_blank_line only collapsed zero-width
