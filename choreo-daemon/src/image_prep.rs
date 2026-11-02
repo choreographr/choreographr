@@ -421,12 +421,10 @@ fn finalize(
         img
     };
 
-    // `ColorType::has_alpha` (image 0.25.6) rather than `DynamicImage::has_alpha`
-    // (added in 0.25.8): blitz-dom pins image to =0.25.6 workspace-wide.
-    //
     // `Encode::Png` (masks) forces PNG regardless of alpha: the transparent
     // region is the edit target and JPEG would drop it. `Encode::Auto` picks
-    // PNG only when the image actually carries alpha.
+    // PNG only when the image actually carries alpha, read through the
+    // `ColorType` predicate because that is what `DynamicImage::color` exposes.
     let (data, mime_type) = if encode == Encode::Png || resized.color().has_alpha() {
         (encode_png(&resized)?, "image/png")
     } else {

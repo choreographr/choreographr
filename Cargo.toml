@@ -463,16 +463,15 @@ redb = "4"
 # `avif` feature on each consumer, so the default/release build stays C-free
 # (see the release.sh static-musl rationale).
 #
-# NOTE — the caret here resolves to the latest stable image 0.25.x. The
-# Dioxus Native renderer stack (dioxus-native 0.8.0-alpha.3 -> blitz-dom
-# 0.3.0-beta.4, pulled in only by choreo-gui) now requires `image = "^0.25.6"`
-# (a caret, not the old `=0.25.6` exact pin that blitz-dom 0.2.4 imposed), so
-# cargo is free to lift the shared lock's image to the newest 0.25.x. choreo-gui
-# is not in the release build and is `publish = false`, so its move onto the
-# dioxus 0.8 alpha / blitz 0.3 beta line cannot affect a shipped artifact. If a
-# future blitz-dom reintroduces an exact image pin, the workspace lock would
-# snap back to it — keep the `image` surface conservative (e.g. prefer
-# `ColorType::has_alpha()` via `.color()` over `DynamicImage::has_alpha`).
+# NOTE — the caret here resolves to the latest stable image 0.25.x. The caret is
+# what makes that possible: the Dioxus Native renderer stack (dioxus-native
+# 0.8.0-alpha.3 -> blitz-dom 0.3.0-beta.4, pulled in only by choreo-gui) requires
+# `image = "^0.25.6"` rather than an exact pin, so cargo unifies the whole
+# workspace on one 0.25.x and the shared lock follows the newest one. choreo-gui
+# is not in the release build and is `publish = false`, so its renderer stack
+# cannot reach a shipped artifact. Keep the `image` surface conservative (e.g.
+# prefer `ColorType::has_alpha()` via `.color()` over `DynamicImage::has_alpha`)
+# so an exact pin from any backend can be absorbed without a source change.
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp", "rayon"] }
 # Pure-Rust HEIC/HEIF still-image decoder (ISOBMFF container + HEVC via
 # rust_h265). Built in unconditionally: no C dependencies, so it does NOT
@@ -483,10 +482,11 @@ heif-oxide = "0.1"
 # Pure-Rust ICC colour-management engine (colour conversion to sRGB). Used by
 # choreo-image to colour-manage a source's embedded ICC profile on the shared
 # decode path, so Display-P3/AdobeRGB photos reach the model and the terminal as
-# sRGB instead of being reinterpreted as sRGB. Already pulled in transitively by
-# `image` 0.25 (declaring it directly adds no new crate) and C-free — the reason
-# it is used instead of `lcms2` (a C library) is the release build's static-musl,
-# no-C-toolchain stance.
+# sRGB instead of being reinterpreted as sRGB. C-free — the reason it is used
+# instead of `lcms2` (a C library) is the release build's static-musl,
+# no-C-toolchain stance. `image` 0.25.7+ happens to depend on it too, so today it
+# adds no crate to the tree; declaring the direct dependency is what makes the
+# colour path independent of an `image`-internal detail that could disappear.
 moxcms = "0.8"
 rand = "0.10"
 resvg = "0.49"

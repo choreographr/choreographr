@@ -41,12 +41,12 @@ zeroize.workspace = true
 # desktop and aarch64-linux-android alike — there is no webview (webkit2gtk,
 # etc.) anywhere in the dependency tree. The platform-agnostic `launch`
 # facade maps to dioxus_native under the `native` cfg, so no per-platform
-# entry code is needed. Pinned to the 0.8.0-alpha.3 pre-release: dioxus-native
-# 0.8 pins blitz-dom 0.3.0-beta.4, which drops the `image =0.25.6` exact pin
-# that the 0.7 -> blitz-dom 0.2.4 line imposed on the whole workspace (see the
-# `image` note in the root Cargo.toml). The GUI is not in the release build and
-# is `publish = false`, so tracking an alpha here does not affect shipped
-# artifacts; revisit when dioxus 0.8 reaches stable.
+# entry code is needed. The GUI tracks the dioxus 0.8 line, which is a
+# pre-release today; dioxus-native 0.8 pins blitz-dom 0.3.0-beta.4, whose
+# `image` requirement is a caret so the workspace lock still resolves the newest
+# stable 0.25.x (see the `image` note in the root Cargo.toml). The GUI is not in
+# the release build and is `publish = false`, so a pre-release here cannot reach
+# a shipped artifact; bump to the 0.8.0 release when it ships.
 dioxus = { version = "0.8.0-alpha.3", features = ["native"] }
 futures-channel.workspace = true
 futures-util.workspace = true
