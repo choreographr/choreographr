@@ -38,7 +38,9 @@ const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 /// `image` crate decodes, plus SVG (`resvg`), plus HEIC/HEIF (`heif-oxide`), and
 /// AVIF (gated behind the `avif` feature — see `normalize_image_mime_type`).
 /// The gate is intentionally broad: the client's decoder sniffs the bytes, and
-/// `inspect_image_dimensions` validates it can actually decode the payload.
+/// `inspect_image_dimensions` checks the payload is a well-formed image of the
+/// claimed family (its header parses, and it is within the decode budget) before
+/// the tool claims to have displayed it.
 fn is_supported_image_mime(mime: &str) -> bool {
     matches!(
         mime,
@@ -259,16 +261,24 @@ fn fetch_image_bytes(url_str: &str, expected_mime_type: &str) -> io::Result<Vec<
     Ok(bytes)
 }
 
+/// Probe the pixel dimensions of an image without decoding it.
+///
+/// Every arm routes through a shared guard so a hostile payload cannot drive a
+/// huge allocation *during the probe*, not just during the client's display
+/// decode: the raster path reads only the header (and applies the same
+/// total-pixel budget the full decode would), SVG stops at the parsed viewport,
+/// and HEIC runs the container's pre-decode geometry guard. The probe therefore
+/// costs a header parse rather than a full decode — it answers "how big is this"
+/// and leaves "do the pixels decode" to the consumer that actually renders them
+/// (which uses the same shared decoder).
 fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u32)> {
     match mime_type {
         // All raster formats the `image` crate decodes (PNG, JPEG, WebP, GIF,
         // BMP, TIFF, TGA, DDS, ICO, PNM, HDR, OpenEXR, Farbfeld, QOI) — plus
-        // AVIF when the gated `avif` feature is on. `decode_raster_oriented`
-        // sniffs the bytes (so the MIME is largely advisory) *and* applies the
-        // decompression-bomb guard (a total-pixel budget on the declared size,
-        // plus `image::Limits`), so a hostile raster can't drive a huge
-        // allocation during the dimension probe either — not just the display
-        // decode.
+        // AVIF when the gated `avif` feature is on. `probe_dimensions` sniffs
+        // the bytes (so the MIME is largely advisory) and applies the same
+        // decompression-bomb guard the full decode does, without reading a
+        // single pixel.
         "image/png"
         | "image/jpeg"
         | "image/webp"
@@ -297,12 +307,7 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
         | "image/vnd.ms-dds"
         | "image/farbfeld"
         | "image/x-farbfeld"
-        | "image/avif" => {
-            // Route through the shared guarded decoder (with EXIF orientation
-            // baked in), so a hostile raster is bounded before it allocates.
-            let img = choreo_image::decode_raster_oriented(data).map_err(io::Error::other)?;
-            Ok(img.dimensions())
-        }
+        | "image/avif" => choreo_image::probe_dimensions(data).map_err(io::Error::other),
         "image/svg+xml" => {
             let options = usvg::Options::default();
             let tree = usvg::Tree::from_data(data, &options).map_err(io::Error::other)?;

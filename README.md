@@ -533,11 +533,18 @@ so phone/camera photos are not rotated. Colour is managed: an embedded ICC
 profile is converted to sRGB with the pure-Rust `moxcms` engine on the shared
 decode path, so a Display-P3 or AdobeRGB photo reaches the model and the terminal
 with the right colours instead of being reinterpreted as sRGB (which reads
-noticeably desaturated) — a profile that will not parse is assumed sRGB and the
-decode still succeeds. The raster-decode and HEIC-decode
+noticeably desaturated). Only an RGB profile on an RGB buffer is applied, at the
+buffer's own depth (a 16-bit source stays 16-bit); an sRGB-tagged image is
+recognised and skipped rather than converted to itself, and a profile that will
+not parse is assumed sRGB so the decode still succeeds. A HEIC that carries an
+`nclx` colour description is already converted by `heif-oxide`; one whose only
+colour tag is an embedded ICC profile is left as decoded (the decoder reports the
+profile but does not return its bytes). The raster-decode and HEIC-decode
 paths live in the shared `choreo-image` leaf crate, so the model and UI paths
 use the same guarded decoder — a hostile HEIC's declared geometry is rejected
-before it allocates.
+before it allocates — and a caller that needs only an image's size (the
+`display_image` probe) reads the header through the same guard instead of
+decoding the pixels.
 `read_image` reads a file from disk,
 normalizes it (resize to ≤2000px, re-encode to PNG/JPEG under a decompression-bomb
 guard), and feeds it to a vision-capable model as image input on the next request.

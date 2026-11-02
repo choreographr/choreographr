@@ -51,7 +51,8 @@ Choreographr (workspace)
 │                       the child-process code-injection env set
 ├── choreo-image          Leaf crate — shared image decode (EXIF-orientation
 │                       baking, ICC→sRGB colour management via `moxcms`,
-│                       HEIC/HEIF with a pre-decode allocation guard)
+│                       header-only dimension probe, HEIC/HEIF with a
+│                       pre-decode allocation guard)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
 ├── choreo-client-core     Shared client logic (parsing, images, history, credentials, first-run setup)
@@ -150,7 +151,14 @@ stdio child strip the same variables.
 `choreo-daemon` and `choreo-tui` — it owns the single decode path for raster
 formats (with EXIF orientation baked in, and any embedded ICC profile converted
 to sRGB with the pure-Rust `moxcms` engine) and for HEIC/HEIF (with a pre-decode
-allocation guard), so the model path and the UI path cannot drift apart.
+allocation guard), so the model path and the UI path cannot drift apart. Colour
+management applies to an RGB profile on an RGB buffer at the buffer's own depth,
+and is skipped for a source that is already sRGB (detected from its primaries and
+transfer curves) — an sRGB tag is the common case, and converting it to itself
+would cost a full extra pass and buffer for no change. A caller that needs only
+the pixel dimensions (the daemon's `display_image` probe) uses the same crate's
+header-only probe, which enforces the identical decompression-bomb bound without
+decoding or colour-managing a single pixel.
 
 ---
 
