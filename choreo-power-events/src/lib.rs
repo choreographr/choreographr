@@ -92,6 +92,21 @@ pub enum PowerMonitorError {
         /// Underlying subscription failure.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// The provider was reachable but did not answer the connect/subscribe
+    /// handshake within the startup budget.
+    ///
+    /// Reported instead of blocking startup indefinitely on a wedged provider:
+    /// the monitor thread keeps running and exits by itself once it finds no
+    /// consumer, so giving up here leaves nothing behind.
+    #[error("the platform power-notification provider did not answer within {limit:?}")]
+    SetupTimeout {
+        /// The budget that elapsed before giving up.
+        limit: std::time::Duration,
+    },
+    /// The monitor thread stopped during setup — it returned early or panicked
+    /// before reporting whether it subscribed — so no events can ever arrive.
+    #[error("the power-monitor thread stopped before finishing setup")]
+    MonitorThreadStopped,
     /// Could not spawn the dedicated monitor thread.
     #[error("failed to spawn the power-monitor thread: {source}")]
     Spawn {
@@ -149,8 +164,10 @@ impl PowerMonitor {
     /// # Platform behaviour
     /// - **Linux**: connects to the session/system D-Bus and subscribes to
     ///   logind's `PrepareForSleep` signal. Errors (no bus, no logind,
-    ///   subscription rejected) are returned as
-    ///   [`PowerMonitorError::Connection`] / [`PowerMonitorError::Subscription`].
+    ///   subscription rejected, no answer within the startup budget) are
+    ///   returned as [`PowerMonitorError::Connection`] /
+    ///   [`PowerMonitorError::Subscription`] /
+    ///   [`PowerMonitorError::SetupTimeout`].
     /// - **macOS**: registers an `IOKit` system-power interest callback on a
     ///   CFRunLoop-driven monitor thread. **The monitor calls
     ///   `IOAllowPowerChange` for every sleep notification** — declining
@@ -168,8 +185,11 @@ impl PowerMonitor {
     ///
     /// Returns [`PowerMonitorError::Connection`] / [`PowerMonitorError::Subscription`]
     /// when the platform provider cannot be reached or subscribed to (Linux),
-    /// and [`PowerMonitorError::Spawn`] when the monitor thread cannot be
-    /// created. Never fails on platforms without a native mechanism.
+    /// [`PowerMonitorError::SetupTimeout`] when it does not answer within the
+    /// startup budget, [`PowerMonitorError::MonitorThreadStopped`] when the
+    /// monitor thread dies before finishing setup, and
+    /// [`PowerMonitorError::Spawn`] when the monitor thread cannot be created.
+    /// Never fails on platforms without a native mechanism.
     pub fn new() -> Result<Self, PowerMonitorError> {
         platform::spawn_monitor()
     }

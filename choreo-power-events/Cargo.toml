@@ -20,14 +20,13 @@ thiserror.workspace = true
 # consumer (recv'd inside its `select!`), so crossbeam per AGENTS.md.
 crossbeam-channel.workspace = true
 
-# Linux: systemd-logind's PrepareForSleep signal over D-Bus. zbus 6 exposes
-# only an async API (its old `zbus::blocking` façade and the `async-io` /
-# `blocking-api` features are gone), so the Linux backend drives it
-# synchronously with `zbus::block_on`. The default `zruntime` backend needs no
-# external executor, so the crate still contains zero tokio code — but
-# `default-features = false` plus an explicit `proxy`/`default-rt`/`tracing`
-# selection keeps the service/object-server halves out of the build.
-# `futures-util` provides `StreamExt::next` for the async signal stream.
+# Linux: systemd-logind's PrepareForSleep signal over D-Bus. zbus 6 exposes only
+# an async API, so the Linux backend drives it synchronously with
+# `zbus::block_on`. The default `zruntime` backend needs no external executor, so
+# this crate contains zero tokio code — and `default-features = false` plus an
+# explicit `proxy`/`default-rt`/`tracing` selection keeps the service/object-server
+# halves out of the build. `futures-util` provides `StreamExt::next` for the async
+# signal stream.
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus = { version = "6", default-features = false, features = ["proxy", "default-rt", "tracing"] }
 futures-util.workspace = true
