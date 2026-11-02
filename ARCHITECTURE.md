@@ -208,7 +208,14 @@ which release builds never produce. `choreo-gui` is built separately (desktop vi
 Android via `dx build --platform android`, iOS via `scripts/build-ios.sh` +
 the `ios/` Xcode scaffold) and is not shipped either.
 
-The shipped target set is exactly four; `release.sh` and `install.sh`
+The CI release additionally publishes a **Windows `x86_64-pc-windows-msvc` `.zip`**
+(the same two `.exe` binaries) as a GitHub-release asset — it is built only by
+the release workflow's `windows-msvc` job, which `release.sh`/`install.sh` do not
+produce (they handle the POSIX tarballs). The four targets below are what
+`release.sh` and `install.sh` build and install; the Windows zip rides alongside
+them on the releases page for users to extract onto their `PATH`.
+
+The `release.sh`/`install.sh` shipped target set is exactly four; `release.sh` and `install.sh`
 hardcode this set and refuse any other platform ("ships Linux x86_64 + arm64,
 macOS arm64, and macOS x86_64"), and `release.sh` builds each Linux host's
 own arch — the x86_64 tarball on a Linux-x86_64 host, the aarch64 tarball on a

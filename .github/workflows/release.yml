@@ -65,17 +65,12 @@
 # lands (observed: 0.16.0 passed, 0.17.0 failed all jobs). Pin the last release
 # zlob accepts; bump it once zlob ships Zig 0.17 support.
 #
-# The windows-msvc build is TEMPORARILY excluded from the published release:
-# the job still runs (build + smoke tests + artifact upload) so the Windows
-# binary stays exercised on every tag, but the release job neither lists it in
-# `needs` NOR downloads it — its `download-artifact` step enumerates the four
-# shipping platforms (Linux x86_64 + arm64, macOS, Android), with a guard that
-# fails on a stray Windows artifact.
-# `needs` alone is not enough (it only gates when the job starts): a bare
-# `pattern: "*"` download pulls in EVERY artifact in the run, so the zip once
-# raced into a release and leaked into SHA256SUMS. When the Windows runtime is
-# ready to ship: add windows-msvc to `needs` AND to the download `pattern`,
-# and drop the guard.
+# The windows-msvc build ships in the published release: the release job
+# downloads its zip, folds it into the combined SHA256SUMS, and attaches it
+# alongside the tarballs / .deb / .rpm / Termux .deb. The release job still
+# enumerates the shipping artifact names explicitly rather than using
+# `pattern: "*"` — a bare wildcard pulls in EVERY artifact in the run, so an
+# explicit list is what keeps an unrelated future artifact out of a release.
 #
 # Every desktop job additionally runs scripts/daemon-smoke.sh on its artifact
 # (after smoke-test.sh): smoke-test.sh only exercises the clap --version/--help
@@ -809,7 +804,7 @@ jobs:
 
   release:
     name: verify + (on tag) create GitHub release
-    needs: [linux-x86_64, linux-arm64, macos-arm64, android-termux]
+    needs: [linux-x86_64, linux-arm64, macos-arm64, windows-msvc, android-termux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Runs on BOTH tag pushes and workflow_dispatch so the dry run exercises this
@@ -832,27 +827,16 @@ jobs:
           fetch-depth: 0
 
       # Enumerate the SHIPPING platforms explicitly — do NOT use `pattern: "*"`,
-      # which downloads EVERY artifact in the run and races the not-yet-shippable
-      # windows-msvc zip into the release (it once did, and leaked into
-      # SHA256SUMS). `needs` gates when this job starts; it does not scope the
-      # download. Both Linux arches (x86_64 + aarch64) ship, each from its own
-      # runner, so both artifact names are listed.
+      # which downloads EVERY artifact in the run (it once raced a stray artifact
+      # into a release and leaked it into SHA256SUMS). `needs` gates when this job
+      # starts; it does not scope the download. Each platform ships from its own
+      # runner: both Linux arches, macOS (both darwin tarballs), Windows (the
+      # .exe zip), and Android/Termux (tarball + .deb).
       - uses: actions/download-artifact@v8
         with:
-          pattern: "{linux-x86_64-musl,linux-aarch64-musl,macos-aarch64,android-aarch64-termux}"
+          pattern: "{linux-x86_64-musl,linux-aarch64-musl,macos-aarch64,windows-x86_64-msvc,android-aarch64-termux}"
           merge-multiple: true
           path: dist
-
-      - name: Guard against unintended artifacts
-        # Belt-and-suspenders: if a future artifact rename silently re-includes a
-        # platform that is not shipping yet (Windows today), fail the release
-        # rather than publish it.
-        run: |
-          if ls dist/*windows* >/dev/null 2>&1; then
-            echo "error: unexpected Windows artifact in dist/ — the Windows build is not shipping yet" >&2
-            ls dist >&2
-            exit 1
-          fi
 
       - name: Combined SHA256SUMS
         run: |

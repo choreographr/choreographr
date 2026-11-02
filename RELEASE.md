@@ -64,7 +64,7 @@ built nowhere.
 | `linux-x86_64` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
 | `linux-arm64` | ubuntu-24.04-arm | static `aarch64-unknown-linux-musl` tarball + arm64 `.deb` + `.rpm` (via `scripts/release.sh` on a NATIVE arm64 runner, so its smoke tests execute the arm64 binaries on real arm64 hardware) |
 | `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball **plus** the cross-built `x86_64-apple-darwin` tarball (both via one `scripts/release.sh` pass; the Intel slice is smoke-tested under Rosetta and verified by construction downstream — no free x64 macOS runner exists) |
-| `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files — **built and smoke-tested on every tag, but currently NOT part of the published release** (the `release` job's `needs` omits this job until the Windows runtime is ready to ship) |
+| `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files — built, smoke-tested, and published with the release (the `release` job downloads it and folds it into the combined `SHA256SUMS`) |
 | `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) + the Termux-native `.deb` (via `scripts/build-deb-termux.sh`, structural smoke-test on the runner; the packaged binaries are then extracted with Termux's own dpkg-deb under qemu-user and executed against an unpacked Termux aarch64 rootfs — see the workflow's qemu step) |
 | `ios-build` | macos-latest | **none** — `choreo-gui` (the only crate that ships to iOS) compile check for both iOS targets, the real Xcode app link via the `ios/` scaffold, and a non-blocking simulator boot smoke (`continue-on-error` until the plumbing has proven stable). Deliberately not part of the release; a failing link is diagnosed from the log |
 
@@ -81,9 +81,9 @@ no docker), closing the "never executed before release" gap.
 
 The `release` job runs on every tag push **and** on `workflow_dispatch` (only
 the final `gh release create` step is push-gated, so a dispatch runs every other
-check). It downloads the four shipping platforms' build artifacts
-(`linux-x86_64`, `linux-arm64`, `macos-arm64`, `android-termux` — deliberately
-not the not-yet-shipped `windows-msvc`), generates one combined `SHA256SUMS`
+check). It downloads the five shipping platforms' build artifacts
+(`linux-x86_64`, `linux-arm64`, `macos-arm64`, `windows-msvc`, `android-termux`),
+generates one combined `SHA256SUMS`
 over everything, installs `cargo-deny` + `git-cliff`, runs the supply-chain
 guard, then on a tag guards that the pushed tag matches the manifest version,
 generates the release body from the commit messages with git-cliff
