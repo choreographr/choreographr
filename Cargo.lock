@@ -3002,6 +3002,7 @@ version = "0.2.3"
 dependencies = [
  "heif-oxide",
  "image",
+ "moxcms",
  "tracing",
 ]
 

@@ -14,6 +14,15 @@
 //! Keeping these in one leaf crate means an orientation bug fix or a security
 //! guard change lands in the model path and the UI path together, so they can
 //! never drift apart.
+//!
+//! The raster path also performs **colour management**: an embedded ICC profile
+//! is converted to sRGB with the pure-Rust `moxcms` CMM before the pixels leave
+//! this crate, so a `Display-P3` or `AdobeRGB` source reaches the model and the
+//! terminal as sRGB values instead of having its numbers reinterpreted as sRGB
+//! (which reads visibly desaturated). The HEIC path is already sRGB from
+//! `heif-oxide`'s `nclx` handling, so it needs no second conversion. A profile
+//! that will not parse or convert is assumed sRGB and decoding carries on — a
+//! metadata tag never fails an image.
 
 // Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
 // every public item carries docs, enforced as a hard error by clippy-strict's
@@ -23,9 +32,10 @@
 mod heif;
 
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
+use image::{DynamicImage, ImageDecoder, ImageReader, RgbImage, RgbaImage};
+use moxcms::{ColorProfile, Layout, TransformOptions};
 use std::io::Cursor;
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Primary decompression-bomb guard: the total decoded-pixel budget (px).
 ///
@@ -102,15 +112,93 @@ pub fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
             "image is {width}x{height} ({pixels} pixels), over the {MAX_DECODE_PIXELS} pixel decode budget"
         ));
     }
-    // Read the EXIF orientation from the header (JPEG/WebP/PNG-eXIf) before
-    // decoding pixels, then rotate/flip in place. One decode pass total.
+    // Read the EXIF orientation and the embedded ICC profile from the header
+    // (JPEG/WebP/PNG-eXIf, JPEG/PNG/WebP/TIFF ICC) before decoding pixels, then
+    // rotate/flip and colour-manage in place. One decode pass total.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let icc = decoder.icc_profile().unwrap_or_else(|error| {
+        debug!(%error, "the embedded colour profile could not be read");
+        None
+    });
     let mut img = DynamicImage::from_decoder(decoder)
         .map_err(|e| format!("failed to decode raster image: {e}"))?;
     if orientation != Orientation::NoTransforms {
         img.apply_orientation(orientation);
     }
+    // Colour-manage to sRGB after orientation (the two are independent: one is a
+    // pixel reordering, the other a per-pixel value remap). Only an image that
+    // carries a profile pays for the transform; a profile-less source is left as
+    // the decoder produced it, so the common sRGB-photo path is unchanged.
+    if let Some(icc) = icc {
+        img = to_srgb(img, &icc);
+    }
     Ok(img)
+}
+
+/// Converts an ICC-tagged image to sRGB, preserving its dimensions and alpha.
+///
+/// The source's embedded profile is transformed into sRGB with the pure-Rust
+/// `moxcms` colour-management engine (no `lcms2`/C dependency — see the crate
+/// docs for why the release build stays C-free). Alpha is a separate channel a
+/// colour transform never touches, so an `Rgba8` buffer is transformed in the
+/// `Rgba8` layout and its alpha channel is carried through untouched.
+///
+/// This is deliberately **fail-soft**: a profile that will not parse, or a
+/// transform that will not build or run, leaves the pixels as they are (assumed
+/// sRGB) rather than failing the decode. A metadata tag is not worth refusing a
+/// photograph over, and the source is still a perfectly decodable image. Only
+/// RGB-family images are transformed — a luma/LA buffer has no RGB primaries to
+/// reinterpret and is returned as the decoder produced it.
+fn to_srgb(img: DynamicImage, icc: &[u8]) -> DynamicImage {
+    if !img.color().has_color() {
+        return img;
+    }
+    let source = match ColorProfile::new_from_slice(icc) {
+        Ok(source) => source,
+        Err(error) => {
+            debug!(%error, "the embedded colour profile does not parse; assuming sRGB");
+            return img;
+        }
+    };
+    let target = ColorProfile::new_srgb();
+    let has_alpha = img.color().has_alpha();
+    let layout = if has_alpha { Layout::Rgba } else { Layout::Rgb };
+    let transform =
+        match source.create_transform_8bit(layout, &target, layout, TransformOptions::default()) {
+            Ok(transform) => transform,
+            Err(error) => {
+                debug!(%error, "no transform to sRGB could be built; assuming sRGB");
+                return img;
+            }
+        };
+
+    if has_alpha {
+        let src = img.to_rgba8();
+        // The transform rewrites a same-length buffer, so the destination is the
+        // source's byte length exactly.
+        let mut dst = vec![0u8; src.as_raw().len()];
+        if let Err(error) = transform.transform(src.as_raw(), &mut dst) {
+            debug!(%error, "the colour conversion failed; assuming sRGB");
+            return DynamicImage::ImageRgba8(src);
+        }
+        match RgbaImage::from_raw(src.width(), src.height(), dst) {
+            Some(converted) => DynamicImage::ImageRgba8(converted),
+            // The transform cannot change the buffer length, but keep the source
+            // if it somehow does rather than hand back a mismatched image.
+            None => DynamicImage::ImageRgba8(src),
+        }
+    } else {
+        let src = img.to_rgb8();
+        let mut dst = vec![0u8; src.as_raw().len()];
+        if let Err(error) = transform.transform(src.as_raw(), &mut dst) {
+            debug!(%error, "the colour conversion failed; assuming sRGB");
+            return DynamicImage::ImageRgb8(src);
+        }
+        match RgbImage::from_raw(src.width(), src.height(), dst) {
+            Some(converted) => DynamicImage::ImageRgb8(converted),
+            None => DynamicImage::ImageRgb8(src),
+        }
+    }
 }
 
 /// Decode a HEIC/HEIF image to an RGBA [`DynamicImage`].
@@ -161,6 +249,7 @@ fn heic_geometry_within_limits(data: &[u8]) -> bool {
 mod tests {
     use super::*;
     use image::GenericImageView;
+    use image::ImageEncoder;
 
     /// Build a box header + the given content. `size` is written as the box
     /// size (content + header).
@@ -293,5 +382,93 @@ mod tests {
             decode_heic(&[1, 2, 3]).unwrap_err().contains("heic"),
             "non-HEIF bytes should fail via the guarded heif path"
         );
+    }
+
+    /// Encode an RGB image as a PNG, embedding `icc` when it is non-empty.
+    fn png_with_icc(img: &RgbImage, icc: &[u8]) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut out);
+        if !icc.is_empty() {
+            encoder
+                .set_icc_profile(icc.to_vec())
+                .expect("the PNG encoder supports ICC profiles");
+        }
+        encoder
+            .write_image(
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .expect("encode png");
+        out.into_inner()
+    }
+
+    #[test]
+    fn to_srgb_leaves_the_image_unchanged_on_an_unparsable_profile() {
+        // A broken ICC tag must never fail the decode: the pixels are assumed
+        // sRGB and handed back exactly as they were.
+        let img = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, image::Rgb([10, 20, 30])));
+        let out = to_srgb(img.clone(), b"not an ICC profile");
+        assert_eq!(out.to_rgb8(), img.to_rgb8());
+    }
+
+    #[test]
+    fn to_srgb_converts_display_p3_and_keeps_neutral_in_the_steps() {
+        let icc = ColorProfile::new_display_p3()
+            .encode()
+            .expect("encode a Display P3 profile");
+
+        // A saturated, non-neutral colour is remapped when its P3 numbers are
+        // reinterpreted in sRGB (the whole point of the conversion).
+        let colour = image::Rgb([0u8, 128, 255]);
+        let iimg = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, colour));
+        let got = to_srgb(iimg, &icc).to_rgb8().get_pixel(0, 0).0;
+        assert!(
+            got.iter()
+                .zip(colour.0.iter())
+                .any(|(a, b)| a.abs_diff(*b) > 0),
+            "a saturated P3 colour should change under sRGB conversion, got {got:?}"
+        );
+
+        // A neutral grey is D65 in both spaces, so it stays put (sanity that the
+        // transform is not mangling the neutral axis).
+        let grey = image::Rgb([128u8, 128, 128]);
+        let gimg = DynamicImage::ImageRgb8(RgbImage::from_pixel(1, 1, grey));
+        let gout = to_srgb(gimg, &icc).to_rgb8().get_pixel(0, 0).0;
+        assert!(
+            gout.iter()
+                .zip(grey.0.iter())
+                .all(|(a, b)| a.abs_diff(*b) <= 2),
+            "neutral grey should stay neutral, got {gout:?}"
+        );
+    }
+
+    #[test]
+    fn decode_raster_oriented_applies_an_embedded_profile() {
+        let icc = ColorProfile::new_display_p3()
+            .encode()
+            .expect("encode a Display P3 profile");
+        let colour = image::Rgb([0u8, 128, 255]);
+        let img = RgbImage::from_pixel(3, 2, colour);
+
+        // With a P3 profile embedded, the decode colour-manages to sRGB, so the
+        // pixel comes back changed.
+        let with =
+            decode_raster_oriented(&png_with_icc(&img, &icc)).expect("decode a P3-tagged png");
+        assert_eq!(with.dimensions(), (3, 2));
+        let got = with.to_rgb8().get_pixel(0, 0).0;
+        assert!(
+            got.iter()
+                .zip(colour.0.iter())
+                .any(|(a, b)| a.abs_diff(*b) > 0),
+            "the embedded profile should be applied, got {got:?}"
+        );
+
+        // The same pixels with no profile are returned byte-for-byte unchanged,
+        // so the common sRGB path pays nothing and is not perturbed.
+        let plain =
+            decode_raster_oriented(&png_with_icc(&img, &[])).expect("decode an untagged png");
+        assert_eq!(plain.to_rgb8(), img);
     }
 }

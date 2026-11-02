@@ -23,6 +23,13 @@
 //! so phone/camera photos reach the model upright. HEIC carries its own
 //! orientation and is already applied by `heif-oxide`; SVG has no orientation.
 //!
+//! Colour management: an embedded ICC profile is converted to sRGB by the shared
+//! [`choreo_image::decode_raster_oriented`] path (pure-Rust `moxcms`), so a
+//! `Display-P3` or `AdobeRGB` raster reaches the model with sRGB values instead of
+//! being reinterpreted as sRGB (which reads desaturated). HEIC is already sRGB
+//! from `heif-oxide`'s `nclx` handling, and SVG is rasterized through `resvg`,
+//! which is sRGB.
+//!
 //! Fixed constants (the vision plan chose fixed limits over configurable
 //! ones): images are downscaled to fit within [`MAX_IMAGE_DIMENSION`] px on
 //! the longest edge, decoded under a decompression-bomb guard (the shared

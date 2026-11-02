@@ -486,7 +486,7 @@ data model.
 | `choreo-content` | Choreographr Coordination Platform client — publish/retract items, revisions, profiles, and account pins against a Substrate content registry (content on IPFS, revisions via an event indexer, signed writes on a subxt tokio sidecar); pulled in by the daemon's `content` feature (off by default) |
 | `choreo-proto` | Framed binary protocol (MessagePack named + length prefix) shared between clients and daemon |
 | `choreo-sanitize` | Internal leaf crate — the single source of truth for the Unicode "spoofing" predicates (bidi/ZWSP escaping) and the shared tool-output byte budget + `...[truncated]` marker, used by the daemon, TUI, blockchain tools, and client |
-| `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
+| `choreo-image` | Leaf crate — the single raster decode path (EXIF orientation baked in, embedded ICC profiles converted to sRGB with the pure-Rust `moxcms` engine) and HEIC/HEIF decode (with a pre-decode allocation guard), shared by the daemon and the TUI so the model and UI paths cannot drift |
 | `choreo-keystore` | X25519 + ECDH/AES-256-GCM crypto library for the per-daemon unlock-key keystore |
 | `choreo-transport` | Noise-IK encrypted transport over TCP |
 | `choreo-mcp` | MCP (Model Context Protocol) client built on the official `rmcp` SDK — connects over a stdio subprocess or a remote Streamable HTTP endpoint, negotiates the protocol era (`server/discover` with an `initialize` fallback), lists paginated tools, and dispatches cancellable, deadline-bounded, concurrency-capped calls behind a blocking facade (one dispatcher thread per server). Streams server progress notifications as live output, drives the MRTR `input_required` retry loop, exposes a server's resources (list/read) as wrapper tools when the capability is declared, and opens a `subscriptions/listen` stream so a server that changes its tool or resource list refreshes the daemon's catalogue live (no restart). Tool names are sanitized to the provider-safe alphabet and capped at 64 chars (with a stable hash suffix on collision), a server config can set a `cwd`, a `disabledTools` list, and a per-server log file (`mcp-<slug>.log`), and a server that requires authorization fails with an actionable message naming the static-token and OAuth paths. The stdio read path is capped (a single oversized frame drops the connection instead of allocating without limit), and each server's in-flight calls are bounded by `maxConcurrentCalls` (default 4). Linked via the daemon's `mcp` feature, which is on by default (an embedder opts out with `default-features = false`); ships no binary (its only `[[bin]]` is a test fixture server) |
@@ -529,7 +529,12 @@ OpenEXR, Farbfeld, QOI) plus SVG (`resvg`) and HEIC/HEIF (`heif-oxide`, pure Rus
 AVIF is gated behind the `avif` feature (`image/avif-native`/dav1d, a C library) so
 the default/release build stays C-free — see the static-musl rationale. EXIF
 orientation is baked in for raster sources (and applied by `heif-oxide` for HEIC),
-so phone/camera photos are not rotated. The raster-decode and HEIC-decode
+so phone/camera photos are not rotated. Colour is managed: an embedded ICC
+profile is converted to sRGB with the pure-Rust `moxcms` engine on the shared
+decode path, so a Display-P3 or AdobeRGB photo reaches the model and the terminal
+with the right colours instead of being reinterpreted as sRGB (which reads
+noticeably desaturated) — a profile that will not parse is assumed sRGB and the
+decode still succeeds. The raster-decode and HEIC-decode
 paths live in the shared `choreo-image` leaf crate, so the model and UI paths
 use the same guarded decoder — a hostile HEIC's declared geometry is rejected
 before it allocates.

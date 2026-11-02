@@ -480,6 +480,14 @@ image = { version = "0.25", default-features = false, features = ["bmp", "dds", 
 # normalization + display_image dimension inspection) and choreo-tui (client
 # display decode).
 heif-oxide = "0.1"
+# Pure-Rust ICC colour-management engine (colour conversion to sRGB). Used by
+# choreo-image to colour-manage a source's embedded ICC profile on the shared
+# decode path, so Display-P3/AdobeRGB photos reach the model and the terminal as
+# sRGB instead of being reinterpreted as sRGB. Already pulled in transitively by
+# `image` 0.25 (declaring it directly adds no new crate) and C-free — the reason
+# it is used instead of `lcms2` (a C library) is the release build's static-musl,
+# no-C-toolchain stance.
+moxcms = "0.8"
 rand = "0.10"
 resvg = "0.49"
 serde_json = "1"

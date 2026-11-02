@@ -50,7 +50,8 @@ Choreographr (workspace)
 │                       the tool-output byte budget + truncation marker, and
 │                       the child-process code-injection env set
 ├── choreo-image          Leaf crate — shared image decode (EXIF-orientation
-│                       baking, HEIC/HEIF with a pre-decode allocation guard)
+│                       baking, ICC→sRGB colour management via `moxcms`,
+│                       HEIC/HEIF with a pre-decode allocation guard)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
 ├── choreo-client-core     Shared client logic (parsing, images, history, credentials, first-run setup)
@@ -144,10 +145,11 @@ set stripped from every spawned child, so every sanitizer and streaming cap in
 the workspace agrees on the same policy and budget and the shell tool and MCP
 stdio child strip the same variables.
 
-`choreo-image` is a leaf crate (only `image` + `heif-oxide` + `tracing`)
-consumed by
+`choreo-image` is a leaf crate (only `image` + `heif-oxide` + `moxcms` +
+`tracing`) consumed by
 `choreo-daemon` and `choreo-tui` — it owns the single decode path for raster
-formats (with EXIF orientation baked in) and for HEIC/HEIF (with a pre-decode
+formats (with EXIF orientation baked in, and any embedded ICC profile converted
+to sRGB with the pure-Rust `moxcms` engine) and for HEIC/HEIF (with a pre-decode
 allocation guard), so the model path and the UI path cannot drift apart.
 
 ---
@@ -3651,7 +3653,7 @@ cargo run -p choreo-im -- telegram
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | choreo-tui | Terminal UI |
 | `dioxus` | choreo-gui | Desktop/Android UI (Native/Blitz renderer) |
-| `image` + `resvg` + `heif-oxide` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (heif-oxide) with a pre-decode allocation guard |
+| `image` + `resvg` + `heif-oxide` + `moxcms` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (heif-oxide) with a pre-decode allocation guard, and ICC→sRGB colour management of the embedded profile (moxcms, pure Rust) so a Display-P3/AdobeRGB photo is not rendered desaturated |
 | `syntect` | choreo-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
