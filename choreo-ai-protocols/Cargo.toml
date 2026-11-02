@@ -59,7 +59,7 @@ structured-zstd.workspace = true
 # insertion order, not BTreeMap order. Already in the dependency tree
 # (2.14.0 via ratatui/serde_json transitive deps); the `serde` feature lets
 # serde deserialize straight into `IndexMap`.
-indexmap = { version = "2.14", features = ["serde"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
 # Serialize the normalized models.dev base into the embedded `catalog.bin`
 # (postcard, the same format the S4 runtime cache will use — one load path).
 postcard.workspace = true

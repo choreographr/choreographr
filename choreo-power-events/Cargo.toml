@@ -20,14 +20,17 @@ thiserror.workspace = true
 # consumer (recv'd inside its `select!`), so crossbeam per AGENTS.md.
 crossbeam-channel.workspace = true
 
-# Linux: systemd-logind's PrepareForSleep signal over D-Bus. default-features =
-# false keeps tokio OUT entirely; "async-io" pulls zbus's own async runtime
-# (async-io/async-executor/async-task/async-lock — all pure-Rust), and
-# "blocking-api" enables the `zbus::blocking` module whose `SignalIterator`
-# internally bridges to async via `block_on` on the calling (monitor) thread —
-# so the crate contains zero tokio code.
+# Linux: systemd-logind's PrepareForSleep signal over D-Bus. zbus 6 exposes
+# only an async API (its old `zbus::blocking` façade and the `async-io` /
+# `blocking-api` features are gone), so the Linux backend drives it
+# synchronously with `zbus::block_on`. The default `zruntime` backend needs no
+# external executor, so the crate still contains zero tokio code — but
+# `default-features = false` plus an explicit `proxy`/`default-rt`/`tracing`
+# selection keeps the service/object-server halves out of the build.
+# `futures-util` provides `StreamExt::next` for the async signal stream.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
+zbus = { version = "6", default-features = false, features = ["proxy", "default-rt", "tracing"] }
+futures-util.workspace = true
 
 # macOS: IOKit power-management notifications. io-kit-sys 0.5 links the IOKit
 # framework (its build.rs emits `cargo:rustc-link-lib=framework=IOKit`) but

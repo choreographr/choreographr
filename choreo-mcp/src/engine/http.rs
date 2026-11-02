@@ -215,6 +215,10 @@ pub(super) fn status_from_chain(root: &(dyn std::error::Error + 'static)) -> Opt
 fn http_error_status(error: &StreamableHttpError<reqwest::Error>) -> Option<u16> {
     match error {
         StreamableHttpError::Client(e) => e.status().map(|s| s.as_u16()),
+        // rmcp's built-in reqwest client surfaces a body-free 429/5xx as this
+        // structural variant; the status is a field, so no message parsing is
+        // needed (the parser below is only for the string-carrying shape).
+        StreamableHttpError::HttpStatus(e) => Some(e.status),
         StreamableHttpError::UnexpectedServerResponse(message) => parse_http_status(message),
         // rmcp models a 401 challenge and an insufficient-scope 403 as their
         // own variants (no status number); map them to the codes they represent
@@ -370,6 +374,13 @@ mod tests {
             ),
         );
         assert!(retryable_connect(&retryable));
+
+        // rmcp's structural body-free status variant (a bare 429/5xx) is the
+        // primary shape; its status field must classify as retryable too.
+        let structural = init_error(StreamableHttpError::<reqwest::Error>::HttpStatus(
+            rmcp::transport::streamable_http_client::HttpStatusError::new(503, None),
+        ));
+        assert!(retryable_connect(&structural));
 
         let fatal = init_error(
             StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(

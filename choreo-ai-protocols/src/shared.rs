@@ -359,7 +359,7 @@ pub(crate) fn build_agent(
         cfg = cfg.user_agent(ua);
     }
 
-    // Connector chain mirroring ureq 3.4's `DefaultConnector` for OUR feature
+    // Connector chain mirroring ureq 3.5's `DefaultConnector` for OUR feature
     // set (rustls enabled via ureq's default features; `socks-proxy` NOT
     // enabled anywhere in the workspace, so `SocksConnector` was never part
     // of the pre-change default chain either — no proxy regression). The only

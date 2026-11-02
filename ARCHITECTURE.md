@@ -1950,7 +1950,7 @@ The strongest remaining option — bit-for-bit reproducible builds from a checke
 dependency snapshot via `cargo vendor` + a `[source]` replacement in `.cargo/config.toml` —
 is intentionally not enabled (repository size).
 
-The MCP path's heaviest third-party dependency is **`rmcp` 3.5** (the official Model
+The MCP path's heaviest third-party dependency is **`rmcp` 3.8** (the official Model
 Context Protocol Rust SDK, Apache-2.0), linked by default now that the `mcp` feature
 ships on. It is pinned (a deliberate upgrade, not an auto-follow of `3.x` churn),
 declared with `default-features = false` so only the needed transports compile, and

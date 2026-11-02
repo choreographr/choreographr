@@ -60,7 +60,7 @@ impl RegisteringTcpConnector {
 }
 
 impl<In: Transport> Connector<In> for RegisteringTcpConnector {
-    // ureq 3.4 does NOT re-export its internal `TcpTransport` (only
+    // ureq 3.5 does NOT re-export its internal `TcpTransport` (only
     // `TcpConnector`), so a bespoke connector cannot reuse it in its `Out`
     // type — we ship our own transport below (`RegisteredTcpTransport`)
     // instead. Behavior matches ureq's socket transport; ours additionally
@@ -131,9 +131,9 @@ impl<In: Transport> Connector<In> for RegisteringTcpConnector {
 }
 
 /// Dials the first reachable address, splitting the overall connect budget
-/// across resolved addresses the way ureq 3.4's `TcpConnector` does.
+/// across resolved addresses the way ureq 3.5's `TcpConnector` does.
 ///
-/// This mirrors ureq 3.4's `try_connect`/`try_connect_with` (a fixed
+/// This mirrors ureq 3.5's `try_connect`/`try_connect_with` (a fixed
 /// ConnectionRefused-only fall-through in an earlier version of this file was
 /// a deviation from upstream that gave up on blackholed first addresses —
 /// the macOS IPv6-first scenario, ureq issue #1184 — and burned the whole
@@ -293,7 +293,7 @@ fn std_instant(i: Instant) -> time::Instant {
 /// `current_time().duration_since(start)`); `budget` is the OVERALL connect
 /// timeout dereffed from ureq's `timeout.after` (an effectively-unbounded
 /// std duration when none was set — `NotHappening`); `reason` is the timeout
-/// kind to report on exhaustion (Connect for us). Mirrors ureq 3.4's
+/// kind to report on exhaustion (Connect for us). Mirrors ureq 3.5's
 /// fall-through/elapsed logic in pure-function shape so it is unit testable
 /// without sockets, real clocks, or sleeps.
 fn classify_failure(
@@ -598,6 +598,8 @@ mod tests {
         NextTimeout {
             after: Duration::Exact(time::Duration::from_secs(secs)),
             reason: Timeout::Global,
+            per_read: None,
+            per_write: None,
         }
     }
 
@@ -620,6 +622,8 @@ mod tests {
         let not_happening = NextTimeout {
             after: Duration::NotHappening,
             reason: Timeout::Global,
+            per_read: None,
+            per_write: None,
         };
         assert_eq!(cap_read_timeout(not_happening, Some(idle)), Some(idle));
         // Neither bound → no socket timeout at all.
@@ -835,6 +839,8 @@ mod tests {
         let timeout = NextTimeout {
             after: BUDGET_10S,
             reason: Timeout::Connect,
+            per_read: None,
+            per_write: None,
         };
         let addrs = addrs(chased);
         let result = try_connect_with(&addrs, start, timeout, &clock, |a, t| script.dial(a, t));
@@ -854,6 +860,8 @@ mod tests {
         let timeout = NextTimeout {
             after: BUDGET_10S,
             reason: Timeout::Connect,
+            per_read: None,
+            per_write: None,
         };
         let addrs = addrs(chased);
         let err = try_connect_with(&addrs, start, timeout, &clock, |a, t| script.dial(a, t))
@@ -883,6 +891,8 @@ mod tests {
         let timeout = NextTimeout {
             after: BUDGET_10S,
             reason: Timeout::Connect,
+            per_read: None,
+            per_write: None,
         };
         let addrs = addrs(chased);
         let err = try_connect_with(&addrs, start, timeout, &clock, |a, t| script.dial(a, t))
@@ -904,6 +914,8 @@ mod tests {
         let timeout = NextTimeout {
             after: Duration::NotHappening,
             reason: Timeout::Connect,
+            per_read: None,
+            per_write: None,
         };
         let addrs = addrs(chased);
         try_connect_with(&addrs, start, timeout, &clock, |a, t| script.dial(a, t))
@@ -934,6 +946,8 @@ mod tests {
         let timeout = NextTimeout {
             after: BUDGET_10S,
             reason: Timeout::Connect,
+            per_read: None,
+            per_write: None,
         };
         let addrs = addrs(chased);
         let _ = try_connect_with(&addrs, start, timeout, &clock, |a, t| rec.dial(a, t));
@@ -969,6 +983,8 @@ mod tests {
         let timeout = NextTimeout {
             after: BUDGET_10S,
             reason: Timeout::Connect,
+            per_read: None,
+            per_write: None,
         };
         let addrs = addrs(chased);
         try_connect_with(&addrs, start, timeout, &clock, |a, t| rec.dial(a, t))
