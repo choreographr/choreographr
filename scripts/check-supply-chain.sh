@@ -16,8 +16,10 @@
 #      Neither cargo-deny nor cargo-audit inspects idle cache files — this does.
 #   2. cargo-deny (deny.toml, preferred) — hard BANS on the attacker's versions
 #      (fails even if the lockfile is regenerated), RustSec advisories
-#      (vulnerability/malicious always fail in 0.20), and a crates.io-only
-#      source restriction. This is the authoritative dependency-graph check.
+#      (vulnerability/malicious fail by default in 0.20; the one upstream-blocked
+#      RUSTSEC-2026-0387 is a documented `ignore` in deny.toml), and a
+#      crates.io-only source restriction. This is the authoritative
+#      dependency-graph check.
 #   3. cargo-audit fallback — same RustSec DB when cargo-deny isn't installed,
 #      plus a literal lockfile scan for the banned names/versions.
 #

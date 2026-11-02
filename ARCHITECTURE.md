@@ -1943,8 +1943,12 @@ re-resolving against the live registry.
 2. **`deny.toml`** (`cargo-deny`) — hard bans on every version from the 2026-08-20 attack
 (`arrayref =0.3.10`, `internment =0.8.7`, `append-only-vec =0.1.9`, plus the six deleted
 payload crates by name: `proc-macro1`, `proc-macro-en`, `aovine`, `arone`, `aronenao`,
-`tinymember`), RustSec advisory checking (vulnerability and "malicious" advisories always
-fail in cargo-deny 0.20; unmaintained only for direct deps), and a crates.io-only source
+`tinymember`), RustSec advisory checking (vulnerabilities and "malicious" advisories
+fail by default in cargo-deny 0.20; unmaintained only for direct deps; the one
+upstream-blocked vulnerability — RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5 via
+`sp-core`/`alloy` on `elliptic-curve` 0.13) — is a documented, reachability-
+justified `ignore` in `deny.toml` until those stacks reach `crypto-bigint` 0.7),
+and a crates.io-only source
 restriction (all 1261 locked packages currently resolve from the crates.io index).
 3. **`scripts/check-supply-chain.sh`** — a first scan of the local `~/.cargo/registry` cache
 for the DELETED malicious `.crate` files (neither cargo-deny nor cargo-audit inspects idle

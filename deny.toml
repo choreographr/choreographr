@@ -14,9 +14,11 @@
 # advisories fail unconditionally, and only crates.io is an allowed source.
 
 [advisories]
-# cargo-deny 0.20 removed the severity knobs: every vulnerability and
-# "malicious" advisory (the category that flagged the arrayref attack)
-# hard-fails the check no matter what. The remaining scopes are:
+# cargo-deny 0.20 removed the severity knobs, so a vulnerability (and a
+# "malicious" advisory — the category that flagged the arrayref attack) fails
+# the gate by default. `ignore` (below) is the one mechanism that exempts a
+# specific advisory, and it is used for exactly one upstream-blocked entry. The
+# remaining scopes are:
 #
 #   unmaintained = "workspace" — an unmaintained advisory only fails when the
 #       crate is a DIRECT dependency. The tree's unmaintained crates
@@ -27,6 +29,19 @@
 #       does not block, so legitimate yanks don't wedge the gate.
 unmaintained = "workspace"
 yanked = "warn"
+
+# RUSTSEC-2026-0387: constant-time timing variability in `crypto-bigint` 0.5.5
+# (fixed only in 0.7.6+, with no 0.5.x backport). It is neither reachable for
+# secret-key math here nor fixable by a version bump today: the crate enters
+# only through `elliptic-curve` 0.13, whose roots are `sp-core` 43 (the latest,
+# which pins `k256` 0.13) and `alloy` 2.5 (the latest) — both still on
+# elliptic-curve 0.13. The affected operations are secp256k1/ECDSA constant-time
+# arithmetic; this workspace signs only sr25519 (`choreo-keystore` rejects any
+# keyring encoding other than pkcs8/sr25519 and signs via `schnorrkel`) and its
+# alloy usage is read-only EVM queries with no local secp256k1 signing, so those
+# operations never run on a secret. DELETE this ignore — and bump the crate —
+# once `sp-core` or `alloy` moves to `crypto-bigint` 0.7 (elliptic-curve 0.14).
+ignore = ["RUSTSEC-2026-0387"]
 
 [bans]
 # 126 crates legitimately appear at multiple versions in this tree (e.g. aes
