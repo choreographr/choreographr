@@ -39,9 +39,16 @@ yanked = "warn"
 # arithmetic; this workspace signs only sr25519 (`choreo-keystore` rejects any
 # keyring encoding other than pkcs8/sr25519 and signs via `schnorrkel`) and its
 # alloy usage is read-only EVM queries with no local secp256k1 signing, so those
-# operations never run on a secret. DELETE this ignore — and bump the crate —
+# operations never run on a secret. DELETE this entry — and bump the crate —
 # once `sp-core` or `alloy` moves to `crypto-bigint` 0.7 (elliptic-curve 0.14).
-ignore = ["RUSTSEC-2026-0387"]
+#
+# Written in the structured form (id + reason) rather than as a bare id so the
+# justification is repeated in cargo-deny's own output, where a future reader
+# meets the exemption without opening this file.
+ignore = [
+    # One line per entry: a TOML inline table cannot span lines.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 is reached only via elliptic-curve 0.13 (sp-core 43 / alloy 2.5, both latest). The affected secp256k1/ECDSA constant-time math never runs here: the workspace signs only sr25519 and makes read-only EVM queries." },
+]
 
 [bans]
 # 126 crates legitimately appear at multiple versions in this tree (e.g. aes
