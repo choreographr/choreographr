@@ -36,13 +36,18 @@ base64.workspace = true
 clap.workspace = true
 # Wipe the pending unlock key (secret material) when a rejection discards it.
 zeroize.workspace = true
-# Dioxus 0.7 Native renderer (Blitz/wgpu) instead of the desktop/webview
+# Dioxus 0.8 Native renderer (Blitz/wgpu) instead of the desktop/webview
 # renderer: it is ALSO the Android and iOS renderer, so one renderer serves
 # desktop and aarch64-linux-android alike — there is no webview (webkit2gtk,
 # etc.) anywhere in the dependency tree. The platform-agnostic `launch`
 # facade maps to dioxus_native under the `native` cfg, so no per-platform
-# entry code is needed.
-dioxus = { version = "0.7", features = ["native"] }
+# entry code is needed. Pinned to the 0.8.0-alpha.3 pre-release: dioxus-native
+# 0.8 pins blitz-dom 0.3.0-beta.4, which drops the `image =0.25.6` exact pin
+# that the 0.7 -> blitz-dom 0.2.4 line imposed on the whole workspace (see the
+# `image` note in the root Cargo.toml). The GUI is not in the release build and
+# is `publish = false`, so tracking an alpha here does not affect shipped
+# artifacts; revisit when dioxus 0.8 reaches stable.
+dioxus = { version = "0.8.0-alpha.3", features = ["native"] }
 futures-channel.workspace = true
 futures-util.workspace = true
 humfmt.workspace = true
@@ -74,13 +79,13 @@ choreo-client-core = { workspace = true, features = ["test-support"] }
 # us the `AndroidApp` argument type of the `android_main` symbol the native
 # runtime calls, and blitz-shell (dioxus-native's shell layer) exposes the
 # `set_android_app` slot its event-loop factory reads on Android. Versions
-# match the ones dioxus-native/winit already resolve to (blitz-shell 0.2,
+# match the ones dioxus-native/winit already resolve to (blitz-shell 0.3.0-beta.4,
 # android-activity 0.6, native-activity flavor), so Cargo unifies them into a
 # single crate — the AndroidApp type identity must be shared for the slot to
 # accept the handle we pass.
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["native-activity"] }
-blitz-shell = "0.2"
+blitz-shell = "0.3.0-beta.4"
 
 # Resolution hold, NOT a code dependency (nothing here references libc): an
 # exact `libc = "=0.2.189"` requirement that pins the shared workspace lock's

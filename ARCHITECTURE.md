@@ -1956,9 +1956,10 @@ ships on. It is pinned (a deliberate upgrade, not an auto-follow of `3.x` churn)
 declared with `default-features = false` so only the needed transports compile, and
 resolves from crates.io like every other package — so the four layers above cover it
 exactly as they cover the rest of the tree. Its HTTP transport shares one compiled
-`reqwest` 0.13 build with `alloy` and `choreo-mcp` (the lockfile's other `reqwest`
-major, 0.12, predates MCP and comes from `blitz-net` → `dioxus-native` → `choreo-gui`;
-`deny.toml` keeps `multiple-versions = "warn"`).
+`reqwest` 0.13 build with `alloy` and `choreo-mcp` (the whole tree now resolves a single
+`reqwest` 0.13 major: the GUI's `blitz-net` → `dioxus-native` path moved onto it with the
+dioxus 0.8 / blitz 0.3 line; `deny.toml` keeps `multiple-versions = "warn"` so any future
+divergence is reported rather than silently duplicated).
 
 ### MCP client trust boundary
 

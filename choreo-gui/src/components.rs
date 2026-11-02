@@ -1,10 +1,5 @@
-// This module is pure dioxus RSX. The `"{expr}"` text/attribute interpolation
-// syntax is idiomatic dioxus and is NOT Rust `format!` — but the rustc macro
-// expansion looks like a zero-argument format string, so `clippy::useless_format`
-// fires on every interp. clippy's suggested `.to_string()` rewrite is wrong for
-// dioxus (it fails to parse and defeats the reactive interpolation), so allow the
-// false positive here.
-#![expect(clippy::useless_format)]
+// This module is pure dioxus RSX: the `"{expr}"` text/attribute interpolation
+// syntax is idiomatic dioxus, not Rust `format!`.
 use crate::client::{DaemonHandle, send_client_message, submit_input};
 use crate::onboarding::{
     StepMark, checklist, request_models, select_account, select_model, submit_setup_form,
@@ -411,7 +406,7 @@ pub(crate) fn Composer(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>
                 onkeydown: {
                     let mut os = on_submit;
                     move |event| {
-                        if event.key() == Key::Enter && !event.modifiers().shift() {
+                        if event.key() == Key::Named(NamedKey::Enter) && !event.modifiers().shift() {
                             event.prevent_default();
                             os();
                         }
