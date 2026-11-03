@@ -7,7 +7,7 @@
 //! coloured. The probe shares the same guard but reads the header only, so a
 //! caller that needs nothing but the geometry never pays for a pixel decode.
 
-use crate::{DecodeError, MAX_DECODE_ALLOC, MAX_DECODE_PIXELS, MAX_SOURCE_DIMENSION};
+use crate::{DecodeError, MAX_DECODE_ALLOC, MAX_SOURCE_DIMENSION};
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader};
 use std::io::Cursor;
@@ -21,7 +21,9 @@ use tracing::debug;
 fn open_guarded(data: &[u8]) -> Result<impl ImageDecoder, DecodeError> {
     let mut reader = ImageReader::new(Cursor::new(data))
         .with_guessed_format()
-        .map_err(|_| DecodeError::UnrecognizedFormat)?;
+        // A failure here is an I/O error reading the bytes, not an unrecognized
+        // format — surface it as a decode error rather than mislabelling it.
+        .map_err(|error| DecodeError::Raster(image::ImageError::IoError(error)))?;
     // `with_guessed_format` leaves the format unset (rather than failing) when no
     // signature matched, and `into_decoder` would then reject it as an
     // `image`-crate "unsupported"; report it as what it is instead.
@@ -42,21 +44,13 @@ fn open_guarded(data: &[u8]) -> Result<impl ImageDecoder, DecodeError> {
 
     let decoder = reader.into_decoder().map_err(DecodeError::Raster)?;
     // The real guard: reject an over-budget image from the size the header
-    // declares, *before* any pixel allocation. Keying on total pixels (not a
-    // per-side dimension) admits a tall screenshot — a large height with few
-    // enough pixels — while a decompression bomb of any shape stays bounded, and
-    // it holds even for a decoder that enforces no `max_alloc` (the PNM decoder
-    // is one). `u64` arithmetic cannot overflow a pair of `u32` sides.
+    // declares, *before* any pixel allocation. It keys on total pixels (not a
+    // per-side dimension) so a tall screenshot is admitted while a bomb of any
+    // shape stays bounded, and it holds even for a decoder that enforces no
+    // `max_alloc` (the PNM decoder is one). The bound and its `OverBudget` error
+    // are shared with the HEIC path (see `crate::check_pixel_budget`).
     let (width, height) = decoder.dimensions();
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > MAX_DECODE_PIXELS {
-        return Err(DecodeError::OverBudget {
-            width,
-            height,
-            pixels,
-            budget: MAX_DECODE_PIXELS,
-        });
-    }
+    crate::check_pixel_budget(width, height)?;
     Ok(decoder)
 }
 
@@ -86,7 +80,7 @@ fn swaps_sides(orientation: Orientation) -> bool {
 /// Returns [`DecodeError::UnrecognizedFormat`] when the data is not a raster
 /// format at all, [`DecodeError::Raster`] when the header will not parse, and
 /// [`DecodeError::OverBudget`] when it declares more pixels than the
-/// [`MAX_DECODE_PIXELS`] budget. A *header* that parses does not guarantee the
+/// [`crate::MAX_DECODE_PIXELS`] budget. A *header* that parses does not guarantee the
 /// pixel data decodes; a caller that needs that guarantee should call
 /// [`decode_raster_oriented`] instead (or leave it to the consumer that actually
 /// displays the pixels).
@@ -108,7 +102,7 @@ pub fn probe_dimensions(data: &[u8]) -> Result<(u32, u32), DecodeError> {
 /// is then converted to sRGB (see the crate-level colour notes) — orientation is
 /// a pixel reordering and colour a per-pixel value remap, so the two are
 /// independent. The decode runs under a decompression-bomb guard whose
-/// authoritative bound is the total-pixel budget [`MAX_DECODE_PIXELS`], checked
+/// authoritative bound is the total-pixel budget [`crate::MAX_DECODE_PIXELS`], checked
 /// against the image's declared size before any pixel allocation — so aspect
 /// ratio never decides the limit.
 ///

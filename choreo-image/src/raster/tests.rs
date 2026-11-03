@@ -1,6 +1,7 @@
 //! Unit tests for the raster decode path and its header-only probe.
 
 use super::*;
+use crate::MAX_DECODE_PIXELS;
 use image::{ExtendedColorType, GenericImageView, ImageEncoder, Rgb, RgbImage, RgbaImage};
 
 /// A minimal little-endian TIFF/Exif payload whose only IFD0 entry is the

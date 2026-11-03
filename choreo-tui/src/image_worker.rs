@@ -175,6 +175,13 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: &
 /// with the container's embedded profile — or its `nclx` description —
 /// converted to sRGB. Raster formats use the shared `image`-crate decoder with
 /// EXIF orientation baked in, so phone/camera photos render upright.
+///
+/// The shared [`choreo_image::DecodeError`] is stringified at this boundary
+/// because it is the display worker's terminal error point — the only caller logs
+/// the message and clears the pending job — and the sibling SVG arm already yields
+/// a plain `String`, so one `String` result is the natural type for these mixed
+/// sources. A caller that must branch on the failure kind (e.g. treat an
+/// over-budget image as a policy rejection) uses the shared crate directly.
 fn decode_image(
     metadata: &ImageMetadata,
     data: &[u8],
@@ -183,6 +190,8 @@ fn decode_image(
 ) -> Result<DynamicImage, String> {
     match metadata.mime_type.as_str() {
         "image/svg+xml" => rasterize_svg_at_size(data, target_px_w, target_px_h),
+        // Stringify the structured decode error to match the SVG arm's `String`;
+        // the formatted message carries the same detail to the log line.
         "image/heic" | "image/heif" => choreo_image::decode_heic(data).map_err(|e| e.to_string()),
         _ => choreo_image::decode_raster_oriented(data).map_err(|e| e.to_string()),
     }

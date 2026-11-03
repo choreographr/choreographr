@@ -72,11 +72,28 @@ fn first_pixel(img: &DynamicImage) -> [u8; 3] {
 
 #[test]
 fn decode_heic_rejects_non_heif_bytes() {
+    // Non-HEIF bytes cannot be measured, so the decode's header pre-check defers
+    // (see `check_declared_budget`) rather than failing itself — the container
+    // decode is what rejects them.
     let error = decode_heic(&[1, 2, 3]).unwrap_err();
     assert!(
-        matches!(error, DecodeError::HeicGeometry(_)),
-        "non-HEIF bytes should fail in the container parse, got: {error}"
+        matches!(error, DecodeError::Heic(_)),
+        "non-HEIF bytes should fail in the container decode, got: {error}"
     );
+}
+
+#[test]
+fn decode_pre_check_defers_on_unmeasurable_geometry() {
+    // The decode pre-check must only reject a *measurable* over-budget geometry;
+    // an unmeasurable container is handed to the decoder, whose own `max_pixels`
+    // bound holds the allocation. Bytes that are not a container cannot be
+    // measured, so the pre-check is `Ok` and the decode fails as a container
+    // error, not a geometry rejection.
+    assert!(check_declared_budget(&[1, 2, 3]).is_ok());
+    assert!(matches!(
+        decode_heic(&[1, 2, 3]).unwrap_err(),
+        DecodeError::Heic(_)
+    ));
 }
 
 #[test]
@@ -198,7 +215,7 @@ fn declared_geometry_bomb_is_rejected_by_both_probe_and_decode() {
         decode_heic(&bomb).unwrap_err(),
     ] {
         assert!(
-            matches!(&error, DecodeError::HeicGeometry(reason) if reason.contains("decompression-bomb guard")),
+            matches!(&error, DecodeError::OverBudget { .. }),
             "expected the over-budget error, got: {error}"
         );
     }

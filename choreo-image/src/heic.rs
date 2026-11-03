@@ -21,9 +21,13 @@
 //!
 //! The pixel budget is enforced twice, on purpose:
 //!
-//! - [`probe_heic_dimensions`] rejects a hostile *declared* geometry from the
-//!   container header, before any decoding work starts, and is also the guard a
-//!   size-only caller (the daemon's `display_image` probe) goes through.
+//! - A declared-geometry pre-check rejects a hostile *measurable* geometry from
+//!   the container header, before any decoding work starts. [`probe_heic_dimensions`]
+//!   applies it for a size-only caller (the daemon's `display_image` probe) and
+//!   must therefore fail on any container it cannot measure; [`decode_heic`]'s own
+//!   pre-check is narrower — it fires only on a measurable over-budget geometry
+//!   and otherwise defers to the decoder, so a container the probe cannot size but
+//!   `heifer` can assemble is still decoded (the limit below bounds it).
 //! - `heifer` enforces the same ceiling itself, at the allocation site, against
 //!   the picture it is about to produce — including a `grid` item's tile
 //!   amplification. That is the bound that holds when a container's declaration
@@ -38,10 +42,13 @@ use tracing::warn;
 /// Decode a HEIC/HEIF image to sRGB [`DynamicImage`].
 ///
 /// The decode runs under the decompression-bomb guard: the container's
-/// *declared* geometry is checked first (see [`probe_heic_dimensions`]), and the
-/// decoder enforces [`MAX_DECODE_PIXELS`] itself against the picture it is about
-/// to allocate, so a hostile file is rejected from its header and a
-/// maliciously-amplified grid cannot allocate past the budget either.
+/// *measurable* declared geometry is checked first (see `check_declared_budget`),
+/// and the decoder enforces [`MAX_DECODE_PIXELS`] itself against the picture it is
+/// about to allocate — so a hostile file is rejected from its header and a
+/// maliciously-amplified grid cannot allocate past the budget either. A container
+/// whose geometry cannot be measured is still decoded: `heifer`'s own limit holds
+/// the allocation, so a file the size-only [`probe_heic_dimensions`] would refuse
+/// as unmeasurable is not lost here.
 ///
 /// The returned image is `Rgb8` when the container carries no alpha plane and
 /// `Rgba8` when it does. Preserving that distinction matters downstream: the
@@ -50,15 +57,35 @@ use tracing::warn;
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError::HeicGeometry`] when the declared geometry exceeds the
-/// decompression-bomb guard or cannot be measured, and [`DecodeError::Heic`]
-/// when the container or the HEVC bitstream does not decode.
+/// Returns [`DecodeError::OverBudget`] when the declared geometry exceeds the
+/// decompression-bomb guard, and [`DecodeError::Heic`] when the container or the
+/// HEVC bitstream does not decode.
 pub fn decode_heic(data: &[u8]) -> Result<DynamicImage, DecodeError> {
-    // Defence in depth: reject a hostile declared geometry from the header,
-    // before the decoder does any work. `heifer` enforces the same budget at the
-    // allocation site; this pre-check just fails faster, with a clearer message.
-    probe_heic_dimensions(data)?;
+    // Defence in depth: reject a hostile *measurable* declared geometry from the
+    // header, before the decoder does any work. `heifer` enforces the same budget
+    // at the allocation site; this pre-check just fails faster, with a clearer
+    // message. An unmeasurable geometry is not a rejection — see the helper.
+    check_declared_budget(data)?;
     decode_heic_with_budget(data, MAX_DECODE_PIXELS)
+}
+
+/// Reject a *measurable* declared geometry that is over the decode budget,
+/// without failing on a container the header cannot measure.
+///
+/// [`probe_heic_dimensions`] treats "cannot measure" as an error because a
+/// size-only caller needs a real size. The decode does not: a container whose
+/// primary item declares no extent of its own (an `iovl`/`iden` derived image
+/// without an `ispe`) is one `heifer` can still assemble, and its own `max_pixels`
+/// bound holds the allocation at the decoder's allocation site. So this pre-check
+/// fires only on a measurable over-budget geometry and otherwise returns `Ok`,
+/// letting the decoder (and its limit) take over.
+fn check_declared_budget(data: &[u8]) -> Result<(), DecodeError> {
+    match declared_heic_geometry(data) {
+        Ok(geometry) => crate::check_pixel_budget(geometry.canvas.0, geometry.canvas.1),
+        // Could not measure the declared geometry: not a rejection here — the
+        // decoder's own pixel limit is the backstop.
+        Err(_) => Ok(()),
+    }
 }
 
 /// [`decode_heic`]'s pixel decode, with the budget supplied by the caller.
@@ -81,11 +108,19 @@ fn decode_heic_with_budget(data: &[u8], max_pixels: u64) -> Result<DynamicImage,
     // space — a Display-P3 or BT.2020 photo read as sRGB, visibly desaturated.
     let decoded = match heifer::decode_srgb_rgba8(data, &options) {
         Ok(decoded) => decoded,
-        // A colour space `heifer` cannot convert must not fail the photo: re-run
-        // the plain decode and keep the coded samples, exactly as an untagged
-        // source is handled.
+        // `Unsupported` is broader than colour: `heifer` also reports an
+        // unsupported item type, an uncompressed item, or an undersized alpha
+        // plane this way. A colour space it cannot convert must not fail the
+        // photo, so retry the plain decode (which skips the colour conversion)
+        // and keep the coded samples; a genuinely unsupported file fails again
+        // there with the same reason, so the retry is wasted only on that rare
+        // path and never on the common one.
         Err(heifer::Error::Unsupported(reason)) => {
-            warn!(%reason, "the heic colour space cannot be converted; keeping the coded samples");
+            warn!(
+                %reason,
+                "heifer declined the file (unconvertible colour or an unsupported feature); \
+                 retrying without colour management"
+            );
             heifer::decode_rgba8(data, &options).map_err(DecodeError::Heic)?
         }
         Err(error) => return Err(DecodeError::Heic(error)),
@@ -131,13 +166,15 @@ struct DeclaredGeometry {
 ///
 /// # Errors
 ///
-/// Returns [`DecodeError::HeicGeometry`] when the container does not parse, has
-/// no size for its primary item, or declares more than [`MAX_DECODE_PIXELS`] —
-/// the probe never reports a size the decode would refuse.
+/// Returns [`DecodeError::HeicGeometry`] when the container does not parse or has
+/// no size for its primary item, and [`DecodeError::OverBudget`] when it declares
+/// more than [`MAX_DECODE_PIXELS`] — the probe never reports a size over the
+/// decode budget. (The decode itself tolerates an unmeasurable geometry; see
+/// [`decode_heic`].)
 pub fn probe_heic_dimensions(data: &[u8]) -> Result<(u32, u32), DecodeError> {
     let geometry = declared_heic_geometry(data)?;
     let (width, height) = geometry.canvas;
-    check_budget(width, height, MAX_DECODE_PIXELS)?;
+    crate::check_pixel_budget(width, height)?;
     Ok(geometry.display)
 }
 
@@ -150,8 +187,9 @@ pub fn probe_heic_dimensions(data: &[u8]) -> Result<(u32, u32), DecodeError> {
 /// A derived item type `heifer` resolves by reference (`iovl`, `iden`) has no
 /// extent of its own beyond its `ispe`, so a container that omits one is
 /// rejected here even though the decoder could assemble it. That is deliberate:
-/// a probe that cannot prove the size must not report one, and the caller that
-/// needs the pixels has [`decode_heic`].
+/// a probe that cannot prove the size must not report one, while [`decode_heic`]'s
+/// [`check_declared_budget`] ignores a geometry it cannot measure and lets
+/// `heifer`'s own limit bound the allocation.
 fn declared_heic_geometry(data: &[u8]) -> Result<DeclaredGeometry, DecodeError> {
     let file = heifer_isobmff::HeifFile::parse(data)
         .map_err(|e| DecodeError::HeicGeometry(format!("the container does not parse: {e}")))?;
@@ -254,26 +292,6 @@ fn aperture_side(size: (u32, u32), offset: (i32, u32), extent: u32) -> u32 {
     {
         declared.round().min(remaining) as u32
     }
-}
-
-/// Reject a declared HEIC geometry that exceeds `max_pixels`.
-///
-/// The bound is on *area*, not a per-side dimension, matching the raster path's
-/// guard: a tall or wide HEIC with few enough pixels is admitted while a bomb of
-/// any shape is rejected. `u64` arithmetic cannot overflow a pair of `u32` sides.
-fn check_budget(width: u32, height: u32, max_pixels: u64) -> Result<(), DecodeError> {
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > max_pixels {
-        warn!(
-            width,
-            height, pixels, max_pixels, "rejecting heic: declared geometry is over the budget"
-        );
-        return Err(DecodeError::HeicGeometry(format!(
-            "its declared {width}x{height} geometry ({pixels} pixels) is beyond the \
-             decompression-bomb guard ({max_pixels} pixels)"
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]

@@ -47,6 +47,8 @@
 // `-D warnings`.
 #![warn(missing_docs)]
 
+use tracing::warn;
+
 mod colour;
 pub mod heic;
 pub mod raster;
@@ -64,7 +66,7 @@ pub use raster::{decode_raster_oriented, probe_dimensions};
 /// allocates. The raster path checks it against the image's declared size in
 /// [`decode_raster_oriented`]; the HEIC path passes it to `heifer` as its
 /// `max_pixels` limit and checks it against the container's declared geometry in
-/// [`probe_heic_dimensions`].
+/// [`probe_heic_dimensions`] and in the decode's own header pre-check.
 pub const MAX_DECODE_PIXELS: u64 = 8192 * 8192;
 
 /// Cap on total raster decoder allocation (bytes) — derived from (and consistent
@@ -128,4 +130,38 @@ pub enum DecodeError {
         /// The declared height, in pixels.
         height: u32,
     },
+}
+
+/// Reject a declared geometry whose pixel count exceeds [`MAX_DECODE_PIXELS`].
+///
+/// Shared by the raster header guard ([`raster::probe_dimensions`] /
+/// [`decode_raster_oriented`]) and the HEIC declared-geometry checks
+/// ([`probe_heic_dimensions`] and the decode's header pre-check) so every path
+/// reports the *same* [`DecodeError::OverBudget`] for an over-budget source — a
+/// caller that treats "too many pixels" as a policy rejection matches one variant
+/// regardless of the incoming format, rather than a structured error on rasters
+/// and a string on HEIC.
+///
+/// The bound is on the total area, not a per-side dimension (see
+/// [`MAX_DECODE_PIXELS`]), so a tall screenshot or wide panorama with few enough
+/// pixels is admitted while a bomb of any shape is rejected. `u64` arithmetic
+/// cannot overflow a pair of `u32` sides.
+pub(crate) fn check_pixel_budget(width: u32, height: u32) -> Result<(), DecodeError> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_DECODE_PIXELS {
+        warn!(
+            width,
+            height,
+            pixels,
+            budget = MAX_DECODE_PIXELS,
+            "rejecting image: declared geometry is over the decode budget"
+        );
+        return Err(DecodeError::OverBudget {
+            width,
+            height,
+            pixels,
+            budget: MAX_DECODE_PIXELS,
+        });
+    }
+    Ok(())
 }
