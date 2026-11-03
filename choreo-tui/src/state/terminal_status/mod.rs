@@ -9,10 +9,17 @@
 //!
 //! The `App` fields this module reads (`term_status_override`,
 //! `attached_status`, `session_mgr`, …) stay on the struct in `state/`.
+//!
+//! The `host_report` submodule is the SECOND consumer of the same derivation:
+//! a hosting workspace manager is told the same state word and the same
+//! one-line text this module puts in an OSC 7501 record, so the terminal and
+//! the host can never disagree.
 
 use std::collections::HashMap;
 
 use choreo_proto::SessionStatus;
+
+pub mod host_report;
 
 use super::App;
 use crate::terminal;

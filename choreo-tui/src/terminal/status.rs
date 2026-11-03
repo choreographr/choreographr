@@ -200,7 +200,11 @@ fn encode(text: &str) -> String {
 /// display text, and a separator would break the record's one-line shape —
 /// exactly the characters the grid filter escapes. Truncation snaps to a char
 /// boundary so a multi-byte character is never split.
-fn sanitize_value(text: &str, max_bytes: usize) -> String {
+///
+/// `pub(crate)` because the host reporter (`state::host_report`) puts the same
+/// `title`/`msg` text on a command line: one sanitizer, so the terminal record
+/// and the host report can never disagree about what a field's text is.
+pub(crate) fn sanitize_value(text: &str, max_bytes: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max_bytes));
     for c in text.chars() {
         if is_control_char(c) || is_unsafe_display_char(c) {

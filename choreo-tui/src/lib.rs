@@ -25,6 +25,14 @@
 // API contract — the re-exports exist only for that test target.
 #[doc(hidden)]
 pub mod autostart;
+
+// `pub`: the hosting-workspace-manager reporter's command-line shape is
+// exercised end-to-end from tests/it/host_report.rs (it spawns a stand-in host
+// binary and reads what it recorded, so it belongs in the integration suite per
+// AGENTS.md), which needs cross-crate visibility. `#[doc(hidden)]`: an
+// implementation detail, not part of the public API contract.
+#[doc(hidden)]
+pub use state::host_report;
 mod backend;
 mod cache;
 mod connection;

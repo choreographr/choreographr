@@ -15,4 +15,5 @@
 //! inner attributes — inside a module they apply to that module.
 
 mod autostart_poll;
+mod host_report;
 mod integration;

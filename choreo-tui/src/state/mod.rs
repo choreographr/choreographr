@@ -43,6 +43,11 @@ mod terminal_advice;
 mod terminal_status;
 mod turn;
 
+// The hosting-workspace-manager reporter lives beside the OSC 7501 derivation
+// it shares (`terminal_status`), and is re-exported here because `run_app` and
+// the UI loop reach it through `state`.
+pub use terminal_status::host_report;
+
 // Compatibility layer: every item moved into the sibling modules is
 // re-exported here so `crate::state::X` references (in this crate and in the
 // crate's `crate::tests` suite) keep resolving exactly as before.
@@ -322,6 +327,10 @@ pub(crate) struct App {
     /// records or the window title; the UI loop recomputes and publishes them
     /// outside the render closure.
     pub(crate) term_status_dirty: bool,
+    /// Queue into the hosting workspace manager's reporter thread, when one is
+    /// running (see [`host_report`]). `None` whenever this process is not
+    /// inside a workspace-manager pane, so the whole feature is inert.
+    pub(crate) host_report_sink: Option<host_report::HostReportSink>,
     /// Terminal turn outcomes the session status cannot express: `done` after
     /// a completed turn, `error` after a failed one, `idle` after a
     /// cancellation. Keyed by session id; persists until a new turn begins (a
@@ -510,6 +519,7 @@ impl App {
             attached_tool_groups: Vec::new(),
             term_status: terminal::status::Publisher::new(),
             term_status_dirty: false,
+            host_report_sink: None,
             term_status_override: HashMap::new(),
             term_title: None,
             term_pointer: None,

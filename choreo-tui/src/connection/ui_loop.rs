@@ -443,6 +443,14 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
         "welcome terminal advice"
     );
 
+    // Keep a hosting workspace manager's pane state in step with the attached
+    // session. Inert unless the host's marker environment is present, and the
+    // reports leave on their own thread, so this can never delay the UI.
+    let host_reporter = crate::state::host_report::Reporter::start_from_env();
+    app.host_report_sink = host_reporter
+        .as_ref()
+        .map(crate::state::host_report::Reporter::sink);
+
     // Latch the `--attach <SESSION_ID>` request (if any). It is NOT dispatched
     // here: `run_app` sends its startup requests before the connection is even
     // established, and applying the attach before the daemon's session snapshot
@@ -513,6 +521,15 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
         &resume_rx,
     )
     .map_err(io::Error::from);
+
+    // Release the host's pane state before anything else in teardown: the
+    // reporter thread is waiting on the channel, so dropping our handle ends it,
+    // and `shutdown` then runs the release command and joins. The pane stops
+    // showing a session state the moment the client exits.
+    app.host_report_sink = None;
+    if let Some(reporter) = host_reporter {
+        reporter.shutdown();
+    }
 
     // Signal the image worker to shut down and wait for it to finish.
     app.image_job_tx = None;
@@ -786,6 +803,10 @@ fn run_ui_loop(
         if app.term_status_dirty {
             let desired = app.desired_status_records();
             app.term_status.sync(desired);
+            // The hosting workspace manager reads the SAME state: one report per
+            // state change, sent to a background thread so no host invocation can
+            // ever block this loop (see `state::host_report`).
+            app.publish_host_report();
             app.term_status_dirty = false;
 
             // Dedupe the window title against the last one emitted; a title
