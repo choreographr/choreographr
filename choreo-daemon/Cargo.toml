@@ -47,7 +47,6 @@ gix = { version = "0.90", features = ["revision"] }
 gix-imara-diff = { version = "0.3", features = ["unified_diff"] }
 hmac = "0.13"
 image.workspace = true
-heif-oxide.workspace = true
 rand.workspace = true
 redb.workspace = true
 tiktoken = "4"

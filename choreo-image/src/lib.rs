@@ -6,32 +6,39 @@
 //! with EXIF orientation baked in ([`decode_raster_oriented`], the `image`-crate
 //! path under a decompression-bomb guard — a total-pixel budget checked against
 //! the declared size, plus `image::Limits` as defense-in-depth — in a single
-//! pass), the header-only dimension probe ([`probe_dimensions`], which enforces
-//! the same guard without decoding pixels), and the pure-Rust `heif-oxide`
-//! HEIC/HEIF decode ([`decode_heic`], which applies the container's orientation
-//! and runs a pre-decode allocation guard so a hostile container cannot drive a
-//! huge allocation before we reject it).
+//! pass), the header-only dimension probes ([`probe_dimensions`] for rasters and
+//! [`probe_heic_dimensions`] for HEIC, both enforcing the same guard without
+//! decoding pixels), and the pure-Rust `heifer` HEIC/HEIF decode
+//! ([`decode_heic`]).
 //!
 //! Keeping these in one leaf crate means an orientation bug fix or a security
 //! guard change lands in the model path and the UI path together, so they can
 //! never drift apart.
 //!
-//! The raster path also performs **colour management**: an embedded ICC profile
-//! is converted to sRGB with the pure-Rust `moxcms` CMM before the pixels leave
-//! this crate, so a `Display-P3` or `AdobeRGB` source reaches the model and the
-//! terminal as sRGB values instead of having its numbers reinterpreted as sRGB
-//! (which reads visibly desaturated). See `colour` for the scope (RGB profiles
-//! on RGB buffers only) and the fail-soft contract — a metadata tag never fails
-//! an image.
+//! # Colour management
 //!
-//! The HEIC path is already sRGB when the container carries an `nclx` colour
-//! description, which `heif-oxide` converts (Display-P3/BT.2020 → sRGB) as part
-//! of the decode. A HEIC whose only colour tag is an embedded ICC profile
-//! (`rICC`/`prof`) is *not* colour-managed: `heif-oxide` reports the profile's
-//! presence but does not hand back its bytes, so there is nothing to apply
-//! through the crate's colour path. That gap is upstream and covers only the
-//! ICC-tagged HEIC case; the same applies to PNG `cICP`/`sRGB`-chunk colour,
-//! which is not an ICC profile at all.
+//! Both decode paths convert an embedded ICC profile to sRGB with the pure-Rust
+//! `moxcms` CMM before the pixels leave this crate, so a `Display-P3` or
+//! `AdobeRGB` source reaches the model and the terminal as sRGB values instead
+//! of having its numbers reinterpreted as sRGB (which reads visibly desaturated).
+//! See `colour` for the scope (RGB profiles on RGB buffers only) and the
+//! fail-soft contract — a metadata tag never fails an image.
+//!
+//! # HEIC
+//!
+//! `heifer` is the pure-Rust HEIC decoder. It applies the container's own
+//! orientation transforms (rotate/mirror/crop), so nothing here re-applies an
+//! `Orientation` tag from the retained Exif box — doing so would rotate the
+//! picture a second time. The decompression-bomb bound is enforced in two
+//! places: `heifer` itself rejects a picture larger than its `max_pixels` option
+//! at the allocation site, and [`decode_heic`] additionally pre-checks the
+//! container's *declared* geometry (see [`probe_heic_dimensions`]) so a hostile
+//! file is rejected before any decoding work starts.
+//!
+//! An embedded ICC profile (`rICC`/`prof`) read from the container is applied
+//! through `colour::to_srgb`, so an ICC-tagged HEIC is colour-managed like any
+//! raster source. When the container instead (or additionally) signals colour via
+//! its `nclx` description, that conversion is part of the decode.
 
 // Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
 // every public item carries docs, enforced as a hard error by clippy-strict's
@@ -39,8 +46,8 @@
 #![warn(missing_docs)]
 
 mod colour;
-mod heif;
 
+use heifer_isobmff::boxes::Property;
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageDecoder, ImageReader, RgbaImage};
 use std::io::Cursor;
@@ -182,60 +189,239 @@ pub fn decode_raster_oriented(data: &[u8]) -> Result<DynamicImage, String> {
     Ok(img)
 }
 
-/// Decode a HEIC/HEIF image to an RGBA [`DynamicImage`].
+/// Decode a HEIC/HEIF image to an RGBA [`DynamicImage`], colour-managed to sRGB.
 ///
-/// `heif-oxide` applies the container's orientation transforms and converts an
-/// `nclx` colour description to sRGB, so no further rotation or colour pass is
-/// needed here (an ICC-tagged HEIC is the one gap — see the crate docs). A
-/// *pre-decode* allocation guard rejects hostile declared geometry before the
-/// decoder runs (see `heic_geometry_within_limits`).
+/// The decode runs under the decompression-bomb guard: the container's
+/// *declared* geometry is checked first (see [`probe_heic_dimensions`]), and the
+/// decoder enforces [`MAX_DECODE_PIXELS`] itself against the picture it is about
+/// to allocate, so a hostile file is rejected from its header and a
+/// maliciously-amplified grid cannot allocate past the budget either.
+///
+/// `heifer` applies the container's own orientation transforms, so nothing here
+/// re-applies an Exif `Orientation` tag — that would rotate the picture twice.
+/// An embedded ICC profile is then converted to sRGB through `colour`; the
+/// profile is a metadata tag, so a failure to read it is fail-soft and leaves
+/// the pixels as decoded.
 ///
 /// # Errors
 ///
 /// Returns a human-readable error string when the declared HEIC geometry
-/// exceeds the pre-decode guard or the decode itself fails.
+/// exceeds the decompression-bomb guard or the decode itself fails.
 pub fn decode_heic(data: &[u8]) -> Result<DynamicImage, String> {
-    if !heic_geometry_within_limits(data) {
+    // Defence in depth: reject a hostile declared geometry from the header,
+    // before the decoder does any work. `heifer` enforces the same budget at the
+    // allocation site; this pre-check just fails faster and with a clearer
+    // message.
+    probe_heic_dimensions(data)?;
+    decode_heic_with_budget(data, MAX_DECODE_PIXELS)
+}
+
+/// [`decode_heic`]'s pixel decode, with the budget supplied by the caller.
+///
+/// The budget is a parameter rather than the constant so the in-decoder limit
+/// can be exercised by a test with a small value; `decode_heic` passes
+/// [`MAX_DECODE_PIXELS`]. The declared-geometry pre-check lives in the caller:
+/// this function's bound is `heifer`'s own `max_pixels`, enforced against the
+/// picture it is about to allocate.
+fn decode_heic_with_budget(data: &[u8], max_pixels: u64) -> Result<DynamicImage, String> {
+    let decoded = heifer::decode_with_options(
+        data,
+        &heifer::Options {
+            max_pixels,
+            max_threads: 0,
+        },
+    )
+    .map_err(|e| format!("failed to decode heic: {e}"))?;
+    let rgba = RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
+        .ok_or_else(|| "heic decoded to a buffer that does not match its size".to_string())?;
+    let img = DynamicImage::ImageRgba8(rgba);
+
+    // Colour-manage to sRGB when the container carries an ICC profile. This is
+    // fail-soft by design: a metadata tag must never fail an otherwise good
+    // photograph, so an unreadable profile leaves the decoded pixels alone.
+    match heifer::read_metadata(data) {
+        Ok(metadata) => match metadata.icc_profile {
+            Some(icc) => Ok(colour::to_srgb(img, &icc)),
+            None => Ok(img),
+        },
+        Err(error) => {
+            debug!(%error, "the heic colour profile could not be read; assuming sRGB");
+            Ok(img)
+        }
+    }
+}
+
+/// The container-declared geometry of a HEIC's primary item.
+struct DeclaredGeometry {
+    /// The extent the decoder works at — the picture extent of a single coded
+    /// image, or a `grid`'s canvas. This is the size the pixel budget is checked
+    /// against, because it is what the decoder allocates before the container's
+    /// crop shrinks it.
+    canvas: (u32, u32),
+    /// The size of the picture the decode produces, after the container's crop
+    /// (`clap`) and rotation/mirror (`irot`/`imir`) transforms.
+    display: (u32, u32),
+}
+
+/// Report a HEIC/HEIF image's declared dimensions without decoding pixels.
+///
+/// This is **header-only** — it parses the container's box structure (no HEVC
+/// decode, no pixel allocation), so it costs microseconds rather than the tens
+/// to hundreds of milliseconds a full decode takes. A caller that needs only the
+/// geometry (a size probe before displaying, a layout calculation) uses this
+/// instead of paying for a decode.
+///
+/// The returned size is the one a decode would produce: the primary item's
+/// `grid` canvas (the assembled tiles, already cropped) or its `ispe` extent,
+/// with the container's crop and rotation/mirror transforms applied. Because it
+/// trusts those declarations rather than inspecting the coded picture, the probe
+/// is **conservative** — a file declaring an oversized extent is rejected even
+/// if the coded picture would turn out to be small.
+///
+/// # Errors
+///
+/// Returns a human-readable error string when the container does not parse, has
+/// no size for its primary item, or declares more than [`MAX_DECODE_PIXELS`] —
+/// the probe never reports a size the decode would refuse.
+pub fn probe_heic_dimensions(data: &[u8]) -> Result<(u32, u32), String> {
+    let geometry = declared_heic_geometry(data)?;
+    let (width, height) = geometry.canvas;
+    check_heic_budget(data, width, height, MAX_DECODE_PIXELS)?;
+    Ok(geometry.display)
+}
+
+/// Read the container-declared geometry of a HEIC's primary item.
+///
+/// A `grid` item's canvas wins: it is the assembled, cropped size the decoder
+/// produces. A non-grid item falls back to its `ispe` extent, and a container
+/// that declares neither size is an error rather than a guessed size.
+fn declared_heic_geometry(data: &[u8]) -> Result<DeclaredGeometry, String> {
+    let file = heifer_isobmff::HeifFile::parse(data)
+        .map_err(|e| format!("failed to parse heic container: {e}"))?;
+    let id = file.primary_id;
+    // `grid` errors when the item is not a grid at all, which is the signal to
+    // fall back to the plain image extent rather than a hard failure.
+    let canvas = if let Ok(grid) = file.grid(id) {
+        (grid.output_width, grid.output_height)
+    } else {
+        match file.image_size(id) {
+            Ok(Some(size)) => size,
+            Ok(None) => {
+                return Err("heic container declares no size for its primary image".to_string());
+            }
+            Err(error) => return Err(format!("failed to read heic image size: {error}")),
+        }
+    };
+    if canvas.0 == 0 || canvas.1 == 0 {
+        return Err("heic container declares a zero-sized image".to_string());
+    }
+    let display = transformed_extent(&file, id, canvas)?;
+    Ok(DeclaredGeometry { canvas, display })
+}
+
+/// Apply the container's transformative properties to a declared extent.
+///
+/// The decoder applies them in association order after decoding, so replaying
+/// the same properties in the same order yields the size it will hand back: a
+/// `clap` crop shrinks the extent, an odd `irot` quarter swaps the sides, and a
+/// mirror changes neither.
+fn transformed_extent(
+    file: &heifer_isobmff::HeifFile<'_>,
+    id: heifer_isobmff::ItemId,
+    (width, height): (u32, u32),
+) -> Result<(u32, u32), String> {
+    let (mut width, mut height) = (width, height);
+    let properties = file
+        .item_properties(id)
+        .map_err(|e| format!("failed to read heic image properties: {e}"))?;
+    for property in properties {
+        match *property {
+            Property::CleanAperture {
+                width: aperture_width,
+                height: aperture_height,
+                horiz_offset,
+                vert_offset,
+            } => {
+                if aperture_width.1 == 0
+                    || aperture_height.1 == 0
+                    || horiz_offset.1 == 0
+                    || vert_offset.1 == 0
+                {
+                    return Err("heic clean aperture has a zero denominator".to_string());
+                }
+                width = aperture_side(aperture_width, horiz_offset, width);
+                height = aperture_side(aperture_height, vert_offset, height);
+            }
+            Property::Rotation(quarters) if quarters % 2 == 1 => {
+                core::mem::swap(&mut width, &mut height);
+            }
+            _ => {}
+        }
+    }
+    Ok((width, height))
+}
+
+/// One axis of a `clap` (clean aperture) crop: the aperture's declared size,
+/// clamped to the remaining span the way the decoder's centred crop clamps it —
+/// an aperture that runs past the edge yields what is left of the picture.
+fn aperture_side(size: (u32, u32), offset: (i32, u32), extent: u32) -> u32 {
+    let declared = f64::from(size.0) / f64::from(size.1);
+    let centre = f64::from(offset.0) / f64::from(offset.1) + (f64::from(extent) - 1.0) / 2.0;
+    let start = (centre - (declared - 1.0) / 2.0).round().max(0.0);
+    let remaining = (f64::from(extent) - start).max(0.0);
+    // Non-negative and bounded by `extent` (a `u32`), so the cast is exact for
+    // every value this can produce.
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        declared.round().min(remaining) as u32
+    }
+}
+
+/// Reject a declared HEIC geometry that exceeds `max_pixels`.
+///
+/// The bound is on *area*, not a per-side dimension, matching the raster path's
+/// guard: a tall or wide HEIC with few enough pixels is admitted while a bomb of
+/// any shape is rejected. `u64` arithmetic cannot overflow a pair of `u32` sides.
+fn check_heic_budget(data: &[u8], width: u32, height: u32, max_pixels: u64) -> Result<(), String> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > max_pixels {
         warn!(
             size = data.len(),
-            "rejecting heic: declared geometry exceeds the decompression-bomb guard"
+            width, height, "rejecting heic: declared geometry exceeds the decompression-bomb guard"
         );
         return Err(
             "heic image declares dimensions beyond the decompression-bomb guard".to_string(),
         );
     }
-    let decoded =
-        heif_oxide::decode_bytes(data).map_err(|e| format!("failed to decode heic: {e}"))?;
-    let rgba = RgbaImage::from_raw(decoded.width, decoded.height, decoded.to_rgba8())
-        .ok_or_else(|| "heic decoded to a buffer that does not match its size".to_string())?;
-    Ok(DynamicImage::ImageRgba8(rgba))
-}
-
-/// True when the declared image geometry in an ISOBMFF/HEIF container stays
-/// within the decompression-bomb guard, so `heif-oxide` won't allocate from a
-/// hostile size.
-///
-/// `heif-oxide` exposes no decoder limit, so we pre-parse the container for
-/// the geometry it allocates: every `ispe` (`ImageSpatialExtentsProperty`)
-/// extent (the per-item frame size a single coded image or grid tile is
-/// decoded from) and every `grid` derived item's canvas (tile extent ×
-/// rows/cols, read from the grid item payload located via `iinf`/`iloc`).
-/// See [`heif`] for the details; parsing is bounds-checked and a container
-/// whose size we cannot prove is rejected rather than decoded (the safe
-/// default — a valid HEIF still image always carries `ispe` geometry).
-fn heic_geometry_within_limits(data: &[u8]) -> bool {
-    heif::geometry_within_limits(data, MAX_DECODE_PIXELS)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use image::GenericImageView;
+    use image::{ColorType, GenericImageView};
 
-    // The HEIC container fixtures and the pre-decode geometry guard's own tests
-    // live with the parser (`heif::tests`); what belongs here is the public
-    // decode contract, so the two cannot drift into testing the same parser
-    // twice.
+    /// A 16×16 HEIC with no embedded colour profile.
+    const FIXTURE: &[u8] = include_bytes!("../tests/fixtures/heic-16x16.heic");
+    /// The same 16×16 picture tagged with an embedded `AdobeRGB` ICC profile.
+    const FIXTURE_ICC: &[u8] = include_bytes!("../tests/fixtures/heic-16x16-icc.heic");
+
+    /// Rewrite the first `ispe` extent's width and height in place, producing a
+    /// container that *declares* a bomb-sized image.
+    ///
+    /// The box layout is: `ispe` type at `idx` (a 4-byte size precedes it), then
+    /// the full-box `version/flags` at `idx + 4`, and the two big-endian `u32`
+    /// extents at `idx + 8` and `idx + 12`.
+    fn patch_ispe_extent(heic: &[u8], width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = heic.to_vec();
+        let idx = bytes
+            .windows(4)
+            .position(|w| w == b"ispe")
+            .expect("the fixture carries an ispe box");
+        bytes[idx + 8..idx + 12].copy_from_slice(&width.to_be_bytes());
+        bytes[idx + 12..idx + 16].copy_from_slice(&height.to_be_bytes());
+        bytes
+    }
 
     #[test]
     fn decode_raster_oriented_preserves_dimensions() {
@@ -313,7 +499,75 @@ mod tests {
     fn decode_heic_rejects_non_heif_bytes() {
         assert!(
             decode_heic(&[1, 2, 3]).unwrap_err().contains("heic"),
-            "non-HEIF bytes should fail via the guarded heif path"
+            "non-HEIF bytes should fail via the guarded heic path"
+        );
+    }
+
+    #[test]
+    fn decode_heic_decodes_the_plain_fixture() {
+        let img = decode_heic(FIXTURE).expect("the 16x16 fixture should decode");
+        assert_eq!(img.dimensions(), (16, 16));
+        assert_eq!(img.color(), ColorType::Rgba8);
+    }
+
+    #[test]
+    fn decode_heic_colour_manages_an_icc_tagged_fixture() {
+        // An ICC-tagged HEIC decodes *and* carries a profile the colour path can
+        // consume. The assertion stops at "the profile parses as a colour
+        // profile": the converted pixel values depend on the CMM's numerics,
+        // which is not something this crate should pin.
+        let img = decode_heic(FIXTURE_ICC).expect("the icc fixture should decode");
+        assert_eq!(img.dimensions(), (16, 16));
+
+        let metadata = heifer::read_metadata(FIXTURE_ICC).expect("metadata should parse");
+        let icc = metadata
+            .icc_profile
+            .expect("the fixture carries an embedded ICC profile");
+        assert!(
+            moxcms::ColorProfile::new_from_slice(&icc).is_ok(),
+            "the embedded profile must be usable by the colour path"
+        );
+    }
+
+    #[test]
+    fn probe_heic_dimensions_reports_the_declared_size() {
+        assert_eq!(probe_heic_dimensions(FIXTURE), Ok((16, 16)));
+        assert_eq!(probe_heic_dimensions(FIXTURE_ICC), Ok((16, 16)));
+        assert!(probe_heic_dimensions(b"not a heif file").is_err());
+    }
+
+    #[test]
+    fn declared_geometry_bomb_is_rejected_by_both_probe_and_decode() {
+        // Patching the declared `ispe` extent turns an in-budget picture into one
+        // that *claims* 60_000 x 60_000 pixels (3.6e9, far over the budget) while
+        // its coded picture stays tiny. Both entry points must reject it: the probe
+        // (so a size caller never sees a bomb dimension) and the decode (before the
+        // decoder does any work). The guard keys on the *declared allocation*
+        // extent, which the container's crop does not shrink — this fixture's crop
+        // stays 16x16, so a guard that looked at the cropped size would let the
+        // over-budget extent through.
+        let bomb = patch_ispe_extent(FIXTURE, 60_000, 60_000);
+        for error in [
+            probe_heic_dimensions(&bomb).unwrap_err(),
+            decode_heic(&bomb).unwrap_err(),
+        ] {
+            assert!(
+                error.contains("decompression-bomb guard"),
+                "expected the over-budget error, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn decode_heic_enforces_the_decoders_own_pixel_limit() {
+        // The declared geometry (16x16) fits any sane budget, so this reaches
+        // `heifer` and is rejected by *its* `max_pixels` bound against the
+        // padded picture it would allocate — proving the in-decoder limit is
+        // actually wired, not just our header pre-check.
+        let error = decode_heic_with_budget(FIXTURE, 100).unwrap_err();
+        assert!(
+            error.contains("failed to decode heic"),
+            "expected the decoder's size-limit rejection, got: {error}"
         );
     }
 }

@@ -23,7 +23,6 @@ base64.workspace = true
 clap.workspace = true
 crossterm = "0.29"
 image.workspace = true
-heif-oxide.workspace = true
 serde.workspace = true
 ratatui = "0.30"
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }

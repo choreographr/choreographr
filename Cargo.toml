@@ -473,12 +473,23 @@ redb = "4"
 # prefer `ColorType::has_alpha()` via `.color()` over `DynamicImage::has_alpha`)
 # so an exact pin from any backend can be absorbed without a source change.
 image = { version = "0.25", default-features = false, features = ["bmp", "dds", "exr", "ff", "gif", "hdr", "ico", "jpeg", "png", "pnm", "qoi", "tga", "tiff", "webp", "rayon"] }
-# Pure-Rust HEIC/HEIF still-image decoder (ISOBMFF container + HEVC via
-# rust_h265). Built in unconditionally: no C dependencies, so it does NOT
-# threaten the static-musl release build. Used by both choreo-daemon (read_img
-# normalization + display_image dimension inspection) and choreo-tui (client
-# display decode).
-heif-oxide = "0.1"
+# Pure-Rust HEIC/HEIF still-image codec (ISOBMFF container + HEVC). Built in
+# unconditionally: no C dependencies, so it does NOT threaten the static-musl
+# release build. Chosen because it is pure Rust (the decoder forbids unsafe
+# code), its HEVC decoder is conformance-tested, it enforces its own `max_pixels`
+# limit inside the decoder against the picture it is about to allocate, and it
+# hands back the container's embedded ICC profile so our colour path can manage
+# ICC-tagged HEIC. One cost to know about: `heifer` links its HEVC *encoder* crate
+# as well as the decoder, so a build compiles a decode-only subset plus an unused
+# encoder — an upstream decode-only feature would trim that. Used by choreo-image
+# (read_image normalisation + display_image), which choreo-daemon and choreo-tui
+# both go through.
+heifer = "0.3"
+# `heifer`'s ISOBMFF container layer, used directly for the header-only HEIC
+# geometry probe: parsing boxes costs microseconds and never decodes pixels, so a
+# caller that needs only the dimensions (and the decompression-bomb check) does
+# not pay for a decode.
+heifer-isobmff = "0.3"
 # Pure-Rust ICC colour-management engine (colour conversion to sRGB). Used by
 # choreo-image to colour-manage a source's embedded ICC profile on the shared
 # decode path, so Display-P3/AdobeRGB photos reach the model and the terminal as
