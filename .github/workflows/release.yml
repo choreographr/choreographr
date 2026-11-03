@@ -56,6 +56,10 @@
 #                   before release" gap: until this step the Android
 #                   artifacts had only ever been structurally inspected,
 #                   never run.
+#   freebsd-x86_64  scripts/release.sh on a FreeBSD VM (vmactions/freebsd-vm;
+#                   there is no hosted FreeBSD runner) — the native
+#                   x86_64-unknown-freebsd tarball, then smoke-test.sh and
+#                   daemon-smoke.sh run the binaries natively in the VM.
 #
 # Zig version pin: every job installs Zig via mlugg/setup-zig@v2 with an
 # explicit `version: 0.16.0`. zlob (a choreo-daemon dependency) compiles its
@@ -572,6 +576,16 @@ jobs:
           # smoke-test.sh checks on the desktop artifacts, which until now
           # the Android builds had never had. Timing-sensitive behaviour and
           # real device interaction remain on-device responsibilities.
+          # Refresh the package index FIRST and scope it to Ubuntu's own
+          # sources (drop third-party sourceparts) — the same guard the Linux
+          # jobs use. The runner image's baked index goes stale, and an
+          # unscoped update can die on a flaky third-party repo (the Google
+          # Chrome repo has). Without this, `qemu-user-static` resolves to
+          # "no installation candidate" (exit 100, seen 2026-11-03).
+          sudo apt-get update -qq \
+            -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0"
           sudo apt-get install -y -qq skopeo qemu-user-static
 
           ROOTFS=/tmp/termux-rootfs
@@ -804,20 +818,19 @@ jobs:
 
   freebsd-x86_64:
     name: freebsd x86_64 (VM build + smoke)
-    # STAGED / NON-BLOCKING. GitHub has no hosted FreeBSD runner, so this builds
-    # natively inside a FreeBSD VM via vmactions/freebsd-vm. It is deliberately
-    # kept OUT of `release.needs` and the release job's download `pattern:`
-    # until a native FreeBSD build has been validated end to end — the same
-    # staging the windows-msvc job used before its runtime was ready. Promote it
-    # by adding `freebsd-x86_64` to both places once this job is consistently
-    # green. Host parity without a VM: `just check-freebsd` type-checks every
-    # library for x86_64-unknown-freebsd from any host.
+    # SHIPPING. GitHub has no hosted FreeBSD runner, so this builds natively
+    # inside a FreeBSD VM via vmactions/freebsd-vm, then uploads the tarball it
+    # produced (the action's `copyback` syncs dist/ back to the runner). It is in
+    # `release.needs` and the download `pattern:` below, so a FreeBSD build
+    # failure blocks the release — validated by a green build+smoke run on
+    # 2026-11-03 (daemon booted, fingerprint computed, clean SIGTERM exit).
+    # Host parity without a VM: `just check-freebsd` type-checks every library
+    # for x86_64-unknown-freebsd from any host.
     # NOTE: `pkg install zig` may lag the Zig 0.16.0 that zlob 1.7.1 requires;
-    # if the build fails on zlob, pin the Zig version here (download the 0.16.0
-    # tarball into PATH) before promoting the job.
+    # if a future build fails on zlob, pin the Zig version here (download the
+    # 0.16.0 tarball into PATH).
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v7
 
@@ -848,9 +861,17 @@ jobs:
             ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-x86_64-unknown-freebsd.tar.gz"
             ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-x86_64-unknown-freebsd.tar.gz"
 
+      - uses: actions/upload-artifact@v7
+        with:
+          # The VM action's copyback (default on) already rsynced dist/ back to
+          # the runner, so the tarball release.sh built inside FreeBSD is here.
+          name: freebsd-x86_64
+          path: dist/choreographr-*
+          if-no-files-found: error
+
   release:
     name: verify + (on tag) create GitHub release
-    needs: [linux-x86_64, linux-arm64, macos-arm64, windows-msvc, android-termux]
+    needs: [linux-x86_64, linux-arm64, macos-arm64, freebsd-x86_64, windows-msvc, android-termux]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Runs on BOTH tag pushes and workflow_dispatch so the dry run exercises this
@@ -876,11 +897,11 @@ jobs:
       # which downloads EVERY artifact in the run (it once raced a stray artifact
       # into a release and leaked it into SHA256SUMS). `needs` gates when this job
       # starts; it does not scope the download. Each platform ships from its own
-      # runner: both Linux arches, macOS (both darwin tarballs), Windows (the
-      # .exe zip), and Android/Termux (tarball + .deb).
+      # runner: both Linux arches, macOS (both darwin tarballs), FreeBSD x86_64,
+      # Windows (the .exe zip), and Android/Termux (tarball + .deb).
       - uses: actions/download-artifact@v8
         with:
-          pattern: "{linux-x86_64-musl,linux-aarch64-musl,macos-aarch64,windows-x86_64-msvc,android-aarch64-termux}"
+          pattern: "{linux-x86_64-musl,linux-aarch64-musl,macos-aarch64,freebsd-x86_64,windows-x86_64-msvc,android-aarch64-termux}"
           merge-multiple: true
           path: dist
 
