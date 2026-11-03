@@ -120,6 +120,16 @@ pub(crate) fn hosted_pane_sentence(platform: Platform) -> String {
     )
 }
 
+/// The one sentence a GNU screen pane gets in place of terminal advice.
+///
+/// Screen does not forward the sequences the client relies on through its
+/// pane, so the fix is to run inside a multiplexer that does. Both the welcome
+/// notice and the Terminal page print this, so screen advice lives with the
+/// rest of the shared tables rather than in a single surface.
+pub(crate) fn screen_sentence() -> &'static str {
+    "Screen does not forward keys, images, or clipboard through its pane; run this inside tmux or zellij instead."
+}
+
 /// The terminals worth recommending on `platform`, best first.
 ///
 /// Android is empty by design: the platform's terminal is the Android app the
@@ -415,6 +425,13 @@ mod tests {
             full_support_terminals(Platform::Android),
             Vec::<&str>::new()
         );
+    }
+
+    #[test]
+    fn the_screen_sentence_names_the_alternative_not_a_setting() {
+        let sentence = screen_sentence();
+        assert!(sentence.contains("does not forward"));
+        assert!(sentence.contains("tmux or zellij"));
     }
 
     #[test]

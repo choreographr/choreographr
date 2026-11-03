@@ -15,7 +15,7 @@
 
 use crate::state::{
     PopupSize, centered_popup, gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting,
-    recommendations, tmux_lines,
+    recommendations, screen_sentence, tmux_lines,
 };
 use crate::terminal::profile::{
     Capabilities, Host, Mux, NativeImages, TerminalKind, TerminalProfile,
@@ -186,6 +186,11 @@ fn recommendation_lines(
     if matches!(profile.host, Host::Hosted(_)) {
         return Vec::new();
     }
+    // A GNU screen pane is told the same thing in its fixes block, so a
+    // recommendations block here could only contradict it.
+    if matches!(profile.host, Host::Mux(Mux::Screen)) {
+        return Vec::new();
+    }
     let mut lines = vec![Line::from(Span::styled("recommendations", heading_style()))];
     let gaps = gap_phrases(capabilities);
     if gaps.is_empty() {
@@ -267,6 +272,13 @@ fn fix_lines(profile: &TerminalProfile) -> Vec<Line<'static>> {
                 .into_iter()
                 .map(|line| Line::from(Span::styled(format!("  {line}"), Style::default()))),
         );
+        any = true;
+    }
+    // A GNU screen pane has no setting to offer: screen does not forward the
+    // client's sequences at all, so the fix is another multiplexer, not a
+    // configuration line.
+    if let Host::Mux(Mux::Screen) = profile.host {
+        lines.push(Line::from(Span::styled(screen_sentence(), dim_style())));
         any = true;
     }
     if matches!(profile.host, Host::Hosted(_)) {
@@ -563,6 +575,22 @@ mod tests {
             Host::Direct,
         ));
         assert!(linux.contains("Nothing to configure"));
+    }
+
+    #[test]
+    fn a_screen_pane_gets_the_shared_sentence_instead_of_nothing_to_configure() {
+        // The welcome panel warns that screen blocks the client's features, so
+        // the page must agree: the same sentence, no "nothing to configure",
+        // and no recommendations block that would call the pane healthy.
+        let out = text(&profile(
+            TerminalKind::Unknown,
+            Platform::Linux,
+            Host::Mux(Mux::Screen),
+        ));
+        assert!(out.contains("does not forward"), "unexpected page:\n{out}");
+        assert!(out.contains("tmux or zellij"), "unexpected page:\n{out}");
+        assert!(!out.contains("Nothing to configure"), "page:\n{out}");
+        assert!(!out.contains("recommendations"), "page:\n{out}");
     }
 
     #[test]

@@ -20,7 +20,7 @@
 use super::App;
 use super::terminal_advice::{
     gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting, recommendations,
-    tmux_lines,
+    screen_sentence, tmux_lines,
 };
 use crate::terminal::profile::{Host, Mux, Platform, TerminalKind, TerminalProfile, Version};
 use choreo_client_core::{SetupFollow, SetupProgress, suggest_account_name};
@@ -42,7 +42,10 @@ pub(crate) struct TerminalNotice {
 impl App {
     /// The launch-time terminal advice, or `None` when the terminal and its
     /// host cost this client nothing.
-    pub(crate) fn terminal_notice(&self) -> Option<&TerminalNotice> {
+    ///
+    /// Named for the advice it returns rather than for the notice field it
+    /// prints from, so a read of the field cannot be mistaken for a call.
+    pub(crate) fn terminal_advice(&self) -> Option<&TerminalNotice> {
         self.terminal_notice.as_ref()
     }
 }
@@ -65,11 +68,9 @@ pub(crate) fn terminal_notice(profile: &TerminalProfile) -> Option<TerminalNotic
         Host::Mux(Mux::Zellij) => None,
         Host::Mux(Mux::Screen) => Some(TerminalNotice {
             headline: "GNU screen blocks these features".to_string(),
-            lines: vec![
-                "Screen does not forward keys, images, or clipboard through its pane; \
-                 run this inside tmux or zellij instead."
-                    .to_string(),
-            ],
+            // The sentence is the shared one the Terminal page prints, so the two
+            // surfaces cannot disagree about a screen pane.
+            lines: vec![screen_sentence().to_string()],
         }),
         Host::Hosted(_) => Some(TerminalNotice {
             headline: "This pane cannot forward everything the client uses".to_string(),
@@ -509,7 +510,7 @@ mod tests {
     #[test]
     fn fresh_app_has_no_terminal_notice() {
         let app = App::new();
-        assert!(app.terminal_notice().is_none());
+        assert!(app.terminal_advice().is_none());
     }
 
     #[test]

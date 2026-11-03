@@ -3209,8 +3209,11 @@ recommendations (printed only when a gap actually exists), and the
 copy-pasteable fixes. Both the advice tables it prints and the rule deciding
 whether the macOS Option-as-Meta setting applies live in
 `state/terminal_advice.rs`, shared with the welcome notice, so the two surfaces
-cannot drift into recommending different things; the in-source rustdoc of that
-module is the reference for each rule.
+cannot drift into recommending different things; that module also holds the
+single GNU screen sentence both surfaces print for a screen pane (screen
+forwards none of the client's sequences, so the advice is another multiplexer
+rather than a setting, and the page prints no recommendations block for it).
+The in-source rustdoc of that module is the reference for each rule.
 
 ### Hosted panes: reporting status to the workspace manager
 

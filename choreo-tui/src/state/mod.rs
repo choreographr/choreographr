@@ -80,7 +80,7 @@ pub(crate) use streaming::StreamingResponseCache;
 // item that moved into a sibling module.
 pub(crate) use terminal_advice::{
     gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting, recommendations,
-    tmux_lines,
+    screen_sentence, tmux_lines,
 };
 
 pub(crate) const STATUS_BAR_HEIGHT: u16 = 1;
