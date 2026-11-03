@@ -427,6 +427,15 @@ unsupported, the welcome panel says which one and recommends terminals that
 support it on your platform, then stays silent once nothing is missing. If you
 see no advice, nothing about your terminal is costing you a feature.
 
+Press `Alt+T` (or type `/terminal`) at any time for the **Terminal page**: a
+read-only summary of what the client negotiated with this terminal — its
+identity, version, platform, host layer and image protocol — the seven
+escape-sequence features it checked (each marked supported, not supported, or
+unknown, where "unknown" means the client could not settle the question and
+never counts against you), and the copy-pasteable fix for every gap: the macOS
+Option-as-Meta setting for the terminal it detected, the tmux lines below, or,
+in a hosted pane, a note that terminal advice does not apply there.
+
 On **macOS**:
 
 | Terminal | Install |
@@ -1273,6 +1282,7 @@ runs the command**, and `Esc` discards the line without cancelling anything.
 - `Alt+M` — open the model selector: list models available on the attached session's account (alphabetical, case-insensitively by id), type to filter, `↑`/`↓`/`PgUp`/`PgDn` or the mouse wheel to navigate, click a row or press Enter to select, Esc to dismiss. The list paints instantly from the daemon's cache or the local catalog's curated ids for the account's provider, and refreshes in place when the live fetch lands, keeping the row you are on; while it is a stand-in rather than the account's live list the footer says `provisional: live models not fetched yet`.
 - `Alt+Up` / `Alt+Down` — undo / redo one undo batch (same as `/undo` and `/redo`; both require an idle session)
 - `Alt+H` — toggle the keyboard-shortcut help overlay (the two cyan lines at the bottom of the Chat page)
+- `Alt+T` / `/terminal` — open the read-only **Terminal page**: the terminal the client launched in (identity, version, platform, host layer, negotiated image protocol), a checklist of the seven escape-sequence features it checked (`supported` / `not supported` / `unknown` — an unasserted capability is never reported as unsupported), and how to close any gap: the macOS Option-as-Meta setting for the detected terminal, the tmux forwarding lines, or a note that a workspace manager owns the pane. `Esc` or `Alt+T` closes it; nothing behind it takes input while it is open
 - `Alt+Q` — quit the client from any page or open modal (same as `/quit`)
 - `Ctrl+Backspace` — clear the draft prompt in the input box (empties the whole draft wherever the cursor sits; `Ctrl+W` deletes the previous word and `Ctrl+U` clears only up to the cursor; inert while browsing prompt history with `↑`, where it can neither clear nor detach the recalled entry)
 - **Readline / emacs editing keys** — the prompt honours the shell's readline bindings. Movement: `Ctrl+A`/`Ctrl+E` (start/end of the logical line), `Ctrl+B`/`Ctrl+F` (one char), `Alt+B`/`Alt+F` (one word), `Home`/`End` (line edges), `Ctrl+Home`/`Ctrl+End` (buffer edges). Killing/editing: `Ctrl+D` (delete char), `Ctrl+H`/`Backspace` (delete char back), `Ctrl+K` (kill to end of line), `Ctrl+T` (transpose), `Ctrl+W` (kill word back), `Alt+D` (kill word forward), `Alt+Backspace` (kill word back), `Ctrl+U` (kill to line start). History: `Ctrl+P`/`Ctrl+N` (previous/next prompt, the same as `↑`/`↓`). Every app *command* lives on an `Alt+` chord (above), so these `Ctrl+`/`Alt` editing chords are free

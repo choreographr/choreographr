@@ -620,6 +620,18 @@ fn parses_quit() {
     assert_eq!(parse_input_line("/quit"), Command::Quit);
 }
 
+#[test]
+fn parses_bare_terminal_as_the_terminal_page() {
+    // A local-UI command: it parses to its own variant, never to a daemon
+    // message, so the front-end can show the page.
+    assert_eq!(parse_input_line("/terminal"), Command::OpenTerminalHelp);
+    // Anything after the name is not this command.
+    assert!(matches!(
+        parse_input_line("/terminal now"),
+        Command::UnknownCommand(_)
+    ));
+}
+
 // ── Command catalog drift guard ──────────────────────────────────────────
 //
 // The catalog (`choreo_client_core::command_catalog`) and the parser are two
@@ -652,6 +664,7 @@ const PARSER_COMMAND_NAMES: &[&str] = &[
     "acl",
     "refresh-models",
     "mcp",
+    "terminal",
     "quit",
 ];
 

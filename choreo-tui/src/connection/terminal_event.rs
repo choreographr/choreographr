@@ -152,8 +152,8 @@ pub(crate) fn handle_terminal_event(
     // and trigger submission of the partial text instead of inserting
     // the newline.
     if let Event::Paste(data) = &event {
-        if app.fullscreen_image_target.is_some() {
-            tracing::debug!("[choreo-tui] ignoring paste while fullscreen overlay is active");
+        if app.fullscreen_image_target.is_some() || app.show_terminal_page {
+            tracing::debug!("[choreo-tui] ignoring paste while a full-screen overlay is active");
             return Ok(());
         }
         tracing::debug!("[choreo-tui] handling paste event");
@@ -246,6 +246,24 @@ pub(crate) fn handle_terminal_event(
     // before this point so the user can always quit while it is open.
     if app.model_selector.is_open() {
         return handle_model_selector_event(&event, app, client_tx);
+    }
+    // The Terminal page is a read-only modal over the Chat page and takes the
+    // same overlay priority: while it is open every event stops here, so a
+    // keystroke can never reach the composer underneath.  `Esc` and its own
+    // `Alt+T` toggle close it; a mouse event is inert because the page has no
+    // clickable rows (Alt+Q still quits from above).
+    if app.show_terminal_page {
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+        {
+            let alt_t = key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Char('t' | 'T'));
+            if key.code == KeyCode::Esc || alt_t {
+                tracing::debug!("[choreo-tui] closing the terminal page");
+                app.show_terminal_page = false;
+            }
+        }
+        return Ok(());
     }
     // The account modals (new-account wizard + API-key entry) take the same
     // overlay priority over the AI providers page.  They can only be opened

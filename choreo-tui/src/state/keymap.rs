@@ -98,8 +98,12 @@ fn key_label(key: Key) -> String {
 /// One logical shortcut per command, all on `Alt+<key>`.
 ///
 /// The bindings are chosen to avoid readline's `Meta` (Alt) set — `b f d u l c
-/// t y . < > { } ~ $ @ ! # & * / ? = \ ^` and the digits — so every `Alt+`
+/// y . < > { } ~ $ @ ! # & * / ? = \ ^` and the digits — so every `Alt+`
 /// command chord is free of the editing kernel's word/case/history bindings.
+/// `alt+t` is the one exception: readline binds `Meta-t` to `transpose-chars`,
+/// but the shortcut table is consulted *before* the editing arm in
+/// `connection/chat.rs`, so the command chord wins and `Ctrl+T` (the editing
+/// transpose) is untouched.
 const SHORTCUTS: &[(Chord, &str)] = &[
     (Chord::alt(Key::Char('m')), "model"),
     (Chord::alt(Key::Char('r')), "reasoning"),
@@ -108,6 +112,7 @@ const SHORTCUTS: &[(Chord, &str)] = &[
     (Chord::alt(Key::Down), "redo"),
     (Chord::alt(Key::Char('s')), "session"),
     (Chord::alt(Key::Char('a')), "account"),
+    (Chord::alt(Key::Char('t')), "terminal"),
     (Chord::alt(Key::Char('q')), "quit"),
 ];
 
@@ -168,6 +173,7 @@ mod tests {
         assert_eq!(binding_for(&alt('r')), Some("reasoning"));
         assert_eq!(binding_for(&alt('s')), Some("session"));
         assert_eq!(binding_for(&alt('a')), Some("account"));
+        assert_eq!(binding_for(&alt('t')), Some("terminal"));
         assert_eq!(binding_for(&alt('q')), Some("quit"));
         assert_eq!(
             binding_for(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
@@ -223,6 +229,7 @@ mod tests {
         assert_eq!(shortcut_label_for("undo").as_deref(), Some("Alt+↑"));
         assert_eq!(shortcut_label_for("redo").as_deref(), Some("Alt+↓"));
         assert_eq!(shortcut_label_for("quit").as_deref(), Some("Alt+Q"));
+        assert_eq!(shortcut_label_for("terminal").as_deref(), Some("Alt+T"));
         // `help` toggles the overlay, not a catalog command — no palette label.
         assert_eq!(shortcut_label_for("help"), None);
         assert_eq!(shortcut_label_for("nope"), None);

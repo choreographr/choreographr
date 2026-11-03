@@ -39,6 +39,7 @@ mod providers;
 mod session;
 mod session_manager;
 mod streaming;
+mod terminal_advice;
 mod terminal_status;
 mod turn;
 
@@ -68,6 +69,14 @@ pub(crate) use providers::*;
 pub(crate) use session::*;
 pub(crate) use session_manager::*;
 pub(crate) use streaming::StreamingResponseCache;
+// The terminal advice tables are read by the welcome notice derivation
+// (`state/onboarding.rs`) and by the Terminal page renderer
+// (`render/terminal_help.rs`), so they are re-exported here like every other
+// item that moved into a sibling module.
+pub(crate) use terminal_advice::{
+    HOSTED_PANE_SENTENCE, gap_phrases, join_phrases, option_key_setting, recommendations,
+    tmux_lines,
+};
 
 pub(crate) const STATUS_BAR_HEIGHT: u16 = 1;
 pub(crate) const MIN_INPUT_CONTENT_LINES: u16 = 1;
@@ -119,10 +128,17 @@ pub(crate) fn input_inner_width(term_width: u16) -> usize {
 /// Every app command lives on an `Alt+` chord (see `state/keymap.rs`); the
 /// readline-style `Ctrl+<letter>` editing chords are advertised in the
 /// `README` rather than here so the overlay stays two short lines.
+///
+/// Both lines must fit a standard 80-column terminal (the overlay is drawn
+/// inside a one-column inset on each side, so they are kept a little narrower
+/// than that), which fixes how the entries are grouped: the turn-control and
+/// app-level chords go first, the settings/page chords second. `alt+up` and
+/// `alt+down` share one `undo/redo` entry because two separate entries would
+/// push the first line past the margin.
 pub(crate) const HELP_LINE1: &str =
-    "alt+h help  alt+q quit  alt+a accounts  alt+s sessions  alt+m models";
+    "esc stop  alt+enter continue  alt+up/down undo/redo  alt+h help  alt+q quit";
 pub(crate) const HELP_LINE2: &str =
-    "esc stop  alt+enter continue  alt+up undo  alt+down redo  alt+r reasoning";
+    "alt+m model  alt+r reasoning  alt+t terminal  alt+a account  alt+s session";
 
 pub(crate) struct SessionDisplayState {
     pub(crate) view: SessionView,
@@ -352,6 +368,10 @@ pub(crate) struct App {
     /// immutable for the process lifetime; `None` means this terminal and its
     /// host cost the client nothing, so the panel stays silent.
     pub(crate) terminal_notice: Option<TerminalNotice>,
+    /// Whether the read-only Terminal page is open over the Chat page. Toggled
+    /// by `Alt+T` / `/terminal`; the page is a view over [`Self::terminal`], so
+    /// nothing is copied or derived into this flag beyond `true`/`false`.
+    pub(crate) show_terminal_page: bool,
     /// Persistent latch of whether the daemon's credential keystore is locked.
     /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
     /// and the subscribe-time lock-state push in `handle_daemon_message`;
@@ -497,6 +517,7 @@ impl App {
             mouse_tracking_reassert: false,
             terminal: crate::terminal::profile::TerminalProfile::default(),
             terminal_notice: None,
+            show_terminal_page: false,
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,
@@ -885,6 +906,29 @@ impl App {
         self.text_selection = None;
         if let Some(d) = self.active_display() {
             d.progress_dirty = true;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HELP_LINE1, HELP_LINE2};
+
+    /// The widest line the help overlay may draw: the two-line block is a
+    /// fixed-size affordance under the composer, so it has to read on a
+    /// standard 80-column terminal without wrapping or clipping.
+    const MAX_HELP_WIDTH: usize = 80;
+
+    #[test]
+    fn help_lines_fit_the_margin() {
+        // Both lines are plain ASCII, so `chars().count()` IS the column count —
+        // no Unicode-width machinery needed for this assertion.
+        for line in [HELP_LINE1, HELP_LINE2] {
+            let width = line.chars().count();
+            assert!(
+                width <= MAX_HELP_WIDTH,
+                "help line is {width} columns wide, over the {MAX_HELP_WIDTH}-column margin: {line:?}"
+            );
         }
     }
 }

@@ -562,6 +562,16 @@ pub(super) fn run_command(
             tracing::debug!("[choreo-tui] dispatching /reasoning list");
             reasoning_list(app);
         }
+        Command::OpenTerminalHelp => {
+            // The page is a read-only view over the launch-time profile, so
+            // opening it is the whole effect. `Alt+T` reaches this same arm
+            // through the shortcut table (`state::binding_for`), which is what
+            // makes the key and its typed `/terminal` spelling one path; while
+            // the page is already open the terminal-event guard swallows the
+            // chord and closes it, so the pair reads as a toggle.
+            tracing::debug!("[choreo-tui] dispatching /terminal (open the Terminal page)");
+            app.show_terminal_page = true;
+        }
     }
     Ok(())
 }

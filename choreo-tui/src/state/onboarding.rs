@@ -10,11 +10,19 @@
 //! so the rules are unit-testable without a daemon. The render side lives in
 //! `render/welcome.rs`; the message-handling side (auto-selecting the account
 //! once its credential is confirmed) lives in `connection/daemon.rs`.
+//!
+//! The advice *data* — the per-platform recommendations, the tmux lines, the
+//! macOS Option-as-Meta settings, and the phrases naming each capability gap —
+//! lives in `state/terminal_advice.rs`, because the Terminal page prints the
+//! same tables. This module keeps only the copy that arranges them into the
+//! welcome panel's headline-plus-lines shape.
 
 use super::App;
-use crate::terminal::profile::{
-    Capabilities, Host, Mux, NativeImages, Platform, TerminalKind, TerminalProfile, Version,
+use super::terminal_advice::{
+    HOSTED_PANE_SENTENCE, gap_phrases, join_phrases, option_key_setting, recommendations,
+    tmux_lines,
 };
+use crate::terminal::profile::{Host, Mux, Platform, TerminalKind, TerminalProfile, Version};
 use choreo_client_core::{SetupFollow, SetupProgress, suggest_account_name};
 
 /// What the welcome panel says about the terminal the client is running in.
@@ -30,11 +38,6 @@ pub(crate) struct TerminalNotice {
     /// The supporting lines, drawn dim beneath the headline.
     pub(crate) lines: Vec<String>,
 }
-
-/// tmux gained synchronized output (what the client's atomic frames need) in
-/// 3.7; below it the panel says so rather than leaving a user to guess why
-/// redraws tear.
-const TMUX_FRAME_SYNC: Version = Version::new(3, 7, 0);
 
 impl App {
     /// The launch-time terminal advice, or `None` when the terminal and its
@@ -70,24 +73,14 @@ pub(crate) fn terminal_notice(profile: &TerminalProfile) -> Option<TerminalNotic
         }),
         Host::Hosted(_) => Some(TerminalNotice {
             headline: "Terminal advice does not apply in this pane".to_string(),
-            lines: vec![
-                "a workspace manager owns this pane and keeps its own screen model, so \
-                 the terminal is not ours to recommend."
-                    .to_string(),
-            ],
+            lines: vec![HOSTED_PANE_SENTENCE.to_string()],
         }),
     };
 
-    // The Option-as-Alt line is about the emulator's own key handling, which a
-    // multiplexer passes through but a workspace manager's pane does not: under
-    // a hosted layer we cannot name the outer terminal, so it is withheld there.
-    let option_key = match profile.host {
-        Host::Hosted(_) => None,
-        Host::Direct | Host::Mux(_) if profile.platform == Platform::MacOs => {
-            Some(macos_option_notice(profile.name))
-        }
-        Host::Direct | Host::Mux(_) => None,
-    };
+    // The second block is the macOS Option-as-Meta setting, which
+    // `option_key_setting` withholds under a hosted layer (the outer terminal
+    // cannot be named there) and on every non-macOS platform.
+    let option_key = option_key_setting(profile).map(macos_option_notice);
 
     match (host, option_key) {
         (None, None) => None,
@@ -126,61 +119,29 @@ fn direct_notice(profile: &TerminalProfile) -> Option<TerminalNotice> {
     let mut lines = vec!["A terminal that supports it:".to_string()];
     lines.extend(
         recommendations(profile.platform)
-            .into_iter()
-            .map(str::to_string),
+            .iter()
+            .map(|pick| (*pick).to_string()),
     );
     Some(TerminalNotice { headline, lines })
 }
 
 /// The tmux configuration lines that let the client's features through a pane.
 fn tmux_notice(version: Option<Version>) -> TerminalNotice {
-    let mut lines = vec![
-        "set -g extended-keys on".to_string(),
-        "set -g allow-passthrough on".to_string(),
-    ];
-    // Only a version we actually read can rule frame synchronization out; an
-    // unknown tmux version is told nothing rather than told it is too old.
-    if version.is_some_and(|version| !version.at_least(TMUX_FRAME_SYNC)) {
-        lines.push("frame synchronization needs tmux 3.7 or newer".to_string());
-    }
     TerminalNotice {
         headline: "tmux must be told to forward what this client uses".to_string(),
-        lines,
+        // The lines (plus the frame-sync floor when the running tmux is known
+        // to be too old) come from the shared advice table the Terminal page
+        // reads, so the two surfaces cannot drift.
+        lines: tmux_lines(version)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     }
 }
 
-/// The macOS Option-as-Alt advice, with the setting for the detected terminal.
-///
-/// Option+key composes a character on macOS before any application sees it, so
-/// an `alt+` shortcut never arrives unless the terminal is told to send Option
-/// as Meta. The setting names the exact key and file for the terminal we
-/// identified; an unidentified terminal gets the generic sentence, because
-/// naming a setting we cannot be sure applies would be worse than naming none.
-fn macos_option_notice(name: TerminalKind) -> TerminalNotice {
-    let setting = match name {
-        TerminalKind::Ghostty => {
-            "Ghostty: set `macos-option-as-alt = true` in ~/.config/ghostty/config (the \
-             U.S. Standard and U.S. International layouts already default to on)"
-        }
-        TerminalKind::Kitty => {
-            "kitty: set `macos_option_as_alt left` in ~/.config/kitty/kitty.conf"
-        }
-        TerminalKind::Alacritty => {
-            "Alacritty: set `option_as_alt = \"Both\"` under [window] in \
-             ~/.config/alacritty/alacritty.toml"
-        }
-        TerminalKind::WezTerm => {
-            "WezTerm: set `send_composed_key_when_left_alt_is_pressed = false` in ~/.wezterm.lua"
-        }
-        TerminalKind::ItTerm => "iTerm2: Profiles → Keys → Left/Right Option Key = Esc+",
-        TerminalKind::AppleTerminal => "Terminal.app: Profiles → Keyboard → Use Option as Meta key",
-        // An unidentified terminal (or one of the remaining rows) has no
-        // setting we can point at, so the sentence stays generic.
-        _ => {
-            "Set your terminal to send Option as Meta (Alt); the setting is in its \
-             keyboard or profile preferences"
-        }
-    };
+/// The macOS Option-as-Meta advice, carrying the setting for the detected
+/// terminal (see `terminal_advice::option_key_setting`).
+fn macos_option_notice(setting: &'static str) -> TerminalNotice {
     TerminalNotice {
         headline: "Option+key shortcuts never arrive on macOS".to_string(),
         lines: vec![
@@ -189,54 +150,6 @@ fn macos_option_notice(name: TerminalKind) -> TerminalNotice {
                 .to_string(),
             setting.to_string(),
         ],
-    }
-}
-
-/// The user-facing name of what the client loses when each capability is
-/// asserted unsupported.
-///
-/// Only the capabilities whose loss is visible in the client's own features:
-/// copy-on-select, flicker-free frame redraws, the disambiguated modified keys
-/// (Shift+Enter and friends), and inline images. The reporting extras — the
-/// OSC 9;4 progress bar, OSC 7501 program status, OSC 22 pointer shape — are
-/// silent when unsupported, so their absence never warrants a recommendation.
-fn gap_phrases(capabilities: Capabilities) -> Vec<&'static str> {
-    let mut gaps = Vec::new();
-    if capabilities.clipboard_write == Some(false) {
-        gaps.push("copy-on-select");
-    }
-    if capabilities.synchronized_output == Some(false) {
-        gaps.push("flicker-free redraws");
-    }
-    if capabilities.kitty_keyboard == Some(false) {
-        gaps.push("Shift+Enter and other modified keys");
-    }
-    if capabilities.images == NativeImages::None {
-        gaps.push("inline images");
-    }
-    gaps
-}
-
-/// The terminals worth recommending on `platform`, best first.
-///
-/// Android is empty by design: the platform's terminal is the Android app the
-/// user already chose, and no alternative is offered.
-fn recommendations(platform: Platform) -> Vec<&'static str> {
-    match platform {
-        Platform::MacOs => vec![
-            "Ghostty — brew install --cask ghostty",
-            "iTerm2 — brew install --cask iterm2",
-        ],
-        Platform::Linux => vec![
-            "Ghostty — install from your distribution or ghostty.org",
-            "kitty — apt install kitty (or dnf install kitty)",
-            "WezTerm — install from your distribution or wezterm.org",
-        ],
-        Platform::Windows => vec![
-            "Windows Terminal — winget install Microsoft.WindowsTerminal",
-            "WezTerm — winget install wez.wezterm",
-        ],
-        Platform::Android => Vec::new(),
     }
 }
 
@@ -257,16 +170,6 @@ fn user_name(kind: TerminalKind) -> &'static str {
         TerminalKind::Termux => "Termux",
         TerminalKind::Rex => "Rex",
         TerminalKind::Unknown => "this terminal",
-    }
-}
-
-/// Join phrases into one English list: `a`, `a and b`, `a, b, and c`.
-fn join_phrases(phrases: &[&str]) -> String {
-    match phrases {
-        [] => String::new(),
-        [only] => (*only).to_string(),
-        [first, second] => format!("{first} and {second}"),
-        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
 }
 
@@ -329,7 +232,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::profile::{HostedKind, ImageSupport};
+    use crate::terminal::profile::{HostedKind, ImageSupport, NativeImages};
     use choreo_proto::AccountInfo;
 
     /// A synthetic profile with the fields the notice reads: a known (or

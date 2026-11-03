@@ -2,7 +2,8 @@
 //!
 //! `text_layout` covers history-text measurement and markdown rendering;
 //! `terminal_events` covers the basic key-to-input path and prompt submission;
-//! `prompt_gating` pins the rule that a prompt is only accepted while the
+//! `terminal_page` covers the read-only Terminal page's open/close keys and its
+//! input swallowing; `prompt_gating` pins the rule that a prompt is only accepted while the
 //! session is idle; `drafts` covers the per-session unsent-prompt hand-off plus
 //! the commands dispatched from a session's command line (`/refresh-models`,
 //! `/mcp`, catalog and credential handling); `palette` covers the inline
@@ -12,6 +13,7 @@ mod drafts;
 mod palette;
 mod prompt_gating;
 mod terminal_events;
+mod terminal_page;
 mod text_layout;
 
 use crate::connection::handle_terminal_event;

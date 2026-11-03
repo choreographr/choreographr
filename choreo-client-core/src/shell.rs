@@ -103,6 +103,11 @@ pub enum Command {
     OpenAccounts,
     /// Bare `/model` — open the model picker.
     OpenModelSelector,
+    /// Bare `/terminal` — open the read-only Terminal page, which reports what
+    /// the client negotiated with this terminal and how to close any gap. A
+    /// local-UI command with no daemon message of its own: the page is a view
+    /// over data the client already holds.
+    OpenTerminalHelp,
     /// Bare `/reasoning` — cycle the reasoning effort on the attached session.
     ReasoningCycle,
     /// `/reasoning list` — list the available reasoning levels.
@@ -442,6 +447,14 @@ fn parse_command(rest: &str) -> Command {
 
     if rest == "quit" {
         return Command::Quit;
+    }
+
+    // Bare `/terminal` opens the read-only Terminal page. Like the other bare
+    // local-UI commands above it has no daemon message — the page renders the
+    // launch-time terminal profile — so it parses to a variant the front-end
+    // turns into the page being shown.
+    if rest == "terminal" {
+        return Command::OpenTerminalHelp;
     }
 
     if let Some(key) = rest.strip_prefix("unlock ") {

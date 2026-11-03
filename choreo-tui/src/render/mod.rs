@@ -114,6 +114,7 @@ mod login;
 mod model_selector;
 mod session_manager;
 mod status;
+mod terminal_help;
 mod welcome;
 
 #[cfg(test)]
@@ -124,6 +125,7 @@ use self::command_palette::render_command_palette;
 use self::login::render_login_modal;
 use self::model_selector::render_model_selector;
 use self::session_manager::render_session_manager;
+use self::terminal_help::render_terminal_help;
 use self::welcome::render_welcome;
 
 use self::history::render_history;
@@ -197,6 +199,16 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         && app.command_palette_active()
     {
         render_command_palette(frame, app, input_rect);
+    }
+
+    // The Terminal page (Alt+T / `/terminal`) is a read-only modal over the
+    // Chat page: it reports what the launch-time profile negotiated and how to
+    // close any gap.  It draws after the chat content and the inline palette so
+    // it covers both, and while it is open the input path swallows every
+    // keystroke (see `handle_terminal_event`), so nothing reaches the composer
+    // underneath.
+    if app.show_terminal_page {
+        render_terminal_help(frame, app);
     }
 
     // The OAuth login modal is the topmost overlay: it covers whatever page is

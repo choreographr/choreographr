@@ -171,6 +171,12 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::Session,
         },
         CommandSpec {
+            name: "terminal",
+            summary: "Show terminal capabilities and setup advice",
+            arg_hint: None,
+            group: CommandGroup::System,
+        },
+        CommandSpec {
             name: "undo",
             summary: "Undo the last turn",
             arg_hint: None,
@@ -275,6 +281,18 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), count, "catalog command names must be unique");
+    }
+
+    #[test]
+    fn the_terminal_page_is_a_system_command() {
+        // `terminal` is the discoverable spelling of the Chat page's `Alt+T`
+        // page, so it has to be in the catalog the palette lists.
+        let spec = command_catalog()
+            .iter()
+            .find(|spec| spec.name == "terminal")
+            .expect("the terminal command belongs in the catalog");
+        assert_eq!(spec.group, CommandGroup::System);
+        assert_eq!(spec.arg_hint, None);
     }
 
     #[test]

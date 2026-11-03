@@ -3136,6 +3136,28 @@ renderer sizes the notice against the area's remaining rows after reserving the
 closing `alt+h` hint, and degrades in three explicit steps: the whole notice, the
 headline alone, or nothing.
 
+### Terminal page
+
+The Terminal page (`Alt+T`, or `/terminal` from the command palette) is a
+**read-only view over that same launch-time profile** — it adds no data flow and
+re-detects nothing. `App::show_terminal_page` is a single flag, toggled from the
+Chat page's shortcut table (so the key and its typed spelling run one command,
+as every other `Alt+` binding does) and closed by `Esc` or the same chord in the
+modifier guard `handle_terminal_event` applies before page dispatch, which also
+swallows every other key so nothing reaches the composer underneath. The
+renderer (`render/terminal_help.rs`) is another `centered_popup(PopupSize::LIST)`
+block drawn over the Chat page, and its content is built by the pure
+`terminal_page_lines(&TerminalProfile)`: an identity line (terminal, version,
+platform, negotiated image protocol, host layer), the seven-row capability
+checklist rendered in the table's own three states — an unasserted capability
+reads "unknown" and is never drawn as a settled "no" — the platform's
+recommendations (printed only when a gap actually exists), and the
+copy-pasteable fixes. Both the advice tables it prints and the rule deciding
+whether the macOS Option-as-Meta setting applies live in
+`state/terminal_advice.rs`, shared with the welcome notice, so the two surfaces
+cannot drift into recommending different things; the in-source rustdoc of that
+module is the reference for each rule.
+
 ---
 
 ## Design decisions
