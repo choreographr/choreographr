@@ -1,11 +1,10 @@
 # Plan: BSD release target
 
-**Status:** implemented (repo side) — the build/release/install/packaging/docs
-support lands with this change and a real FreeBSD ELF links; **a native FreeBSD
-VM run and promotion of the staged `freebsd-x86_64` CI job remain.** FreeBSD is
-the primary target (a drop-in Rust Tier-2 host); NetBSD x86_64 is nearly free;
-OpenBSD and DragonFly are a tier harder (Tier 3, no prebuilt `std`) and are
-deferred.
+**Status:** implemented and validated — landed in-tree and proven by a green
+`workflow_dispatch` release run (2026-11-03, run 41643334712): the FreeBSD job
+builds + smoke-tests natively in a FreeBSD VM, uploads the tarball, and is a
+release blocker; `choreographr-<version>-x86_64-unknown-freebsd.tar.gz` is in the
+combined release set. This plan can be deleted once a tagged release ships it.
 **Date:** 2026-10-09
 **Targets:** `x86_64-unknown-freebsd` + `aarch64-unknown-freebsd` (both Tier 2
 with host tools), then `x86_64-unknown-netbsd`; Tier-3 `x86_64-unknown-openbsd`
