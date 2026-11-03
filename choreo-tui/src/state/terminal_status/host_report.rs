@@ -507,9 +507,12 @@ fn invoke(config: &ReporterConfig, argv: &[String], subcommand: &'static str) ->
             return false;
         }
     };
-    if child_tx.send(child).is_err() {
-        // The reaper is gone, so nothing would ever reap this child; it was
-        // already started, so report only that the invocation did not complete.
+    if let Err(error) = child_tx.send(child) {
+        // The reaper is gone, so nothing would wait for this child; kill and
+        // reap it here rather than leak a zombie.
+        let mut child = error.0;
+        let _ = child.kill();
+        let _ = child.wait();
         return false;
     }
     // Detaching the handle is deliberate: the reaper exits on its own once the
@@ -520,6 +523,10 @@ fn invoke(config: &ReporterConfig, argv: &[String], subcommand: &'static str) ->
         recv(channel::after(INVOCATION_TIMEOUT)) -> _ => true,
     };
     if timed_out {
+        // A timed-out reaper is intentionally left blocked in `wait()` so the
+        // reporter is never stalled behind a wedged host. Each such leftover is
+        // bounded by `INVOCATION_TIMEOUT` and reports are human-rate, so they
+        // only accumulate while a host stays permanently wedged.
         tracing::debug!(subcommand, "host report invocation exceeded its timeout");
     }
     true
