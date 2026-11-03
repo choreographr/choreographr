@@ -356,7 +356,7 @@ pub(crate) fn handle_daemon_message(
                     if let (Some(cw), Some(tokens)) =
                         (display.context_window, display.last_prompt_tokens)
                     {
-                        progress::update(Some(tokens), Some(cw));
+                        progress::update(Some(tokens), Some(cw), &app.terminal);
                     }
                 }
             }

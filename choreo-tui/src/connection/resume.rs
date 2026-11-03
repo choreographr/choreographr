@@ -319,7 +319,7 @@ pub(super) fn handle_resume_command(
             // Clear the terminal-native records BEFORE the process stops so
             // the shell the user lands in does not show a stale progress bar,
             // program-status record, or window title left by the TUI.
-            progress::update(None, None);
+            progress::update(None, None, &app.terminal);
             app.term_status.clear_all();
             title::clear();
             app.term_title = None;

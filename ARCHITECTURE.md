@@ -3102,8 +3102,16 @@ the unidentified default, which is what every test sees.
 
 Later phases consume the stored profile rather than re-detecting: the Terminal
 page reports identity and capabilities, and the OSC 7501/9;4/OSC 22 emission
-gates read `Capabilities` to stay silent where a terminal would ignore or
-mishandle the sequence.
+gates read `Capabilities` (and the host layer) to stay silent where a terminal
+would ignore or mishandle the sequence. The OSC 9;4 progress gate at
+`terminal/progress.rs::should_emit` combines three inputs as a pure, unit-tested
+decision: support must be asserted by the capability **or** by the cached
+`anstyle-progress` environment probe (the probe is an OR fallback, never a veto,
+so a terminal the probe already recognised cannot regress on a `Some(false)` or
+`None` row — which is what brings kitty ≥0.47, bare VTE terminals and zellij
+into range), an unasserted `None` never enables it alone, and a `Hosted(_)` pane
+suppresses it because the workspace manager owns the pane's progress surface. A
+multiplexer (`Mux(_)`) passes the sequence through and does not suppress.
 
 ### Welcome-screen terminal advice
 

@@ -567,7 +567,7 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
     // native progress bar (OSC 9;4), the program-status records (OSC 7501),
     // and the window title (OSC 2). These must not outlive the TUI's
     // ownership of the display.
-    progress::update(None, None);
+    progress::update(None, None, &app.terminal);
     app.term_status.clear_all();
     title::clear();
     // Hand the pointer back to the terminal too, and forget the cached shape
@@ -901,7 +901,7 @@ fn run_ui_loop(
                 d.progress_dirty = false;
             }
             if app.page != Page::Chat {
-                progress::update(None, None);
+                progress::update(None, None, &app.terminal);
             }
         }
     }
