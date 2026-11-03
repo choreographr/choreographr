@@ -465,7 +465,11 @@ jobs:
           if-no-files-found: error
   android-termux:
     name: android aarch64 (Termux)
-    runs-on: ubuntu-latest
+    # PINNED to the 24.04 LTS image: `ubuntu-latest` now resolves to ubuntu-26.04,
+    # which no longer ships `qemu-user-static` (the Termux smoke-test step below
+    # needs it to run the binaries under emulation). 24.04 still carries it.
+    # Revisit once 26.04's replacement for qemu-user-static is known.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -576,12 +580,9 @@ jobs:
           # smoke-test.sh checks on the desktop artifacts, which until now
           # the Android builds had never had. Timing-sensitive behaviour and
           # real device interaction remain on-device responsibilities.
-          # Refresh the package index FIRST and scope it to Ubuntu's own
-          # sources (drop third-party sourceparts) — the same guard the Linux
-          # jobs use. The runner image's baked index goes stale, and an
-          # unscoped update can die on a flaky third-party repo (the Google
-          # Chrome repo has). Without this, `qemu-user-static` resolves to
-          # "no installation candidate" (exit 100, seen 2026-11-03).
+          # Refresh the package index before installing (the runner image's
+          # baked index goes stale; scoping to Ubuntu's own sources drops the
+          # flaky third-party repos the other jobs avoid).
           sudo apt-get update -qq \
             -o Dir::Etc::sourcelist="sources.list.d/ubuntu.sources" \
             -o Dir::Etc::sourceparts="-" \
