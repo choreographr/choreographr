@@ -56,6 +56,10 @@ pub(crate) use keymap::*;
 pub(crate) use layout::*;
 pub(crate) use login::*;
 pub(crate) use model_selector::*;
+// `onboarding` is mostly inherent `App` methods, but the welcome panel's
+// terminal advice needs its type and derivation at the launch site and in the
+// renderer.
+pub(crate) use onboarding::{TerminalNotice, terminal_notice};
 pub(crate) use pages::*;
 pub(crate) use pin::*;
 // `pointer` declares only inherent `App` methods, so there is nothing to
@@ -342,6 +346,12 @@ pub(crate) struct App {
     /// profile, so an `App` built by a test (which never runs `run_app`) still
     /// holds a valid value.
     pub(crate) terminal: crate::terminal::profile::TerminalProfile,
+    /// The welcome panel's terminal advice, derived once at launch from
+    /// [`Self::terminal`] beside it (see `state::onboarding::terminal_notice`).
+    /// Stored rather than re-derived per frame because the profile it reads is
+    /// immutable for the process lifetime; `None` means this terminal and its
+    /// host cost the client nothing, so the panel stays silent.
+    pub(crate) terminal_notice: Option<TerminalNotice>,
     /// Persistent latch of whether the daemon's credential keystore is locked.
     /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
     /// and the subscribe-time lock-state push in `handle_daemon_message`;
@@ -486,6 +496,7 @@ impl App {
             pointer_hover: None,
             mouse_tracking_reassert: false,
             terminal: crate::terminal::profile::TerminalProfile::default(),
+            terminal_notice: None,
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,

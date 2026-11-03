@@ -418,6 +418,73 @@ and ACP adapter mirror only on a terminal. `choreo-tui` also takes
 `/session switch <id>`), which lets a multiplexer or workspace manager resume on
 the exact session it was showing.
 
+### Terminals
+
+`choreo-tui` uses a handful of terminal features — clipboard copy-on-select,
+inline images, flicker-free frame redraws, and disambiguated modified keys such
+as `Shift+Enter`. When the terminal it was launched in settles one of those as
+unsupported, the welcome panel says which one and recommends terminals that
+support it on your platform, then stays silent once nothing is missing. If you
+see no advice, nothing about your terminal is costing you a feature.
+
+On **macOS**:
+
+| Terminal | Install |
+|---|---|
+| [Ghostty](https://ghostty.org) | `brew install --cask ghostty` |
+| [iTerm2](https://iterm2.com) | `brew install --cask iterm2` |
+
+On **Linux**:
+
+| Terminal | Install |
+|---|---|
+| [Ghostty](https://ghostty.org) | your distribution's package, or build from source |
+| [kitty](https://sw.kovidgoyal.net/kitty/) | `apt install kitty` (or `dnf install kitty`) |
+| [WezTerm](https://wezfurlong.org/wezterm/) | your distribution's package, or [wezterm.org](https://wezfurlong.org/wezterm/) |
+
+On **Windows**:
+
+| Terminal | Install |
+|---|---|
+| Windows Terminal | `winget install Microsoft.WindowsTerminal` |
+| [WezTerm](https://wezfurlong.org/wezterm/) | `winget install wez.wezterm` |
+
+Android offers no recommendation: the terminal is the app you already chose.
+
+#### macOS: Option as Alt
+
+macOS composes a character for `Option+key` before any application sees it, so
+`alt+` shortcuts do not arrive at all until the terminal is told to send Option
+as Meta. The setting, per terminal:
+
+| Terminal | Setting |
+|---|---|
+| Ghostty | `macos-option-as-alt = true` in `~/.config/ghostty/config` (the U.S. Standard and U.S. International layouts already default to on) |
+| kitty | `macos_option_as_alt left` in `~/.config/kitty/kitty.conf` |
+| Alacritty | `[window] option_as_alt = "Both"` in `~/.config/alacritty/alacritty.toml` |
+| WezTerm | `send_composed_key_when_left_alt_is_pressed = false` in `~/.wezterm.lua` |
+| iTerm2 | Profiles → Keys → Left/Right Option Key = **Esc+** |
+| Terminal.app | Profiles → Keyboard → **Use Option as Meta key** |
+
+#### tmux and other multiplexers
+
+Under tmux, two settings let the client's features reach the pane. Put them in
+`~/.tmux.conf` (or run them at tmux's `prefix + :` prompt):
+
+```tmux
+set -g extended-keys on
+set -g allow-passthrough on
+```
+
+Frame synchronization additionally needs **tmux 3.7 or newer**; below that,
+redraws tear. Zellij needs nothing — it forwards these features already. GNU
+screen does not forward them at all, so run inside tmux or zellij instead.
+
+A layer that owns the pane — a workspace manager hosting `choreo-tui` as one of
+its panes — keeps its own screen model, and the client's terminal advice does
+not apply there: the panel says so instead of recommending a terminal it cannot
+identify.
+
 ### First conversation
 
 Start `choreo-tui`. An empty session shows a **welcome checklist** that ticks

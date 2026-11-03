@@ -434,6 +434,14 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
     // the derivation up top — `mode` is moved by now).
     app.connection_addr = connection_addr;
     app.terminal = terminal_profile;
+    // The welcome advice is derived here, once, from the same immutable
+    // profile: it cannot change afterwards, so a stored notice is enough and
+    // the render path stays free of derivation.
+    app.terminal_notice = crate::state::terminal_notice(&app.terminal);
+    tracing::debug!(
+        advised = app.terminal_notice.is_some(),
+        "welcome terminal advice"
+    );
 
     // Latch the `--attach <SESSION_ID>` request (if any). It is NOT dispatched
     // here: `run_app` sends its startup requests before the connection is even

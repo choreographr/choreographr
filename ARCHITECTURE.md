@@ -3098,11 +3098,43 @@ markers (`term`, `term_program`, `evidence`) and the derived capabilities — so
 support report can be read without re-deriving anything. `App::new` starts from
 the unidentified default, which is what every test sees.
 
-Later phases consume the stored profile rather than re-detecting: the welcome
-notice picks its wording from the terminal and host, the Terminal page reports
-identity and capabilities, and the OSC 7501/9;4/OSC 22 emission gates read
-`Capabilities` to stay silent where a terminal would ignore or mishandle the
-sequence.
+Later phases consume the stored profile rather than re-detecting: the Terminal
+page reports identity and capabilities, and the OSC 7501/9;4/OSC 22 emission
+gates read `Capabilities` to stay silent where a terminal would ignore or
+mishandle the sequence.
+
+### Welcome-screen terminal advice
+
+The empty-session welcome panel names a terminal gap only when the profile
+settles one as unsupported, and only for a feature the client actually uses:
+copy-on-select (OSC 52), inline images, flicker-free redraws (mode 2026), and
+the disambiguated modified keys (`Shift+Enter` and friends). The reporting
+extras — the OSC 9;4 progress bar, OSC 7501 program status, OSC 22 pointer
+shape — are silent when unsupported, so their absence never warrants advice.
+
+`state::onboarding::terminal_notice` is a **pure function over `&TerminalProfile`**
+(the same shape as the capability table), so every rule of the advice matrix is
+unit-tested from synthetic profiles: a `Direct` terminal with an asserted gap
+gets a headline naming that gap plus the terminals recommended for its platform
+(and nothing at all on Android, where no alternative is offered); tmux gets its
+`extended-keys` / `allow-passthrough` lines and a 3.7 version floor; zellij gets
+nothing (it forwards these already); GNU screen gets one line pointing at tmux
+or zellij; a hosted workspace manager gets one line saying the advice does not
+apply, because it owns the pane. An unidentified terminal — or any capability
+answer of `None` — never produces a notice, so a false negative can never nag a
+user. On macOS a second block is added (and withheld under a hosted layer, where
+the outer terminal cannot be identified) naming the detected terminal's own
+Option-as-Meta setting, because macOS composes `Option+key` into a character
+before the app sees it.
+
+The result is derived **once at launch**, beside `App::terminal`, and stored as
+`App::terminal_notice` — the profile it reads is immutable, so re-deriving it
+per frame would only re-allocate the same strings. `render/welcome.rs` owns all
+styling and wraps the block to the panel's width; because the paragraph is
+clamped to the panel rectangle (which would silently cut the tail mid-line), the
+renderer sizes the notice against the area's remaining rows after reserving the
+closing `alt+h` hint, and degrades in three explicit steps: the whole notice, the
+headline alone, or nothing.
 
 ---
 
