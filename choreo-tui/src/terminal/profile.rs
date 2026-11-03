@@ -523,7 +523,7 @@ impl TerminalProfile {
     #[must_use]
     pub(crate) fn capabilities(&self) -> Capabilities {
         let version = self.version;
-        match self.name {
+        let mut caps = match self.name {
             // Ghostty 1.2 added OSC 9;4, and it is the only terminal that
             // implements OSC 7501.
             TerminalKind::Ghostty => Capabilities {
@@ -656,7 +656,22 @@ impl TerminalProfile {
             // Nothing verified about Ptyxis's own support, so nothing is
             // asserted — its VTE base is not evidence for its build's features.
             TerminalKind::Ptyxis | TerminalKind::Unknown => Capabilities::UNASSERTED,
+        };
+        // The picker negotiated the image protocol with this terminal, and a
+        // negotiated protocol is a measurement, so it outranks the table. It is
+        // also the only capability a hosted pane can report at all: the
+        // workspace manager's emulator answers the query while no terminal
+        // identity reaches us.
+        match self.images {
+            ImageSupport::Kitty => caps.images = NativeImages::Kitty,
+            ImageSupport::Sixel => caps.images = NativeImages::Sixel,
+            ImageSupport::Iterm2 => caps.images = NativeImages::Iterm2,
+            // No native protocol negotiated, which several terminals answer
+            // whether or not they can draw images (a console's ConPTY drops the
+            // query), so the table's own answer stands.
+            ImageSupport::Halfblocks => {}
         }
+        caps
     }
 
     /// The version as a log/report string, `unknown` when the environment
@@ -972,6 +987,26 @@ mod tests {
         let profile = detect_linux(&[("TERM", "xterm-256color")]);
         assert_eq!(profile.name, TerminalKind::Unknown);
         assert_eq!(profile.evidence, Vec::<&'static str>::new());
+    }
+
+    #[test]
+    fn a_negotiated_image_protocol_outranks_the_table() {
+        // The picker asked the terminal and got an answer: that is a
+        // measurement, so it stands even where the identity table asserts
+        // nothing — the only capability a hosted pane can report.
+        let mut profile = detect_linux(&[("TERM", "xterm-256color")]);
+        assert_eq!(profile.capabilities().images, NativeImages::Unknown);
+
+        profile.images = ImageSupport::Kitty;
+        assert_eq!(profile.capabilities().images, NativeImages::Kitty);
+
+        profile.images = ImageSupport::Sixel;
+        assert_eq!(profile.capabilities().images, NativeImages::Sixel);
+
+        // No native protocol negotiated keeps the table's answer: several
+        // terminals answer the query that way whether or not they draw images.
+        profile.images = ImageSupport::Halfblocks;
+        assert_eq!(profile.capabilities().images, NativeImages::Unknown);
     }
 
     #[test]

@@ -17,7 +17,9 @@ use crate::state::{
     HOSTED_PANE_SENTENCE, PopupSize, centered_popup, gap_phrases, join_phrases, option_key_setting,
     recommendations, tmux_lines,
 };
-use crate::terminal::profile::{Capabilities, Host, Mux, NativeImages, TerminalProfile};
+use crate::terminal::profile::{
+    Capabilities, Host, Mux, NativeImages, TerminalKind, TerminalProfile,
+};
 use ratatui::{
     Frame,
     style::{Color, Modifier, Style},
@@ -124,9 +126,10 @@ fn host_label(host: Host) -> String {
 /// and host layer. The version is omitted when the environment carried none
 /// rather than printed as a second "unknown".
 fn identity_line(profile: &TerminalProfile) -> String {
-    let terminal = match profile.version {
-        Some(version) => format!("{} {version}", profile.name),
-        None => profile.name.to_string(),
+    let terminal = match (profile.name, profile.version) {
+        (TerminalKind::Unknown, _) => "unknown terminal".to_string(),
+        (name, Some(version)) => format!("{name} {version}"),
+        (name, None) => name.to_string(),
     };
     format!(
         "{terminal} · {} · images: {} · host: {}",
@@ -163,13 +166,31 @@ fn recommendation_lines(
     profile: &TerminalProfile,
     capabilities: Capabilities,
 ) -> Vec<Line<'static>> {
+    // A hosted pane has no terminal of its own to recommend, and the fixes
+    // block already explains why. Claiming health or a gap here would either
+    // contradict that or invent a terminal the user cannot choose.
+    if matches!(profile.host, Host::Hosted(_)) {
+        return Vec::new();
+    }
     let mut lines = vec![Line::from(Span::styled("recommendations", heading_style()))];
     let gaps = gap_phrases(capabilities);
     if gaps.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "nothing this client uses is missing — no change needed",
-            supported_style(),
-        )));
+        // "Nothing is missing" is only true when something was actually
+        // asserted. A pane that reported nothing (an unidentified terminal in a
+        // multiplexer, for instance) knows no more than its own silence, so it
+        // must not be congratulated.
+        let (verbatim, style) = if any_capability_asserted(capabilities) {
+            (
+                "nothing this client uses is missing — no change needed",
+                supported_style(),
+            )
+        } else {
+            (
+                "this pane did not report what its terminal supports — nothing to recommend",
+                dim_style(),
+            )
+        };
+        lines.push(Line::from(Span::styled(verbatim, style)));
         return lines;
     }
     lines.push(Line::from(Span::styled(
@@ -194,6 +215,15 @@ fn recommendation_lines(
             .map(|pick| Line::from(Span::styled(format!("  {pick}"), Style::default()))),
     );
     lines
+}
+
+/// Whether the profile asserted *any* of the capabilities the client's advice
+/// is built on, as opposed to reporting nothing at all.
+fn any_capability_asserted(capabilities: Capabilities) -> bool {
+    capabilities.clipboard_write.is_some()
+        || capabilities.synchronized_output.is_some()
+        || capabilities.kitty_keyboard.is_some()
+        || !matches!(capabilities.images, NativeImages::Unknown)
 }
 
 /// The fixes block: the copy-pasteable setting for each gap the profile
@@ -260,8 +290,11 @@ pub(super) fn terminal_page_lines(profile: &TerminalProfile) -> Vec<Line<'static
             .map(capability_line),
     );
     lines.push(Line::default());
-    lines.extend(recommendation_lines(profile, capabilities));
-    lines.push(Line::default());
+    let recommendations = recommendation_lines(profile, capabilities);
+    if !recommendations.is_empty() {
+        lines.extend(recommendations);
+        lines.push(Line::default());
+    }
     lines.extend(fix_lines(profile));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
@@ -296,7 +329,7 @@ pub(super) fn render_terminal_help(frame: &mut Frame<'_>, app: &crate::state::Ap
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::profile::{HostedKind, ImageSupport, Platform, TerminalKind, Version};
+    use crate::terminal::profile::{HostedKind, ImageSupport, Platform, Version};
 
     /// A synthetic profile; `version` is `None` unless a test sets one.
     fn profile(name: TerminalKind, platform: Platform, host: Host) -> TerminalProfile {
@@ -526,5 +559,49 @@ mod tests {
                 .collect::<String>()
         });
         assert_eq!(last.as_deref(), Some("Esc or Alt+T to close"));
+    }
+
+    #[test]
+    fn a_hosted_pane_offers_no_recommendations_at_all() {
+        // The fixes block explains the hosted pane; a recommendations block
+        // could only contradict it or invent a terminal the user cannot pick.
+        let out = text(&profile(
+            TerminalKind::Unknown,
+            Platform::Linux,
+            Host::Hosted(HostedKind::Herdr),
+        ));
+        assert!(!out.contains("recommendations"));
+        assert!(!out.contains("nothing this client uses is missing"));
+        assert!(out.contains(HOSTED_PANE_SENTENCE));
+    }
+
+    #[test]
+    fn a_pane_that_asserted_nothing_is_not_called_healthy() {
+        // An unidentified terminal under a multiplexer asserts no capability:
+        // the page must say so rather than congratulate it.
+        let out = text(&profile(
+            TerminalKind::Unknown,
+            Platform::Linux,
+            Host::Mux(Mux::Zellij),
+        ));
+        assert!(out.contains("did not report what its terminal supports"));
+        assert!(!out.contains("nothing this client uses is missing"));
+    }
+
+    #[test]
+    fn a_negotiated_image_protocol_shows_as_supported_without_an_identity() {
+        // A hosted pane reaches us with no terminal identity, but the picker
+        // still negotiated the protocol: that measurement is the one fact the
+        // page can report.
+        let mut hosted = profile(
+            TerminalKind::Unknown,
+            Platform::Linux,
+            Host::Hosted(HostedKind::Herdr),
+        );
+        hosted.images = ImageSupport::Kitty;
+        let out = text(&hosted);
+        assert!(out.contains("inline images"));
+        assert!(out.contains("supported"));
+        assert!(out.contains("unknown terminal"));
     }
 }
