@@ -66,7 +66,7 @@ pub(crate) fn terminal_notice(profile: &TerminalProfile) -> Option<TerminalNotic
         Host::Mux(Mux::Screen) => Some(TerminalNotice {
             headline: "GNU screen blocks these features".to_string(),
             lines: vec![
-                "screen does not forward keys, images, or clipboard through its pane; \
+                "Screen does not forward keys, images, or clipboard through its pane; \
                  run this inside tmux or zellij instead."
                     .to_string(),
             ],

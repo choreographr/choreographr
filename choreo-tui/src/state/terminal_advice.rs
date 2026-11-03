@@ -176,7 +176,7 @@ pub(crate) fn gap_phrases(capabilities: Capabilities) -> Vec<&'static str> {
 pub(crate) fn tmux_lines(version: Option<Version>) -> Vec<&'static str> {
     let mut lines = vec!["set -g extended-keys on", "set -g allow-passthrough on"];
     if version.is_some_and(|version| !version.at_least(TMUX_FRAME_SYNC)) {
-        lines.push("frame synchronization needs tmux 3.7 or newer");
+        lines.push("Frame synchronization needs tmux 3.7 or newer.");
     }
     lines
 }

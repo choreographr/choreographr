@@ -195,12 +195,12 @@ fn recommendation_lines(
         // must not be congratulated.
         let (verbatim, style) = if any_capability_asserted(capabilities) {
             (
-                "nothing this client uses is missing — no change needed",
+                "Nothing this client uses is missing — no change needed.",
                 supported_style(),
             )
         } else {
             (
-                "this pane did not report what its terminal supports — nothing to recommend",
+                "This pane did not report what its terminal supports — nothing to recommend.",
                 dim_style(),
             )
         };
@@ -208,19 +208,19 @@ fn recommendation_lines(
         return lines;
     }
     lines.push(Line::from(Span::styled(
-        format!("this terminal costs you: {}", join_phrases(&gaps)),
+        format!("This terminal costs you: {}.", join_phrases(&gaps)),
         gap_style(),
     )));
     let picks = recommendations(profile.platform);
     if picks.is_empty() {
         lines.push(Line::from(Span::styled(
-            "no alternative terminal is offered on this platform",
+            "No alternative terminal is offered on this platform.",
             dim_style(),
         )));
         return lines;
     }
     lines.push(Line::from(Span::styled(
-        "a terminal that supports it:",
+        "A terminal that supports it:",
         dim_style(),
     )));
     lines.extend(
@@ -248,7 +248,7 @@ fn fix_lines(profile: &TerminalProfile) -> Vec<Line<'static>> {
     let mut any = false;
     if let Some(setting) = option_key_setting(profile) {
         lines.push(Line::from(Span::styled(
-            "option as alt (macOS) — macOS composes Option+key before the app sees it:",
+            "Option as Alt (macOS) — macOS composes Option+key before the app sees it:",
             dim_style(),
         )));
         lines.push(Line::from(Span::styled(
@@ -280,7 +280,7 @@ fn fix_lines(profile: &TerminalProfile) -> Vec<Line<'static>> {
     }
     if !any {
         lines.push(Line::from(Span::styled(
-            "nothing to configure for this host",
+            "Nothing to configure for this host.",
             dim_style(),
         )));
     }
@@ -497,7 +497,7 @@ mod tests {
             Platform::Linux,
             Host::Direct,
         ));
-        assert!(ghostty.contains("nothing this client uses is missing"));
+        assert!(ghostty.contains("Nothing this client uses is missing"));
         assert!(!ghostty.contains("ghostty.org"));
     }
 
@@ -508,8 +508,8 @@ mod tests {
             Platform::Android,
             Host::Direct,
         ));
-        assert!(out.contains("this terminal costs you:"));
-        assert!(out.contains("no alternative terminal is offered"));
+        assert!(out.contains("This terminal costs you:"));
+        assert!(out.contains("No alternative terminal is offered"));
     }
 
     #[test]
@@ -562,7 +562,7 @@ mod tests {
             Platform::Linux,
             Host::Direct,
         ));
-        assert!(linux.contains("nothing to configure"));
+        assert!(linux.contains("Nothing to configure"));
     }
 
     #[test]
@@ -605,7 +605,7 @@ mod tests {
             Host::Mux(Mux::Zellij),
         ));
         assert!(out.contains("did not report what its terminal supports"));
-        assert!(!out.contains("nothing this client uses is missing"));
+        assert!(!out.contains("Nothing this client uses is missing"));
     }
 
     #[test]
