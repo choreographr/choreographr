@@ -86,6 +86,21 @@ fn loses_nothing(kind: TerminalKind, platform: Platform) -> bool {
         )
 }
 
+/// Join a list of alternatives: "A", "A or B", "A, B or C".
+///
+/// A choice is not a union, so the conjunction is *or*, and the serial comma is
+/// omitted — the list reads as one sentence rather than as an enumeration. (The
+/// shared [`join_phrases`] joins cumulative lists — "costs you: A, B, and C" —
+/// which is why this is a separate helper rather than a flag on it.)
+fn join_choices(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [only] => (*only).to_string(),
+        [first, second] => format!("{first} or {second}"),
+        [rest @ .., last] => format!("{} or {last}", rest.join(", ")),
+    }
+}
+
 /// The sentence a hosted pane gets in place of terminal advice.
 ///
 /// The layer above us owns the pane's screen model and forwards what it
@@ -101,7 +116,7 @@ pub(crate) fn hosted_pane_sentence(platform: Platform) -> String {
     }
     format!(
         "Run choreo-tui directly in a terminal that supports every feature: {}.",
-        join_phrases(&full)
+        join_choices(&full)
     )
 }
 
@@ -375,6 +390,15 @@ mod tests {
     }
 
     #[test]
+    fn join_choices_offers_alternatives() {
+        assert_eq!(join_choices(&[]), "");
+        assert_eq!(join_choices(&["a"]), "a");
+        assert_eq!(join_choices(&["a", "b"]), "a or b");
+        // No serial comma: the list is a choice, not an enumeration.
+        assert_eq!(join_choices(&["a", "b", "c"]), "a, b or c");
+    }
+
+    #[test]
     fn full_support_terminals_are_the_platforms_flawless_ones() {
         assert_eq!(
             full_support_terminals(Platform::Linux),
@@ -398,11 +422,11 @@ mod tests {
         assert_eq!(
             hosted_pane_sentence(Platform::Linux),
             "Run choreo-tui directly in a terminal that supports every feature: \
-             Ghostty, kitty, and WezTerm."
+             Ghostty, kitty or WezTerm."
         );
         assert_eq!(
             hosted_pane_sentence(Platform::MacOs),
-            "Run choreo-tui directly in a terminal that supports every feature: Ghostty and iTerm2."
+            "Run choreo-tui directly in a terminal that supports every feature: Ghostty or iTerm2."
         );
         assert_eq!(
             hosted_pane_sentence(Platform::Windows),

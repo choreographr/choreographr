@@ -544,7 +544,7 @@ mod tests {
         ));
         // The sentence names the terminals that keep every feature, so it is the
         // platform's list rather than an appeal to "your terminal".
-        assert!(out.contains("supports every feature: Ghostty and iTerm2."));
+        assert!(out.contains("supports every feature: Ghostty or iTerm2."));
         // No macOS Option advice: the outer terminal cannot be identified, and
         // no tmux lines: the pane is not a multiplexer's.
         assert!(!out.contains("Option as Meta"));
