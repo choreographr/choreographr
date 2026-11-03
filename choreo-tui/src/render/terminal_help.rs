@@ -58,6 +58,9 @@ fn gap_style() -> Style {
 struct CapabilityRow {
     label: &'static str,
     support: Option<bool>,
+    /// The answer comes from the layer hosting this pane rather than from the
+    /// terminal itself, so the verdict can say who provides it.
+    host_provided: bool,
 }
 
 /// The seven rows the checklist always shows, in a fixed order.
@@ -65,36 +68,44 @@ struct CapabilityRow {
 /// The state is the capability table's own three-state answer, so an
 /// unasserted capability stays distinct from a settled "no" (see
 /// `terminal/profile.rs`).
-fn capability_rows(capabilities: Capabilities) -> [CapabilityRow; 7] {
+fn capability_rows(capabilities: Capabilities, host: Capabilities) -> [CapabilityRow; 7] {
+    let row = |label, support: Option<bool>, provided: Option<bool>| CapabilityRow {
+        label,
+        support,
+        host_provided: provided == Some(true) && support == Some(true),
+    };
     [
-        CapabilityRow {
-            label: "kitty keyboard protocol",
-            support: capabilities.kitty_keyboard,
-        },
-        CapabilityRow {
-            label: "synchronized output (mode 2026)",
-            support: capabilities.synchronized_output,
-        },
-        CapabilityRow {
-            label: "OSC 52 clipboard write",
-            support: capabilities.clipboard_write,
-        },
-        CapabilityRow {
-            label: "OSC 9;4 progress bar",
-            support: capabilities.progress,
-        },
-        CapabilityRow {
-            label: "OSC 7501 program status",
-            support: capabilities.program_status,
-        },
-        CapabilityRow {
-            label: "OSC 22 pointer shape",
-            support: capabilities.pointer_shape,
-        },
-        CapabilityRow {
-            label: "inline images",
-            support: native_image_support(capabilities.images),
-        },
+        row(
+            "kitty keyboard protocol",
+            capabilities.kitty_keyboard,
+            host.kitty_keyboard,
+        ),
+        row(
+            "synchronized output (mode 2026)",
+            capabilities.synchronized_output,
+            host.synchronized_output,
+        ),
+        row(
+            "OSC 52 clipboard write",
+            capabilities.clipboard_write,
+            host.clipboard_write,
+        ),
+        row("OSC 9;4 progress bar", capabilities.progress, host.progress),
+        row(
+            "OSC 7501 program status",
+            capabilities.program_status,
+            host.program_status,
+        ),
+        row(
+            "OSC 22 pointer shape",
+            capabilities.pointer_shape,
+            host.pointer_shape,
+        ),
+        row(
+            "inline images",
+            native_image_support(capabilities.images),
+            (!matches!(host.images, NativeImages::Unknown)).then_some(true),
+        ),
     ]
 }
 
@@ -144,6 +155,9 @@ fn identity_line(profile: &TerminalProfile) -> String {
 /// `?` and "unknown" — never a cross, which would claim a settled "no".
 fn capability_line(row: CapabilityRow) -> Line<'static> {
     let (glyph, verdict, style) = match row.support {
+        // A feature the hosting layer provides is supported *through* that
+        // layer, which is worth saying: it does not depend on the terminal.
+        Some(true) if row.host_provided => ("✓", "supported (host)", supported_style()),
         Some(true) => ("✓", "supported", supported_style()),
         Some(false) => ("✗", "not supported", dim_style()),
         None => ("?", "unknown", dim_style()),
@@ -278,6 +292,7 @@ fn fix_lines(profile: &TerminalProfile) -> Vec<Line<'static>> {
 /// the closing key hint.
 pub(super) fn terminal_page_lines(profile: &TerminalProfile) -> Vec<Line<'static>> {
     let capabilities = profile.capabilities();
+    let host = profile.host_capabilities();
     let mut lines = vec![Line::from(Span::styled(
         identity_line(profile),
         Style::default(),
@@ -285,7 +300,7 @@ pub(super) fn terminal_page_lines(profile: &TerminalProfile) -> Vec<Line<'static
     lines.push(Line::default());
     lines.push(Line::from(Span::styled("capabilities", heading_style())));
     lines.extend(
-        capability_rows(capabilities)
+        capability_rows(capabilities, host)
             .into_iter()
             .map(capability_line),
     );
@@ -423,7 +438,7 @@ mod tests {
         // An unidentified terminal asserts nothing: every row must read
         // "unknown", and none may be drawn as a cross or as a settled no.
         let caps = profile(TerminalKind::Unknown, Platform::Linux, Host::Direct).capabilities();
-        for row in capability_rows(caps) {
+        for row in capability_rows(caps, Capabilities::UNASSERTED) {
             let support = row.support;
             let label = row.label;
             assert_eq!(support, None, "{label} must stay unasserted");
@@ -603,5 +618,40 @@ mod tests {
         assert!(out.contains("inline images"));
         assert!(out.contains("supported"));
         assert!(out.contains("unknown terminal"));
+    }
+
+    #[test]
+    fn a_host_provided_capability_says_so() {
+        // A workspace manager answers for the features it provides itself, so
+        // the row reads "supported (host)" rather than a bare "supported": the
+        // answer does not depend on the terminal below it.
+        let out = text(&profile(
+            TerminalKind::Unknown,
+            Platform::Linux,
+            Host::Hosted(HostedKind::Herdr),
+        ));
+        assert!(out.contains("supported (host)"));
+        assert!(out.contains("OSC 52 clipboard write"));
+        assert!(out.contains("synchronized output (mode 2026)"));
+        // Its terminal app does not read OSC 7501, so that row stays unknown.
+        let status = out
+            .lines()
+            .find(|line| line.contains("OSC 7501 program status"))
+            .unwrap_or_default();
+        assert!(status.contains("unknown"), "{status}");
+    }
+
+    #[test]
+    fn a_host_that_provides_program_status_says_so() {
+        let out = text(&profile(
+            TerminalKind::Unknown,
+            Platform::Linux,
+            Host::Hosted(HostedKind::Rex),
+        ));
+        let status = out
+            .lines()
+            .find(|line| line.contains("OSC 7501 program status"))
+            .unwrap_or_default();
+        assert!(status.contains("supported (host)"), "{status}");
     }
 }

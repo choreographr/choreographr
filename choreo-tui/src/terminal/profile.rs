@@ -353,6 +353,38 @@ pub(crate) enum HostedKind {
     Other,
 }
 
+impl HostedKind {
+    /// What the hosting layer itself provides to a program in one of its panes.
+    ///
+    /// A workspace manager owns the terminal, so these answers come from its own
+    /// emulator rather than from the user's terminal: a feature it handles is one
+    /// the client can use no matter what the outer terminal is. Only behaviour
+    /// verified in the host's own implementation is asserted here.
+    #[must_use]
+    pub(crate) fn capabilities(self) -> Capabilities {
+        match self {
+            // Its panes are parsed by a vendored libghostty core: OSC 52 writes
+            // are captured and re-emitted to the viewer's clipboard, kitty
+            // graphics are re-emitted to the host terminal, and synchronized
+            // output is consumed so the host composes its own frames. Program
+            // status is deliberately left unasserted — its terminal app does not
+            // read OSC 7501 (a program reports through the pane API instead).
+            Self::Herdr => Capabilities {
+                synchronized_output: YES,
+                clipboard_write: YES,
+                ..Capabilities::UNASSERTED
+            },
+            // Implements the program-status protocol it publishes, so OSC 7501
+            // reaches the host's own status view.
+            Self::Rex => Capabilities {
+                program_status: YES,
+                ..Capabilities::UNASSERTED
+            },
+            Self::Other => Capabilities::UNASSERTED,
+        }
+    }
+}
+
 impl fmt::Display for HostedKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -411,7 +443,7 @@ pub(crate) struct Capabilities {
 impl Capabilities {
     /// The answer "nothing is asserted": used by an unidentified terminal and by
     /// any terminal whose remaining behaviour is unverified.
-    const UNASSERTED: Self = Self {
+    pub(crate) const UNASSERTED: Self = Self {
         kitty_keyboard: None,
         synchronized_output: None,
         clipboard_write: None,
@@ -432,6 +464,16 @@ impl Capabilities {
 
 const YES: Option<bool> = Some(true);
 const NO: Option<bool> = Some(false);
+
+/// A hosting layer's asserted answer wins over the terminal's; anything else
+/// leaves the terminal's answer in place.
+fn host_preferred(host: Option<bool>, terminal: Option<bool>) -> Option<bool> {
+    if host == Some(true) {
+        Some(true)
+    } else {
+        terminal
+    }
+}
 
 /// The terminal, its host layer, and the evidence that identified them.
 ///
@@ -671,7 +713,31 @@ impl TerminalProfile {
             // query), so the table's own answer stands.
             ImageSupport::Halfblocks => {}
         }
+        // A hosting layer answers for the features it provides itself, which
+        // outranks a table answer about a terminal whose identity never reached
+        // us. A host that asserts nothing leaves the terminal's answer alone.
+        let host = self.host_capabilities();
+        caps.kitty_keyboard = host_preferred(host.kitty_keyboard, caps.kitty_keyboard);
+        caps.synchronized_output =
+            host_preferred(host.synchronized_output, caps.synchronized_output);
+        caps.clipboard_write = host_preferred(host.clipboard_write, caps.clipboard_write);
+        caps.progress = host_preferred(host.progress, caps.progress);
+        caps.program_status = host_preferred(host.program_status, caps.program_status);
+        caps.pointer_shape = host_preferred(host.pointer_shape, caps.pointer_shape);
+        if !matches!(host.images, NativeImages::Unknown) {
+            caps.images = host.images;
+        }
         caps
+    }
+
+    /// The capability answers of the layer hosting this program, or the empty
+    /// set when the program talks to a terminal directly.
+    #[must_use]
+    pub(crate) fn host_capabilities(&self) -> Capabilities {
+        match self.host {
+            Host::Hosted(kind) => kind.capabilities(),
+            Host::Direct | Host::Mux(_) => Capabilities::UNASSERTED,
+        }
     }
 
     /// The version as a log/report string, `unknown` when the environment

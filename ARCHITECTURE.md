@@ -3084,6 +3084,13 @@ What it produces:
   than "unsupported"; a later phase that consults the table can therefore never
   disable a feature on a false negative. The research behind every row is
   recorded in [`docs/plans/terminal-profile.md`](docs/plans/terminal-profile.md).
+  A **hosting layer answers for the features it provides itself**
+  (`HostedKind::capabilities`): a manager that captures OSC 52 writes and composes
+  its own frames asserts those rows, and its assertion outranks the table
+  (`TerminalProfile::capabilities` merges it in; `host_capabilities` exposes it
+  separately so the Terminal page can label the verdict "supported (host)").
+  That is the only honest answer available in a hosted pane, where the terminal
+  underneath cannot be identified at all.
 
 **Terminal identity is only reported for a `Direct` session** (plus Rex, whose
 panes really are Rex's own terminal): a multiplexer or a hosting manager rewrites
