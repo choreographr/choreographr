@@ -457,6 +457,15 @@ impl Capabilities {
     /// floor, `Some(false)` below a *known* older version, and `None` when the
     /// version is unknown — the conservative direction, since only a version we
     /// actually read can rule a feature out.
+    ///
+    /// A terminal identified only by a version-less marker — a `TERM` prefix
+    /// (`alacritty*`, `foot*`) or `KITTY_WINDOW_ID` — always takes the `None`
+    /// arm at runtime: the marker names the terminal but carries no version, so
+    /// there is no evidence to place against the floor. The gate itself stays,
+    /// because an explicit version (a test's, or a future version source's) is
+    /// evaluated normally. At runtime such a row is either resolved by the OSC
+    /// 9;4 environment probe (progress) or left unasserted, which is the honest
+    /// answer for a terminal whose version never reached us.
     fn at_least(version: Option<Version>, floor: Version) -> Option<bool> {
         version.map(|v| v.at_least(floor))
     }
@@ -577,7 +586,9 @@ impl TerminalProfile {
                 pointer_shape: YES,
                 images: NativeImages::Kitty,
             },
-            // Kitty: graphics from 0.28, OSC 9;4 from 0.47.
+            // Kitty: graphics from 0.28, OSC 9;4 from 0.47. `KITTY_WINDOW_ID`
+            // carries no version, so the 0.47 floor yields `None` at runtime and
+            // the OSC 9;4 environment probe is what resolves progress.
             TerminalKind::Kitty => Capabilities {
                 kitty_keyboard: YES,
                 synchronized_output: YES,
@@ -601,7 +612,9 @@ impl TerminalProfile {
                 images: NativeImages::Iterm2,
             },
             // Alacritty: keyboard protocol, synchronized output and OSC 52
-            // arrived together in 0.13. No graphics, no progress, no OSC 22.
+            // arrived together in 0.13. A `TERM=alacritty*` marker carries no
+            // version, so these three floors yield `None` at runtime and the
+            // rows stay unasserted. No graphics, no progress, no OSC 22.
             TerminalKind::Alacritty => Capabilities {
                 kitty_keyboard: Capabilities::at_least(version, Version::new(0, 13, 0)),
                 synchronized_output: Capabilities::at_least(version, Version::new(0, 13, 0)),
@@ -611,7 +624,9 @@ impl TerminalProfile {
                 pointer_shape: NO,
                 images: NativeImages::None,
             },
-            // Foot: the keyboard protocol from 1.10.3, plus sixel. No OSC 9;4.
+            // Foot: the keyboard protocol from 1.10.3, plus sixel. A
+            // `TERM=foot*` marker carries no version, so the floor yields `None`
+            // at runtime and keyboard support stays unasserted. No OSC 9;4.
             TerminalKind::Foot => Capabilities {
                 kitty_keyboard: Capabilities::at_least(version, Version::new(1, 10, 3)),
                 synchronized_output: YES,
@@ -1262,6 +1277,34 @@ mod tests {
         };
         assert_eq!(kitty_new.capabilities().progress, Some(true));
         assert_eq!(kitty_new.capabilities().images, NativeImages::Kitty);
+    }
+
+    #[test]
+    fn version_less_alacritty_leaves_its_gated_rows_unasserted() {
+        // `TERM=alacritty-direct` names the terminal but carries no version, so
+        // the 0.13 floors resolve to `None` rather than asserting a verdict the
+        // environment never gave us.
+        let caps = detect_linux(&[("TERM", "alacritty-direct")]).capabilities();
+        assert_eq!(caps.kitty_keyboard, None);
+        assert_eq!(caps.synchronized_output, None);
+        assert_eq!(caps.clipboard_write, None);
+    }
+
+    #[test]
+    fn version_less_foot_leaves_kitty_keyboard_unasserted() {
+        // `TERM=foot-extra` names the terminal but carries no version, so the
+        // 1.10.3 floor cannot be evaluated and the row stays unasserted.
+        let caps = detect_linux(&[("TERM", "foot-extra")]).capabilities();
+        assert_eq!(caps.kitty_keyboard, None);
+    }
+
+    #[test]
+    fn version_less_kitty_leaves_progress_to_the_probe() {
+        // `KITTY_WINDOW_ID` identifies kitty but carries no version, so the
+        // 0.47 progress floor yields `None`: the OSC 9;4 environment probe is
+        // what decides progress at runtime.
+        let caps = detect_linux(&[("KITTY_WINDOW_ID", "1")]).capabilities();
+        assert_eq!(caps.progress, None);
     }
 
     #[test]

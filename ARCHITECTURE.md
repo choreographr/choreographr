@@ -3119,7 +3119,12 @@ What it produces:
   the native image protocol. Each is three-state — `Some(true)`,
   `Some(false)`, `None` — so an unidentified terminal answers "unknown" rather
   than "unsupported"; a later phase that consults the table can therefore never
-  disable a feature on a false negative. The research behind every row is
+  disable a feature on a false negative. A row gated on a version floor stays
+  **unasserted** whenever the terminal was identified by a marker that carries
+  no version — a `TERM` prefix (`alacritty*`, `foot*`) or `KITTY_WINDOW_ID` —
+  because the floor can only be evaluated against a version actually read
+  (progress then relies on the OSC 9;4 environment probe below). The research
+  behind every row is
   recorded in [`docs/plans/terminal-profile.md`](docs/plans/terminal-profile.md).
   A **hosting layer answers for the features it provides itself**
   (`HostedKind::capabilities`): a manager that captures OSC 52 writes and composes
