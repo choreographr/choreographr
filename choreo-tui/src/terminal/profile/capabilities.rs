@@ -18,16 +18,18 @@ fn host_preferred(host: Option<bool>, terminal: Option<bool>) -> Option<bool> {
     }
 }
 
-/// The capability table: what the terminal identified by `name` supports at
-/// `version`, then corrected by the picker's negotiated protocol (`images`) and
-/// by anything the hosting layer `host` provides itself.
-pub(crate) fn capabilities_of(
-    name: TerminalKind,
-    version: Option<Version>,
-    images: ImageSupport,
-    host: Host,
-) -> Capabilities {
-    let mut caps = match name {
+/// The capability table for the terminal identified by `name` at `version`,
+/// from the table alone.
+///
+/// This is the raw row, with no correction from anything the runtime observed:
+/// a caller that wants the answer for *this* launch (the negotiated image
+/// protocol, the hosting layer's own capabilities) uses
+/// [`TerminalProfile::capabilities`](super::TerminalProfile::capabilities). The
+/// advice tables use this one, because a recommendation has to rest on what the
+/// terminal's own documentation settles rather than on what one session
+/// negotiated.
+pub(crate) fn table_capabilities(name: TerminalKind, version: Option<Version>) -> Capabilities {
+    match name {
         // Ghostty 1.2 added OSC 9;4, and it is the only terminal that
         // implements OSC 7501.
         TerminalKind::Ghostty => Capabilities {
@@ -39,9 +41,12 @@ pub(crate) fn capabilities_of(
             pointer_shape: YES,
             images: NativeImages::Kitty,
         },
-        // Kitty: graphics from 0.28, OSC 9;4 from 0.47. `KITTY_WINDOW_ID`
-        // carries no version, so the 0.47 floor yields `None` at runtime and
-        // the OSC 9;4 environment probe is what resolves progress.
+        // Kitty: Kitty graphics throughout, OSC 9;4 from 0.47. The floor is a
+        // statement of when the support arrived, and it is unreachable at
+        // runtime: `KITTY_WINDOW_ID` carries no version, so the row resolves to
+        // `None` there. That is the intended outcome — the 9;4 gate emits on an
+        // unasserted row (an unsupported sequence is inert), so kitty gets its
+        // progress bar without the version ever being known.
         TerminalKind::Kitty => Capabilities {
             kitty_keyboard: YES,
             synchronized_output: YES,
@@ -113,12 +118,15 @@ pub(crate) fn capabilities_of(
             images: NativeImages::None,
         },
         // iTerm2: everything but OSC 22 and OSC 7501, plus its own image
-        // protocol.
+        // protocol. OSC 9;4 arrived in 3.6.6 (advertised through the `P`
+        // feature of its `TERM_FEATURES` report), and `TERM_PROGRAM_VERSION`
+        // carries the version, so the row is version-gated rather than asserted
+        // outright.
         TerminalKind::ItTerm => Capabilities {
             kitty_keyboard: YES,
             synchronized_output: YES,
             clipboard_write: YES,
-            progress: YES,
+            progress: Capabilities::at_least(version, Version::new(3, 6, 6)),
             program_status: NO,
             pointer_shape: NO,
             images: NativeImages::Iterm2,
@@ -163,10 +171,26 @@ pub(crate) fn capabilities_of(
             program_status: YES,
             ..Capabilities::UNASSERTED
         },
-        // Nothing verified about Ptyxis's own support, so nothing is
-        // asserted — its VTE base is not evidence for its build's features.
-        TerminalKind::Ptyxis | TerminalKind::Unknown => Capabilities::UNASSERTED,
-    };
+        // Ptyxis: OSC 9;4 from 48.0, and `PTYXIS_VERSION` carries the version.
+        // Nothing else about its build is asserted — its VTE base is not
+        // evidence for the features the build actually implements.
+        TerminalKind::Ptyxis => Capabilities {
+            progress: Capabilities::at_least(version, Version::new(48, 0, 0)),
+            ..Capabilities::UNASSERTED
+        },
+        TerminalKind::Unknown => Capabilities::UNASSERTED,
+    }
+}
+
+/// The terminal's capability row, corrected by the picker's negotiated protocol
+/// (`images`) and by anything the hosting layer `host` provides itself.
+pub(crate) fn capabilities_of(
+    name: TerminalKind,
+    version: Option<Version>,
+    images: ImageSupport,
+    host: Host,
+) -> Capabilities {
+    let mut caps = table_capabilities(name, version);
     // The picker negotiated the image protocol with this terminal, and a
     // negotiated protocol is a measurement, so it outranks the table. It is
     // also the only capability a hosted pane can report at all: the

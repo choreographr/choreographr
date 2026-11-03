@@ -388,6 +388,21 @@ mod tests {
     }
 
     #[test]
+    fn every_capability_label_fits_the_verdict_column() {
+        // Labels are padded to `LABEL_WIDTH` so the verdicts line up; a longer
+        // one would silently push its verdict out of the column instead of
+        // failing anywhere, so a new row is guarded here.
+        for row in capability_rows(Capabilities::UNASSERTED, Capabilities::UNASSERTED) {
+            assert!(
+                row.label.chars().count() <= LABEL_WIDTH,
+                "{:?} is {} chars, over the {LABEL_WIDTH}-char column",
+                row.label,
+                row.label.chars().count()
+            );
+        }
+    }
+
+    #[test]
     fn identity_line_names_the_terminal_platform_images_and_host() {
         let ghostty = TerminalProfile {
             version: Some(Version::new(1, 4, 0)),

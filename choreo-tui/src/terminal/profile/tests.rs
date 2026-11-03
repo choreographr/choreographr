@@ -138,7 +138,13 @@ fn terminal_version_is_parsed_where_the_environment_carries_one() {
 
 #[test]
 fn detects_each_host_layer() {
-    let herdr = detect_linux(&[("HERDR_PANE_ID", "pane-7")]);
+    // A Herdr pane is identified only by its full marker set: all three are the
+    // contract its reporting API runs on.
+    let herdr = detect_linux(&[
+        ("HERDR_ENV", "1"),
+        ("HERDR_BIN_PATH", "/usr/bin/herdr"),
+        ("HERDR_PANE_ID", "pane-7"),
+    ]);
     assert_eq!(herdr.host, Host::Hosted(HostedKind::Herdr));
 
     let rex = detect_linux(&[("REX_SESSION", "s-1")]);
@@ -152,6 +158,44 @@ fn detects_each_host_layer() {
 }
 
 #[test]
+fn a_partial_host_marker_set_is_not_a_hosted_pane() {
+    // The same predicate the reporter applies before it invokes anything: with
+    // a marker missing, the reporter would never start, so calling the pane
+    // hosted could only hide the real terminal from the Terminal page.
+    let full = [
+        ("HERDR_ENV", "1"),
+        ("HERDR_BIN_PATH", "/usr/bin/herdr"),
+        ("HERDR_PANE_ID", "pane-7"),
+    ];
+    for missing in 0..full.len() {
+        let partial: Vec<(&str, &str)> = full
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != missing)
+            .map(|(_, pair)| *pair)
+            .collect();
+        let profile = detect_linux(&partial);
+        assert_eq!(profile.host, Host::Direct, "{partial:?}");
+        // Every marker that *was* set is still recorded, so the audit line can
+        // explain the verdict.
+        let expected: Vec<&str> = partial.iter().map(|(name, _)| *name).collect();
+        assert_eq!(profile.evidence, expected, "{partial:?}");
+    }
+
+    // With the whole set present the pane is hosted.
+    assert_eq!(detect_linux(&full).host, Host::Hosted(HostedKind::Herdr));
+}
+
+#[test]
+fn a_partial_host_marker_set_leaves_the_terminal_identifiable() {
+    // A stale inherited marker from an unrelated shell must not blind the
+    // identity detection of a plain terminal.
+    let profile = detect_linux(&[("HERDR_PANE_ID", "pane-7"), ("TERM_PROGRAM", "ghostty")]);
+    assert_eq!(profile.host, Host::Direct);
+    assert_eq!(profile.name, TerminalKind::Ghostty);
+}
+
+#[test]
 fn rex_is_recognized_by_its_terminfo_entry_alone() {
     let profile = detect_linux(&[("TERM", "xterm-rex")]);
     assert_eq!(profile.host, Host::Hosted(HostedKind::Rex));
@@ -161,7 +205,12 @@ fn rex_is_recognized_by_its_terminfo_entry_alone() {
 
 #[test]
 fn a_hosted_layer_outranks_a_multiplexer() {
-    let profile = detect_linux(&[("HERDR_ENV", "1"), ("TMUX", "/tmp/tmux-1000/default,1,0")]);
+    let profile = detect_linux(&[
+        ("HERDR_ENV", "1"),
+        ("HERDR_BIN_PATH", "/usr/bin/herdr"),
+        ("HERDR_PANE_ID", "pane-7"),
+        ("TMUX", "/tmp/tmux-1000/default,1,0"),
+    ]);
     assert_eq!(profile.host, Host::Hosted(HostedKind::Herdr));
     // The multiplexer was still seen, so the audit line explains the nesting.
     assert!(profile.evidence.contains(&"TMUX"));
@@ -218,9 +267,15 @@ fn termux_refines_linux_into_android() {
     assert_eq!(android.platform, Platform::Android);
     assert_eq!(android.name, TerminalKind::Termux);
 
-    // The PREFIX alone is enough: it is Termux's own layout.
+    // Termux's own layout is enough on its own: it names the app-private
+    // prefix no other environment uses.
     let prefix_only = detect_linux(&[("PREFIX", "/data/data/com.termux/files/usr")]);
     assert_eq!(prefix_only.platform, Platform::Android);
+
+    // A `PREFIX` from some build or dev environment is not Termux, so the
+    // platform stays Linux and the advice stays the platform's own.
+    let other_prefix = detect_linux(&[("PREFIX", "/opt/homebrew")]);
+    assert_eq!(other_prefix.platform, Platform::Linux);
 
     let plain = detect_linux(&[("TERM", "xterm-256color")]);
     assert_eq!(plain.platform, Platform::Linux);
@@ -271,7 +326,7 @@ fn ghostty_is_the_only_program_status_terminal_with_mode_2026() {
 }
 
 #[test]
-fn version_floors_gate_progress_and_images() {
+fn version_floors_gate_progress() {
     // Ghostty below the 1.2 floor has no OSC 9;4, and an unknown version
     // cannot rule it out.
     let old_ghostty = detect_linux(&[
@@ -281,23 +336,70 @@ fn version_floors_gate_progress_and_images() {
     assert_eq!(old_ghostty.capabilities().progress, Some(false));
     let unknown_version = detect_linux(&[("TERM", "xterm-ghostty")]);
     assert_eq!(unknown_version.capabilities().progress, None);
+}
 
-    // Kitty: OSC 9;4 needs 0.47.
-    let kitty_old = detect_linux(&[("TERM_PROGRAM", "kitty")]);
-    assert_eq!(kitty_old.capabilities().progress, None);
-    let kitty = TerminalProfile {
+#[test]
+fn kitty_progress_is_unasserted_because_its_marker_carries_no_version() {
+    // `KITTY_WINDOW_ID` names kitty but exports no version, so the 0.47 floor
+    // cannot be evaluated. The row stays unasserted — and the 9;4 gate emits on
+    // an unasserted row, so the bar is drawn without the version being known.
+    let caps = detect_linux(&[("KITTY_WINDOW_ID", "1")]).capabilities();
+    assert_eq!(caps.progress, None);
+    assert_eq!(caps.images, NativeImages::Kitty);
+
+    // An explicit version — a test's today, a real source's if the client ever
+    // learns kitty's own — is evaluated against the floor normally.
+    let old = TerminalProfile {
         name: TerminalKind::Kitty,
         version: Some(Version::new(0, 46, 0)),
         ..detect_linux(&[])
     };
-    assert_eq!(kitty.capabilities().progress, Some(false));
-    let kitty_new = TerminalProfile {
-        name: TerminalKind::Kitty,
+    assert_eq!(old.capabilities().progress, Some(false));
+    let new = TerminalProfile {
         version: Some(Version::new(0, 47, 0)),
-        ..detect_linux(&[])
+        ..old
     };
-    assert_eq!(kitty_new.capabilities().progress, Some(true));
-    assert_eq!(kitty_new.capabilities().images, NativeImages::Kitty);
+    assert_eq!(new.capabilities().progress, Some(true));
+    assert_eq!(new.capabilities().images, NativeImages::Kitty);
+}
+
+#[test]
+fn iterm_progress_is_gated_on_the_366_floor() {
+    let old = detect_linux(&[
+        ("TERM_PROGRAM", "iTerm.app"),
+        ("TERM_PROGRAM_VERSION", "3.6.5"),
+    ]);
+    assert_eq!(old.capabilities().progress, Some(false));
+    let new = detect_linux(&[
+        ("TERM_PROGRAM", "iTerm.app"),
+        ("TERM_PROGRAM_VERSION", "3.6.6"),
+    ]);
+    assert_eq!(new.capabilities().progress, Some(true));
+    // The rest of the iTerm2 row is unaffected by the floor.
+    assert_eq!(new.capabilities().clipboard_write, Some(true));
+    assert_eq!(new.capabilities().program_status, Some(false));
+}
+
+#[test]
+fn ptyxis_asserts_only_its_progress_floor() {
+    let old = detect_linux(&[("PTYXIS_VERSION", "47.1")]).capabilities();
+    assert_eq!(old.progress, Some(false));
+    let new = detect_linux(&[("PTYXIS_VERSION", "48.0")]).capabilities();
+    assert_eq!(new.progress, Some(true));
+    // A version we cannot read leaves the one asserted row unasserted rather
+    // than guessing.
+    let unreadable = detect_linux(&[("PTYXIS_VERSION", "unknown")]).capabilities();
+    assert_eq!(unreadable.progress, None);
+    // Every other row stays unasserted: its VTE base is not evidence for what
+    // this build implements.
+    for caps in [old, new] {
+        assert_eq!(caps.kitty_keyboard, None);
+        assert_eq!(caps.synchronized_output, None);
+        assert_eq!(caps.clipboard_write, None);
+        assert_eq!(caps.program_status, None);
+        assert_eq!(caps.pointer_shape, None);
+        assert_eq!(caps.images, NativeImages::Unknown);
+    }
 }
 
 #[test]
@@ -320,10 +422,10 @@ fn version_less_foot_leaves_kitty_keyboard_unasserted() {
 }
 
 #[test]
-fn version_less_kitty_leaves_progress_to_the_probe() {
-    // `KITTY_WINDOW_ID` identifies kitty but carries no version, so the
-    // 0.47 progress floor yields `None`: the OSC 9;4 environment probe is
-    // what decides progress at runtime.
+fn version_less_kitty_leaves_its_version_gated_rows_unasserted() {
+    // `KITTY_WINDOW_ID` identifies kitty but carries no version, so the 0.47
+    // progress floor yields `None`. That is the honest answer, and it is not a
+    // gap: the OSC 9;4 gate emits on an unasserted row.
     let caps = detect_linux(&[("KITTY_WINDOW_ID", "1")]).capabilities();
     assert_eq!(caps.progress, None);
 }

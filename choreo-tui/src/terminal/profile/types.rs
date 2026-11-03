@@ -108,11 +108,19 @@ impl Platform {
     /// `linux` triple. Termux exports `TERMUX_VERSION` and `PREFIX` (its
     /// app-private install prefix), so the environment decides in that case.
     ///
+    /// `TERMUX_VERSION` is the marker; `PREFIX` only counts when its value names
+    /// Termux's own `/data/data/<app>/files/usr` layout, because `PREFIX` on its
+    /// own is an ordinary variable that build and development environments
+    /// export. A false positive here is not harmless: it switches the platform
+    /// advice to Android, which offers no alternative terminal and no
+    /// Option-as-Meta setting.
+    ///
     /// Called by [`super::TerminalProfile::detect`], which owns the injected
     /// environment.
     #[must_use]
     pub(crate) fn refine_android(self, env: &impl Fn(&str) -> Option<String>) -> Self {
-        let termux = value(env, "TERMUX_VERSION").is_some() || value(env, "PREFIX").is_some();
+        let termux = value(env, "TERMUX_VERSION").is_some()
+            || value(env, "PREFIX").is_some_and(|prefix| prefix.starts_with("/data/data/"));
         if self == Self::Linux && termux {
             Self::Android
         } else {
@@ -337,7 +345,7 @@ impl fmt::Display for Host {
 ///
 /// Every field is `Some(true)` (supported), `Some(false)` (settled as not
 /// supported), or `None` (not asserted).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Capabilities {
     /// The Kitty keyboard protocol (disambiguated keys, key release/repeat).
     pub(crate) kitty_keyboard: Option<bool>,
@@ -379,9 +387,10 @@ impl Capabilities {
     /// arm at runtime: the marker names the terminal but carries no version, so
     /// there is no evidence to place against the floor. The gate itself stays,
     /// because an explicit version (a test's, or a future version source's) is
-    /// evaluated normally. At runtime such a row is either resolved by the OSC
-    /// 9;4 environment probe (progress) or left unasserted, which is the honest
-    /// answer for a terminal whose version never reached us.
+    /// evaluated normally. At runtime such a row stays unasserted, which is the
+    /// honest answer for a terminal whose version never reached us — and for the
+    /// `progress` row that still means the bar is drawn, because the OSC 9;4
+    /// gate emits on `None` (an unsupported 9;4 is inert).
     pub(crate) fn at_least(version: Option<Version>, floor: Version) -> Option<bool> {
         version.map(|v| v.at_least(floor))
     }

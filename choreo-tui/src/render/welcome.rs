@@ -98,8 +98,9 @@ fn steps(progress: SetupProgress, has_accounts: bool) -> [Step; 3] {
     ]
 }
 
-/// Build the panel's lines for an area `max_height` rows tall. Split from the
-/// drawing so tests can check the content without a terminal.
+/// Build the panel's lines for a panel `width` columns wide and `max_height`
+/// rows tall. Split from the drawing so tests can check the content without a
+/// terminal.
 ///
 /// `notice` is the launch-time terminal advice; it is appended after the
 /// checklist and before the closing hint, truncated by [`append_notice`] when
@@ -108,6 +109,7 @@ pub(super) fn welcome_lines(
     progress: SetupProgress,
     has_accounts: bool,
     notice: Option<&TerminalNotice>,
+    width: u16,
     max_height: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
@@ -171,10 +173,34 @@ pub(super) fn welcome_lines(
     ];
 
     if let Some(notice) = notice {
-        append_notice(&mut lines, notice, hint.len(), max_height);
+        let reserved = lines_rows(&hint, usize::from(width));
+        append_notice(&mut lines, notice, reserved, width, max_height);
     }
     lines.extend(hint);
     lines
+}
+
+/// The number of terminal rows `line` occupies when wrapped at `width` columns.
+///
+/// The panel is drawn with wrapping on, so one logical line can cost several
+/// rows. Budgeting by line count would under-count a long advice line and let
+/// the paragraph widget clip it mid-sentence — the exact failure the
+/// degradation below exists to avoid.
+fn line_rows(line: &Line<'_>, width: usize) -> usize {
+    if width == 0 {
+        return 1;
+    }
+    let columns = line.width();
+    if columns == 0 {
+        1
+    } else {
+        columns.div_ceil(width)
+    }
+}
+
+/// The rows `lines` occupy together when wrapped at `width` columns.
+fn lines_rows(lines: &[Line<'_>], width: usize) -> usize {
+    lines.iter().map(|line| line_rows(line, width)).sum()
 }
 
 /// Append as much of `notice` as the area has room for, after `reserved` rows
@@ -183,14 +209,19 @@ pub(super) fn welcome_lines(
 /// The paragraph widget is clamped to the panel rectangle and would silently
 /// cut the tail, leaving half a recommendation on screen. Degrading here
 /// instead keeps the block honest: the whole notice when it fits, then the
-/// headline alone, then nothing at all.
+/// headline alone, then nothing at all. Room is measured in *drawn* rows, so a
+/// notice line that wraps is charged for every row it takes.
 fn append_notice(
     lines: &mut Vec<Line<'static>>,
     notice: &TerminalNotice,
     reserved: usize,
+    width: u16,
     max_height: u16,
 ) {
-    let free = usize::from(max_height).saturating_sub(lines.len() + reserved);
+    let width = usize::from(width);
+    let free = usize::from(max_height)
+        .saturating_sub(lines_rows(lines, width))
+        .saturating_sub(reserved);
     let mut block = Vec::with_capacity(notice.lines.len() + 2);
     // The blank line is part of the block: it separates the notice from the
     // checklist above it, so a headline-only degradation takes both.
@@ -206,10 +237,14 @@ fn append_notice(
             .map(|text| Line::from(Span::styled(text.clone(), dim_style()))),
     );
 
-    if block.len() <= free {
+    // The separator and the headline are what a degraded block keeps; the
+    // advice lines under them are the part that gets dropped.
+    let headline_rows = block
+        .get(..2)
+        .map_or(usize::MAX, |head| lines_rows(head, width));
+    if lines_rows(&block, width) <= free {
         lines.extend(block);
-    } else if free >= 2 {
-        // Room for the separator and the headline, but not the advice under it.
+    } else if headline_rows <= free {
         lines.extend(block.into_iter().take(2));
     }
 }
@@ -219,16 +254,20 @@ pub(super) fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let width = area.width.min(MAX_WIDTH);
     let lines = welcome_lines(
         app.setup_progress(),
         !app.ai_providers.accounts.is_empty(),
         app.terminal_advice(),
+        width,
         area.height,
     );
-    let width = area.width.min(MAX_WIDTH);
-    // The line count is a handful of fixed rows, so the cast cannot truncate.
-    #[expect(clippy::cast_possible_truncation)]
-    let height = (lines.len() as u16).min(area.height);
+    // The panel's height is the rows its lines *draw*, not how many lines it
+    // has: a wrapped line occupies several, and sizing by the line count would
+    // leave the panel shorter than its own content. Both terms are bounded by
+    // the area, so the conversion cannot truncate.
+    let drawn = lines_rows(&lines, usize::from(width));
+    let height = u16::try_from(drawn).unwrap_or(area.height).min(area.height);
     let panel = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -249,6 +288,10 @@ mod tests {
 
     /// A height no test panel runs out of, so the notice is never truncated.
     const TALL: u16 = 100;
+
+    /// A width wide enough that no panel line wraps, so a row count equals the
+    /// line count in the tests that reason in lines.
+    const WIDE: u16 = 200;
 
     fn text(lines: &[Line<'_>]) -> String {
         lines
@@ -277,13 +320,22 @@ mod tests {
     /// the no-notice line count minus those is the budget the notice competes
     /// for.
     fn base_len() -> u16 {
-        let height = welcome_lines(SetupProgress::default(), false, None, TALL).len();
-        u16::try_from(height.saturating_sub(2)).unwrap_or(u16::MAX)
+        let rows = lines_rows(
+            &welcome_lines(SetupProgress::default(), false, None, WIDE, TALL),
+            usize::from(WIDE),
+        );
+        u16::try_from(rows.saturating_sub(2)).unwrap_or(u16::MAX)
     }
 
     #[test]
     fn fresh_setup_points_at_adding_an_account() {
-        let out = text(&welcome_lines(SetupProgress::default(), false, None, TALL));
+        let out = text(&welcome_lines(
+            SetupProgress::default(),
+            false,
+            None,
+            WIDE,
+            TALL,
+        ));
         assert!(out.contains("→ 1. Add an AI provider account"));
         assert!(out.contains("alt+a, then n"));
         assert!(out.contains("○ 2."));
@@ -292,7 +344,13 @@ mod tests {
 
     #[test]
     fn keyless_account_points_at_setting_its_key() {
-        let out = text(&welcome_lines(SetupProgress::default(), true, None, TALL));
+        let out = text(&welcome_lines(
+            SetupProgress::default(),
+            true,
+            None,
+            WIDE,
+            TALL,
+        ));
         assert!(out.contains("alt+a, select it, c"));
     }
 
@@ -303,7 +361,7 @@ mod tests {
             session_has_account: true,
             session_has_model: false,
         };
-        let out = text(&welcome_lines(progress, true, None, TALL));
+        let out = text(&welcome_lines(progress, true, None, WIDE, TALL));
         assert!(out.contains("✓ 1."));
         assert!(out.contains("✓ 2."));
         assert!(out.contains("→ 3. Choose a model"));
@@ -316,7 +374,7 @@ mod tests {
             session_has_account: true,
             session_has_model: true,
         };
-        let out = text(&welcome_lines(progress, true, None, TALL));
+        let out = text(&welcome_lines(progress, true, None, WIDE, TALL));
         assert!(out.contains("You're all set"));
         assert!(!out.contains("1."));
     }
@@ -324,7 +382,7 @@ mod tests {
     #[test]
     fn a_tall_panel_shows_the_whole_notice_before_the_hint() {
         let notice = sample_notice();
-        let lines = welcome_lines(SetupProgress::default(), false, Some(&notice), TALL);
+        let lines = welcome_lines(SetupProgress::default(), false, Some(&notice), WIDE, TALL);
         let out = text(&lines);
         assert!(out.contains("NOTICE-HEADLINE"));
         assert!(out.contains("NOTICE-LINE-1"));
@@ -342,11 +400,43 @@ mod tests {
             SetupProgress::default(),
             false,
             Some(&notice),
+            WIDE,
             height,
         ));
         assert!(out.contains("NOTICE-HEADLINE"));
         assert!(!out.contains("NOTICE-LINE-1"));
         assert!(!out.contains("NOTICE-LINE-2"));
+    }
+
+    #[test]
+    fn a_wrapping_notice_line_is_budgeted_as_the_rows_it_draws() {
+        // A narrow panel wraps both the fixed checklist and the advice, so the
+        // budget has to be counted in drawn rows. Under a line count this
+        // four-line block would look like it fits and then be clipped
+        // mid-sentence by the paragraph widget.
+        let width = 20;
+        let notice = TerminalNotice {
+            headline: "H".to_string(),
+            lines: vec!["x".repeat(2 * usize::from(width))],
+        };
+        let base = lines_rows(
+            &welcome_lines(SetupProgress::default(), false, None, width, TALL),
+            usize::from(width),
+        );
+        // Two free rows: the separator and the headline, nothing else.
+        let height = u16::try_from(base + 2).expect("the test panel fits a u16");
+        let out = text(&welcome_lines(
+            SetupProgress::default(),
+            false,
+            Some(&notice),
+            width,
+            height,
+        ));
+        assert!(out.contains('H'), "the headline still fits:\n{out}");
+        assert!(
+            !out.contains('x'),
+            "a two-row advice line cannot fit:\n{out}"
+        );
     }
 
     #[test]
@@ -358,6 +448,7 @@ mod tests {
             SetupProgress::default(),
             false,
             Some(&notice),
+            WIDE,
             height,
         ));
         assert!(!out.contains("NOTICE"));

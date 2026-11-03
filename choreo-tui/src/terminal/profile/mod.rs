@@ -39,6 +39,8 @@ mod version;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use capabilities::table_capabilities;
+pub(crate) use detect::{HERDR_BIN_PATH, HERDR_ENV, HERDR_PANE_ID, value};
 pub(crate) use types::*;
 pub(crate) use version::*;
 

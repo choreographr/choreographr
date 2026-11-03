@@ -117,12 +117,10 @@ fn direct_notice(profile: &TerminalProfile) -> Option<TerminalNotice> {
         known => user_name(known).to_string(),
     };
     let headline = format!("{subject} — {} won't work", join_phrases(&gaps));
+    // The recommendations are already the display lines the Terminal page
+    // prints, so the panel and the page name the same terminals and installers.
     let mut lines = vec!["A terminal that supports it:".to_string()];
-    lines.extend(
-        recommendations(profile.platform)
-            .iter()
-            .map(|pick| (*pick).to_string()),
-    );
+    lines.extend(recommendations(profile.platform));
     Some(TerminalNotice { headline, lines })
 }
 

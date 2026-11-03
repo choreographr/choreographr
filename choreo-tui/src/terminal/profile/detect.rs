@@ -3,9 +3,39 @@
 //!
 //! Every function takes the environment injected as a closure, so the whole
 //! rule set is unit-testable without touching the real process.
+//!
+//! The marker names and the [`value`] lookup are shared with the components
+//! outside this module that read the same environment — the hosted-pane
+//! reporter (`state::terminal_status::host_report`) names the host's markers and
+//! applies the same "an empty value is not a claim" rule — so one spelling of a
+//! variable serves both and the two cannot drift apart.
 
 use super::types::{Host, HostedKind, Mux, TerminalKind};
 use super::version::{Version, parse_packed_or_dotted};
+
+/// The opt-in marker every Herdr pane exports.
+pub(crate) const HERDR_ENV: &str = "HERDR_ENV";
+/// The marker naming the host's own binary, the program a report invokes.
+pub(crate) const HERDR_BIN_PATH: &str = "HERDR_BIN_PATH";
+/// The marker naming the pane this program runs in.
+pub(crate) const HERDR_PANE_ID: &str = "HERDR_PANE_ID";
+
+/// The full marker set a Herdr pane exports, all of it required.
+///
+/// All three are demanded, not any one: they are the contract the host's
+/// reporting API runs on (a pane id to address and a binary to invoke), so a
+/// process carrying only a stale inherited slice of them is not a managed pane
+/// — and treating it as one would hide the real terminal's identity from the
+/// Terminal page and the advice panels for a reporter that never starts.
+/// `state::terminal_status::host_report` requires exactly this set before it
+/// invokes anything, so the profile and the reporter cannot disagree.
+pub(crate) const HERDR_MARKERS: [&str; 3] = [HERDR_ENV, HERDR_BIN_PATH, HERDR_PANE_ID];
+
+/// The markers a Rex pane exports. Any one of them identifies the layer: they
+/// are per-session / per-block identifiers rather than one contract, and a Rex
+/// pane can also be recognised by its terminfo entry alone (see
+/// [`detect_hosted`]).
+const REX_MARKERS: [&str; 3] = ["REX_SESSION", "REX_BLOCK", "REX_SERVER"];
 
 /// Read `name`, treating an empty value as absent: a marker variable set to the
 /// empty string is not a claim.
@@ -29,7 +59,7 @@ fn marker(
 
 /// Record every variable in `names` that the environment sets, reporting
 /// whether any did.
-fn note_markers(
+fn any_marker(
     env: &impl Fn(&str) -> Option<String>,
     evidence: &mut Vec<&'static str>,
     names: &[&'static str],
@@ -44,6 +74,25 @@ fn note_markers(
         }
     }
     matched
+}
+
+/// Record every variable in `names` that the environment sets, reporting
+/// whether **all** of them did.
+///
+/// Same evidence rule as [`any_marker`] — every marker that matched is kept, so
+/// the audit line shows a partial set — but the verdict needs the whole set.
+fn all_markers(
+    env: &impl Fn(&str) -> Option<String>,
+    evidence: &mut Vec<&'static str>,
+    names: &[&'static str],
+) -> bool {
+    let mut matched = 0;
+    for name in names {
+        if marker(env, evidence, name).is_some() {
+            matched += 1;
+        }
+    }
+    matched == names.len()
 }
 
 /// Identify the layer immediately hosting this program.
@@ -73,11 +122,7 @@ fn detect_hosted(
     evidence: &mut Vec<&'static str>,
 ) -> Option<HostedKind> {
     let mut hosted: Option<HostedKind> = None;
-    if note_markers(
-        env,
-        evidence,
-        &["HERDR_ENV", "HERDR_PANE_ID", "HERDR_BIN_PATH"],
-    ) {
+    if all_markers(env, evidence, &HERDR_MARKERS) {
         hosted.get_or_insert(HostedKind::Herdr);
     }
     // Rex ships its own terminfo entry under `xterm-rex`, so its panes export
@@ -86,7 +131,7 @@ fn detect_hosted(
     if rex_term {
         evidence.push("TERM=xterm-rex");
     }
-    if note_markers(env, evidence, &["REX_SESSION", "REX_BLOCK", "REX_SERVER"]) || rex_term {
+    if any_marker(env, evidence, &REX_MARKERS) || rex_term {
         hosted.get_or_insert(HostedKind::Rex);
     }
     hosted

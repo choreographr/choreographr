@@ -3109,10 +3109,15 @@ What it produces:
   build compiles under a Linux triple.
 - The **host layer** (`Host`): `Direct`, a multiplexer (`Tmux { version }`,
   `Zellij`, `Screen`), or a hosting workspace manager (`Herdr`, `Rex`, and a
-  reserved `Other`). Hosted layers outrank multiplexers; every marker that
+  reserved `Other`). Hosted layers outrank multiplexers, and every marker that
   matched is kept in `evidence` so a nested session's chain is in the log. A
-  hosted pane is also where pane-level status reporting applies (see *Hosted
-  panes: reporting status to the workspace manager* below).
+  workspace manager is identified only when its **whole** marker set is present
+  — for Herdr, the opt-in switch, the binary to invoke and the pane id — which is
+  the same predicate the hosted-pane reporter applies before it invokes
+  anything, so the pane the client believes it is in is the pane it reports to;
+  a partial set (a stale inherited value, say) names `Direct` and still lands in
+  `evidence`. A hosted pane is also where pane-level status reporting applies
+  (see *Hosted panes: reporting status to the workspace manager* below).
 - The **capability table** (`Capabilities`), derived from the kind and version:
   the Kitty keyboard protocol, mode 2026 synchronized output, OSC 52 clipboard
   writes, OSC 9;4 progress, OSC 7501 program status, OSC 22 pointer shape, and
@@ -3122,8 +3127,9 @@ What it produces:
   disable a feature on a false negative. A row gated on a version floor stays
   **unasserted** whenever the terminal was identified by a marker that carries
   no version — a `TERM` prefix (`alacritty*`, `foot*`) or `KITTY_WINDOW_ID` —
-  because the floor can only be evaluated against a version actually read
-  (progress then relies on the OSC 9;4 environment probe below). The research
+  because the floor can only be evaluated against a version actually read (for
+  `progress` that still means the bar is drawn — see the gate rule below). The
+  research
   behind every row is
   recorded in [`docs/plans/terminal-profile.md`](docs/plans/terminal-profile.md).
   A **hosting layer answers for the features it provides itself**
@@ -3153,14 +3159,19 @@ Later phases consume the stored profile rather than re-detecting: the Terminal
 page reports identity and capabilities, and the OSC 7501/9;4/OSC 22 emission
 gates read `Capabilities` (and the host layer) to stay silent where a terminal
 would ignore or mishandle the sequence. The OSC 9;4 progress gate at
-`terminal/progress.rs::should_emit` combines three inputs as a pure, unit-tested
-decision: support must be asserted by the capability **or** by the cached
-`anstyle-progress` environment probe (the probe is an OR fallback, never a veto,
-so a terminal the probe already recognised cannot regress on a `Some(false)` or
-`None` row — which is what brings kitty ≥0.47, bare VTE terminals and zellij
-into range), an unasserted `None` never enables it alone, and a `Hosted(_)` pane
-suppresses it because the workspace manager owns the pane's progress surface. A
-multiplexer (`Mux(_)`) passes the sequence through and does not suppress.
+`terminal/progress.rs::should_emit` is a pure, unit-tested decision over two
+inputs — the `progress` capability and the host layer — and it rests on one
+property of the sequence: where a terminal does not implement OSC 9;4 it is
+**inert** (an unrecognised OSC is discarded, and a set command produces no
+reply, so nothing can land on the input stream). So a settled `Some(false)`
+withholds, while `Some(true)` and an unasserted `None` emit; requiring
+`Some(true)` would keep the bar off every terminal identified by a
+version-less marker, kitty first among them (its `KITTY_WINDOW_ID` carries no
+version, so the 0.47 floor cannot be evaluated and the row stays unasserted).
+A `Hosted(_)` pane suppresses the write because the workspace manager owns the
+pane's progress surface, and a GNU screen pane suppresses it because screen
+forwards none of the client's sequences (the same fact the shared screen advice
+states). tmux and zellij pass the sequence through and do not suppress.
 
 ### Welcome-screen terminal advice
 
@@ -3193,7 +3204,11 @@ styling and wraps the block to the panel's width; because the paragraph is
 clamped to the panel rectangle (which would silently cut the tail mid-line), the
 renderer sizes the notice against the area's remaining rows after reserving the
 closing `alt+h` hint, and degrades in three explicit steps: the whole notice, the
-headline alone, or nothing.
+headline alone, or nothing. Room is counted in **drawn rows**, not in line
+counts: every line is charged for the rows it wraps onto at the panel's width
+(the fixed checklist included), and the panel's own height is that same sum — a
+line count would size the panel too short for its own content on a narrow
+terminal.
 
 ### Terminal page
 
@@ -3218,7 +3233,12 @@ cannot drift into recommending different things; that module also holds the
 single GNU screen sentence both surfaces print for a screen pane (screen
 forwards none of the client's sequences, so the advice is another multiplexer
 rather than a setting, and the page prints no recommendations block for it).
-The in-source rustdoc of that module is the reference for each rule.
+Each platform's terminals are **one table of rows** — identity, display name and
+install command — and both the recommendation lines and the "keeps every
+feature" filter are derived from it, so the two cannot name different terminals;
+the filter reads the capability table alone (`table_capabilities`), never what
+this launch negotiated. The in-source rustdoc of that module is the reference for
+each rule.
 
 ### Hosted panes: reporting status to the workspace manager
 
@@ -3239,11 +3259,25 @@ The reporter is **opt-in by environment** (all of the host's markers must be
 present) and touches no shared state: `Reporter::start` spawns one serving
 thread fed by a capacity-1 crossbeam channel, and the UI loop enqueues a report
 only where it already publishes the OSC records — same tick, same state. The
-sink overwrites an unsent report so only the latest state survives, a stale one
-being worthless and a bounded queue being what stops a wedged host from growing
-a backlog. `--seq` is wall-clock milliseconds nudged strictly upward, because
-the host drops a report whose sequence is not above the last it saw (including
+marker names and the empty-value rule come from the terminal profile, and the
+profile calls a pane hosted only when that same full set is present, so the two
+cannot disagree about whether this process is in a managed pane. The sink
+overwrites an unsent report so only the latest state survives, a stale one being
+worthless and a bounded queue being what stops a wedged host from growing a
+backlog. `--seq` is wall-clock milliseconds nudged strictly upward, because the
+host drops a report whose sequence is not above the last it saw (including
 across client restarts).
+
+Its pieces are focused modules under `state/terminal_status/host_report/`:
+`config` (detection plus what the host needs to be addressed), `argv` (the whole
+command-line contract — the report argv, the release argv, the resume command
+and the sequence number) and `invoke` (the process boundary), with the report
+types, the channel and the serving thread in the module root. Everything the
+host is told passes the one choke point in `argv`: the message is sanitized and
+capped there, a message the host's parser could read as an option is withheld,
+and the resume command's first word — a program name the host starts itself —
+must pass an allow-list of program-name characters rather than a deny-list of a
+few dangerous ones.
 
 Each invocation is bounded and blind: the child's stdin/stdout/stderr are null,
 the child is owned by a short-lived reaper thread that blocks in `wait()`, and

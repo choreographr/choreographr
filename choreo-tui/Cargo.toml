@@ -17,7 +17,6 @@ path = "src/main.rs"
 
 [dependencies]
 ansi-to-tui = "8.0.1"
-anstyle-progress = "0.1"
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

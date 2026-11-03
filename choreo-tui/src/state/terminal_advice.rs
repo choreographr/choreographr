@@ -13,8 +13,8 @@
 //! its fields), so each rule is unit-testable without a terminal.
 
 use crate::terminal::profile::{
-    Capabilities, Host, ImageSupport, NativeImages, Platform, TerminalKind, TerminalProfile,
-    Version,
+    Capabilities, Host, NativeImages, Platform, TerminalKind, TerminalProfile, Version,
+    table_capabilities,
 };
 
 /// tmux gained synchronized output (what the client's atomic frames need) in
@@ -22,25 +22,78 @@ use crate::terminal::profile::{
 /// redraws tear.
 const TMUX_FRAME_SYNC: Version = Version::new(3, 7, 0);
 
-/// The terminals this platform offers, as their short user-facing names, in
-/// recommendation order. Kept beside [`recommendations`] so the two lists can
-/// never disagree about which terminals a platform has.
-const MACOS_TERMINALS: &[(TerminalKind, &str)] = &[
-    (TerminalKind::Ghostty, "Ghostty"),
-    (TerminalKind::ItTerm, "iTerm2"),
-];
-const LINUX_TERMINALS: &[(TerminalKind, &str)] = &[
-    (TerminalKind::Ghostty, "Ghostty"),
-    (TerminalKind::Kitty, "kitty"),
-    (TerminalKind::WezTerm, "WezTerm"),
-];
-const WINDOWS_TERMINALS: &[(TerminalKind, &str)] = &[
-    (TerminalKind::WindowsTerminal, "Windows Terminal"),
-    (TerminalKind::WezTerm, "WezTerm"),
+/// One terminal a platform offers: how it is identified, the name a person
+/// reads, and how to install it there.
+///
+/// One row per terminal, so the short user-facing name and the install command
+/// cannot disagree about which terminals a platform has — the recommendation
+/// list and the "keeps every feature" filter are both derived from this table
+/// rather than hand-kept beside it.
+struct Recommendation {
+    kind: TerminalKind,
+    name: &'static str,
+    install: &'static str,
+}
+
+impl Recommendation {
+    /// The line the Terminal page prints: `<name> — <install>`.
+    fn line(&self) -> String {
+        format!("{} — {}", self.name, self.install)
+    }
+}
+
+/// The terminals macOS offers, in recommendation order.
+const MACOS_TERMINALS: &[Recommendation] = &[
+    Recommendation {
+        kind: TerminalKind::Ghostty,
+        name: "Ghostty",
+        install: "brew install --cask ghostty",
+    },
+    Recommendation {
+        kind: TerminalKind::ItTerm,
+        name: "iTerm2",
+        install: "brew install --cask iterm2",
+    },
 ];
 
-/// The terminals a platform offers, as `(kind, display name)` pairs.
-fn platform_terminals(platform: Platform) -> &'static [(TerminalKind, &'static str)] {
+/// The terminals Linux offers, in recommendation order.
+const LINUX_TERMINALS: &[Recommendation] = &[
+    Recommendation {
+        kind: TerminalKind::Ghostty,
+        name: "Ghostty",
+        install: "install from your distribution or ghostty.org",
+    },
+    Recommendation {
+        kind: TerminalKind::Kitty,
+        name: "kitty",
+        install: "apt install kitty (or dnf install kitty)",
+    },
+    Recommendation {
+        kind: TerminalKind::WezTerm,
+        name: "WezTerm",
+        install: "install from your distribution or wezterm.org",
+    },
+];
+
+/// The terminals Windows offers, in recommendation order.
+const WINDOWS_TERMINALS: &[Recommendation] = &[
+    Recommendation {
+        kind: TerminalKind::WindowsTerminal,
+        name: "Windows Terminal",
+        install: "winget install Microsoft.WindowsTerminal",
+    },
+    Recommendation {
+        kind: TerminalKind::WezTerm,
+        name: "WezTerm",
+        install: "winget install wez.wezterm",
+    },
+];
+
+/// The terminals a platform offers.
+///
+/// Android is empty by design: the platform's terminal is the Android app the
+/// user already chose, and no alternative is offered.
+fn platform_terminals(platform: Platform) -> &'static [Recommendation] {
     match platform {
         Platform::MacOs => MACOS_TERMINALS,
         Platform::Linux => LINUX_TERMINALS,
@@ -59,24 +112,18 @@ fn platform_terminals(platform: Platform) -> &'static [(TerminalKind, &'static s
 pub(crate) fn full_support_terminals(platform: Platform) -> Vec<&'static str> {
     platform_terminals(platform)
         .iter()
-        .filter(|(kind, _)| loses_nothing(*kind, platform))
-        .map(|(_, name)| *name)
+        .filter(|recommendation| loses_nothing(recommendation.kind))
+        .map(|recommendation| recommendation.name)
         .collect()
 }
 
 /// Whether `kind` asserts every feature the client's advice tracks.
-fn loses_nothing(kind: TerminalKind, platform: Platform) -> bool {
-    let profile = TerminalProfile {
-        name: kind,
-        version: None,
-        platform,
-        // The negotiated protocol is a runtime fact; the table's own answer is
-        // what a recommendation has to rest on.
-        images: ImageSupport::Halfblocks,
-        host: Host::Direct,
-        evidence: Vec::new(),
-    };
-    let capabilities = profile.capabilities();
+///
+/// The table's own answer, with no negotiated protocol and no host layer folded
+/// in: a recommendation has to rest on what the terminal's documentation
+/// settles, not on what this one launch happened to negotiate.
+fn loses_nothing(kind: TerminalKind) -> bool {
+    let capabilities = table_capabilities(kind, None);
     capabilities.clipboard_write == Some(true)
         && capabilities.synchronized_output == Some(true)
         && capabilities.kitty_keyboard == Some(true)
@@ -130,27 +177,16 @@ pub(crate) fn screen_sentence() -> &'static str {
     "Screen does not forward keys, images, or clipboard through its pane; run this inside tmux or zellij instead."
 }
 
-/// The terminals worth recommending on `platform`, best first.
+/// The terminals worth recommending on `platform`, best first, as the lines the
+/// Terminal page prints.
 ///
-/// Android is empty by design: the platform's terminal is the Android app the
-/// user already chose, and no alternative is offered.
-pub(crate) fn recommendations(platform: Platform) -> &'static [&'static str] {
-    match platform {
-        Platform::MacOs => &[
-            "Ghostty — brew install --cask ghostty",
-            "iTerm2 — brew install --cask iterm2",
-        ],
-        Platform::Linux => &[
-            "Ghostty — install from your distribution or ghostty.org",
-            "kitty — apt install kitty (or dnf install kitty)",
-            "WezTerm — install from your distribution or wezterm.org",
-        ],
-        Platform::Windows => &[
-            "Windows Terminal — winget install Microsoft.WindowsTerminal",
-            "WezTerm — winget install wez.wezterm",
-        ],
-        Platform::Android => &[],
-    }
+/// Android yields nothing by design: the platform's terminal is the Android app
+/// the user already chose, and no alternative is offered.
+pub(crate) fn recommendations(platform: Platform) -> Vec<String> {
+    platform_terminals(platform)
+        .iter()
+        .map(Recommendation::line)
+        .collect()
 }
 
 /// The user-facing names of what the client loses when each capability is
@@ -271,6 +307,32 @@ mod tests {
             host,
             evidence: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_recommendation_table_is_one_source_of_truth() {
+        // The recommendation lines and the "keeps every feature" names are both
+        // derived from the platform's table, so they cannot disagree about which
+        // terminals a platform has; this pins that the derivation still holds.
+        for platform in [Platform::MacOs, Platform::Linux, Platform::Windows] {
+            let table = platform_terminals(platform);
+            assert!(!table.is_empty(), "{platform} must offer something");
+            let lines = recommendations(platform);
+            assert_eq!(lines.len(), table.len(), "{platform}");
+            for (line, row) in lines.iter().zip(table) {
+                assert!(line.starts_with(row.name), "{line:?} names {:?}", row.name);
+                assert!(!row.install.is_empty(), "{} has no installer", row.name);
+                assert!(line.contains(row.install), "{line:?}");
+            }
+            // Every terminal promised as "keeps every feature" is one of the
+            // platform's own rows.
+            for name in full_support_terminals(platform) {
+                assert!(table.iter().any(|row| row.name == name), "{name:?}");
+            }
+        }
+        // Android offers nothing at all.
+        assert!(platform_terminals(Platform::Android).is_empty());
+        assert_eq!(recommendations(Platform::Android), Vec::<String>::new());
     }
 
     #[test]
