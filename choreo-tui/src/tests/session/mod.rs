@@ -21,9 +21,13 @@
 //! parent/child relationship rather than about `SessionCreated` gating; keeping
 //! them beside the sub-session finish tests leaves `lifecycle` a single
 //! coherent subject instead of a 900-line catalogue.
+//!
+//! `startup_attach` covers the one-shot `--attach <SESSION_ID>` latch that the
+//! daemon handler fires once the initial `Sessions` snapshot has been applied.
 
 mod background_meta;
 mod lifecycle;
 mod manager;
+mod startup_attach;
 mod streaming;
 mod subsession;

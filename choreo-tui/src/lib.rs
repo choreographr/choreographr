@@ -207,6 +207,12 @@ struct Cli {
     /// 'choreographr fingerprint'). Ignored when --server-pk is given.
     #[arg(long = "trust-fingerprint")]
     trust_fingerprint: Option<String>,
+
+    /// Open this session id at startup instead of waiting for one to be picked.
+    /// Equivalent to running `/session switch <id>` once the initial session
+    /// list has loaded.
+    #[arg(long = "attach", value_name = "SESSION_ID")]
+    attach: Option<u64>,
 }
 
 /// Resolve the connection mode for a TCP address, implementing the trust
@@ -487,7 +493,7 @@ pub fn main() -> anyhow::Result<()> {
         "choreo-tui starting"
     );
 
-    connection::run_app(mode)?;
+    connection::run_app(mode, cli.attach)?;
     Ok(())
 }
 

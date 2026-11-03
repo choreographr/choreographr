@@ -50,7 +50,7 @@ const NOTIFY_TOKEN: Token = Token(0);
 #[cfg(unix)]
 const STDIN_TOKEN: Token = Token(1);
 
-pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
+pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<()> {
     tracing::info!("[choreo-tui] run_app starting");
 
     let (client_tx, client_rx) = crossbeam_channel::unbounded::<ClientMessage>();
@@ -392,6 +392,18 @@ pub(crate) fn run_app(mode: ConnectionMode) -> io::Result<()> {
     // The address that keys this daemon's unlock key in known_servers (see
     // the derivation up top — `mode` is moved by now).
     app.connection_addr = connection_addr;
+
+    // Latch the `--attach <SESSION_ID>` request (if any). It is NOT dispatched
+    // here: `run_app` sends its startup requests before the connection is even
+    // established, and applying the attach before the daemon's session snapshot
+    // lands would let `handle_sessions`' auto-attach race or overwrite it. The
+    // UI loop's daemon handler fires it exactly once, right after the first
+    // `Sessions` reply is applied (see `App::dispatch_pending_attach`).
+    if let Some(session_id) = attach {
+        app.pending_attach = Some(session_id);
+    } else {
+        tracing::debug!("no --attach given; opening the default startup session");
+    }
 
     // ── Auto-unlock the daemon on connect ──────────────────────────
     //

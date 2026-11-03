@@ -218,3 +218,29 @@ fn cli_parses_the_shared_verbosity_flags() {
     assert_eq!(default.verbosity.verbose, 0);
     assert_eq!(default.verbosity.quiet, 0);
 }
+
+// ── `--attach <SESSION_ID>` ────────────────────────────
+
+/// `--attach` parses a session id in both the space and `=` forms, and is
+/// absent (`None`) without the flag.
+#[test]
+fn cli_parses_the_attach_flag() {
+    let spaced = Cli::try_parse_from(["choreo-tui", "--attach", "7"]).expect("attach parses");
+    assert_eq!(spaced.attach, Some(7));
+
+    let equals = Cli::try_parse_from(["choreo-tui", "--attach=7"]).expect("--attach= parses");
+    assert_eq!(equals.attach, Some(7));
+
+    let default = Cli::try_parse_from(["choreo-tui"]).expect("no attach parses");
+    assert_eq!(default.attach, None, "absence of --attach is None");
+}
+
+/// A non-numeric session id must be rejected at parse time (the field is a
+/// `u64`, so clap fails before the TUI ever starts).
+#[test]
+fn cli_rejects_non_numeric_attach() {
+    assert!(
+        Cli::try_parse_from(["choreo-tui", "--attach", "not-a-number"]).is_err(),
+        "a non-numeric session id must be rejected"
+    );
+}

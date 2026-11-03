@@ -122,7 +122,15 @@ pub(crate) fn handle_daemon_message(
             // The Sessions handler manages the full lifecycle and should not
             // fall through to the generic dispatch (which would duplicate
             // the summary output).
-            return app.handle_sessions(sessions, client_tx);
+            app.handle_sessions(sessions, client_tx)?;
+            // This is the initial (and any refresher) session snapshot. Apply
+            // the one-shot `--attach <SESSION_ID>` request only AFTER the
+            // snapshot — including its auto-attach to the most-recent session —
+            // so the explicitly named session wins rather than being raced or
+            // clobbered. `dispatch_pending_attach` takes the latch, so only the
+            // first snapshot dispatches; a later ListSessions refresh is inert.
+            app.dispatch_pending_attach(client_tx);
+            return Ok(());
         }
         DaemonMessageType::Session {
             session_id: Some(session_id),

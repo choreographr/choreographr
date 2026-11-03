@@ -413,7 +413,10 @@ Each client accepts the same `-v`/`-q` flags as the daemon and the same
 (`$XDG_STATE_HOME/choreographr/<binary>-<pid>.log`, or `{base}/log/...` under
 `--base-dir`, else the platform temp dir — e.g. `tui-<pid>.log`, `gui-<pid>.log`,
 `acp-<pid>.log`); the daemon and IM bridge also mirror to stderr, while the GUI
-and ACP adapter mirror only on a terminal.
+and ACP adapter mirror only on a terminal. `choreo-tui` also takes
+`--attach <SESSION_ID>` to open a specific session at startup (the CLI form of
+`/session switch <id>`), which lets a multiplexer or workspace manager resume on
+the exact session it was showing.
 
 ### First conversation
 

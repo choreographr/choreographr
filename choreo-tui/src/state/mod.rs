@@ -280,6 +280,13 @@ pub(crate) struct App {
     quit_message: DisplayLine,
     pub(crate) image_job_tx: Option<crossbeam_channel::Sender<ImageJob>>,
     pub(crate) attached_session_id: Option<u64>,
+    /// A `--attach <SESSION_ID>` request named at startup that has not been
+    /// dispatched yet. Set once from the CLI in `run_app` and taken exactly
+    /// once by [`App::dispatch_pending_attach`], which runs right after the
+    /// initial `Sessions` snapshot is applied — so the requested attach is
+    /// never raced or clobbered by `handle_sessions`' auto-attach. `None` both
+    /// before that take and when no flag was given.
+    pub(crate) pending_attach: Option<u64>,
     /// Account slug shown in the status bar — the attached session's account
     /// name (the account name is its slug). Replaces the inference provider
     /// slug that used to be shown here.
@@ -460,6 +467,7 @@ impl App {
             image_job_tx: None,
             pending_job_idx: HashMap::new(),
             attached_session_id: None,
+            pending_attach: None,
             attached_account_slug: None,
             attached_status: None,
             attached_tool_groups: Vec::new(),

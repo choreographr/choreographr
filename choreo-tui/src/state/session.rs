@@ -526,6 +526,35 @@ impl App {
         Ok(())
     }
 
+    /// Dispatch the one-shot `--attach <SESSION_ID>` request, if one is latched.
+    ///
+    /// Called exactly once, right after the initial `Sessions` snapshot has been
+    /// applied, so `handle_sessions`' auto-attach to the most-recent session
+    /// cannot race or overwrite the explicitly requested one. The latch is
+    /// taken here, so a later `ListSessions` refresh (the Session Manager page
+    /// also lists sessions) sends nothing. Returns whether a request was sent.
+    ///
+    /// The request goes out as the same `AttachSession` message the Session
+    /// Manager's Enter handler sends, but WITHOUT the optimistic local attach
+    /// that `attach_to_session` does: `attached_session_id` is set by the
+    /// daemon's `SessionAttached` reply instead. A bad id is therefore rejected
+    /// by the daemon with an `attach_session` failure that surfaces on the
+    /// status line, while the view stays on whatever the snapshot attached —
+    /// no phantom attachment is ever fabricated for a session that does not
+    /// exist.
+    pub(crate) fn dispatch_pending_attach(
+        &mut self,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    ) -> bool {
+        let Some(session_id) = self.pending_attach.take() else {
+            return false;
+        };
+        tracing::info!(session_id, "attaching to session at startup");
+        self.pending
+            .send(client_tx, ClientMessageType::AttachSession { session_id });
+        true
+    }
+
     /// Switch the Chat view back to the parent session of a sub-session that
     /// just finished, and surface a status notification explaining the jump.
     ///
