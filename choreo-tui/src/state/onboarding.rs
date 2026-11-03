@@ -72,7 +72,7 @@ pub(crate) fn terminal_notice(profile: &TerminalProfile) -> Option<TerminalNotic
             ],
         }),
         Host::Hosted(_) => Some(TerminalNotice {
-            headline: "Terminal advice does not apply in this pane".to_string(),
+            headline: "This pane cannot forward everything the client uses".to_string(),
             lines: vec![HOSTED_PANE_SENTENCE.to_string()],
         }),
     };
@@ -359,17 +359,17 @@ mod tests {
     }
 
     #[test]
-    fn a_hosted_pane_says_advice_does_not_apply() {
+    fn a_hosted_pane_points_at_running_in_a_terminal_directly() {
         let notice = terminal_notice(&profile(
             TerminalKind::Unknown,
             Platform::MacOs,
             Host::Hosted(HostedKind::Herdr),
         ))
-        .expect("a hosted pane is told why the advice is withheld");
+        .expect("a hosted pane is told what to do instead");
         // One line only, and no Option-as-Alt advice: we cannot name the outer
         // terminal under a workspace manager.
         assert_eq!(notice.lines.len(), 1);
-        assert!(notice.lines[0].contains("workspace manager"));
+        assert!(notice.lines[0].contains("directly in your terminal"));
         assert!(!all_text(&notice).contains("Option"));
     }
 

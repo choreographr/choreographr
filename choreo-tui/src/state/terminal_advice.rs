@@ -22,9 +22,11 @@ use crate::terminal::profile::{
 const TMUX_FRAME_SYNC: Version = Version::new(3, 7, 0);
 
 /// The line a hosted pane gets in place of terminal advice: the layer above us
-/// owns the pane's screen model, so the terminal is not ours to recommend.
-pub(crate) const HOSTED_PANE_SENTENCE: &str = "a workspace manager owns this pane and keeps its own \
-     screen model, so the terminal is not ours to recommend.";
+/// owns the pane's screen model and forwards what it chooses, so the fix is to
+/// run the client in a terminal directly rather than to pick a different
+/// terminal underneath the host.
+pub(crate) const HOSTED_PANE_SENTENCE: &str =
+    "run choreo-tui directly in your terminal for full functionality";
 
 /// The terminals worth recommending on `platform`, best first.
 ///

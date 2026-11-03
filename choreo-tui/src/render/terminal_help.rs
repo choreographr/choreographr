@@ -539,7 +539,7 @@ mod tests {
             Platform::MacOs,
             Host::Hosted(HostedKind::Herdr),
         ));
-        assert!(out.contains("workspace manager owns this pane"));
+        assert!(out.contains("run choreo-tui directly in your terminal"));
         // No macOS Option advice: the outer terminal cannot be identified, and
         // no tmux lines: the pane is not a multiplexer's.
         assert!(!out.contains("Option as Meta"));

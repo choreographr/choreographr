@@ -490,9 +490,9 @@ redraws tear. Zellij needs nothing — it forwards these features already. GNU
 screen does not forward them at all, so run inside tmux or zellij instead.
 
 A layer that owns the pane — a workspace manager hosting `choreo-tui` as one of
-its panes — keeps its own screen model, and the client's terminal advice does
-not apply there: the panel says so instead of recommending a terminal it cannot
-identify.
+its panes — keeps its own screen model and forwards what it chooses, so the
+panel's advice is to run the client in a terminal directly rather than to pick a
+different terminal underneath the host.
 
 #### Running inside a workspace manager
 
