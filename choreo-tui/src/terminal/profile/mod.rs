@@ -133,6 +133,15 @@ impl TerminalProfile {
     ///
     /// The table itself lives in [`capabilities_of`], which also applies the
     /// picker's negotiated image protocol and the hosting layer's own answers.
+    ///
+    /// Derived on each call on purpose: the table is a small `match` that
+    /// allocates nothing, and the profile is built once per process, so the cost
+    /// is noise beside the work its callers do. Do not turn this into a
+    /// memoised cache — a `OnceCell`/`RefCell` field would put shared mutability
+    /// into a value the renderers read as `&App`, and the only cache worth
+    /// having here is a field derived in the constructor from the inputs it
+    /// closes over (which would also make those inputs private, so they cannot
+    /// diverge from the stored answer). No caller needs that yet.
     #[must_use]
     pub(crate) fn capabilities(&self) -> Capabilities {
         capabilities_of(self.name, self.version, self.images, self.host)
