@@ -172,9 +172,9 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: &
 /// `heifer` decoder (via [`choreo_image::decode_heic`]): it applies the
 /// container's own orientation transforms, and the shared probe it starts from
 /// enforces the pixel budget on the declared geometry before any decode work,
-/// with an embedded ICC profile colour-managed to sRGB. Raster formats use the
-/// shared `image`-crate decoder with EXIF orientation baked in, so phone/camera
-/// photos render upright.
+/// with the container's embedded profile — or its `nclx` description —
+/// converted to sRGB. Raster formats use the shared `image`-crate decoder with
+/// EXIF orientation baked in, so phone/camera photos render upright.
 fn decode_image(
     metadata: &ImageMetadata,
     data: &[u8],
@@ -183,8 +183,8 @@ fn decode_image(
 ) -> Result<DynamicImage, String> {
     match metadata.mime_type.as_str() {
         "image/svg+xml" => rasterize_svg_at_size(data, target_px_w, target_px_h),
-        "image/heic" | "image/heif" => choreo_image::decode_heic(data),
-        _ => choreo_image::decode_raster_oriented(data),
+        "image/heic" | "image/heif" => choreo_image::decode_heic(data).map_err(|e| e.to_string()),
+        _ => choreo_image::decode_raster_oriented(data).map_err(|e| e.to_string()),
     }
 }
 

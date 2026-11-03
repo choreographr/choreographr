@@ -24,15 +24,15 @@
 //! orientation and `heifer` applies the container's transforms during the
 //! decode; SVG has no orientation.
 //!
-//! Colour management: an embedded ICC profile is converted to sRGB by the shared
-//! [`choreo_image`] colour path (pure-Rust `moxcms`), so a `Display-P3` or
-//! `AdobeRGB` source reaches the model with sRGB values instead of being
-//! reinterpreted as sRGB (which reads desaturated). That applies to every source
-//! the shared decoder handles — rasters through
-//! [`choreo_image::decode_raster_oriented`] and HEIC through
-//! [`choreo_image::decode_heic`]. A HEIC whose colour is signalled by the
-//! container's `nclx` description rather than an ICC profile is converted as
-//! part of the decode, and SVG is rasterized through `resvg`, which is sRGB.
+//! Colour management: every source reaches the model as sRGB, so a
+//! `Display-P3` or `AdobeRGB` photo is not read as if its numbers were sRGB
+//! (which reads desaturated). The two decode paths own their conversion
+//! separately, matching how their decoders expose colour: rasters through
+//! [`choreo_image::decode_raster_oriented`], which converts the embedded ICC
+//! profile with the pure-Rust `moxcms` engine, and HEIC through
+//! [`choreo_image::decode_heic`], whose `heifer` decode converts the container's
+//! embedded profile — or, when it carries none, its `nclx` colour description —
+//! itself. SVG is rasterized through `resvg`, which is sRGB.
 //!
 //! Fixed constants (the vision plan chose fixed limits over configurable
 //! ones): images are downscaled to fit within [`MAX_IMAGE_DIMENSION`] px on
@@ -350,10 +350,12 @@ fn normalize_raster(
 /// Normalize a HEIC/HEIF image via the shared pure-Rust `heifer` decoder.
 ///
 /// [`choreo_image::decode_heic`] applies a pre-decode allocation guard (the
-/// container's declared `ispe` extents) so a hostile HEIC cannot drive a huge
-/// allocation, applies the container's own orientation transforms, and
-/// delivers display-ready sRGB (an embedded ICC profile colour-managed, an
-/// `nclx` description converted during the decode).
+/// container's declared geometry) and then hands the ceiling to `heifer`, which
+/// enforces it again against the picture it is about to allocate — so a hostile
+/// HEIC cannot drive a huge allocation either way. It applies the container's
+/// own orientation transforms and delivers display-ready sRGB: `heifer` converts
+/// the container's embedded ICC profile, or its `nclx` description when there is
+/// no profile.
 fn normalize_heic(
     bytes: &[u8],
     region: Option<CropRegion>,

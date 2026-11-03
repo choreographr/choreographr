@@ -51,8 +51,9 @@ Choreographr (workspace)
 │                       the child-process code-injection env set
 ├── choreo-image          Leaf crate — shared image decode (EXIF-orientation
 │                       baking, ICC→sRGB colour management via `moxcms`,
-│                       header-only dimension probes, HEIC/HEIF decode through
-│                       `heifer` under an in-decoder pixel budget)
+│                       header-only dimension probes, HEIC/HEIF decode +
+│                       colour conversion through `heifer` under an
+│                       in-decoder pixel budget)
 ├── choreo-keystore        X25519 + ECDH keypair crypto, encrypted storage primitives
 ├── choreo-transport       Noise IK encrypted TCP transport abstraction
 ├── choreo-client-core     Shared client logic (parsing, images, history, credentials, first-run setup)
@@ -147,24 +148,38 @@ the workspace agrees on the same policy and budget and the shell tool and MCP
 stdio child strip the same variables.
 
 `choreo-image` is a leaf crate (only `image` + `heifer` + `heifer-isobmff` +
-`moxcms` + `tracing`) consumed by
+`moxcms` + `thiserror` + `tracing`) consumed by
 `choreo-daemon` and `choreo-tui` — it owns the single decode path for raster
-formats (with EXIF orientation baked in), the HEIC/HEIF decode (with `heifer`,
-which applies the container's own orientation transforms), and the conversion of
-an embedded ICC profile — raster or HEIC — to sRGB with the pure-Rust `moxcms`
-engine, so the model path and the UI path cannot drift apart. HEIC/HEIF memory is
-bounded inside the decoder: `heifer` enforces its own `max_pixels` against the
-picture it is about to allocate, so a container whose declared geometry
-disagrees with its coded picture cannot defeat the budget, and a
-declared-geometry pre-check rejects a hostile file before any decoding work
-starts. Colour management applies to an RGB profile on an RGB buffer at the
-buffer's own depth, and is skipped for a source that is already sRGB (detected
-from its primaries and transfer curves) — an sRGB tag is the common case, and
-converting it to itself would cost a full extra pass and buffer for no change. A
-caller that needs only the pixel dimensions (the daemon's `display_image` probe)
-uses the same crate's header-only probe — the `image`-crate header for rasters,
-the ISOBMFF container boxes for HEIC — which enforces the identical
-decompression-bomb bound without decoding or colour-managing a single pixel.
+formats (with EXIF orientation baked in) and the HEIC/HEIF decode (with `heifer`,
+which applies the container's own orientation transforms), so the model path and
+the UI path cannot drift apart. It is split by decoder, not by caller: `raster`
+owns the `image`-crate decode and probe, `heic` owns the `heifer` decode and its
+container-geometry probe, and the two modules own their colour conversion
+separately because their decoders expose it differently. A raster's embedded ICC
+profile is converted with the pure-Rust `moxcms` engine — an RGB profile on an
+RGB buffer, at the buffer's own depth, skipped for a source that is already sRGB
+(detected from its primaries and transfer curves, since an sRGB tag is the common
+case and converting it to itself would cost a full extra pass and buffer for no
+change). A HEIC's colour is converted inside `heifer`'s decode, from the
+container's embedded profile or, when it carries none, its `nclx` description or
+the HEVC VUI — so the crate must not re-apply a profile to a HEIC buffer, and a
+colour space `heifer` cannot convert (HDR's PQ/HLG) keeps the coded samples
+rather than failing the image.
+
+HEIC/HEIF memory is bounded inside the decoder: `heifer` enforces its own
+`max_pixels` against the picture it is about to allocate, so a container whose
+declared geometry disagrees with its coded picture cannot defeat the budget, and
+a declared-geometry pre-check rejects a hostile file before any decoding work
+starts. A caller that needs only the pixel dimensions (the daemon's
+`display_image` probe) uses the same crate's header-only probe — the `image`-crate
+header for rasters, the ISOBMFF container boxes for HEIC — which enforces the
+identical decompression-bomb bound without decoding or colour-managing a single
+pixel, and reports the extent the decode would actually produce (the raster probe
+applies the EXIF quarter turn, the HEIC probe replays the container's own
+crop/rotate). That HEIC replay is arithmetic duplicated from `heifer`, so it is
+pinned by a test that encodes containers through `heifer`'s own encoder and
+asserts the probe's prediction equals the decoded extent — a drift becomes a test
+failure instead of a silently wrong size.
 
 ---
 
@@ -3881,7 +3896,7 @@ cargo run -p choreo-im -- telegram
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | choreo-tui | Terminal UI |
 | `dioxus` | choreo-gui | Desktop/Android UI (Native/Blitz renderer) |
-| `image` + `resvg` + `heifer` + `moxcms` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (`heifer`, pure Rust, with `unsafe_code` forbidden) bounded by the decoder's own pixel limit against the buffer it is about to allocate plus a declared-geometry pre-check, and ICC→sRGB colour management of the embedded profile for both raster and HEIC sources (moxcms, pure Rust) so a Display-P3/AdobeRGB photo is not rendered desaturated |
+| `image` + `resvg` + `heifer` + `moxcms` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (`heifer`, pure Rust, with `unsafe_code` forbidden) bounded by the decoder's own pixel limit against the buffer it is about to allocate plus a declared-geometry pre-check, and sRGB colour management on both decode paths (`moxcms` for a raster's embedded ICC profile; `heifer`'s own decode for a HEIC's profile or `nclx` description) so a Display-P3/AdobeRGB photo is not rendered desaturated |
 | `syntect` | choreo-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
