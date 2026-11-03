@@ -494,6 +494,36 @@ its panes — keeps its own screen model, and the client's terminal advice does
 not apply there: the panel says so instead of recommending a terminal it cannot
 identify.
 
+#### Running inside a workspace manager
+
+The client works as one pane of a terminal workspace manager (Herdr, Rex, or any
+other). Run the **daemon as a user service** — a systemd user unit, launchd
+agent, or the equivalent — and start the **client in the pane**, so restarting
+the pane never takes the daemon and its sessions down with it.
+
+Start the client with `--attach <SESSION_ID>` (the CLI form of
+`/session switch <id>`): the pane then always opens the session it was showing
+rather than whatever the daemon considers most recent. That flag is also what
+makes a pane **resumable** after the pane or the host restarts, because the
+client hands the host a resume command of the same shape.
+
+Rebind the workspace manager's **prefix key** away from the chords the composer
+binds: every client command is an `Alt+<key>` chord (`Alt+M` models, `Alt+A`
+accounts, `Alt+T` terminal, `Alt+Q` quit, `Alt+Enter`, `Alt+↑`/`Alt+↓`), so a
+host whose prefix is itself an `Alt+` chord swallows those keys before the
+client sees them. A `Ctrl+`-based prefix leaves them alone.
+
+**Herdr** panes need no further setup: the client reports the attached session's
+state (`working`, `blocked`, `idle`) and its resume command to the pane through
+Herdr's own reporting command, so the host shows which pane needs attention and
+can bring the session back in the same pane. Only the state word and a
+one-line status leave the client — never a prompt, a response, or tool output —
+and the whole feature is inert outside a Herdr pane.
+
+**Rex** panes likewise need no extra configuration: session status reaches Rex
+through the **Program Status Protocol** (OSC 7501, the same records the client
+emits to any terminal that honours them), which Rex authors and implements.
+
 ### First conversation
 
 Start `choreo-tui`. An empty session shows a **welcome checklist** that ticks

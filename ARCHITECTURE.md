@@ -3073,7 +3073,9 @@ What it produces:
 - The **host layer** (`Host`): `Direct`, a multiplexer (`Tmux { version }`,
   `Zellij`, `Screen`), or a hosting workspace manager (`Herdr`, `Rex`, and a
   reserved `Other`). Hosted layers outrank multiplexers; every marker that
-  matched is kept in `evidence` so a nested session's chain is in the log.
+  matched is kept in `evidence` so a nested session's chain is in the log. A
+  hosted pane is also where pane-level status reporting applies (see *Hosted
+  panes: reporting status to the workspace manager* below).
 - The **capability table** (`Capabilities`), derived from the kind and version:
   the Kitty keyboard protocol, mode 2026 synchronized output, OSC 52 clipboard
   writes, OSC 9;4 progress, OSC 7501 program status, OSC 22 pointer shape, and
@@ -3157,6 +3159,53 @@ whether the macOS Option-as-Meta setting applies live in
 `state/terminal_advice.rs`, shared with the welcome notice, so the two surfaces
 cannot drift into recommending different things; the in-source rustdoc of that
 module is the reference for each rule.
+
+### Hosted panes: reporting status to the workspace manager
+
+A workspace manager hosting the client in a pane is told what the attached
+session is doing through **one derivation with two consumers**. The OSC 7501
+child records (`state/terminal_status`) are the terminal-facing consumer and
+reach every terminal that honours them, Rex panes included. The workspace
+manager's own per-pane reporting command is the second consumer
+(`state/terminal_status/host_report`, gated on the host's marker environment):
+it invokes the host's binary to report `working` / `blocked` / `idle` together
+with a resume command (`<binary> --attach <session id>`), so the host can flag
+the pane and restore the session in it. Both read the same
+`terminal::status::state_for` mapping and the same sanitizer, so the terminal
+record and the host report cannot disagree about the state or the one-line text
+— which is the whole point of keeping the two in one place.
+
+The reporter is **opt-in by environment** (all of the host's markers must be
+present) and touches no shared state: `Reporter::start` spawns one serving
+thread fed by a capacity-1 crossbeam channel, and the UI loop enqueues a report
+only where it already publishes the OSC records — same tick, same state. The
+sink overwrites an unsent report so only the latest state survives, a stale one
+being worthless and a bounded queue being what stops a wedged host from growing
+a backlog. `--seq` is wall-clock milliseconds nudged strictly upward, because
+the host drops a report whose sequence is not above the last it saw (including
+across client restarts).
+
+Each invocation is bounded and blind: the child's stdin/stdout/stderr are null,
+the child is owned by a short-lived reaper thread that blocks in `wait()`, and
+the reporter waits for that hand-back on a channel raced against a timer — an
+event-driven wait, never a `try_wait` poll loop. A host binary that wedges
+therefore cannot stall the reporter (or the UI): past the timeout the reaper is
+abandoned to reap whenever the child exits. Every failure is a `debug` line
+naming the subcommand only, since a host that cannot answer must never slow the
+client.
+
+The **no-payload rule** holds across the boundary: a report carries the state
+word, a session id, and a one-line status — the login flow's status line or the
+NAME of the tool a session is running, the same text the OSC record's `msg`
+carries. A prompt, a model response, and a tool's arguments or output never
+reach the host, and the text is stripped of control characters and capped at the
+single point where the command line is assembled, exactly as a record is
+sanitized where its sequence is framed.
+
+Teardown is the release: the UI loop drops its sink and joins the reporter,
+which sends one `release-agent` report (if it ever reported) and exits, so the
+pane stops showing a state and a resume command for a client that is gone. A
+pane that never reported is never released.
 
 ---
 
