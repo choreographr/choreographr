@@ -8,7 +8,7 @@
 //! shut down once the editor disconnects.
 
 use crossbeam_channel::Sender;
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::thread;
 use tracing::{debug, error, info};
 
@@ -38,9 +38,11 @@ pub fn spawn_acp_reader(event_tx: Sender<Event>) -> Result<thread::JoinHandle<()
             info!("ACP stdin reader thread started");
 
             // Lock stdin once so we hold the exclusive reference for the
-            // lifetime of this thread (avoids concurrent reads).
+            // lifetime of this thread (avoids concurrent reads). `StdinLock` is
+            // already buffered, so it is used directly rather than wrapped in a
+            // second `BufReader`.
             let stdin = std::io::stdin();
-            let reader = BufReader::new(stdin.lock());
+            let reader = stdin.lock();
 
             for line in reader.lines() {
                 match line {
