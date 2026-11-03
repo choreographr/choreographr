@@ -21,7 +21,7 @@ use choreo_client_core::dispatch::{SessionStateData, ToolCallEvent};
 use choreo_proto::{OutputStream, SessionStatus, TokenUsage, Turn};
 use std::borrow::Cow;
 
-use super::{App, ResponsePin, SessionDisplayState, merge_token_usage};
+use super::{App, ResponsePin, SPAWN_SUBSESSION_TOOL, SessionDisplayState, merge_token_usage};
 
 /// Invalidate the render cache entry for `turn_id`.
 fn invalidate_turn_cache(display: &mut SessionDisplayState, turn_id: u32) {
@@ -376,6 +376,31 @@ impl TurnEventHandler for App {
     }
 
     fn handle_tool_call_event(&mut self, session_id: u64, stream_id: u64, event: ToolCallEvent) {
+        // Track in-flight `spawn_subsession` calls per session BEFORE folding the
+        // event into the display: the broadcast `SessionCreated` path only
+        // auto-enters a spawned child when exactly one such call is in flight for
+        // the attached session (see `App::spawned_child_should_navigate`). The
+        // start arrives before the child is created and the terminal event only
+        // after the tool returns, so the count is 1 throughout the child's run.
+        match &event {
+            ToolCallEvent::Started { tool_name, .. } if tool_name == SPAWN_SUBSESSION_TOOL => {
+                *self
+                    .spawn_subsession_inflight
+                    .entry(session_id)
+                    .or_insert(0) += 1;
+            }
+            ToolCallEvent::Finished { tool_name, .. } | ToolCallEvent::Failed { tool_name, .. }
+                if tool_name == SPAWN_SUBSESSION_TOOL =>
+            {
+                if let Some(count) = self.spawn_subsession_inflight.get_mut(&session_id) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.spawn_subsession_inflight.remove(&session_id);
+                    }
+                }
+            }
+            _ => {}
+        }
         let display = self.display_for(session_id);
         match event {
             ToolCallEvent::Started {

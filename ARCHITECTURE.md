@@ -2524,6 +2524,24 @@ parent's cancellation, exit, or deletion also stops its children — see the
 daemon's session-lifecycle docs for the cancellation-propagation and
 cascade-deletion rules.
 
+The TUI gives a spawn a navigation round trip. Because the child is created
+server-side by the tool (not by the client), it reaches the TUI only as the
+`SessionCreated` **broadcast** — which is normally notification-only and must
+never move the view. The TUI makes exactly one exception: when the `SessionCreated`
+broadcast names the currently attached session as the parent **and** exactly one
+`spawn_subsession` call is in flight for that session (tracked from
+`ToolCallStarted`/`Finished`/`Failed`, keyed by `tool_name`), it enters the child.
+The in-flight-count gate is what separates the user's own session's spawn from a
+sub-session created by another client (no local call → no navigation) and keeps
+parallel spawns in one turn from thrashing the view. Entering the child records a
+summary-independent `SpawnedChildNav { child_id, parent_id, seen_active }` from
+the creation event's authoritative ids; the child's first **active** status
+latches `seen_active`, so the daemon's creation-time `Inactive` broadcast cannot
+bounce the view back, and the subsequent active→idle transition switches back to
+the parent (the same `switch_back_to_parent` notification the manual-open path
+uses). The record is consumed on finish or abandoned when the user attaches
+elsewhere. See `choreo-tui`'s `state/session.rs`.
+
 ---
 
 ## Session architecture

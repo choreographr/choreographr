@@ -318,6 +318,17 @@ pub(crate) struct App {
     pub(crate) attached_account_slug: Option<String>,
     pub(crate) attached_status: Option<SessionStatus>,
     pub(crate) attached_tool_groups: Vec<String>,
+    /// In-flight `spawn_subsession` tool calls, keyed by the session running
+    /// them. The broadcast `SessionCreated` path auto-enters a spawned child
+    /// only when exactly one such call is in flight for the attached session
+    /// (see [`App::spawned_child_should_navigate`]). Maintained by
+    /// `state/turn.rs`'s tool-call handler.
+    pub(crate) spawn_subsession_inflight: HashMap<u64, usize>,
+    /// The spawned-child round trip in progress, if any: the TUI auto-entered a
+    /// child because the attached session ran a single `spawn_subsession` call,
+    /// and switches back to `parent_id` when the child finishes (see
+    /// [`SpawnedChildNav`]).
+    pub(crate) spawned_child_nav: Option<SpawnedChildNav>,
     /// OSC 7501 program-status publisher: the child records currently emitted
     /// to the terminal, cached so an unchanged record is not rewritten. Every
     /// report is a CHILD record keyed by session id; the OSC 9;4 root record
@@ -517,6 +528,8 @@ impl App {
             attached_account_slug: None,
             attached_status: None,
             attached_tool_groups: Vec::new(),
+            spawn_subsession_inflight: HashMap::new(),
+            spawned_child_nav: None,
             term_status: terminal::status::Publisher::new(),
             term_status_dirty: false,
             host_report_sink: None,

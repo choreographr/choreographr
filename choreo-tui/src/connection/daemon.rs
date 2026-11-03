@@ -72,7 +72,11 @@ pub(crate) fn handle_daemon_message(
             session_id: Some(session_id),
             event:
                 SessionEvent::SessionCreated {
-                    parent_session_id, ..
+                    parent_session_id,
+                    account_name,
+                    selected_model,
+                    reasoning_effort,
+                    ..
                 },
             ..
         } => {
@@ -83,6 +87,21 @@ pub(crate) fn handle_daemon_message(
             // user is looking at it. This is the fix for a session created by
             // another client (e.g. the phone's view following the laptop).
             app.note_session_created(*session_id, *parent_session_id, client_tx);
+            // The one exception: when the ATTACHED session ran a single
+            // `spawn_subsession` call, enter the child it just created. The
+            // in-flight-count gate tells our own session's spawn apart from a
+            // sub-session created by another client (no local call → no
+            // navigation) and refuses to thrash the view across parallel spawns.
+            if let Some(parent_id) = app.spawned_child_should_navigate(*parent_session_id) {
+                app.navigate_to_spawned_child(
+                    *session_id,
+                    parent_id,
+                    account_name.clone(),
+                    selected_model.clone(),
+                    reasoning_effort.clone(),
+                    client_tx,
+                )?;
+            }
             // Early return: the generic dispatch would push text to the chat
             // history for a session the user never opened.
             return Ok(());
@@ -104,9 +123,14 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             // Detect an attached sub-session finishing BEFORE the status is
-            // applied: the finish check needs the pre-transition (active)
-            // status to distinguish "just finished" from "still idle".
-            let switch_back = app.attached_subsession_finished(*session_id, status);
+            // applied: the finish checks need the pre-transition (active) state.
+            // The auto-entered spawned child is tracked by its own summary-
+            // independent record (see `App::spawned_child_nav`); consult it
+            // first so a spawn's finish is caught even when its summary row has
+            // not arrived, and fall back to the summary-based manual-open path.
+            let spawned_finish = app.note_spawned_child_status(*session_id, status);
+            let switch_back =
+                spawned_finish.or_else(|| app.attached_subsession_finished(*session_id, status));
             app.handle_session_status_changed(*session_id, status, *last_modified);
             // The user was reading the sub-session on the Chat page and it
             // just finished — jump back to its parent with a notification.

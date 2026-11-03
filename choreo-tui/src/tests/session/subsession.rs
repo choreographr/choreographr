@@ -444,3 +444,254 @@ fn handle_sessions_only_archived_creates_default_instead_of_attaching() {
     assert!(matches!(msg.inner, ClientMessageType::CreateSession { .. }));
     assert_eq!(app.attached_session_id, None);
 }
+
+// ── Auto-navigate into a spawned sub-session ───────────────────────
+
+/// A broadcast `ToolCallStarted` for the given session and tool name.
+fn tool_call_started(session_id: u64, call_id: &str, tool_name: &str) -> DaemonMessage {
+    DaemonMessage::broadcast(DaemonMessageType::Session {
+        session_id: Some(session_id),
+        event: SessionEvent::ToolCallStarted {
+            stream_id: 1,
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            arguments_json: "{}".to_string(),
+            invocation_description: String::new(),
+        },
+    })
+}
+
+/// A broadcast `ToolCallFinished` for the given session and tool name.
+fn tool_call_finished(session_id: u64, call_id: &str, tool_name: &str) -> DaemonMessage {
+    DaemonMessage::broadcast(DaemonMessageType::Session {
+        session_id: Some(session_id),
+        event: SessionEvent::ToolCallFinished {
+            stream_id: 1,
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+        },
+    })
+}
+
+/// A broadcast `SessionCreated` for a (optionally sub-) session.
+fn session_created(child: u64, parent: Option<u64>) -> DaemonMessage {
+    DaemonMessage::broadcast(DaemonMessageType::Session {
+        session_id: Some(child),
+        event: SessionEvent::SessionCreated {
+            title: Some("child task".into()),
+            parent_session_id: parent,
+            working_dir: None,
+            account_name: None,
+            selected_model: None,
+            reasoning_effort: None,
+        },
+    })
+}
+
+/// A broadcast `SessionStatusChanged` for the given session.
+fn status_changed(session_id: u64, status: SessionStatus) -> DaemonMessage {
+    DaemonMessage::broadcast(DaemonMessageType::Session {
+        session_id: Some(session_id),
+        event: SessionEvent::SessionStatusChanged {
+            status,
+            last_modified: 1_705_315_000_000,
+        },
+    })
+}
+
+#[test]
+fn single_inflight_spawn_navigates_into_child() {
+    let mut app = test_app();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    // The user is reading session 42 on the Chat page.
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    // Session 42 starts one spawn_subsession call...
+    handle_daemon_message(
+        tool_call_started(42, "call-1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .expect("tool call started");
+    assert_eq!(app.spawn_subsession_inflight_count(42), 1);
+
+    // ...and the daemon broadcasts the child's creation with parent = 42.
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).expect("session created");
+
+    // The view entered the child, and the summary-independent round trip is
+    // recorded from the creation event's authoritative ids.
+    assert_eq!(app.attached_session_id, Some(99));
+    assert_eq!(app.active_session_id, Some(99));
+    let nav = app.spawned_child_nav.as_ref().expect("nav record recorded");
+    assert_eq!((nav.child_id, nav.parent_id), (99, 42));
+    assert!(!nav.seen_active, "no active status seen yet");
+
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
+    assert!(
+        msgs.iter().any(
+            |m| matches!(m, ClientMessageType::AttachSession { session_id } if *session_id == 99)
+        ),
+        "must attach to the spawned child"
+    );
+}
+
+#[test]
+fn parallel_spawns_do_not_navigate() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    // Two spawn_subsession calls are in flight in one turn.
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    handle_daemon_message(
+        tool_call_started(42, "c2", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    assert_eq!(app.spawn_subsession_inflight_count(42), 2);
+
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).unwrap();
+
+    // Ambiguous — do not thrash the view; the child just joins the list.
+    assert_eq!(app.attached_session_id, Some(42));
+    assert!(app.spawned_child_nav.is_none());
+}
+
+#[test]
+fn spawn_from_background_session_does_not_navigate() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    // The user is reading session 7; a *different* (background) session 42
+    // spawns a child.
+    app.attached_session_id = Some(7);
+    app.active_session_id = Some(7);
+    app.page = Page::Chat;
+
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).unwrap();
+
+    // Parent 42 is not the attached session: no navigation.
+    assert_eq!(app.attached_session_id, Some(7));
+    assert!(app.spawned_child_nav.is_none());
+}
+
+#[test]
+fn foreign_sub_session_creation_without_inflight_spawn_does_not_navigate() {
+    // A sub-session created by another client (no local spawn_subsession call)
+    // must never hijack the view, even though its parent is the attached
+    // session.
+    let mut app = test_app();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).unwrap();
+
+    assert_eq!(app.attached_session_id, Some(42));
+    assert!(app.spawned_child_nav.is_none());
+    let msgs: Vec<ClientMessageType> = rx.try_iter().map(|m| m.inner).collect();
+    assert!(
+        !msgs
+            .iter()
+            .any(|m| matches!(m, ClientMessageType::AttachSession { .. })),
+        "no attach may be sent without an in-flight spawn"
+    );
+}
+
+#[test]
+fn spawned_child_finish_switches_back_to_parent() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    // Spawn a single child and enter it.
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).unwrap();
+    assert_eq!(app.attached_session_id, Some(99));
+
+    // The creation-time Inactive broadcast arrives right after creation and
+    // must NOT bounce the view back (the child has not run yet).
+    handle_daemon_message(status_changed(99, SessionStatus::Inactive), &mut app, &tx).unwrap();
+    assert_eq!(
+        app.attached_session_id,
+        Some(99),
+        "creation-time idle must not switch back"
+    );
+
+    // The child runs, then finishes → switch back to the parent and consume the
+    // round trip.
+    handle_daemon_message(status_changed(99, SessionStatus::Responding), &mut app, &tx).unwrap();
+    assert_eq!(app.attached_session_id, Some(99));
+    assert!(
+        app.spawned_child_nav
+            .as_ref()
+            .is_some_and(|n| n.seen_active)
+    );
+
+    handle_daemon_message(status_changed(99, SessionStatus::Inactive), &mut app, &tx).unwrap();
+    assert_eq!(app.attached_session_id, Some(42));
+    assert!(app.spawned_child_nav.is_none(), "record consumed on finish");
+}
+
+#[test]
+fn tool_finish_clears_inflight_spawn_count() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    assert_eq!(app.spawn_subsession_inflight_count(42), 1);
+    handle_daemon_message(
+        tool_call_finished(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    assert_eq!(
+        app.spawn_subsession_inflight_count(42),
+        0,
+        "a finished spawn call is no longer in flight"
+    );
+}
+
+#[test]
+fn non_spawn_tool_calls_do_not_affect_inflight_count() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    handle_daemon_message(tool_call_started(42, "c1", "read_file"), &mut app, &tx).unwrap();
+    assert_eq!(app.spawn_subsession_inflight_count(42), 0);
+}

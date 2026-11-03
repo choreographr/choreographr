@@ -13,6 +13,12 @@
 //! and the token-usage readout and merge ([`App::display_token_usage`],
 //! [`merge_token_usage`]).
 //!
+//! It also owns the sub-session navigation round trip: entering the child the
+//! attached session spawned ([`App::navigate_to_spawned_child`]) and switching
+//! back to the parent when it finishes ([`App::note_spawned_child_status`],
+//! [`App::switch_back_to_parent`]), both gated on the [`SpawnedChildNav`]
+//! record rather than a possibly stale summary.
+//!
 //! Every item here is an inherent `App` method plus the [`merge_token_usage`]
 //! free function; the `App`/`SessionDisplayState` fields they read and write
 //! stay on those structs in `state/`. This module is the session-lifecycle half
@@ -25,6 +31,33 @@ use choreo_proto::{
     AccountInfo, ClientMessage, ClientMessageType, ReasoningCapability, SessionStatus,
     SessionSummary, TokenUsage,
 };
+
+/// The tool whose call makes the TUI auto-enter the sub-session it spawns.
+///
+/// Kept as a constant so the in-flight tracker in `state/turn.rs` and the
+/// navigation gate here cannot drift on the tool's wire name.
+pub(crate) const SPAWN_SUBSESSION_TOOL: &str = "spawn_subsession";
+
+/// Navigation state for a sub-session the TUI auto-entered because the attached
+/// session ran a single `spawn_subsession` tool call.
+///
+/// This is the summary-independent half of the sub-session round trip: the
+/// parent comes straight from the `SessionCreated` broadcast (never a possibly
+/// stale or as-yet-unfetched summary row), and `seen_active` lets a
+/// creation-time `Inactive` status be told apart from a real finish. See
+/// [`App::note_spawned_child_status`] for the finish detection and
+/// [`App::navigate_to_spawned_child`] for how the record is created.
+pub(crate) struct SpawnedChildNav {
+    /// The child session the view was moved into.
+    pub(crate) child_id: u64,
+    /// The parent (the session the user was viewing when the spawn fired).
+    pub(crate) parent_id: u64,
+    /// Latched once the child is observed active. The daemon broadcasts an
+    /// `Inactive` status right after `SessionCreated` (the child has not started
+    /// yet), so every idle before this latch is set is not a finish and must not
+    /// bounce the view back to the parent.
+    pub(crate) seen_active: bool,
+}
 
 impl App {
     /// Enter `session_id`: rebind the active session and reset only the
@@ -106,15 +139,17 @@ impl App {
         reasoning_effort: Option<String>,
         client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
-        // Agent-spawned sub-sessions (parent_session_id = Some) are transient
-        // tool artifacts, not sessions the user opened.  Navigating to one
-        // would hijack the Chat view away from the session the user is reading
-        // and destroy its scroll position, so treat it like background noise.
+        // A sub-session creation relayed to THIS client as the direct requester
+        // reply (`SessionCreatedForRequester` with a parent) does not move the
+        // view: the TUI never creates a sub-session itself, so this only happens
+        // for a frontend whose create carried a parent. Auto-entering a spawned
+        // child is driven separately, by the broadcast `SessionCreated` path and
+        // its in-flight-spawn gate (see `navigate_to_spawned_child`).
         if let Some(parent_id) = parent_session_id {
             tracing::info!(
                 session_id,
                 parent_session_id = parent_id,
-                "sub-session created — not navigating",
+                "sub-session created — not navigating via the requester reply",
             );
             return Ok(());
         }
@@ -128,18 +163,7 @@ impl App {
         // `/new`, `/session new`, and `n` on the Session Manager — so the client
         // that asked for the session always lands on it (previously the Session
         // Manager branch returned early, leaving the creator on the list).
-        //
-        // Prime the display fields from the creation params BEFORE attaching:
-        // the session summary (from the `ListSessions` below) may not have
-        // arrived yet, and the status bar should read correctly the instant the
-        // attach lands.  `attach_to_session` -> `reset_for_session_switch`
-        // preserves these (it clears only transient render state).
-        {
-            let display = self.display_for(session_id);
-            display.account_name = account_name;
-            display.selected_model = selected_model;
-            display.reasoning_effort = reasoning_effort;
-        }
+        self.prime_created_display(session_id, account_name, selected_model, reasoning_effort);
         // Fetch the session summary before attaching ONLY when leaving another
         // page (Chat): the reply populates `session_mgr.all`, so the attach's
         // status-bar priming and the daemon's `SessionAttached` gap-fill have
@@ -161,6 +185,134 @@ impl App {
         // A broken pipe leaves the view on the previous session instead of
         // stranding the user on an un-attached one.
         self.attach_to_session(session_id, client_tx)
+    }
+
+    /// Prime a session's status fields from a create's parameters, before the
+    /// attach lands.
+    ///
+    /// The session summary (from a `ListSessions` reply) may not have arrived
+    /// yet, so the status bar would otherwise read blank for a moment.
+    /// `attach_to_session` -> `reset_for_session_switch` preserves these (it
+    /// clears only transient render state). Shared by the requester attach and
+    /// the spawned-child navigation.
+    fn prime_created_display(
+        &mut self,
+        session_id: u64,
+        account_name: Option<String>,
+        selected_model: Option<String>,
+        reasoning_effort: Option<String>,
+    ) {
+        let display = self.display_for(session_id);
+        display.account_name = account_name;
+        display.selected_model = selected_model;
+        display.reasoning_effort = reasoning_effort;
+    }
+
+    /// Whether a spawned child should pull the view into it, and from which
+    /// parent.
+    ///
+    /// Navigation happens only when the child was created by the attached
+    /// session (`parent == attached`), the user is on the Chat page (so the
+    /// round trip mirrors the finish switch-back, which refuses to jump off the
+    /// Session Manager), and exactly ONE `spawn_subsession` call is in flight
+    /// for that session. The single-call gate does double duty: it distinguishes
+    /// our own model's spawn from a sub-session created by another client (which
+    /// has no local in-flight call and must not hijack the view), and it keeps
+    /// parallel spawns in one turn from thrashing the view between children.
+    pub(crate) fn spawned_child_should_navigate(
+        &self,
+        parent_session_id: Option<u64>,
+    ) -> Option<u64> {
+        let parent = parent_session_id?;
+        if self.page != Page::Chat || self.attached_session_id != Some(parent) {
+            return None;
+        }
+        (self.spawn_subsession_inflight_count(parent) == 1).then_some(parent)
+    }
+
+    /// The number of `spawn_subsession` calls currently in flight for
+    /// `session_id` (0 when none). Maintained by `state/turn.rs`'s tool-call
+    /// handler.
+    pub(crate) fn spawn_subsession_inflight_count(&self, session_id: u64) -> usize {
+        self.spawn_subsession_inflight
+            .get(&session_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Enter the sub-session the attached session just spawned.
+    ///
+    /// Records the round-trip intent ([`SpawnedChildNav`]) from the creation
+    /// event's authoritative ids, primes the status fields, and runs the shared
+    /// attach sequence. No `ListSessions` is sent: the round trip is
+    /// summary-independent (the nav record carries the parent and the status
+    /// latch), and the Session Manager refetches on open, so keeping this from
+    /// rewriting the freshly-navigated view's status line is the better trade.
+    pub(crate) fn navigate_to_spawned_child(
+        &mut self,
+        child_id: u64,
+        parent_id: u64,
+        account_name: Option<String>,
+        selected_model: Option<String>,
+        reasoning_effort: Option<String>,
+        client_tx: &crossbeam_channel::Sender<ClientMessage>,
+    ) -> Result<(), ClientError> {
+        tracing::info!(
+            child_id,
+            parent_id,
+            "spawn_subsession: entering the spawned child session",
+        );
+        // Record before attaching: `attach_to_session` clears a stale nav record
+        // whose child differs from the target, so the record must name the child
+        // we are about to enter.
+        self.spawned_child_nav = Some(SpawnedChildNav {
+            child_id,
+            parent_id,
+            seen_active: false,
+        });
+        self.prime_created_display(child_id, account_name, selected_model, reasoning_effort);
+        self.attach_to_session(child_id, client_tx)
+    }
+
+    /// Fold a status broadcast for `session_id` into the spawned-child nav
+    /// record, returning the parent id to switch back to when the auto-entered
+    /// child just finished.
+    ///
+    /// Latching `seen_active` on the first active status is what makes the
+    /// daemon's creation-time `Inactive` broadcast (sent immediately after
+    /// `SessionCreated`, before the child runs) a no-op rather than an instant
+    /// bounce-back. A finish is the subsequent idle transition while the user is
+    /// still reading the child on the Chat page; the record is consumed either
+    /// way, so it never lingers past the child's run.
+    pub(crate) fn note_spawned_child_status(
+        &mut self,
+        session_id: u64,
+        status: &SessionStatus,
+    ) -> Option<u64> {
+        let nav = self.spawned_child_nav.as_ref()?;
+        if nav.child_id != session_id {
+            return None;
+        }
+        let parent_id = nav.parent_id;
+        let seen_active = nav.seen_active;
+        if status.is_active() {
+            if let Some(nav) = self.spawned_child_nav.as_mut() {
+                nav.seen_active = true;
+            }
+            return None;
+        }
+        // An idle before the child was ever seen active is the creation-time
+        // status (or another pre-start idle): not a finish.
+        if !seen_active {
+            return None;
+        }
+        // The child finished. Consume the record; only jump back when the user is
+        // still looking at it on the Chat page (matching the manual-open path's
+        // gate — never yank the view off the Session Manager or a session the
+        // user moved to).
+        self.spawned_child_nav = None;
+        (self.page == Page::Chat && self.attached_session_id == Some(session_id))
+            .then_some(parent_id)
     }
 
     /// Handle the BROADCAST notification that a session was created — by any
@@ -494,6 +646,17 @@ impl App {
         session_id: u64,
         client_tx: &crossbeam_channel::Sender<ClientMessage>,
     ) -> Result<(), ClientError> {
+        // Entering a session other than the one a spawned-child nav record names
+        // abandons that round trip: the record only applies while the user is
+        // attached to the child it points at. `navigate_to_spawned_child` sets the
+        // record BEFORE calling here, so its own attach keeps it.
+        if self
+            .spawned_child_nav
+            .as_ref()
+            .is_some_and(|nav| nav.child_id != session_id)
+        {
+            self.spawned_child_nav = None;
+        }
         self.pending
             .send(client_tx, ClientMessageType::UnsubscribeSessionsSummary);
         self.pending
