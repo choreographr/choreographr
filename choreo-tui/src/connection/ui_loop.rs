@@ -11,6 +11,7 @@ use crate::build_picker;
 use crate::image_worker::{ImageResult, ImageWorker};
 use crate::render::render;
 use crate::state::{App, LoginModal, Page, UiEvent};
+use crate::terminal::profile::{ImageSupport, TerminalProfile};
 use crate::terminal::{pointer, progress, title};
 use choreo_client_core::{
     ClientError, ConnectionMode, LoginEvent, PendingContext, run_daemon_connection_with_autostart,
@@ -74,6 +75,46 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
     let (ui_tx, ui_rx) = channel::unbounded::<UiEvent>();
 
     let picker = build_picker();
+
+    // Identify the terminal and the layer hosting it once, now that the picker
+    // has finished its own startup query and reported which image protocol it
+    // actually negotiated. `protocol_type` is read here, before the picker moves
+    // into the worker; the resulting profile is immutable for the process
+    // lifetime and is stored on `App` for the features that consult it.
+    let terminal_profile =
+        TerminalProfile::detect_process(ImageSupport::from(picker.protocol_type()));
+    // Exactly one pair of lines per launch: the verdict at `info`, and the
+    // markers it rests on at `debug`. Only the identity and capability facts go
+    // into the log — plus `TERM`/`TERM_PROGRAM` on the evidence line, because
+    // those two are what a reader cross-checks a surprising verdict against.
+    tracing::info!(
+        terminal = %terminal_profile.name,
+        version = %terminal_profile.version_label(),
+        platform = %terminal_profile.platform,
+        images = %terminal_profile.images,
+        host = %terminal_profile.host,
+        "terminal profile"
+    );
+    tracing::debug!(
+        term = std::env::var("TERM").unwrap_or_default(),
+        term_program = std::env::var("TERM_PROGRAM").unwrap_or_default(),
+        evidence = ?terminal_profile.evidence,
+        "terminal profile evidence"
+    );
+    // The capability table is derived from the verdict, so it is logged beside
+    // it: a later phase that gates a feature on one of these answers is
+    // diagnosable from the same log without re-deriving the table by hand.
+    let capabilities = terminal_profile.capabilities();
+    tracing::debug!(
+        kitty_keyboard = ?capabilities.kitty_keyboard,
+        synchronized_output = ?capabilities.synchronized_output,
+        clipboard_write = ?capabilities.clipboard_write,
+        progress = ?capabilities.progress,
+        program_status = ?capabilities.program_status,
+        pointer_shape = ?capabilities.pointer_shape,
+        images = %capabilities.images,
+        "terminal capabilities"
+    );
 
     // Spawn the background image worker that handles SVG rasterisation and
     // terminal protocol encoding without blocking the UI thread.
@@ -392,6 +433,7 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
     // The address that keys this daemon's unlock key in known_servers (see
     // the derivation up top — `mode` is moved by now).
     app.connection_addr = connection_addr;
+    app.terminal = terminal_profile;
 
     // Latch the `--attach <SESSION_ID>` request (if any). It is NOT dispatched
     // here: `run_app` sends its startup requests before the connection is even
@@ -467,6 +509,15 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
     // Signal the image worker to shut down and wait for it to finish.
     app.image_job_tx = None;
     let _ = worker.handle.join();
+
+    // Close the loop on the launch-time profile: one line naming the terminal
+    // and host this session ran in, so an exit reason in the log can be read
+    // against the terminal that produced it without correlating by pid.
+    tracing::debug!(
+        terminal = %app.terminal.name,
+        host = %app.terminal.host,
+        "ui loop exited"
+    );
 
     let _ = shutdown_tx.send(());
     drop(client_tx);

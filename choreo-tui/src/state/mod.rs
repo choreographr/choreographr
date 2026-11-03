@@ -335,6 +335,13 @@ pub(crate) struct App {
     /// degradation is observed) and written by the loop (which owns terminal
     /// output).
     pub(crate) mouse_tracking_reassert: bool,
+    /// The terminal this process launched in, identified once beside the image
+    /// picker (`run_app`) and never re-derived: `TERM`-style variables can change
+    /// under a shell inside the TUI, and a mid-session re-read would describe a
+    /// terminal the user is no longer looking at. Defaults to the unidentified
+    /// profile, so an `App` built by a test (which never runs `run_app`) still
+    /// holds a valid value.
+    pub(crate) terminal: crate::terminal::profile::TerminalProfile,
     /// Persistent latch of whether the daemon's credential keystore is locked.
     /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
     /// and the subscribe-time lock-state push in `handle_daemon_message`;
@@ -478,6 +485,7 @@ impl App {
             term_pointer: None,
             pointer_hover: None,
             mouse_tracking_reassert: false,
+            terminal: crate::terminal::profile::TerminalProfile::default(),
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,

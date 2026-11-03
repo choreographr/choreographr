@@ -3043,6 +3043,69 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
 
 ---
 
+## Terminal integration (`choreo-tui`)
+
+The client talks to whatever terminal it was launched in, and the terminals
+users actually run differ in which escape-sequence families they honour. The
+in-source rustdoc of `choreo-tui/src/terminal/` is the reference for each
+sequence; this section covers how the client decides *which* ones to emit.
+
+### Launch-time terminal profile
+
+`choreo-tui` identifies its terminal **once**, at launch. In `run_app`, right
+after `build_picker()` has finished `ratatui_image`'s own startup capability
+query, the negotiated protocol is read off the picker (as `profile::ImageSupport`)
+and handed to `TerminalProfile::detect_process`, which combines three inputs: the
+process environment, the compile-time platform and that negotiated image
+protocol. Detection is a pure function of injected data
+(`TerminalProfile::detect`), so every rule — each identifying marker, each host
+layer, each capability row — is unit-tested over synthetic environment maps
+without touching the real one.
+
+What it produces:
+
+- The **terminal** (`TerminalKind`) and, where an environment value carries one,
+  its parsed **version** (`Version`, dotted or the packed-integer form Konsole
+  and VTE export).
+- The **platform** (`Linux`/`MacOs`/`Windows`/`Android`), taking Android from
+  the compile target *or* from Termux's own markers, because the shipped Termux
+  build compiles under a Linux triple.
+- The **host layer** (`Host`): `Direct`, a multiplexer (`Tmux { version }`,
+  `Zellij`, `Screen`), or a hosting workspace manager (`Herdr`, `Rex`, and a
+  reserved `Other`). Hosted layers outrank multiplexers; every marker that
+  matched is kept in `evidence` so a nested session's chain is in the log.
+- The **capability table** (`Capabilities`), derived from the kind and version:
+  the Kitty keyboard protocol, mode 2026 synchronized output, OSC 52 clipboard
+  writes, OSC 9;4 progress, OSC 7501 program status, OSC 22 pointer shape, and
+  the native image protocol. Each is three-state — `Some(true)`,
+  `Some(false)`, `None` — so an unidentified terminal answers "unknown" rather
+  than "unsupported"; a later phase that consults the table can therefore never
+  disable a feature on a false negative. The research behind every row is
+  recorded in [`docs/plans/terminal-profile.md`](docs/plans/terminal-profile.md).
+
+**Terminal identity is only reported for a `Direct` session** (plus Rex, whose
+panes really are Rex's own terminal): a multiplexer or a hosting manager rewrites
+`TERM` and passes the outer program's markers through, so an identity read
+underneath one would name the terminal behind the layer.
+
+The profile is **immutable for the process lifetime** and lives on `App`
+(`App::terminal`), not read back from the environment later: `TERM` and its
+siblings can change under a shell started inside the TUI, and a mid-session
+re-read would describe a terminal the user is no longer looking at. It is logged
+exactly once at launch — one `info` line carrying the verdict (`terminal`,
+`version`, `platform`, `images`, `host`) and two `debug` lines carrying the
+markers (`term`, `term_program`, `evidence`) and the derived capabilities — so a
+support report can be read without re-deriving anything. `App::new` starts from
+the unidentified default, which is what every test sees.
+
+Later phases consume the stored profile rather than re-detecting: the welcome
+notice picks its wording from the terminal and host, the Terminal page reports
+identity and capabilities, and the OSC 7501/9;4/OSC 22 emission gates read
+`Capabilities` to stay silent where a terminal would ignore or mishandle the
+sequence.
+
+---
+
 ## Design decisions
 
 1. **Unix sockets, not HTTP for client↔daemon** — keeps everything local, avoids port conflicts,

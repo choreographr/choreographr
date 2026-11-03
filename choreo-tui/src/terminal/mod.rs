@@ -6,7 +6,10 @@
 //! happened" instead of disturbing the UI loop. The submodules build the
 //! individual sequences — OSC 9;4 progress ([`progress`]), OSC 22 pointer shape
 //! ([`pointer`]), OSC 52 clipboard ([`clipboard`]), OSC 2 window title
-//! ([`title`]), and OSC 7501 program status ([`status`]).
+//! ([`title`]), and OSC 7501 program status ([`status`]). [`profile`] identifies
+//! the terminal, its host layer, and the capabilities it actually has; it writes
+//! nothing itself, which is why it sits in this leaf beside the sequence
+//! builders rather than in `connection`.
 //!
 //! This is a leaf module: it carries no view state and never depends on
 //! `App`. Lifecycle orchestration that needs `App` — publishing the status
@@ -31,6 +34,7 @@ use choreo_sanitize::is_unsafe_unicode;
 
 pub(crate) mod clipboard;
 pub(crate) mod pointer;
+pub(crate) mod profile;
 pub(crate) mod progress;
 pub(crate) mod status;
 pub(crate) mod title;
