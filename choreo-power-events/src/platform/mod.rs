@@ -40,11 +40,17 @@ pub fn spawn_monitor() -> Result<PowerMonitor, PowerMonitorError> {
 /// with a never-firing receiver, logged ONCE so the observability layer
 /// knows power events are unavailable and the kernel-level dead-link
 /// detection (sockreg keepalives) is the active layer.
-// `allow(dead_code)` is scoped to exactly this function: on Linux/macOS the
-// platform module below handles subscription and this fallback is never
-// called, but it MUST stay compiled everywhere so the unsupported-platform
-// path is never accidentally deleted when a new platform module is added.
-#[expect(dead_code)]
+// On the platforms with a native module (Linux/macOS/Windows) this fallback is
+// never called, so it is dead there and `expect(dead_code)` is satisfied. On
+// every OTHER platform the `not(any(..))` arm below DOES call it, so an
+// unconditional `expect` would be unfulfilled (and `-D warnings` turns that
+// into a hard error). The expectation is therefore gated to the native-module
+// platforms, keeping both builds warning-free while the fallback stays compiled
+// everywhere so the unsupported-platform path is never accidentally deleted.
+#[cfg_attr(
+    any(target_os = "linux", target_os = "macos", target_os = "windows"),
+    expect(dead_code)
+)]
 fn unsupported_monitor() -> PowerMonitor {
     tracing::info!(
         platform = std::env::consts::OS,

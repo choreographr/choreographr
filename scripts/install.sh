@@ -1,7 +1,8 @@
 #!/bin/sh
 # Choreographr installer — fetches the prebuilt release tarball, verifies its
 # SHA-256 checksum, and installs the shipped binaries plus the platform service
-# file (systemd user unit on Linux, launchd agent on macOS).
+# file (systemd user unit on Linux, launchd agent on macOS, an rc.d script on
+# FreeBSD).
 #
 # Dependencies: curl + tar (+ sha256sum on Linux / shasum on macOS). Nothing
 # else — no build toolchain, no root, no package manager.
@@ -68,14 +69,16 @@ done
 # of its arch regardless of the host's glibc version: x86_64 and aarch64.
 OS="$(uname -s)"
 ARCH="$(uname -m)"
+# FreeBSD reports ARCH=amd64, not x86_64 — match that spelling.
 case "${OS}-${ARCH}" in
     Linux-x86_64) ASSET="choreographr-${VERSION}-x86_64-unknown-linux-musl.tar.gz" ;;
     Linux-aarch64) ASSET="choreographr-${VERSION}-aarch64-unknown-linux-musl.tar.gz" ;;
     Darwin-arm64) ASSET="choreographr-${VERSION}-aarch64-apple-darwin.tar.gz" ;;
     Darwin-x86_64) ASSET="choreographr-${VERSION}-x86_64-apple-darwin.tar.gz" ;;
+    FreeBSD-amd64) ASSET="choreographr-${VERSION}-x86_64-unknown-freebsd.tar.gz" ;;
     *)
         echo "$0: error: unsupported platform: ${OS} ${ARCH}" >&2
-        echo "$0: error: ${VERSION} ships Linux x86_64 + arm64, macOS arm64, and macOS x86_64 only" >&2
+        echo "$0: error: ${VERSION} ships Linux x86_64 + arm64, macOS arm64, macOS x86_64, and FreeBSD x86_64 only" >&2
         exit 1
         ;;
 esac
@@ -112,6 +115,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
             ;;
         Darwin-*) # remove the launchd agent plist (we never loaded it)
             rm -f "$HOME/Library/LaunchAgents/com.choreographr.daemon.plist"
+            ;;
+        FreeBSD-*) # the rc.d script lives under /usr/local/etc/rc.d (system) — not ours to remove
+            :
             ;;
     esac
     echo "==> uninstall complete" >&2
@@ -176,6 +182,16 @@ case "${OS}-${ARCH}" in
         # NOTE: the shipped plist hardcodes /opt/homebrew/bin/choreographr
         # (the Homebrew layout). Non-Homebrew installs that put the binaries
         # elsewhere must edit ProgramArguments in the plist before loading.
+        ;;
+    FreeBSD-*) # rc.d script -> a SYSTEM file under /usr/local/etc/rc.d (needs root).
+        # The no-root installer stages it next to the binaries and prints the
+        # one-time system install + opt-in commands (installed, never auto-enabled).
+        tar -xzf "$TMP/$ASSET" -C "$BIN_DIR" choreographr.rc
+        echo "==> staged rc.d script: $BIN_DIR/choreographr.rc" >&2
+        echo "    install it system-wide and enable it when ready with:" >&2
+        echo "      sudo install -m 0755 $BIN_DIR/choreographr.rc /usr/local/etc/rc.d/choreographr" >&2
+        echo "      sudo sysrc choreographr_enable=YES && sudo service choreographr start" >&2
+        echo "    (if the daemon is not in /usr/local/bin, set choreographr_command in /etc/rc.conf)" >&2
         ;;
 esac
 

@@ -103,6 +103,26 @@ impl SocketTuning {
             );
         }
 
+        #[cfg(target_os = "freebsd")]
+        {
+            // FreeBSD exposes the same three keepalive timings as Linux
+            // (TCP_KEEPIDLE / TCP_KEEPINTVL / TCP_KEEPCNT), all exposed by nix
+            // under `freebsdlike`/non-OpenBSD cfgs with a u32 value — matching
+            // the constants above.
+            best_effort(
+                "TCP_KEEPIDLE",
+                &setsockopt(&fd, sockopt::TcpKeepIdle, &Self::IDLE_SECS),
+            );
+            best_effort(
+                "TCP_KEEPINTVL",
+                &setsockopt(&fd, sockopt::TcpKeepInterval, &Self::INTERVAL_SECS),
+            );
+            best_effort(
+                "TCP_KEEPCNT",
+                &setsockopt(&fd, sockopt::TcpKeepCount, &Self::PROBE_COUNT),
+            );
+        }
+
         #[cfg(target_os = "macos")]
         {
             // macOS has no TCP_KEEPIDLE/TCP_KEEPINTVL/TCP_KEEPCNT; its only
@@ -113,7 +133,12 @@ impl SocketTuning {
             );
         }
 
-        #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_os = "macos",
+            target_os = "freebsd"
+        )))]
         {
             // Other Unixes: nix's TCP sockopt coverage varies; basic
             // SO_KEEPALIVE (set above) still applies with kernel defaults.
@@ -240,7 +265,15 @@ fn win32_opt_len() -> i32 {
     i32::try_from(std::mem::size_of::<u32>()).unwrap_or_default()
 }
 
-#[cfg(unix)]
+// Only the platforms whose `apply` branch above calls this helper compile it,
+// so it is never dead code on any target (a `#[cfg(unix)]`-wide helper is dead
+// on the other Unixes and trips `-D warnings` there).
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd"
+))]
 /// Logs a failed best-effort sockopt at warn and continues — never panics,
 /// never fails the enclosing `apply`. Borrows the result because `T` (the
 /// sockopt value type) is not necessarily `Copy` and is never consumed here.

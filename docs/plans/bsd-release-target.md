@@ -1,9 +1,11 @@
 # Plan: BSD release target
 
-**Status:** proposed — dependency/source analysis complete; **no BSD build has been
-attempted**. FreeBSD is the primary target (a drop-in Rust Tier-2 host); NetBSD
-x86_64 is nearly free; OpenBSD and DragonFly are a tier harder (Tier 3, no
-prebuilt `std`) and are deferred.
+**Status:** implemented (repo side) — the build/release/install/packaging/docs
+support lands with this change and a real FreeBSD ELF links; **a native FreeBSD
+VM run and promotion of the staged `freebsd-x86_64` CI job remain.** FreeBSD is
+the primary target (a drop-in Rust Tier-2 host); NetBSD x86_64 is nearly free;
+OpenBSD and DragonFly are a tier harder (Tier 3, no prebuilt `std`) and are
+deferred.
 **Date:** 2026-10-09
 **Targets:** `x86_64-unknown-freebsd` + `aarch64-unknown-freebsd` (both Tier 2
 with host tools), then `x86_64-unknown-netbsd`; Tier-3 `x86_64-unknown-openbsd`

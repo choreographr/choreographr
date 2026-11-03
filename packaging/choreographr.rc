@@ -1,0 +1,77 @@
+#!/bin/sh
+#
+# choreographr -- Choreographr daemon rc.d script (FreeBSD)
+#
+# PROVIDE: choreographr
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# The daemon is a per-user agent: it opens a Unix socket and a redb database
+# under the running user's state/config dirs. Run as a SYSTEM service it must
+# therefore run as an unprivileged user, NOT root, and with an explicit
+# `--base-dir` so its state does not depend on the caller's $HOME. Create the
+# service user and its data directory first, e.g.:
+#
+#   pw useradd choreographr -d /var/db/choreographr -m -s /usr/sbin/nologin
+#   install -d -o choreographr -g choreographr /var/db/choreographr
+#
+# Policy: installed, never auto-enabled. Install and opt in explicitly:
+#
+#   sudo install -m 0755 choreographr.rc /usr/local/etc/rc.d/choreographr
+#   sudo sysrc choreographr_enable=YES
+#   sudo service choreographr start
+#
+# Overrides (in /etc/rc.conf or /etc/rc.conf.local):
+#
+#   choreographr_enable="YES"
+#   choreographr_user="choreographr"                     # default; must exist
+#   choreographr_command="/usr/local/bin/choreographr"
+#   choreographr_base_dir="/var/db/choreographr"
+#   choreographr_flags=""                                # extra daemon arguments
+
+. /etc/rc.subr
+
+name="choreographr"
+rcvar="choreographr_enable"
+
+start_cmd="${name}_start"
+stop_cmd="${name}_stop"
+status_cmd="${name}_status"
+
+load_rc_config "${name}"
+
+: ${choreographr_enable:="NO"}
+: ${choreographr_user:="choreographr"}
+: ${choreographr_command:="/usr/local/bin/choreographr"}
+: ${choreographr_base_dir:="/var/db/choreographr"}
+: ${choreographr_flags:=""}
+
+pidfile="/var/run/${name}.pid"
+
+choreographr_start()
+{
+    /usr/sbin/daemon -p "${pidfile}" -u "${choreographr_user}" \
+        "${choreographr_command}" --base-dir "${choreographr_base_dir}" \
+        ${choreographr_flags}
+}
+
+choreographr_stop()
+{
+    if [ -f "${pidfile}" ]; then
+        _choreographr_pid="$(cat "${pidfile}")"
+        kill "${_choreographr_pid}" 2>/dev/null || true
+        rm -f "${pidfile}"
+    fi
+}
+
+choreographr_status()
+{
+    if [ -f "${pidfile}" ] && kill -0 "$(cat "${pidfile}")" 2>/dev/null; then
+        echo "${name} is running as pid $(cat "${pidfile}")."
+    else
+        echo "${name} is not running."
+        return 1
+    fi
+}
+
+run_rc_command "$1"

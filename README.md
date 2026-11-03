@@ -215,7 +215,7 @@ Prebuilt releases ship exactly two binaries — `choreographr choreo-tui`
 (`choreo-mcp` is a library-only crate and ships no binary; the `choreo-im`
 and `choreo-acp` bridges ship only in source builds — `cargo build -p choreo-im`
 / `cargo build -p choreo-acp`) — for **Linux (x86_64 and aarch64)**, **macOS
-(Apple Silicon and Intel)**, **Windows (x86_64)**,
+(Apple Silicon and Intel)**, **FreeBSD (x86_64)**, **Windows (x86_64)**,
 and **Android/Termux (aarch64)**. All installs below use prebuilt binaries; no
 Rust or Zig toolchain is required. (The binaries are built by the GitHub
 Actions `release` workflow on every `vX.Y.Z` tag — see RELEASE.md's
@@ -286,6 +286,29 @@ on an Intel/AMD box and the `aarch64` asset on an arm64 one.
   needs Zig — installs the daemon + TUI + bridges; from a local clone, one
   `cargo install --path <crate-dir>` per crate)
 
+### FreeBSD (x86_64)
+
+The `x86_64-unknown-freebsd` tarball is a native build against the FreeBSD base
+system (clang/ld, no musl), shipped in the release.
+
+- **Tarball + installer** — `curl -fsSL https://choreographr.com/install.sh | sh`.
+  The installer puts the binaries in `~/.local/bin` and stages the `rc.d`
+  script next to them. It never needs root; to run the daemon as a service,
+  finish the system install explicitly:
+
+  ```sh
+  sudo install -m 0755 ~/.local/bin/choreographr.rc /usr/local/etc/rc.d/choreographr
+  sudo sysrc choreographr_enable=YES
+  sudo service choreographr start
+  ```
+
+  The `rc.d` script runs the daemon as an unprivileged `choreographr` user with
+  `--base-dir /var/db/choreographr`; its header shows the one-time
+  `pw useradd` / `install -d` to create that user and data directory.
+- **cargo install** — builds from source; needs Zig at build time (a `zlob`
+  build-script dependency):
+  `cargo install choreographr choreo-tui choreo-im choreo-acp`.
+
 ### Windows & Android (Termux)
 
 Windows has no package manager for this — grab the release asset and put the
@@ -322,6 +345,7 @@ the service file but never enable it. One of:
 systemctl --user enable --now choreographr       # Linux: unit ships with the .deb/.rpm and the tarball
 brew services start choreographr                 # macOS: Homebrew launchd agent
 launchctl load ~/Library/LaunchAgents/com.choreographr.daemon.plist   # macOS: non-Homebrew (curl installer)
+sudo service choreographr start                  # FreeBSD: after installing the rc.d script (see FreeBSD above)
 choreographr                                     # ...or just run it in a terminal
 ```
 

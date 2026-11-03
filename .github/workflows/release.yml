@@ -802,6 +802,48 @@ jobs:
             exit 1
           fi
 
+  freebsd-x86_64:
+    name: freebsd x86_64 (VM build + smoke)
+    # STAGED / NON-BLOCKING. GitHub has no hosted FreeBSD runner, so this builds
+    # natively inside a FreeBSD VM via vmactions/freebsd-vm. It is deliberately
+    # kept OUT of `release.needs` and the release job's download `pattern:`
+    # until a native FreeBSD build has been validated end to end — the same
+    # staging the windows-msvc job used before its runtime was ready. Promote it
+    # by adding `freebsd-x86_64` to both places once this job is consistently
+    # green. Host parity without a VM: `just check-freebsd` type-checks every
+    # library for x86_64-unknown-freebsd from any host.
+    # NOTE: `pkg install zig` may lag the Zig 0.16.0 that zlob 1.7.1 requires;
+    # if the build fails on zlob, pin the Zig version here (download the 0.16.0
+    # tarball into PATH) before promoting the job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build + smoke-test on FreeBSD
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          # Native toolchain inside the VM. release.sh builds on STABLE via
+          # scripts/build-stable.sh (`cargo +stable`), so rustup is installed
+          # explicitly; zlob's build.rs needs `zig`; git backs the dirty-tree
+          # guard.
+          prepare: |
+            pkg install -y curl ca_root_nss git zig gmake
+          run: |
+            set -eu
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+            . "$HOME/.cargo/env"
+            rustup toolchain install stable --profile minimal
+            # release.sh detects FreeBSD-amd64 and takes the native freebsd
+            # branch (no musl, no mimalloc), then writes the FreeBSD tarball.
+            ./scripts/release.sh --allow-dirty
+            VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+            ./scripts/smoke-test.sh "dist/choreographr-${VERSION}-x86_64-unknown-freebsd.tar.gz"
+            ./scripts/daemon-smoke.sh "dist/choreographr-${VERSION}-x86_64-unknown-freebsd.tar.gz"
+
   release:
     name: verify + (on tag) create GitHub release
     needs: [linux-x86_64, linux-arm64, macos-arm64, windows-msvc, android-termux]

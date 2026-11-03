@@ -87,16 +87,19 @@ fi
 # tarballs in one pass: native aarch64-apple-darwin plus a cross-built
 # x86_64-apple-darwin (Apple's clang targeting x86_64 from an arm64 host is
 # first-class and shares the single Xcode SDK both triples need — no extra SDK
-# install). Each host builds its own arch's tarball; the CI release workflow
-# pairs an x86_64 runner (this musl path) with an arm64 one (Linux-aarch64) so
-# both Linux tarballs are produced natively.
+# install). A FreeBSD amd64 host builds the native x86_64-unknown-freebsd
+# tarball (base-system clang/ld, no musl). Each host builds its own arch's
+# tarball; the CI release workflow pairs an x86_64 runner (this musl path) with
+# an arm64 one (Linux-aarch64) so both Linux tarballs are produced natively.
+# NOTE: FreeBSD's `uname -m` is `amd64`, not `x86_64`.
 case "$(uname -s)-$(uname -m)" in
     Linux-x86_64) TARGET="x86_64-unknown-linux-musl" ;;
     Linux-aarch64) TARGET="aarch64-unknown-linux-musl" ;;
+    FreeBSD-amd64) TARGET="x86_64-unknown-freebsd" ;;
     Darwin-arm64) TARGET="aarch64-apple-darwin" ;;  # host tarball; x86_64 is cross-built below
     *)
         echo "error: unsupported platform: $(uname -s) $(uname -m)" >&2
-        echo "error: ${VERSION} ships Linux x86_64 + arm64 (static musl), macOS arm64, and macOS x86_64" >&2
+        echo "error: ${VERSION} ships Linux x86_64 + arm64 (static musl), macOS arm64, macOS x86_64, and FreeBSD x86_64" >&2
         echo "error: the macOS x86_64 tarball is cross-built on the Darwin-arm64 host" >&2
         exit 1
         ;;
@@ -210,6 +213,16 @@ elif [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
     # same reasoning as the Darwin-arm64 arm below.
     ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr -p choreo-tui --target aarch64-unknown-linux-musl --features choreographr/metrics,choreographr/blockchain,choreographr/mimalloc,choreo-tui/mimalloc
     TARBALL_JOBS+=("aarch64-unknown-linux-musl target/aarch64-unknown-linux-musl/dist")
+elif [ "$TARGET" = "x86_64-unknown-freebsd" ]; then
+    echo "==> building release binaries (daemon + TUI packages)"
+    # FreeBSD: a NATIVE stable build via the base-system clang/ld — no musl
+    # (FreeBSD is not glibc) and no mimalloc (its allocator is fine; mimalloc
+    # is the musl-tarball concern). Generic x86-64 CPU floor: never
+    # target-cpu=native, so the tarball runs on every amd64 FreeBSD host. The
+    # C deps (aws-lc-sys, ring, onig_sys, secp256k1-sys, zlob/zig) compile with
+    # base clang — validated by `just check-freebsd` and a full link.
+    RUSTFLAGS="-C target-cpu=x86-64" ./scripts/build-stable.sh build --locked --profile dist -p choreographr -p choreo-tui --target x86_64-unknown-freebsd --features choreographr/metrics,choreographr/blockchain
+    TARBALL_JOBS+=("x86_64-unknown-freebsd target/x86_64-unknown-freebsd/dist")
 else
     echo "==> building release binaries (daemon + TUI packages)"
     # Native aarch64: NO target-cpu flag — the aarch64-apple-darwin target spec
@@ -244,9 +257,10 @@ else
     TARBALL_JOBS+=("x86_64-apple-darwin target/x86_64-apple-darwin/dist")
 fi
 
-# Stage each tarball: the shipped binaries plus both service files, all
-# at the top level of the archive (no bin/ prefix) so install.sh and the
-# Homebrew formula can reference them directly. tar preserves exec bits.
+# Stage each tarball: the shipped binaries plus the service files (systemd
+# unit, launchd agent, FreeBSD rc.d script), all at the top level of the
+# archive (no bin/ prefix) so install.sh and the Homebrew formula can reference
+# them directly. tar preserves exec bits.
 # Every entry of TARBALL_JOBS (“triple bindir”) MUST produce a tarball — the
 # hard-fail below fires on a missing binary BEFORE the SHA256SUMS step, so a
 # half-successful pass can never emit an incomplete checksum file (with two
@@ -269,10 +283,11 @@ for job in "${TARBALL_JOBS[@]}"; do
     done
     install -m 0644 packaging/choreographr.service "$STAGE/choreographr.service"
     install -m 0644 packaging/com.choreographr.daemon.plist "$STAGE/com.choreographr.daemon.plist"
+    install -m 0755 packaging/choreographr.rc "$STAGE/choreographr.rc"
 
     TARBALL="dist/choreographr-${VERSION}-${triple}.tar.gz"
     tar czf "$TARBALL" -C "$STAGE" \
-        "${BINARIES[@]}" choreographr.service com.choreographr.daemon.plist
+        "${BINARIES[@]}" choreographr.service com.choreographr.daemon.plist choreographr.rc
     rm -rf "$STAGE"
     STAGE=""
 done

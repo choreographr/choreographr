@@ -214,7 +214,23 @@ check-windows: _require-zig
     rustup target add x86_64-pc-windows-gnu
     RUSTFLAGS="{{ cross_rustflags }}" cargo-zigbuild check {{ CARGO_FLAGS }} {{ cross_config }} --target x86_64-pc-windows-gnu --workspace --lib
 
-# Both foreign-target gates in one command: `check-windows` + `check-macos`.
+# FreeBSD cross-compile gate: type-check every library crate for
+# x86_64-unknown-freebsd using zig's clang+lld via cargo-zigbuild. FreeBSD is a
+# Tier-2 host target (rustup ships its std), so `rustup target add` provides it.
+# Same libs-only rationale and host-arch neutralization as check-macos/windows;
+# `cargo check` runs the C build scripts (aws-lc-sys, onig, secp256k1, zlob), so
+# target-specific C breakage is caught too — a full `cargo build` even links a
+# real FreeBSD ELF (see release.sh's native FreeBSD branch).
+#
+# choreo-gui is EXCLUDED: it is not a BSD release target (it is in neither
+# default-members nor any release job), and its dioxus/blitz/wgpu tree pulls
+# openssl-sys, which has no FreeBSD sysroot to cross-link against from here.
+check-freebsd: _require-zig
+    rustup target add x86_64-unknown-freebsd
+    RUSTFLAGS="{{ cross_rustflags }}" cargo-zigbuild check {{ CARGO_FLAGS }} {{ cross_config }} --target x86_64-unknown-freebsd --workspace --exclude choreo-gui --lib
+
+# All foreign-target gates in one command: `check-windows` + `check-macos` +
+# `check-freebsd`.
 # This is the local stand-in for the release workflow's windows-msvc and macos
 # jobs minus the multi-minute full build/link. It catches `#[cfg(windows)]` /
 # `#[cfg(target_os = "macos")]` breakage that the host gate is structurally
@@ -226,7 +242,7 @@ check-windows: _require-zig
 # — but NOT `pre-commit`: it needs zig + cargo-zigbuild and rebuilds the whole
 # dependency tree once per target. Run it by hand when touching platform-gated
 # code.
-check-cross: check-windows check-macos
+check-cross: check-windows check-macos check-freebsd
 
 # ── Android ───────────────────────────────────────────────────────────────────
 # Termux is the Android runtime for the four suite binaries: they are pushed
@@ -573,8 +589,10 @@ VERSION := `sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1`
 # Host release target — the same target set scripts/release.sh and
 # scripts/install.sh hardcode (Linux x86_64 + arm64 — both static musl — plus
 # both darwin triples, which release.sh builds in one pass on a Darwin-arm64
-# host; smoke-test defaults to the host triple's tarball).
-TARGET := `case "$(uname -s)-$(uname -m)" in Linux-x86_64) echo x86_64-unknown-linux-musl ;; Linux-aarch64) echo aarch64-unknown-linux-musl ;; Darwin-arm64) echo aarch64-apple-darwin ;; *) echo unsupported ;; esac`
+# host; plus FreeBSD x86_64, which builds natively on a FreeBSD-amd64 host;
+# smoke-test defaults to the host triple's tarball). Note FreeBSD's `uname -m`
+# is `amd64`, not `x86_64`.
+TARGET := `case "$(uname -s)-$(uname -m)" in Linux-x86_64) echo x86_64-unknown-linux-musl ;; Linux-aarch64) echo aarch64-unknown-linux-musl ;; FreeBSD-amd64) echo x86_64-unknown-freebsd ;; Darwin-arm64) echo aarch64-apple-darwin ;; *) echo unsupported ;; esac`
 
 # The tarball `just release` produces — used as the default for
 # `just smoke-test` (built by concatenation: just does not recursively

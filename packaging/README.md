@@ -17,12 +17,15 @@ choice — so no package manager script, installer, or release tool ever enables
 it. Every installer:
 
 1. places the unit/agent in the user's own config area —
-   `~/.config/systemd/user/` (Linux) or `~/Library/LaunchAgents/` (macOS), and
+   `~/.config/systemd/user/` (Linux) or `~/Library/LaunchAgents/` (macOS) — or,
+   on FreeBSD, stages the `rc.d` script next to the binaries for a root install
+   under `/usr/local/etc/rc.d/` — and
 2. prints the exact one-liner to opt in:
 
 ```bash
 systemctl --user enable --now choreographr                                       # Linux (systemd)
 launchctl load ~/Library/LaunchAgents/com.choreographr.daemon.plist              # macOS (launchd)
+sudo service choreographr start                                                  # FreeBSD (rc.d; after installing the script)
 ```
 
 Consequences: no `%post`/`%preun` in the RPM spec, no `postinst` in the .deb,
@@ -36,6 +39,7 @@ correctly once the user loads it, but loading is always the user's action.
 |---|---|---|
 | `choreographr.service` | systemd **user** unit (runs `~/.local/bin/choreographr`, `Restart=on-failure`) | inside the release tarball, the desktop `.deb`, and the `.rpm`; installed by `scripts/install.sh`. NOT in the Termux `.deb` — there is no systemd on Android |
 | `com.choreographr.daemon.plist` | launchd agent for **non-Homebrew** macOS installs (logs to `/tmp/choreographr.log`) | inside the release tarball; installed by `scripts/install.sh`. Homebrew installs use the formula's `service do` block instead |
+| `choreographr.rc` | FreeBSD `rc.d` script (runs the daemon as an unprivileged `choreographr` user with `--base-dir /var/db/choreographr`) | inside the release tarball; staged by `scripts/install.sh` for a root system install |
 | `homebrew/choreographr.rb` | Homebrew formula — prebuilt tarball variant, no build toolchain | the `choreographr/homebrew-choreographr` tap |
 | `aur/PKGBUILD` + `aur/.SRCINFO` | Arch package `choreographr-bin` (prebuilt, empty `depends=` — static binaries) | the AUR |
 | `rpm/choreographr.spec` | RPM spec for the fat package (shipped binaries + systemd unit) | consumed by `scripts/build-rpm.sh`; the resulting `.rpm` ships in the GitHub release |
@@ -64,7 +68,8 @@ the Termux session.
 ## Release tarball
 
 `scripts/release.sh` packs the shipped binaries — `choreographr choreo-tui`
-— plus both service files into
+— plus the service files (systemd unit, launchd agent, FreeBSD `rc.d` script)
+into
 `dist/choreographr-<version>-<target>.tar.gz`, with the binaries at the **top
 level** of the archive (no `bin/` prefix) and their exec bits preserved. The
 Linux tarballs are **fully static musl** builds (`x86_64-unknown-linux-musl`
@@ -72,7 +77,8 @@ and `aarch64-unknown-linux-musl`, with mimalloc as the allocator), so each
 serves its arch of general Linux — including the AUR `choreographr-bin`
 package — regardless of the host's glibc version;
 the macOS tarballs are the native `aarch64-apple-darwin` build and a
-cross-built `x86_64-apple-darwin` one. The
+cross-built `x86_64-apple-darwin` one; the FreeBSD tarball is the native
+`x86_64-unknown-freebsd` build (base-system clang/ld, no musl). The
 tarballs are published to the GitHub release
 (`https://github.com/choreographr/choreographr/releases`) and mirrored at
 `https://choreographr.com/download/<version>/`, where a `SHA256SUMS` file sits

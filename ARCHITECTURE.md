@@ -229,11 +229,12 @@ produce (they handle the POSIX tarballs). The four targets below are what
 `release.sh` and `install.sh` build and install; the Windows zip rides alongside
 them on the releases page for users to extract onto their `PATH`.
 
-The `release.sh`/`install.sh` shipped target set is exactly four; `release.sh` and `install.sh`
+The `release.sh`/`install.sh` shipped target set is exactly five; `release.sh` and `install.sh`
 hardcode this set and refuse any other platform ("ships Linux x86_64 + arm64,
-macOS arm64, and macOS x86_64"), and `release.sh` builds each Linux host's
-own arch — the x86_64 tarball on a Linux-x86_64 host, the aarch64 tarball on a
-Linux-aarch64 host — and BOTH darwin tarballs on a Darwin-arm64 host (the
+macOS arm64, macOS x86_64, and FreeBSD x86_64"), and `release.sh` builds each
+native host's own arch — the x86_64 tarball on a Linux-x86_64 host, the aarch64
+tarball on a Linux-aarch64 host, the native `x86_64-unknown-freebsd` tarball on
+a FreeBSD-amd64 host — and BOTH darwin tarballs on a Darwin-arm64 host (the
 x86_64 one
 cross-compiled — Apple's arm64-hosted toolchain targets x86_64-apple-darwin
 natively, sharing the single Xcode SDK):
@@ -244,6 +245,7 @@ natively, sharing the single Xcode SDK):
 | `aarch64-unknown-linux-musl` | Linux arm64 | `choreographr-<version>-aarch64-unknown-linux-musl.tar.gz` |
 | `aarch64-apple-darwin` | macOS arm64 (native) | `choreographr-<version>-aarch64-apple-darwin.tar.gz` |
 | `x86_64-apple-darwin` | macOS Intel (cross-built on the arm64 host) | `choreographr-<version>-x86_64-apple-darwin.tar.gz` |
+| `x86_64-unknown-freebsd` | FreeBSD x86_64 (native) | `choreographr-<version>-x86_64-unknown-freebsd.tar.gz` |
 
 The Linux tarballs are **fully static musl builds** — `release.sh`
 cross-builds each to `<arch>-unknown-linux-musl` with `--features mimalloc`, so
@@ -256,8 +258,10 @@ The `.deb`/`.rpm` remain native glibc host-target builds without the
 tag them from the host arch (Debian's `amd64`/`arm64` in the control field,
 the tarball spelling `x86_64`/`aarch64` in the filename). The tarball holds the two
 binaries at the **top level** (no `bin/` prefix)
-plus both service files, exec bits preserved — `install.sh` and the Homebrew
-formula reference them directly.
+plus the platform service files (systemd unit, launchd agent, and the FreeBSD
+`rc.d` script), exec bits preserved — `install.sh` and the Homebrew
+formula reference them directly. The FreeBSD tarball is a **native** build
+against the FreeBSD base system (base clang/ld), not musl — see `release.sh`.
 
 **All shipped binaries are stripped.** The workspace `[profile.dist]` profile
 (root `Cargo.toml` — the shipped-artifact profile every release-pipeline build
