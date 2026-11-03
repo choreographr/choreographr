@@ -15,20 +15,24 @@
 //!     BMP, TIFF, TGA, DDS, ICO, PNM, HDR/Radiance, `OpenEXR`, Farbfeld, QOI);
 //!   - AVIF — only when the gated `avif` feature is enabled (`image/avif-native`,
 //!     dav1d). Recognized but rejected otherwise.
-//!   - HEIC/HEIF — decoded via the pure-Rust `heif-oxide` crate (built in);
+//!   - HEIC/HEIF — decoded via the pure-Rust `heifer` decoder (built in);
 //!   - SVG — rasterized via `resvg`.
 //!
 //! EXIF orientation baking: raster formats (JPEG, WebP, and PNG's `eXIf`
 //! chunk) are rotated/flipped in place to the orientation the header declares,
 //! so phone/camera photos reach the model upright. HEIC carries its own
-//! orientation and is already applied by `heif-oxide`; SVG has no orientation.
+//! orientation and `heifer` applies the container's transforms during the
+//! decode; SVG has no orientation.
 //!
 //! Colour management: an embedded ICC profile is converted to sRGB by the shared
-//! [`choreo_image::decode_raster_oriented`] path (pure-Rust `moxcms`), so a
-//! `Display-P3` or `AdobeRGB` raster reaches the model with sRGB values instead of
-//! being reinterpreted as sRGB (which reads desaturated). HEIC is already sRGB
-//! from `heif-oxide`'s `nclx` handling, and SVG is rasterized through `resvg`,
-//! which is sRGB.
+//! [`choreo_image`] colour path (pure-Rust `moxcms`), so a `Display-P3` or
+//! `AdobeRGB` source reaches the model with sRGB values instead of being
+//! reinterpreted as sRGB (which reads desaturated). That applies to every source
+//! the shared decoder handles — rasters through
+//! [`choreo_image::decode_raster_oriented`] and HEIC through
+//! [`choreo_image::decode_heic`]. A HEIC whose colour is signalled by the
+//! container's `nclx` description rather than an ICC profile is converted as
+//! part of the decode, and SVG is rasterized through `resvg`, which is sRGB.
 //!
 //! Fixed constants (the vision plan chose fixed limits over configurable
 //! ones): images are downscaled to fit within [`MAX_IMAGE_DIMENSION`] px on
@@ -343,12 +347,13 @@ fn normalize_raster(
     finalize_region(img, &format!("{format:?}"), region, encode)
 }
 
-/// Normalize a HEIC/HEIF image via the shared pure-Rust decoder.
+/// Normalize a HEIC/HEIF image via the shared pure-Rust `heifer` decoder.
 ///
 /// [`choreo_image::decode_heic`] applies a pre-decode allocation guard (the
 /// container's declared `ispe` extents) so a hostile HEIC cannot drive a huge
-/// allocation, then applies the container's orientation and delivers
-/// display-ready sRGB.
+/// allocation, applies the container's own orientation transforms, and
+/// delivers display-ready sRGB (an embedded ICC profile colour-managed, an
+/// `nclx` description converted during the decode).
 fn normalize_heic(
     bytes: &[u8],
     region: Option<CropRegion>,

@@ -1,7 +1,6 @@
 use super::{PreparedImage, ToolExecError, context::ToolContext, truncate_tool_output};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
-use image::GenericImageView;
 use resvg::usvg;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -34,9 +33,10 @@ pub struct DisplayImageArgs {
 pub(crate) const MAX_DISPLAY_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const IMAGE_FETCH_TIMEOUT_SECS: u64 = 10;
 
-/// The image MIME types `display_image` accepts. Covers every raster format the
-/// `image` crate decodes, plus SVG (`resvg`), plus HEIC/HEIF (`heif-oxide`), and
-/// AVIF (gated behind the `avif` feature — see `normalize_image_mime_type`).
+/// The image MIME types `display_image` accepts: every raster format the `image`
+/// crate decodes, plus SVG (`resvg`), plus HEIC/HEIF (`heifer`, the pure-Rust
+/// ISO-BMFF HEVC decoder), plus AVIF (gated behind the `avif` feature — see
+/// `normalize_image_mime_type`).
 /// The gate is intentionally broad: the client's decoder sniffs the bytes, and
 /// `inspect_image_dimensions` checks the payload is a well-formed image of the
 /// claimed family (its header parses, and it is within the decode budget) before
@@ -267,7 +267,8 @@ fn fetch_image_bytes(url_str: &str, expected_mime_type: &str) -> io::Result<Vec<
 /// huge allocation *during the probe*, not just during the client's display
 /// decode: the raster path reads only the header (and applies the same
 /// total-pixel budget the full decode would), SVG stops at the parsed viewport,
-/// and HEIC runs the container's pre-decode geometry guard. The probe therefore
+/// and HEIC reads only the container header while enforcing the same
+/// declared-geometry budget the decode does. The probe therefore
 /// costs a header parse rather than a full decode — it answers "how big is this"
 /// and leaves "do the pixels decode" to the consumer that actually renders them
 /// (which uses the same shared decoder).
@@ -314,12 +315,14 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
             let size = tree.size().to_int_size();
             Ok((size.width(), size.height()))
         }
+        // HEIC/HEIF routes through the shared header-only probe: it reads the
+        // container's declared geometry (honouring its crop and rotation, so the
+        // answer is the size the decoder will actually produce) and enforces the
+        // same pixel budget as the decode — without decoding a pixel. That keeps
+        // the probe's hostile-geometry guard identical to the client display
+        // decode's while costing microseconds instead of a full decode.
         "image/heic" | "image/heif" => {
-            // Route through the shared guarded decoder so a hostile HEIC's
-            // declared geometry can't drive a huge allocation during the
-            // dimension probe either (not just the client display decode).
-            let img = choreo_image::decode_heic(data).map_err(io::Error::other)?;
-            Ok(img.dimensions())
+            choreo_image::probe_heic_dimensions(data).map_err(io::Error::other)
         }
         _ => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -421,6 +424,23 @@ mod tests {
     use super::*;
     use image::ImageFormat;
     use std::io::Cursor;
+
+    /// A 16x16 HEIC fixture, held inside the daemon crate so this suite needs no
+    /// path into a sibling crate's test data.
+    const HEIC_FIXTURE: &[u8] = include_bytes!("fixtures/heic-16x16.heic");
+
+    #[test]
+    fn heic_dimension_probe_reports_declared_geometry() {
+        // The HEIC arm answers from the container header alone, so it must
+        // report the fixture's declared size without a pixel decode.
+        assert_eq!(
+            inspect_image_dimensions("image/heic", HEIC_FIXTURE).unwrap(),
+            (16, 16)
+        );
+        // The same arm rejects bytes that are not a HEIF container at all — the
+        // probe parses the box structure rather than trusting the claimed MIME.
+        assert!(inspect_image_dimensions("image/heic", b"not a heif file").is_err());
+    }
 
     #[test]
     fn raster_dimension_probe_reports_dimensions() {

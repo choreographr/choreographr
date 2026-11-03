@@ -169,9 +169,11 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: &
 ///
 /// SVG data is rasterised directly at `target_px_w × target_px_h`
 /// (preserving aspect ratio). HEIC/HEIF goes through the shared pure-Rust
-/// `heif-oxide` decoder (which applies the container's orientation and gates
-/// hostile declared geometry pre-decode). Raster formats use the shared
-/// `image`-crate decoder with EXIF orientation baked in, so phone/camera
+/// `heifer` decoder (via [`choreo_image::decode_heic`]): it applies the
+/// container's own orientation transforms, and the shared probe it starts from
+/// enforces the pixel budget on the declared geometry before any decode work,
+/// with an embedded ICC profile colour-managed to sRGB. Raster formats use the
+/// shared `image`-crate decoder with EXIF orientation baked in, so phone/camera
 /// photos render upright.
 fn decode_image(
     metadata: &ImageMetadata,
@@ -290,7 +292,7 @@ mod tests {
 
     #[test]
     fn decode_image_routes_heic_mime_to_heif_decoder() {
-        // An `image/heic` mime must route to the heif-oxide path (which rejects
+        // An `image/heic` mime must route to the `heifer` path (which rejects
         // non-HEIF bytes), NOT the image-crate raster path.
         let metadata = ImageMetadata {
             mime_type: "image/heic".to_string(),
