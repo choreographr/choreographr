@@ -73,6 +73,22 @@ fi
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
 [ -n "$VERSION" ] || { echo "error: could not read version from Cargo.toml" >&2; exit 1; }
 
+# Portable SHA-256 for the SHA256SUMS file. GNU/Linux ships `sha256sum`; FreeBSD's
+# BASE system ships `sha256` (whose `-r` flag emits the same coreutils "hash
+# filename" form) and NOT `sha256sum`; macOS ships `shasum`. Detect once so a
+# native FreeBSD release (and the freebsd CI job) writes the identical checksum
+# file to the Linux/macOS builds.
+if command -v sha256sum >/dev/null 2>&1; then
+    SHA256_CMD=(sha256sum)
+elif command -v sha256 >/dev/null 2>&1; then
+    SHA256_CMD=(sha256 -r)
+elif command -v shasum >/dev/null 2>&1; then
+    SHA256_CMD=(shasum -a 256)
+else
+    echo "error: no SHA-256 tool found (need sha256sum, sha256, or shasum)" >&2
+    exit 1
+fi
+
 # Releasing from a dirty tree risks shipping uncommitted changes; the flag is
 # an explicit escape hatch for CI-style flows that stage files first.
 if [ "$ALLOW_DIRTY" -eq 0 ] && [ -n "$(git status --porcelain)" ]; then
@@ -341,7 +357,7 @@ fi
 # here, after the .deb/.rpm
 # step and from the glob rather than the single host tarball, means a combined
 # file is produced and `--upload` never clobbers it with a single-host one.
-( cd dist && sha256sum choreographr-${VERSION}-* > SHA256SUMS )
+( cd dist && "${SHA256_CMD[@]}" choreographr-${VERSION}-* > SHA256SUMS )
 
 echo
 echo "==> artifacts in dist/:"

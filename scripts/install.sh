@@ -83,14 +83,19 @@ case "${OS}-${ARCH}" in
         ;;
 esac
 
-# sha256 tool differs per OS; both print "<hash>  <file>", which the awk
-# below parses. Prefer sha256sum (Linux), fall back to shasum (macOS).
+# sha256 tool differs per OS; each prints a line whose second field is the
+# filename and first field the digest, which the awk below parses. Prefer GNU
+# `sha256sum` (Linux), then FreeBSD base `sha256 -r` (emit the coreutils form),
+# then macOS `shasum`. Never `sha256sum` on FreeBSD — it is not in the base
+# system.
 if command -v sha256sum >/dev/null 2>&1; then
     sha256_of() { sha256sum "$1" | awk '{print $1}'; }
+elif command -v sha256 >/dev/null 2>&1; then
+    sha256_of() { sha256 -r "$1" | awk '{print $1}'; }
 elif command -v shasum >/dev/null 2>&1; then
     sha256_of() { shasum -a 256 "$1" | awk '{print $1}'; }
 else
-    echo "$0: error: no sha256 tool found (need sha256sum or shasum)" >&2
+    echo "$0: error: no sha256 tool found (need sha256sum, sha256, or shasum)" >&2
     exit 1
 fi
 
