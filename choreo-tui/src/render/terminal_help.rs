@@ -67,7 +67,7 @@ struct CapabilityRow {
 ///
 /// The state is the capability table's own three-state answer, so an
 /// unasserted capability stays distinct from a settled "no" (see
-/// `terminal/profile.rs`).
+/// `terminal/profile/mod.rs`).
 fn capability_rows(capabilities: Capabilities, host: Capabilities) -> [CapabilityRow; 7] {
     let row = |label, support: Option<bool>, provided: Option<bool>| CapabilityRow {
         label,

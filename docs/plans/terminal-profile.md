@@ -1,7 +1,7 @@
 # Plan: launch-time terminal and host profile (`choreo-tui`)
 
 **Status:** research record for the shipped terminal profile; the reference it
-backs lives in the rustdoc of `choreo-tui/src/terminal/profile.rs` and in
+backs lives in the rustdoc of `choreo-tui/src/terminal/profile/mod.rs` and in
 `ARCHITECTURE.md`'s "Terminal integration" section. This file keeps the
 per-terminal evidence — with the source each row came from — and the open
 questions the later phases (welcome notice, Terminal page, progress/status
