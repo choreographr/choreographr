@@ -79,7 +79,7 @@ pub(crate) use streaming::StreamingResponseCache;
 // (`render/terminal_help.rs`), so they are re-exported here like every other
 // item that moved into a sibling module.
 pub(crate) use terminal_advice::{
-    HOSTED_PANE_SENTENCE, gap_phrases, join_phrases, option_key_setting, recommendations,
+    gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting, recommendations,
     tmux_lines,
 };
 

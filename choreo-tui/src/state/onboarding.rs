@@ -19,7 +19,7 @@
 
 use super::App;
 use super::terminal_advice::{
-    HOSTED_PANE_SENTENCE, gap_phrases, join_phrases, option_key_setting, recommendations,
+    gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting, recommendations,
     tmux_lines,
 };
 use crate::terminal::profile::{Host, Mux, Platform, TerminalKind, TerminalProfile, Version};
@@ -73,7 +73,7 @@ pub(crate) fn terminal_notice(profile: &TerminalProfile) -> Option<TerminalNotic
         }),
         Host::Hosted(_) => Some(TerminalNotice {
             headline: "This pane cannot forward everything the client uses".to_string(),
-            lines: vec![HOSTED_PANE_SENTENCE.to_string()],
+            lines: vec![hosted_pane_sentence(profile.platform)],
         }),
     };
 
@@ -369,7 +369,7 @@ mod tests {
         // One line only, and no Option-as-Alt advice: we cannot name the outer
         // terminal under a workspace manager.
         assert_eq!(notice.lines.len(), 1);
-        assert!(notice.lines[0].contains("directly in your terminal"));
+        assert!(notice.lines[0].contains("directly in a terminal"));
         assert!(!all_text(&notice).contains("Option"));
     }
 

@@ -13,7 +13,8 @@
 //! its fields), so each rule is unit-testable without a terminal.
 
 use crate::terminal::profile::{
-    Capabilities, Host, NativeImages, Platform, TerminalKind, TerminalProfile, Version,
+    Capabilities, Host, ImageSupport, NativeImages, Platform, TerminalKind, TerminalProfile,
+    Version,
 };
 
 /// tmux gained synchronized output (what the client's atomic frames need) in
@@ -21,12 +22,88 @@ use crate::terminal::profile::{
 /// redraws tear.
 const TMUX_FRAME_SYNC: Version = Version::new(3, 7, 0);
 
-/// The line a hosted pane gets in place of terminal advice: the layer above us
-/// owns the pane's screen model and forwards what it chooses, so the fix is to
-/// run the client in a terminal directly rather than to pick a different
-/// terminal underneath the host.
-pub(crate) const HOSTED_PANE_SENTENCE: &str =
-    "run choreo-tui directly in your terminal for full functionality";
+/// The terminals this platform offers, as their short user-facing names, in
+/// recommendation order. Kept beside [`recommendations`] so the two lists can
+/// never disagree about which terminals a platform has.
+const MACOS_TERMINALS: &[(TerminalKind, &str)] = &[
+    (TerminalKind::Ghostty, "Ghostty"),
+    (TerminalKind::ItTerm, "iTerm2"),
+];
+const LINUX_TERMINALS: &[(TerminalKind, &str)] = &[
+    (TerminalKind::Ghostty, "Ghostty"),
+    (TerminalKind::Kitty, "kitty"),
+    (TerminalKind::WezTerm, "WezTerm"),
+];
+const WINDOWS_TERMINALS: &[(TerminalKind, &str)] = &[
+    (TerminalKind::WindowsTerminal, "Windows Terminal"),
+    (TerminalKind::WezTerm, "WezTerm"),
+];
+
+/// The terminals a platform offers, as `(kind, display name)` pairs.
+fn platform_terminals(platform: Platform) -> &'static [(TerminalKind, &'static str)] {
+    match platform {
+        Platform::MacOs => MACOS_TERMINALS,
+        Platform::Linux => LINUX_TERMINALS,
+        Platform::Windows => WINDOWS_TERMINALS,
+        Platform::Android => &[],
+    }
+}
+
+/// The terminals on `platform` that cost the client nothing: every feature its
+/// own advice tracks is *asserted* supported, so nothing is lost and nothing has
+/// to be configured.
+///
+/// A terminal whose image support is merely unverified is left out rather than
+/// promised (a Windows console drops the picker's query, so its images are not
+/// asserted even though it can draw them).
+pub(crate) fn full_support_terminals(platform: Platform) -> Vec<&'static str> {
+    platform_terminals(platform)
+        .iter()
+        .filter(|(kind, _)| loses_nothing(*kind, platform))
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// Whether `kind` asserts every feature the client's advice tracks.
+fn loses_nothing(kind: TerminalKind, platform: Platform) -> bool {
+    let profile = TerminalProfile {
+        name: kind,
+        version: None,
+        platform,
+        // The negotiated protocol is a runtime fact; the table's own answer is
+        // what a recommendation has to rest on.
+        images: ImageSupport::Halfblocks,
+        host: Host::Direct,
+        evidence: Vec::new(),
+    };
+    let capabilities = profile.capabilities();
+    capabilities.clipboard_write == Some(true)
+        && capabilities.synchronized_output == Some(true)
+        && capabilities.kitty_keyboard == Some(true)
+        && !matches!(
+            capabilities.images,
+            NativeImages::None | NativeImages::Unknown
+        )
+}
+
+/// The sentence a hosted pane gets in place of terminal advice.
+///
+/// The layer above us owns the pane's screen model and forwards what it
+/// chooses, so the fix is to run the client in a terminal directly — and only a
+/// terminal that costs the client nothing will do, so the platform's ones are
+/// named rather than left as "your terminal".
+pub(crate) fn hosted_pane_sentence(platform: Platform) -> String {
+    let full = full_support_terminals(platform);
+    if full.is_empty() {
+        // Nothing on this platform is verified to keep every feature, so the
+        // advice names none rather than promising one.
+        return "Run choreo-tui directly in a terminal for full functionality.".to_string();
+    }
+    format!(
+        "Run choreo-tui directly in a terminal that supports every feature: {}.",
+        join_phrases(&full)
+    )
+}
 
 /// The terminals worth recommending on `platform`, best first.
 ///
@@ -295,5 +372,47 @@ mod tests {
         assert_eq!(join_phrases(&["a"]), "a");
         assert_eq!(join_phrases(&["a", "b"]), "a and b");
         assert_eq!(join_phrases(&["a", "b", "c"]), "a, b, and c");
+    }
+
+    #[test]
+    fn full_support_terminals_are_the_platforms_flawless_ones() {
+        assert_eq!(
+            full_support_terminals(Platform::Linux),
+            vec!["Ghostty", "kitty", "WezTerm"]
+        );
+        assert_eq!(
+            full_support_terminals(Platform::MacOs),
+            vec!["Ghostty", "iTerm2"]
+        );
+        // A console's images are unverified (it drops the picker's query), so it
+        // is not promised; WezTerm is.
+        assert_eq!(full_support_terminals(Platform::Windows), vec!["WezTerm"]);
+        assert_eq!(
+            full_support_terminals(Platform::Android),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn the_hosted_sentence_names_terminals_in_sentence_case() {
+        assert_eq!(
+            hosted_pane_sentence(Platform::Linux),
+            "Run choreo-tui directly in a terminal that supports every feature: \
+             Ghostty, kitty, and WezTerm."
+        );
+        assert_eq!(
+            hosted_pane_sentence(Platform::MacOs),
+            "Run choreo-tui directly in a terminal that supports every feature: Ghostty and iTerm2."
+        );
+        assert_eq!(
+            hosted_pane_sentence(Platform::Windows),
+            "Run choreo-tui directly in a terminal that supports every feature: WezTerm."
+        );
+        // Nothing on Android is verified to keep every feature, so no terminal
+        // is named rather than promising one.
+        assert_eq!(
+            hosted_pane_sentence(Platform::Android),
+            "Run choreo-tui directly in a terminal for full functionality."
+        );
     }
 }

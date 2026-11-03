@@ -14,7 +14,7 @@
 //! exactly like `welcome_lines`.
 
 use crate::state::{
-    HOSTED_PANE_SENTENCE, PopupSize, centered_popup, gap_phrases, join_phrases, option_key_setting,
+    PopupSize, centered_popup, gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting,
     recommendations, tmux_lines,
 };
 use crate::terminal::profile::{
@@ -272,7 +272,10 @@ fn fix_lines(profile: &TerminalProfile) -> Vec<Line<'static>> {
     if matches!(profile.host, Host::Hosted(_)) {
         // A hosted pane has no terminal advice to give: the layer above owns
         // the pane's screen model, so saying so is the whole fix block.
-        lines.push(Line::from(Span::styled(HOSTED_PANE_SENTENCE, dim_style())));
+        lines.push(Line::from(Span::styled(
+            hosted_pane_sentence(profile.platform),
+            dim_style(),
+        )));
         any = true;
     }
     if !any {
@@ -539,7 +542,9 @@ mod tests {
             Platform::MacOs,
             Host::Hosted(HostedKind::Herdr),
         ));
-        assert!(out.contains("run choreo-tui directly in your terminal"));
+        // The sentence names the terminals that keep every feature, so it is the
+        // platform's list rather than an appeal to "your terminal".
+        assert!(out.contains("supports every feature: Ghostty and iTerm2."));
         // No macOS Option advice: the outer terminal cannot be identified, and
         // no tmux lines: the pane is not a multiplexer's.
         assert!(!out.contains("Option as Meta"));
@@ -587,7 +592,7 @@ mod tests {
         ));
         assert!(!out.contains("recommendations"));
         assert!(!out.contains("nothing this client uses is missing"));
-        assert!(out.contains(HOSTED_PANE_SENTENCE));
+        assert!(out.contains("supports every feature"));
     }
 
     #[test]
