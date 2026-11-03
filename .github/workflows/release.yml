@@ -824,7 +824,10 @@ jobs:
       - name: Build + smoke-test on FreeBSD
         uses: vmactions/freebsd-vm@v1
         with:
-          usesh: true
+          # 8 GB: the shipped `[profile.dist]` build is fat LTO +
+          # codegen-units = 1, which is memory-hungry at link time; the
+          # action's default VM is 6 GB.
+          mem: 8192
           # Native toolchain inside the VM. `bash` is REQUIRED: release.sh,
           # build-stable.sh and the smoke scripts are bash (arrays, [[ ]]) and
           # FreeBSD base ships only sh/csh. `zig` is zlob's build dependency;
