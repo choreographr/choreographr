@@ -169,27 +169,22 @@ pub(super) fn welcome_lines(
     lines
 }
 
-/// The number of terminal rows `line` occupies when wrapped at `width` columns.
+/// The terminal rows `lines` occupy when drawn in the panel's wrapping
+/// `Paragraph` at `width` columns.
 ///
 /// The panel is drawn with wrapping on, so one logical line can cost several
 /// rows. Budgeting by line count would under-count a long advice line and let
-/// the paragraph widget clip it mid-sentence — the exact failure the
-/// degradation below exists to avoid.
-fn line_rows(line: &Line<'_>, width: usize) -> usize {
-    if width == 0 {
-        return 1;
-    }
-    let columns = line.width();
-    if columns == 0 {
-        1
-    } else {
-        columns.div_ceil(width)
-    }
-}
-
-/// The rows `lines` occupy together when wrapped at `width` columns.
+/// the paragraph widget clip it mid-sentence — the exact failure the degradation
+/// below exists to avoid. Measuring with the same wrapper the renderer uses
+/// ([`crate::state::wrapped_lines_rows`]) also stops a word-wrapped row from
+/// being under-charged by a `div_ceil` approximation.
 fn lines_rows(lines: &[Line<'_>], width: usize) -> usize {
-    lines.iter().map(|line| line_rows(line, width)).sum()
+    // Widths arrive as `usize::from(u16)` (the panel is at most `u16`-wide); the
+    // fallback only guards the impossible overflow and keeps the panel bounded.
+    let Ok(width) = u16::try_from(width) else {
+        return lines.len();
+    };
+    usize::from(crate::state::wrapped_lines_rows(lines, width))
 }
 
 /// Append as much of `notice` as the area has room for, after `reserved` rows

@@ -18,11 +18,16 @@ use super::super::{Line, LineJoin, Span, Style};
 use super::measure::{display_width, grapheme_width};
 
 /// Wrap `text` into plain, unstyled lines of at most `width` display columns.
+///
+/// A test-only convenience over [`plain_text_lines_joined`]: production paths that
+/// draw plain text need the aligned copy metadata, so they call the `_joined`
+/// variant directly.
+#[cfg(test)]
 pub(crate) fn plain_text_lines(text: &str, width: u16) -> Vec<Line<'static>> {
     plain_text_lines_joined(text, width).0
 }
 
-/// [`plain_text_lines`] plus the per-line [`LineJoin`] metadata the copy
+/// `plain_text_lines` plus the per-line [`LineJoin`] metadata the copy
 /// path needs to undo the wrapping (see the enum docs).
 ///
 /// Wrapped chunks of one original line are marked [`LineJoin::Join`]:

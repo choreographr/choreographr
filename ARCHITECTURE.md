@@ -3208,7 +3208,10 @@ headline alone, or nothing. Room is counted in **drawn rows**, not in line
 counts: every line is charged for the rows it wraps onto at the panel's width
 (the fixed checklist included), and the panel's own height is that same sum — a
 line count would size the panel too short for its own content on a narrow
-terminal.
+terminal. Both the budget and the height are measured with ratatui's own
+`Paragraph::line_count` (via `state::wrapped_lines_rows`), so the rows charged are
+exactly the rows the drawing paragraph renders; a `div_ceil` approximation could
+round a word-wrapped line short.
 
 ### Terminal page
 
@@ -3261,7 +3264,11 @@ wrapped height (clamped to the screen), so it never clips the last rows while th
 screen still has room; when the content exceeds the screen the guard's
 `Up`/`Down`/`PgUp`/`PgDn` drive `App::help_modal_scroll` and the renderer clamps
 that offset to the content. The same shared popup draws the Terminal page, so the
-two reference pages cannot drift in border, centering or sizing. Every command
+two reference pages cannot drift in border, centering or sizing. The same
+exact-measurement rule backs `state::wrapped_text_rows`/`state::wrapped_lines_rows`,
+which size the status/error bar and the welcome panel; pre-wrapped markdown and
+history content instead keeps the O(1) `div_ceil` row count, which is exact for
+lines already wrapped to the width. Every command
 chord it prints is read from the Chat page's single shortcut table via
 `state::shortcut_label_for`, so the page and dispatch cannot disagree about which
 key runs which command; only the non-`Alt+` chords (`Esc`, the readline `Ctrl+`

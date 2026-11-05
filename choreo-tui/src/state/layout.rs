@@ -16,7 +16,8 @@
 use super::input::grapheme_offset_at_column;
 use super::{AI_PROVIDER_ITEM_LINES, InputBuffer};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::widgets::{Block, Borders};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 /// Sizing parameters for [`centered_popup`]: width/height as fractions of the
 /// terminal size (numerators over denominators), floored at the minimums,
@@ -78,6 +79,47 @@ pub(crate) fn centered_popup(area: Rect, size: PopupSize) -> Rect {
             height,
         }
     }
+}
+
+/// Rows `text` occupies when drawn in a wrapping [`Paragraph`] at `width`
+/// columns — exactly the rows the renderer's `Paragraph::wrap` draws, embedded
+/// newlines and word-wrap included.
+///
+/// The status/error bar reserves its height with this so the rows it claims equal
+/// the rows the renderer actually draws. Measuring with a hand-rolled wrapper (or
+/// a `width.div_ceil(columns)` approximation) can round differently from
+/// ratatui's word wrapper and either clip the tail or leave a dead row. `0` for a
+/// zero width; empty text measures as the one empty line ratatui draws.
+pub(crate) fn wrapped_text_rows(text: &str, width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    // `line_count` is bounded by the text length; saturate rather than truncate
+    // if a pathological status message ever exceeded `u16::MAX` rows.
+    u16::try_from(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .line_count(width),
+    )
+    .unwrap_or(u16::MAX)
+}
+
+/// Rows `lines` occupy when drawn in a wrapping [`Paragraph`] at `width` columns.
+///
+/// The same exactness contract as [`wrapped_text_rows`], for pre-built lines (the
+/// welcome panel sizes its box from this so a wrapping advice line is budgeted for
+/// every row it draws). Clones the lines to measure; the callers run only on an
+/// empty session, so the copy is irrelevant.
+pub(crate) fn wrapped_lines_rows(lines: &[Line<'_>], width: u16) -> u16 {
+    if width == 0 {
+        return 0;
+    }
+    u16::try_from(
+        Paragraph::new(lines.to_vec())
+            .wrap(Wrap { trim: false })
+            .line_count(width),
+    )
+    .unwrap_or(u16::MAX)
 }
 
 /// The three vertical bands of the LIST-popup layout (shared by the wizard's
@@ -392,6 +434,31 @@ pub(crate) fn session_list_click_index(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapped_text_rows_matches_the_renderer_wrap() {
+        // Fits in one row.
+        assert_eq!(wrapped_text_rows("short", 80), 1);
+        // A single long unbroken word hard-splits: 25 columns at width 10.
+        assert_eq!(wrapped_text_rows(&"x".repeat(25), 10), 3);
+        // Embedded newlines are counted, one row each.
+        assert_eq!(wrapped_text_rows("a\nb\nc", 80), 3);
+        // Zero width draws nothing; empty text is the one empty line ratatui draws.
+        assert_eq!(wrapped_text_rows("anything", 0), 0);
+        assert_eq!(wrapped_text_rows("", 80), 1);
+    }
+
+    #[test]
+    fn wrapped_lines_rows_matches_the_renderer_wrap() {
+        let lines = vec![
+            Line::from("short"),
+            Line::from(""),
+            Line::from("y".repeat(30)),
+        ];
+        // Two single rows (one empty) plus a 30-column word at width 10 → 3 rows.
+        assert_eq!(wrapped_lines_rows(&lines, 10), 1 + 1 + 3);
+        assert_eq!(wrapped_lines_rows(&lines, 0), 0);
+    }
 
     /// A hand-built layout for the row-mapping tests (geometry-only, so the
     /// numbers are picked for clarity rather than derived from a popup).

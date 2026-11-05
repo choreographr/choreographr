@@ -18,7 +18,6 @@ use choreo_proto::{ReasoningCapability, SessionStatus, TokenUsage, socket_path};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::collections::{HashMap, HashSet};
 
-use crate::markdown_render::{lines_height, plain_text_lines};
 use crate::text_filter::normalize_display_text;
 
 mod command_palette;
@@ -722,9 +721,6 @@ impl App {
     /// Number of lines needed for the status/error bar, based on the current
     /// message content and the available terminal width.  Returns 0 when there
     /// is no message to display.
-    // Line counts are bounded by the u16 terminal width, so the usize→u16
-    // cast cannot truncate in practice.
-    #[expect(clippy::cast_possible_truncation)]
     pub(crate) fn status_error_height(&self, width: u16) -> u16 {
         // Read through the accessors, which return the stored (already
         // normalized) text.  Because normalization happens at ingest
@@ -741,13 +737,13 @@ impl App {
             return 0;
         };
         // The status/error Paragraph is drawn inset by one column on each side
-        // (render.rs `notify_area`), so it wraps at `width - 2` columns.
-        // Measure at that same inner width, or a long message's reserved
-        // height can fall short of the rows ratatui actually draws and the
-        // tail gets clipped by the layout.
+        // (render.rs `notify_area`), so it wraps at `width - 2` columns. Measure
+        // at that same inner width with the SAME wrapper the renderer uses
+        // (`Paragraph::wrap`), so the reserved height equals the rows ratatui
+        // actually draws — a hand-rolled wrapper can round differently and clip
+        // the tail.
         let inner = width.saturating_sub(2);
-        let lines = plain_text_lines(text, inner);
-        lines_height(&lines, inner).max(1) as u16
+        wrapped_text_rows(text, inner).max(1)
     }
 
     /// Number of visual content lines the input box currently occupies,
