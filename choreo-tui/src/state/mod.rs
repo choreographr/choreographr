@@ -397,6 +397,11 @@ pub(crate) struct App {
     /// chord in the `handle_terminal_event` overlay guard. Defaults closed — a
     /// modal covering the transcript on every session attach would be noise.
     pub(crate) show_help_modal: bool,
+    /// Scroll offset (in rows) of the Help modal's body. The page is taller than
+    /// most terminals, so the overlay guard's `Up`/`Down`/`PgUp`/`PgDn` drive
+    /// this and the renderer clamps it to the content. Reset to 0 when the modal
+    /// opens so it always starts at the top.
+    pub(crate) help_modal_scroll: u16,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) model_selector: ModelSelectorState,
@@ -540,6 +545,7 @@ impl App {
             keystore_auto_bind: choreo_client_core::KeystoreAutoBind::new(),
             page: Page::Chat,
             show_help_modal: false,
+            help_modal_scroll: 0,
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),

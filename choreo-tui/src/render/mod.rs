@@ -111,13 +111,32 @@ mod history;
 mod image;
 mod login;
 mod model_selector;
+mod popup;
 mod session_manager;
 mod status;
+mod style;
 mod terminal_help;
 mod welcome;
 
 #[cfg(test)]
 mod tests;
+
+/// Join every line of a rendered page into one newline-separated string, for
+/// substring assertions in the reference-page unit tests (the Terminal page and
+/// the Help modal both build a `Vec<Line>` and assert on its text this way).
+#[cfg(test)]
+pub(crate) fn lines_as_text(lines: &[Line<'static>]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 use self::ai_providers::render_ai_providers;
 use self::command_palette::render_command_palette;
@@ -213,9 +232,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     // The Help modal (Alt+H / `/help`) is another read-only overlay over the
     // Chat page, drawing beside the Terminal page it mirrors; `handle_terminal_event`
-    // swallows input while it is open, so nothing reaches the composer beneath.
+    // swallows input while it is open (its scroll keys included), so nothing
+    // reaches the composer beneath.
     if app.show_help_modal {
-        render_help(frame);
+        render_help(frame, app);
     }
 
     // The OAuth login modal is the topmost overlay: it covers whatever page is

@@ -132,3 +132,55 @@ fn the_mouse_is_inert_over_the_modal() {
     assert!(app.text_selection.is_none(), "no row is clickable");
     assert!(app.show_help_modal, "a click never closes the modal");
 }
+
+#[test]
+fn arrows_and_page_keys_scroll_the_modal_body() {
+    // The page is taller than most terminals, so the overlay guard scrolls it.
+    // The offset is stored raw here and clamped to the content at draw time, so
+    // the guard can overshoot harmlessly.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    key(&mut app, &tx, alt_char('h'));
+    assert_eq!(app.help_modal_scroll, 0, "opens at the top");
+
+    let arrow = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    key(&mut app, &tx, arrow(KeyCode::Down));
+    assert_eq!(app.help_modal_scroll, 1, "Down scrolls one row");
+    key(&mut app, &tx, arrow(KeyCode::PageDown));
+    assert_eq!(app.help_modal_scroll, 11, "PageDown scrolls a page");
+    key(&mut app, &tx, arrow(KeyCode::Up));
+    assert_eq!(app.help_modal_scroll, 10, "Up scrolls back one row");
+    key(&mut app, &tx, arrow(KeyCode::PageUp));
+    assert_eq!(app.help_modal_scroll, 0, "PageUp scrolls back a page");
+    // Already at the top: PageUp/Up saturate rather than wrap.
+    key(&mut app, &tx, arrow(KeyCode::Up));
+    key(&mut app, &tx, arrow(KeyCode::PageUp));
+    assert_eq!(app.help_modal_scroll, 0, "scrolling up saturates at 0");
+    assert!(app.show_help_modal, "scrolling never closes the modal");
+}
+
+#[test]
+fn reopening_the_modal_resets_the_scroll() {
+    // A closed-then-reopened modal must start at the top rather than resume a
+    // stale offset from a taller terminal or a previous reading position.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    key(&mut app, &tx, alt_char('h'));
+    key(
+        &mut app,
+        &tx,
+        Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+    );
+    assert!(app.help_modal_scroll > 0);
+
+    key(
+        &mut app,
+        &tx,
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+    assert!(!app.show_help_modal, "Esc closes the modal");
+
+    key(&mut app, &tx, alt_char('h'));
+    assert!(app.show_help_modal, "Alt+H reopens it");
+    assert_eq!(app.help_modal_scroll, 0, "reopening resets the scroll");
+}

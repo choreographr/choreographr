@@ -1,10 +1,14 @@
 //! The Help modal: a read-only overlay listing the keyboard shortcuts.
 //!
 //! Opened with `Alt+H` or `/help` (`App::show_help_modal`), drawn over the Chat
-//! page with the same centered `LIST` popup and bordered block as the Terminal
-//! page and the model selector, and closed by `Esc` or the same chord in
-//! `handle_terminal_event`'s overlay guard, which swallows every other key so
-//! nothing reaches the composer underneath.
+//! page with the shared reference-popup chrome (`render/popup.rs`) and closed by
+//! `Esc` or the same chord in `handle_terminal_event`'s overlay guard, which
+//! swallows every other key so nothing reaches the composer underneath.
+//!
+//! The page is a fixed reference, taller than most terminals, so its popup is
+//! **content-fitted and scrollable**: the shared popup measures the wrapped text
+//! and grows to it (clamped to the screen), and the overlay guard drives
+//! `App::help_modal_scroll` with `Up`/`Down`/`PgUp`/`PgDn` when it overflows.
 //!
 //! The command chords are read from the shortcut table via
 //! [`crate::state::shortcut_label_for`] (the single source of truth shared with
@@ -16,33 +20,24 @@
 //! The line builder ([`help_lines`]) is a pure function, so the whole page is
 //! unit-testable without a terminal, exactly like `terminal_page_lines`.
 
-use crate::state::{PopupSize, centered_popup, shortcut_label_for};
+use super::popup::render_reference_popup;
+use super::style::{dim_style, heading_style};
+use crate::state::{App, PopupSize, shortcut_label_for};
 use ratatui::{
     Frame,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 /// Column the shortcut labels are padded to so every description lines up: wide
 /// enough for the longest literal chord (`Ctrl+A / Ctrl+E`) plus a two-space gap.
 const LABEL_WIDTH: usize = 18;
 
-/// A section heading inside the page.
-fn heading_style() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
-}
-
-/// A key chord, so every shortcut reads as a key rather than prose.
+/// A key chord, so every shortcut reads as a key rather than prose. Yellow here
+/// (the reference-page style module keeps only the styles its users share; the
+/// welcome panel paints its chords cyan).
 fn key_style() -> Style {
     Style::default().fg(Color::Yellow)
-}
-
-/// Secondary prose: the explanatory note under the command row.
-fn dim_style() -> Style {
-    Style::default().fg(Color::DarkGray)
 }
 
 /// The display label for a command from the shortcut table — the same string the
@@ -121,45 +116,26 @@ pub(super) fn help_lines() -> Vec<Line<'static>> {
     lines
 }
 
-/// Draw the Help modal centered over the Chat page.
-pub(super) fn render_help(frame: &mut Frame<'_>) {
-    let popup = centered_popup(frame.area(), PopupSize::LIST);
-    // Erase the region beneath so the page reads as a solid overlay rather than
-    // text drawn on top of the chat history (same as the Terminal page).
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(" Help ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    // Wrapped, because the explanatory line is longer than the popup on a narrow
-    // terminal; the page has no scrollable body, so it clips at the bottom when
-    // the area is too short for it — the content is ordered so the most-used
-    // sections come first.
-    frame.render_widget(
-        Paragraph::new(help_lines()).wrap(Wrap { trim: false }),
-        inner,
+/// Draw the Help modal centered over the Chat page, sized to its content and
+/// scrolled by the overlay guard's `App::help_modal_scroll`.
+pub(super) fn render_help(frame: &mut Frame<'_>, app: &mut App) {
+    render_reference_popup(
+        frame,
+        "Help",
+        PopupSize::LIST,
+        help_lines(),
+        &mut app.help_modal_scroll,
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::lines_as_text;
 
     /// Every line of the page, newline-joined, for substring assertions.
     fn text() -> String {
-        help_lines()
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        lines_as_text(&help_lines())
     }
 
     #[test]
@@ -206,5 +182,28 @@ mod tests {
         assert!(out.contains("Shift+Enter"));
         assert!(out.contains("browse slash commands"));
         assert!(out.contains("Tab completes"));
+    }
+
+    #[test]
+    fn every_row_label_fits_the_description_column() {
+        // `row` pads the label to `LABEL_WIDTH`; a longer label would silently
+        // push its description out of alignment rather than failing anywhere.
+        // Each `row` line is exactly two spans whose first is the two-space
+        // indent plus the padded label — its width is `2 + LABEL_WIDTH` — while
+        // the single note line's first span is the bare two-space indent, and
+        // headings/closing hint are single-span lines. So a first span wider
+        // than the fixed column means a label overflowed it.
+        for line in help_lines() {
+            if let [first, _] = line.spans.as_slice() {
+                let label_field = first.content.as_ref();
+                if label_field.len() > 2 {
+                    assert_eq!(
+                        label_field.chars().count(),
+                        2 + LABEL_WIDTH,
+                        "row label overflows the {LABEL_WIDTH}-column field: {label_field:?}"
+                    );
+                }
+            }
+        }
     }
 }

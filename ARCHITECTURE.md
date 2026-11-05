@@ -3219,8 +3219,9 @@ Chat page's shortcut table (so the key and its typed spelling run one command,
 as every other `Alt+` binding does) and closed by `Esc` or the same chord in the
 modifier guard `handle_terminal_event` applies before page dispatch, which also
 swallows every other key so nothing reaches the composer underneath. The
-renderer (`render/terminal_help.rs`) is another `centered_popup(PopupSize::LIST)`
-block drawn over the Chat page, and its content is built by the pure
+renderer (`render/terminal_help.rs`) draws over the Chat page through the same
+content-fitted reference-popup chrome as the Help modal (`render/popup.rs`), and
+its content is built by the pure
 `terminal_page_lines(&TerminalProfile)`: an identity line (terminal, version,
 platform, negotiated image protocol, host layer), the seven-row capability
 checklist rendered in the table's own three states — an unasserted capability
@@ -3250,15 +3251,23 @@ spelling run one command, as every other `Alt+` binding does) and closed by
 before page dispatch, which also swallows every other key so nothing reaches the
 composer underneath. It defaults **closed** — a modal over the transcript on
 every session attach would be noise; the welcome panel carries the `alt+h`
-discovery hint instead. The renderer (`render/help.rs`) is another
-`centered_popup(PopupSize::LIST)` block drawn over the Chat page, its content
-built by the pure `help_lines()`: turn-control, navigation/settings, editing and
-slash-command rows. Every command chord it prints is read from the Chat page's
-single shortcut table via `state::shortcut_label_for`, so the page and dispatch
-cannot disagree about which key runs which command; only the non-`Alt+` chords
-(`Esc`, the readline `Ctrl+` editing keys) are spelled out locally, because they
-are not in the table. The modal and the Terminal page are mutually exclusive:
-opening either closes the other.
+discovery hint instead. The renderer (`render/help.rs`) draws over the Chat page
+through the shared reference-popup chrome (`render/popup.rs`), its content built
+by the pure `help_lines()`: turn-control, navigation/settings, editing and
+slash-command rows. Because a shortcut reference is taller than most terminals,
+the popup is **content-fitted and scrollable**: `render_reference_popup` measures
+the wrapped `Paragraph` with ratatui's own `line_count` and grows the popup to the
+wrapped height (clamped to the screen), so it never clips the last rows while the
+screen still has room; when the content exceeds the screen the guard's
+`Up`/`Down`/`PgUp`/`PgDn` drive `App::help_modal_scroll` and the renderer clamps
+that offset to the content. The same shared popup draws the Terminal page, so the
+two reference pages cannot drift in border, centering or sizing. Every command
+chord it prints is read from the Chat page's single shortcut table via
+`state::shortcut_label_for`, so the page and dispatch cannot disagree about which
+key runs which command; only the non-`Alt+` chords (`Esc`, the readline `Ctrl+`
+editing keys) are spelled out locally, because they are not in the table. The
+modal and the Terminal page are mutually exclusive: opening either closes the
+other.
 
 ### Hosted panes: reporting status to the workspace manager
 

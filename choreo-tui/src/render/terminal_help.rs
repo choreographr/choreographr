@@ -13,8 +13,10 @@
 //! `&TerminalProfile`, so the whole page is unit-testable without a terminal,
 //! exactly like `welcome_lines`.
 
+use super::popup::render_reference_popup;
+use super::style::{dim_style, heading_style};
 use crate::state::{
-    PopupSize, centered_popup, gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting,
+    PopupSize, gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting,
     recommendations, screen_sentence, tmux_lines,
 };
 use crate::terminal::profile::{
@@ -22,26 +24,13 @@ use crate::terminal::profile::{
 };
 use ratatui::{
     Frame,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
 /// Column the capability labels are padded to so every verdict lines up: the
 /// longest label plus a two-space gap.
 const LABEL_WIDTH: usize = 34;
-
-/// A section heading inside the page.
-fn heading_style() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Secondary prose: explanations and hints.
-fn dim_style() -> Style {
-    Style::default().fg(Color::DarkGray)
-}
 
 /// A capability the terminal is known to support.
 fn supported_style() -> Style {
@@ -334,25 +323,18 @@ pub(super) fn terminal_page_lines(profile: &TerminalProfile) -> Vec<Line<'static
     lines
 }
 
-/// Draw the Terminal page centered over the Chat page.
+/// Draw the Terminal page centered over the Chat page, sized to its content.
 pub(super) fn render_terminal_help(frame: &mut Frame<'_>, app: &crate::state::App) {
-    let popup = centered_popup(frame.area(), PopupSize::LIST);
-    // Erase the region beneath so the page reads as a solid overlay rather
-    // than text drawn on top of the chat history (same as the model selector).
-    frame.render_widget(Clear, popup);
-
-    let block = Block::default()
-        .title(" Terminal ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    // Wrapped, because a recommendation or a settings line is longer than the
-    // popup on a narrow terminal; the page has no scrollable body, so it
-    // simply clips at the bottom when the area is too short for it.
-    frame.render_widget(
-        Paragraph::new(terminal_page_lines(&app.terminal)).wrap(Wrap { trim: false }),
-        inner,
+    // The Terminal page does not scroll: the overlay guard only closes it, and
+    // its content is short. A local offset lets the shared popup content-fit the
+    // page without adding scroll state the guard never drives.
+    let mut scroll = 0u16;
+    render_reference_popup(
+        frame,
+        "Terminal",
+        PopupSize::LIST,
+        terminal_page_lines(&app.terminal),
+        &mut scroll,
     );
 }
 
@@ -375,16 +357,7 @@ mod tests {
 
     /// Every line of the page, newline-joined, for substring assertions.
     fn text(profile: &TerminalProfile) -> String {
-        terminal_page_lines(profile)
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        crate::render::lines_as_text(&terminal_page_lines(profile))
     }
 
     #[test]

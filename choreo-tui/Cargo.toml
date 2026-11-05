@@ -23,7 +23,11 @@ clap.workspace = true
 crossterm = "0.29"
 image.workspace = true
 serde.workspace = true
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, the only exact
+# way to measure a wrapped paragraph's rendered row count. The reference popups
+# (Terminal page, Help modal) size themselves to their content, and measuring
+# with anything other than ratatui's own wrapper would risk a one-row clip.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 signal-hook.workspace = true
 resvg.workspace = true

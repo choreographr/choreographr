@@ -579,6 +579,7 @@ pub(super) fn run_command(
             // closes it on Esc / Alt+H, so the chord toggles like `/terminal`.
             tracing::debug!("[choreo-tui] dispatching /help (open the Help modal)");
             app.show_terminal_page = false;
+            app.help_modal_scroll = 0;
             app.show_help_modal = true;
         }
     }

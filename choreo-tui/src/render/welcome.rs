@@ -11,6 +11,7 @@
 //! degraded explicitly when the area is too short for it — see
 //! [`append_notice`].
 
+use super::style::{dim_style, heading_style};
 use crate::state::{App, TerminalNotice};
 use choreo_client_core::SetupProgress;
 use ratatui::{
@@ -34,18 +35,6 @@ struct Step {
     label: &'static str,
     keys: &'static str,
     done: bool,
-}
-
-/// The panel's title style.
-fn title_style() -> Style {
-    Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD)
-}
-
-/// Secondary prose: unfinished steps and explanatory lines.
-fn dim_style() -> Style {
-    Style::default().fg(Color::DarkGray)
 }
 
 /// A step that is already done.
@@ -113,7 +102,7 @@ pub(super) fn welcome_lines(
     max_height: u16,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(Span::styled("Welcome to Choreographr", title_style())),
+        Line::from(Span::styled("Welcome to Choreographr", heading_style())),
         Line::default(),
     ];
 
