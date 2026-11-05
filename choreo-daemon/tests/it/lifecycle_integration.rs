@@ -29,8 +29,17 @@ fn remove_stale_socket_refuses_live_listener() {
     let acl = choreo_daemon::server::acl::SharedAcl::load(std::path::Path::new("/nonexistent"));
     let socket_str = path.to_str().expect("valid socket path").to_string();
 
-    let err = run_server(&socket_str, state, None, None, transport_sk, &acl, false)
-        .expect_err("run_server over a live socket must fail");
+    let err = run_server(
+        &socket_str,
+        state,
+        None,
+        None,
+        transport_sk,
+        &acl,
+        false,
+        None,
+    )
+    .expect_err("run_server over a live socket must fail");
     let msg = err.to_string();
     assert!(
         msg.contains("already listening") && msg.contains("live.sock"),
@@ -59,7 +68,16 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
 
     // Run the server in a background thread.
     let handle = thread::spawn(move || {
-        run_server(&socket_str, state, None, None, transport_sk, &acl, false)
+        run_server(
+            &socket_str,
+            state,
+            None,
+            None,
+            transport_sk,
+            &acl,
+            false,
+            None,
+        )
     });
 
     // Wait for the socket to appear (server is ready).

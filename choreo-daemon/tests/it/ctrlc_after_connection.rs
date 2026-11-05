@@ -177,11 +177,17 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
             ))
             .expect("send create session");
         // Wait for the create reply (it follows the direct-reply path), so
-        // the session thread is up before the client goes away.
+        // the session thread is up before the client goes away. A short
+        // per-iteration timeout keeps the loop responsive to the deadline, but a
+        // timeout only means "no message yet" — under full-suite load the reply
+        // can take longer than one slice, so keep waiting until the deadline
+        // rather than stopping at the first empty read. Only a closed channel
+        // (the connection thread has exited) means no reply can ever arrive.
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut created = false;
         while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(100)) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(remaining.min(Duration::from_millis(100))) {
                 Ok(msg)
                     if matches!(
                         msg.inner,
@@ -195,7 +201,8 @@ fn sigint_exits_after_create_session_connect_and_disconnect() {
                     break;
                 }
                 Ok(_) => {}
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         assert!(created, "session was never created");

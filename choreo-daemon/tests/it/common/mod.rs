@@ -29,7 +29,7 @@ use choreo_daemon::{DaemonState, run_server};
 use choreo_keystore::ServiceCredential;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -269,10 +269,10 @@ impl SpawnedDaemon {
         panic!("failed to start test daemon after {START_ATTEMPTS} attempts");
     }
 
-    /// One attempt at starting a daemon, or `None` when `run_server` exits
-    /// early while waiting for readiness — the ephemeral-port re-bind race
-    /// under parallel load — so [`Self::start_with_state`] can retry with a
-    /// fresh tempdir/port/socket/state (and, via `build`, a fresh keepalive).
+    /// One attempt at starting a daemon, or `None` when `run_server` fails to
+    /// bind and report its TCP port (a Unix-socket or state error, or an
+    /// unlikely bind failure) — so [`Self::start_with_state`] can retry with a
+    /// fresh tempdir/socket/state (and, via `build`, a fresh keepalive).
     fn try_start(
         state: DaemonState,
         keepalive: Vec<Box<dyn std::any::Any + Send>>,
@@ -308,17 +308,22 @@ impl SpawnedDaemon {
         std::fs::write(&acl_path, acl_toml).expect("write ACL file");
         let acl = SharedAcl::load(&acl_path);
 
-        // Reserve a free TCP port: bind :0, read the kernel-assigned port,
-        // then drop the probe listener so `run_server` can bind it. There
-        // is an inherent race where another process grabs the port in
-        // between — exactly what the retry loop recovers from, because
-        // `run_server` fails fast on the bind error and exits early.
-        let tcp_addr: SocketAddr = {
-            let probe = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
-            let port = probe.local_addr().expect("local_addr").port();
-            SocketAddr::from(([127, 0, 0, 1], port))
-        };
-        let tcp_addr_str = tcp_addr.to_string();
+        // Ask `run_server` to bind an OS-assigned loopback port and report the
+        // address it ACTUALLY bound. Pre-binding a `:0` probe, reading its
+        // port, and dropping it for `run_server` to re-bind leaves a window
+        // where another test process steals that exact ephemeral port: our
+        // `run_server` then fails to bind and exits, yet a readiness
+        // `TcpStream::connect` would SUCCEED against the thief's listener,
+        // handing back a daemon whose own accept loop never started (a Noise
+        // handshake against the wrong server then fails fast, or a client's
+        // `send` panics on the dead channel). Reporting the bound port removes
+        // the window: the address we connect to is unambiguously this process's
+        // listener.
+        let tcp_addr_str = "127.0.0.1:0".to_string();
+        // Carries the bound TCP address; disconnects if `run_server` returns
+        // before binding (a Unix-socket or state error), which the readiness
+        // wait treats as "retry".
+        let (tcp_bound_tx, tcp_bound_rx) = crossbeam_channel::bounded::<SocketAddr>(1);
 
         let mut handle: Option<thread::JoinHandle<std::io::Result<()>>> =
             Some(thread::spawn(move || {
@@ -330,21 +335,44 @@ impl SpawnedDaemon {
                     transport_sk,
                     &acl,
                     false,
+                    Some(tcp_bound_tx),
                 )
             }));
 
-        // Readiness, bounded: first the Unix socket file (created by the
-        // bind inside `run_server`), then a TCP connect probe. A stuck
-        // daemon panics the test with a clear message instead of hanging.
+        // Readiness, bounded: first the Unix socket file (created by the bind
+        // inside `run_server`), then the TCP address it reports it bound, then
+        // a connect probe to that address. A stuck daemon fails the test with a
+        // clear message instead of hanging; one that exits before reporting
+        // signals a retry.
         wait_until("daemon Unix socket", || socket_path.exists());
 
-        // TCP readiness loop that ALSO watches for early server exit: if
-        // the socket file appeared but the server thread has already
-        // finished, `run_server` died before serving — the port-steal
-        // bind failure — so reclaim the JoinHandle result and signal the
-        // caller to retry. `handle` is an Option so the finished branch can
-        // `take()` it (join consumes) while the success branch still owns it
-        // for the daemon struct.
+        // The address the server actually bound. If `run_server` returns before
+        // reporting it (a Unix-socket or state error), the sender drops and this
+        // errors — treat it as an early exit and retry.
+        let tcp_addr = match tcp_bound_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(addr) => addr,
+            Err(err) => {
+                let result = handle
+                    .take()
+                    .expect("server thread must be present")
+                    .join()
+                    .expect("server thread panicked");
+                tracing::warn!(
+                    attempt,
+                    ?result,
+                    ?err,
+                    "daemon exited before reporting its TCP port — retrying start"
+                );
+                return None;
+            }
+        };
+
+        // Confirm the reported listener accepts, and keep watching for an early
+        // exit (bound successfully, then crashed before serving). `tcp_addr` is
+        // the address THIS process bound, so a successful connect is
+        // unambiguously our own server. `handle` is an Option so the finished
+        // branch can `take()` it (join consumes) while the success branch still
+        // owns it for the daemon struct.
         let deadline = Instant::now() + Duration::from_secs(5);
         let ready = loop {
             if handle

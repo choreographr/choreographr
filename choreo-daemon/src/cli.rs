@@ -742,6 +742,9 @@ pub fn main() -> anyhow::Result<()> {
         transport_sk,
         &acl,
         cli.auto_exit,
+        // The CLI binds a fixed, operator-chosen port, so it never needs the
+        // bound address reported back.
+        None,
     )
     .context("failed to run server")
 }

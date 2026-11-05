@@ -3798,7 +3798,13 @@ writes — the old lock-across-`write_all` code deadlocked this scenario
 **Test infrastructure:** Most tests use `UnixStream::pair()` for socket-less daemon↔client
 communication, and mock HTTP servers for API simulation; the end-to-end transport
 tests above instead bind real sockets (a temp Unix-socket path and an ephemeral
-TCP port via `SpawnedDaemon`).
+TCP port via `SpawnedDaemon`). `SpawnedDaemon` has `run_server` bind
+`127.0.0.1:0` itself and report the address it actually bound, so the harness
+connects to this process's own listener: pre-binding a `:0` probe, reading its
+port, and dropping it for `run_server` to re-bind would leave a window where
+another test process steals that port, and the readiness `TcpStream::connect`
+would then succeed against the thief's listener — handing back a daemon whose own
+accept loop never started.
 
 **One integration-test binary per crate.** A crate's integration suite lives in
 a single `tests/it/main.rs` target (one module per former `tests/foo.rs`).
@@ -3831,7 +3837,10 @@ process gets its own copy. Fixed network ports are *not* isolated by
 process-per-test, however: two test processes binding the same address conflict
 just as two threads would, and `#[serial]` cannot serialize across processes —
 prefer ephemeral ports (`TcpListener::bind("127.0.0.1:0")`) so tests never
-contend for a fixed address.
+contend for a fixed address. The `SpawnedDaemon` harness takes this to its
+race-free conclusion: it lets `run_server` bind the ephemeral port itself and
+reports the bound address back, so there is no probe-drop window for another
+process to grab the port between the probe and the real bind.
 
 **Coverage:** the `coverage` cargo alias runs exactly the `test-all` selection
 under cargo-llvm-cov (`just coverage` for a per-file table, `just coverage-lcov`

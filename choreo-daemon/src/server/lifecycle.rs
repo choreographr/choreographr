@@ -303,6 +303,11 @@ pub(crate) fn remove_stale_socket(socket_path: &str) -> io::Result<()> {
 ///
 /// Returns Err if the Unix socket path cannot be prepared/bound, the TCP
 /// or metrics listener cannot be bound, or a fatal accept error occurs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "server bootstrap takes its whole configuration as parameters; a \
+              parameter struct would churn every call site for no behavioral gain"
+)]
 pub fn run_server(
     socket_path: &str,
     state: DaemonState,
@@ -316,6 +321,14 @@ pub fn run_server(
     // in the connection-spawn closures below is skipped and behavior is
     // unchanged.
     auto_exit: bool,
+    // Reports the TCP address the listener ACTUALLY bound, once bound. When
+    // `tcp_addr` asks for an OS-assigned port (`127.0.0.1:0`) a caller cannot
+    // know the port up front, so this hands it back: the harness connects to
+    // the very listener this process owns instead of pre-binding and dropping
+    // a probe port and then re-binding it, which races another process for the
+    // port and can hand back a daemon whose own accept loop never started.
+    // `None` when the caller does not need it (the CLI binds a fixed port).
+    tcp_bound_tx: Option<crossbeam_channel::Sender<std::net::SocketAddr>>,
 ) -> io::Result<()> {
     // ── Signal-handler registration ────────────────────────────────────────
     // Register the SIGINT/SIGTERM handler SYNCHRONOUSLY here, on the
@@ -554,10 +567,19 @@ pub fn run_server(
                 format!("invalid --tcp-addr: {e}"),
             )
         })?;
-        tcp_accept_addr = Some(addr);
         let listener = TcpListener::bind(addr)
             .map_err(|e| io::Error::other(format!("failed to bind TCP listener on {addr}: {e}")))?;
-        info!("TCP (Noise IK) listening on {addr}");
+        // Use the listener's ACTUAL address: with an OS-assigned port (`:0`)
+        // it differs from `addr`, and the shutdown wake-probe below must dial
+        // the real one rather than port 0.
+        let bound = listener.local_addr()?;
+        tcp_accept_addr = Some(bound);
+        // Hand the bound address back so a caller that asked for `:0` can
+        // connect to this exact listener (see the parameter doc).
+        if let Some(tx) = tcp_bound_tx {
+            let _ = tx.send(bound);
+        }
+        info!("TCP (Noise IK) listening on {bound}");
 
         let daemon_tx = daemon_tx.clone();
         let acl = Arc::clone(acl);

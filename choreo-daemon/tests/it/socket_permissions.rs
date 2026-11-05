@@ -64,7 +64,16 @@ fn bound_socket_is_0600_inside_an_owner_only_directory() {
     let acl = choreo_daemon::server::acl::SharedAcl::load(&tmp.path().join("no-acl.toml"));
 
     let handle = thread::spawn(move || {
-        run_server(&socket_str, state, None, None, transport_sk, &acl, false)
+        run_server(
+            &socket_str,
+            state,
+            None,
+            None,
+            transport_sk,
+            &acl,
+            false,
+            None,
+        )
     });
 
     wait_for_mode(&socket_path, 0o600);
