@@ -128,23 +128,6 @@ pub(crate) fn input_inner_width(term_width: u16) -> usize {
     term_width.saturating_sub(INPUT_PAD * 2) as usize
 }
 
-/// The two-line keyboard-shortcut help overlay (toggled with `Alt+H`).
-///
-/// Every app command lives on an `Alt+` chord (see `state/keymap.rs`); the
-/// readline-style `Ctrl+<letter>` editing chords are advertised in the
-/// `README` rather than here so the overlay stays two short lines.
-///
-/// Both lines must fit a standard 80-column terminal (the overlay is drawn
-/// inside a one-column inset on each side, so they are kept a little narrower
-/// than that), which fixes how the entries are grouped: the turn-control and
-/// app-level chords go first, the settings/page chords second. `alt+up` and
-/// `alt+down` share one `undo/redo` entry because two separate entries would
-/// push the first line past the margin.
-pub(crate) const HELP_LINE1: &str =
-    "esc stop  alt+enter continue  alt+up/down undo/redo  alt+h help  alt+q quit";
-pub(crate) const HELP_LINE2: &str =
-    "alt+m model  alt+r reasoning  alt+t terminal  alt+a account  alt+s session";
-
 pub(crate) struct SessionDisplayState {
     pub(crate) view: SessionView,
     pub(crate) visible_turn_ids: Vec<u32>,
@@ -408,7 +391,12 @@ pub(crate) struct App {
     /// [`choreo_client_core::KeystoreAutoBind`]).
     pub(crate) keystore_auto_bind: choreo_client_core::KeystoreAutoBind,
     pub(crate) page: Page,
-    pub(crate) show_help_overlay: bool,
+    /// The Help modal (`Alt+H`, or `/help`): a read-only overlay listing the
+    /// keyboard shortcuts. A single flag, like `show_terminal_page`, toggled
+    /// from the Chat page's shortcut table and closed by `Esc` or the same
+    /// chord in the `handle_terminal_event` overlay guard. Defaults closed — a
+    /// modal covering the transcript on every session attach would be noise.
+    pub(crate) show_help_modal: bool,
     pub(crate) session_mgr: SessionManagerState,
     pub(crate) ai_providers: AIProvidersState,
     pub(crate) model_selector: ModelSelectorState,
@@ -551,7 +539,7 @@ impl App {
             // re-connecting means restarting the TUI with fresh state.
             keystore_auto_bind: choreo_client_core::KeystoreAutoBind::new(),
             page: Page::Chat,
-            show_help_overlay: true,
+            show_help_modal: false,
             session_mgr: SessionManagerState::new(),
             ai_providers: AIProvidersState::new(),
             model_selector: ModelSelectorState::new(),
@@ -784,26 +772,24 @@ impl App {
         self.input_bar_content_lines(term_width) + 2
     }
 
-    /// The five vertical chunks of the Chat page: history, status/error, help,
+    /// The four vertical chunks of the Chat page: history, status/error,
     /// command input box, status bar.
     ///
     /// Single source of truth for the Chat page's vertical layout —
     /// `render_chat` draws into these chunks, `input_box_rect` hit-tests clicks
-    /// against chunk 3, and `update_viewport_from_terminal_size` sizes the
+    /// against chunk 2, and `update_viewport_from_terminal_size` sizes the
     /// history viewport from chunk 0.  Every consumer runs the *identical*
     /// `Layout::split`, so they can never drift apart — including on terminals
     /// too small for the fixed chrome to fit, where the solver shrinks and
     /// relocates chunks rather than honouring every `Length`.
-    pub(crate) fn chat_page_layout(&mut self, term_width: u16, term_height: u16) -> [Rect; 5] {
+    pub(crate) fn chat_page_layout(&mut self, term_width: u16, term_height: u16) -> [Rect; 4] {
         let status_error_height = self.status_error_height(term_width);
-        let help_height = if self.show_help_overlay { 2u16 } else { 0u16 };
         let input_height = self.input_bar_height(term_width);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(1),
                 Constraint::Length(status_error_height),
-                Constraint::Length(help_height),
                 Constraint::Length(input_height),
                 Constraint::Length(STATUS_BAR_HEIGHT),
             ])
@@ -813,15 +799,14 @@ impl App {
                 width: term_width,
                 height: term_height,
             });
-        // Layout::vertical([Min(1), Length(_), Length(_), Length(_),
-        // Length(_)]) always yields exactly 5 chunks; a zero-area fallback
-        // makes mouse hit-tests no-ops (nothing to click on).
+        // Layout::vertical([Min(1), Length(_), Length(_), Length(_)]) always
+        // yields exactly 4 chunks; a zero-area fallback makes mouse hit-tests
+        // no-ops (nothing to click on).
         [
             chunks.first().copied().unwrap_or_default(),
             chunks.get(1).copied().unwrap_or_default(),
             chunks.get(2).copied().unwrap_or_default(),
             chunks.get(3).copied().unwrap_or_default(),
-            chunks.get(4).copied().unwrap_or_default(),
         ]
     }
 
@@ -833,7 +818,7 @@ impl App {
     /// even on tiny terminals where the layout solver shrinks the box rather
     /// than placing it at a fixed distance above the status bar.
     pub(crate) fn input_box_rect(&mut self, term_width: u16, term_height: u16) -> Rect {
-        self.chat_page_layout(term_width, term_height)[3]
+        self.chat_page_layout(term_width, term_height)[2]
     }
 
     /// Client-side submit-time guard shared by every action that begins a NEW
@@ -929,29 +914,6 @@ impl App {
         self.text_selection = None;
         if let Some(d) = self.active_display() {
             d.progress_dirty = true;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{HELP_LINE1, HELP_LINE2};
-
-    /// The widest line the help overlay may draw: the two-line block is a
-    /// fixed-size affordance under the composer, so it has to read on a
-    /// standard 80-column terminal without wrapping or clipping.
-    const MAX_HELP_WIDTH: usize = 80;
-
-    #[test]
-    fn help_lines_fit_the_margin() {
-        // Both lines are plain ASCII, so `chars().count()` IS the column count —
-        // no Unicode-width machinery needed for this assertion.
-        for line in [HELP_LINE1, HELP_LINE2] {
-            let width = line.chars().count();
-            assert!(
-                width <= MAX_HELP_WIDTH,
-                "help line is {width} columns wide, over the {MAX_HELP_WIDTH}-column margin: {line:?}"
-            );
         }
     }
 }

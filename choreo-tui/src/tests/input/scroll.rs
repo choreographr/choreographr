@@ -57,10 +57,10 @@ fn input_box_rect_sits_directly_above_status_bar() {
 }
 
 #[test]
-fn input_box_rect_unaffected_by_status_and_help_rows() {
+fn input_box_rect_unaffected_by_status_row() {
     // The input box is anchored to the status bar at the bottom of the
-    // screen; a status message or the help overlay above it must not shift
-    // its position (only the history area shrinks).
+    // screen; a status message above it must not shift its position (only the
+    // history area shrinks).
     let mut app = test_app();
     app.last_terminal_size = Some((80, 30));
     app.input.text = "hello".to_string();
@@ -85,13 +85,11 @@ fn input_box_rect_matches_renderer_layout() {
     app.update_viewport_from_terminal_size();
 
     let status_error_height = app.status_error_height(80);
-    let help_height = if app.show_help_overlay { 2u16 } else { 0u16 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(status_error_height),
-            Constraint::Length(help_height),
             Constraint::Length(app.input_bar_height(80)),
             Constraint::Length(STATUS_BAR_HEIGHT),
         ])
@@ -102,13 +100,13 @@ fn input_box_rect_matches_renderer_layout() {
             height: 30,
         });
 
-    assert_eq!(app.input_box_rect(80, 30), chunks[3]);
+    assert_eq!(app.input_box_rect(80, 30), chunks[2]);
 }
 
 #[test]
 fn input_box_rect_matches_renderer_layout_in_overflow() {
-    // A terminal too small for the fixed chrome (help + input + status bar)
-    // to fit: the layout solver shrinks the input box instead of placing it
+    // A terminal too small for the fixed chrome (input + status bar) to fit:
+    // the layout solver shrinks the input box instead of placing it
     // at a fixed distance above the status bar.  Replicate render_chat's
     // layout verbatim and assert the hit-test rect agrees with the chunk the
     // renderer draws — the old bottom-anchored formula would report y=0 h=12.
@@ -121,13 +119,11 @@ fn input_box_rect_matches_renderer_layout_in_overflow() {
     app.update_viewport_from_terminal_size();
 
     let status_error_height = app.status_error_height(80);
-    let help_height = if app.show_help_overlay { 2u16 } else { 0u16 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
             Constraint::Length(status_error_height),
-            Constraint::Length(help_height),
             Constraint::Length(app.input_bar_height(80)),
             Constraint::Length(STATUS_BAR_HEIGHT),
         ])
@@ -138,7 +134,7 @@ fn input_box_rect_matches_renderer_layout_in_overflow() {
             height: 10,
         });
 
-    assert_eq!(app.input_box_rect(80, 10), chunks[3]);
+    assert_eq!(app.input_box_rect(80, 10), chunks[2]);
 }
 
 #[test]

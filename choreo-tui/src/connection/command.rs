@@ -570,7 +570,16 @@ pub(super) fn run_command(
             // the page is already open the terminal-event guard swallows the
             // chord and closes it, so the pair reads as a toggle.
             tracing::debug!("[choreo-tui] dispatching /terminal (open the Terminal page)");
+            app.show_help_modal = false;
             app.show_terminal_page = true;
+        }
+        Command::OpenHelp => {
+            // A read-only overlay over the Chat page. `Alt+H` reaches this same
+            // arm through the shortcut table, and the terminal-event guard
+            // closes it on Esc / Alt+H, so the chord toggles like `/terminal`.
+            tracing::debug!("[choreo-tui] dispatching /help (open the Help modal)");
+            app.show_terminal_page = false;
+            app.show_help_modal = true;
         }
     }
     Ok(())

@@ -3,7 +3,7 @@
 //! model) that ticks itself off as the daemon confirms each step, followed by
 //! a "ready" line once nothing is left. It is the first thing a new user sees,
 //! so it names the exact keys for each step rather than leaving them to find
-//! `/account` or the help overlay on their own.
+//! `/account` or the help modal on their own.
 //!
 //! When the terminal or its host layer costs this client a feature it uses,
 //! the panel also carries the advice derived in `state/onboarding.rs`. That

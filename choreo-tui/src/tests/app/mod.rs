@@ -3,13 +3,15 @@
 //! `text_layout` covers history-text measurement and markdown rendering;
 //! `terminal_events` covers the basic key-to-input path and prompt submission;
 //! `terminal_page` covers the read-only Terminal page's open/close keys and its
-//! input swallowing; `prompt_gating` pins the rule that a prompt is only accepted while the
+//! input swallowing; `help_modal` covers the read-only Help modal the same way;
+//! `prompt_gating` pins the rule that a prompt is only accepted while the
 //! session is idle; `drafts` covers the per-session unsent-prompt hand-off plus
 //! the commands dispatched from a session's command line (`/refresh-models`,
 //! `/mcp`, catalog and credential handling); `palette` covers the inline
 //! command palette and unified command dispatch.
 
 mod drafts;
+mod help_modal;
 mod palette;
 mod prompt_gating;
 mod terminal_events;

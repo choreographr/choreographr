@@ -238,6 +238,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
         | Command::OpenAccounts
         | Command::OpenModelSelector
         | Command::OpenTerminalHelp
+        | Command::OpenHelp
         | Command::ReasoningCycle
         | Command::ReasoningList
         | Command::Quit => {

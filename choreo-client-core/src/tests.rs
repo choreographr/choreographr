@@ -632,6 +632,18 @@ fn parses_bare_terminal_as_the_terminal_page() {
     ));
 }
 
+#[test]
+fn parses_bare_help_as_the_help_modal() {
+    // A local-UI command: it parses to its own variant, never to a daemon
+    // message, so the front-end can open the modal.
+    assert_eq!(parse_input_line("/help"), Command::OpenHelp);
+    // Anything after the name is not this command.
+    assert!(matches!(
+        parse_input_line("/help now"),
+        Command::UnknownCommand(_)
+    ));
+}
+
 // ── Command catalog drift guard ──────────────────────────────────────────
 //
 // The catalog (`choreo_client_core::command_catalog`) and the parser are two
@@ -665,6 +677,7 @@ const PARSER_COMMAND_NAMES: &[&str] = &[
     "refresh-models",
     "mcp",
     "terminal",
+    "help",
     "quit",
 ];
 

@@ -419,7 +419,6 @@ impl App {
         }
         self.attached_status = status;
         self.refresh_attached_account_slug();
-        self.show_help_overlay = true;
         if let Some(d) = self.active_display() {
             d.progress_dirty = true;
         }

@@ -152,7 +152,7 @@ pub(crate) fn handle_terminal_event(
     // and trigger submission of the partial text instead of inserting
     // the newline.
     if let Event::Paste(data) = &event {
-        if app.fullscreen_image_target.is_some() || app.show_terminal_page {
+        if app.fullscreen_image_target.is_some() || app.show_terminal_page || app.show_help_modal {
             tracing::debug!("[choreo-tui] ignoring paste while a full-screen overlay is active");
             return Ok(());
         }
@@ -261,6 +261,23 @@ pub(crate) fn handle_terminal_event(
             if key.code == KeyCode::Esc || alt_t {
                 tracing::debug!("[choreo-tui] closing the terminal page");
                 app.show_terminal_page = false;
+            }
+        }
+        return Ok(());
+    }
+    // The Help modal is another read-only overlay over the Chat page and takes
+    // the same priority: while it is open every event stops here. `Esc` and its
+    // own `Alt+H` toggle close it; a mouse event is inert because the page has
+    // no clickable rows (Alt+Q still quits from above).
+    if app.show_help_modal {
+        if let Event::Key(key) = &event
+            && key.kind == KeyEventKind::Press
+        {
+            let alt_h = key.modifiers.contains(KeyModifiers::ALT)
+                && matches!(key.code, KeyCode::Char('h' | 'H'));
+            if key.code == KeyCode::Esc || alt_h {
+                tracing::debug!("[choreo-tui] closing the help modal");
+                app.show_help_modal = false;
             }
         }
         return Ok(());

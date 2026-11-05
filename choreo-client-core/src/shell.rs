@@ -108,6 +108,9 @@ pub enum Command {
     /// local-UI command with no daemon message of its own: the page is a view
     /// over data the client already holds.
     OpenTerminalHelp,
+    /// Bare `/help` — open the read-only Help modal listing every keyboard
+    /// shortcut. A local-UI command with no daemon message of its own.
+    OpenHelp,
     /// Bare `/reasoning` — cycle the reasoning effort on the attached session.
     ReasoningCycle,
     /// `/reasoning list` — list the available reasoning levels.
@@ -455,6 +458,12 @@ fn parse_command(rest: &str) -> Command {
     // turns into the page being shown.
     if rest == "terminal" {
         return Command::OpenTerminalHelp;
+    }
+
+    // Bare `/help` opens the read-only Help modal (`Alt+H` is the same
+    // command through the shortcut table). It has no daemon message either.
+    if rest == "help" {
+        return Command::OpenHelp;
     }
 
     if let Some(key) = rest.strip_prefix("unlock ") {

@@ -9,10 +9,9 @@
 //! resolve (the old `Ctrl+M` ↔ `Ctrl+O` duality is gone).
 //!
 //! The table is the single source of truth for both Chat-page shortcut dispatch
-//! (`binding_for`) and the command palette's right-aligned shortcut labels
-//! (`shortcut_label_for`), so a shortcut and its typed `/command` spelling can
-//! never drift.  `help` is deliberately NOT in the table — it toggles the help
-//! overlay rather than running a catalog command — and `quit` is listed for
+//! (`binding_for`), the command palette's right-aligned shortcut labels
+//! (`shortcut_label_for`), and the Help modal's listed chords, so a shortcut
+//! and its typed `/command` spelling can never drift.  `quit` is listed for
 //! DISPLAY only (it stays the global pre-dispatch special case in
 //! `connection/mod.rs`, so it quits from any page or open modal).
 
@@ -113,6 +112,7 @@ const SHORTCUTS: &[(Chord, &str)] = &[
     (Chord::alt(Key::Char('s')), "session"),
     (Chord::alt(Key::Char('a')), "account"),
     (Chord::alt(Key::Char('t')), "terminal"),
+    (Chord::alt(Key::Char('h')), "help"),
     (Chord::alt(Key::Char('q')), "quit"),
 ];
 
@@ -174,6 +174,7 @@ mod tests {
         assert_eq!(binding_for(&alt('s')), Some("session"));
         assert_eq!(binding_for(&alt('a')), Some("account"));
         assert_eq!(binding_for(&alt('t')), Some("terminal"));
+        assert_eq!(binding_for(&alt('h')), Some("help"));
         assert_eq!(binding_for(&alt('q')), Some("quit"));
         assert_eq!(
             binding_for(&KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
@@ -230,8 +231,7 @@ mod tests {
         assert_eq!(shortcut_label_for("redo").as_deref(), Some("Alt+↓"));
         assert_eq!(shortcut_label_for("quit").as_deref(), Some("Alt+Q"));
         assert_eq!(shortcut_label_for("terminal").as_deref(), Some("Alt+T"));
-        // `help` toggles the overlay, not a catalog command — no palette label.
-        assert_eq!(shortcut_label_for("help"), None);
+        assert_eq!(shortcut_label_for("help").as_deref(), Some("Alt+H"));
         assert_eq!(shortcut_label_for("nope"), None);
     }
 }

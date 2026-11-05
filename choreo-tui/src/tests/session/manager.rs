@@ -12,8 +12,8 @@ fn app_starts_in_chat_page() {
     let app = test_app();
     assert_eq!(app.page, Page::Chat);
     assert!(
-        app.show_help_overlay,
-        "help overlay should be visible by default"
+        !app.show_help_modal,
+        "the help modal starts closed (opened on demand with alt+h or /help)"
     );
 }
 

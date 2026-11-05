@@ -365,45 +365,6 @@ fn alt_x_does_not_insert_char_on_chat() {
 }
 
 #[test]
-fn chat_alt_h_toggles_help() {
-    let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut app = test_app();
-    app.show_help_overlay = false;
-
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
-        &mut app,
-        &tx,
-    )
-    .expect("handle alt+h");
-
-    assert!(app.show_help_overlay, "first press should enable help");
-}
-
-#[test]
-fn chat_alt_h_double_toggle_returns_to_off() {
-    let (tx, _rx) = crossbeam_channel::unbounded();
-    let mut app = test_app();
-    app.show_help_overlay = false;
-
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
-        &mut app,
-        &tx,
-    )
-    .expect("handle alt+h (first)");
-    assert!(app.show_help_overlay, "first press should enable help");
-
-    handle_terminal_event(
-        Event::Key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::ALT)),
-        &mut app,
-        &tx,
-    )
-    .expect("handle alt+h (second)");
-    assert!(!app.show_help_overlay, "second press should disable help");
-}
-
-#[test]
 fn chat_alt_a_enters_ai_providers() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();

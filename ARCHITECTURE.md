@@ -3240,6 +3240,26 @@ the filter reads the capability table alone (`table_capabilities`), never what
 this launch negotiated. The in-source rustdoc of that module is the reference for
 each rule.
 
+### Help modal
+
+The Help modal (`Alt+H`, or `/help` from the command palette) is a **read-only
+overlay listing the keyboard shortcuts**. `App::show_help_modal` is a single
+flag, opened from the Chat page's shortcut table (so the key and its typed
+spelling run one command, as every other `Alt+` binding does) and closed by
+`Esc` or the same chord in the modifier guard `handle_terminal_event` applies
+before page dispatch, which also swallows every other key so nothing reaches the
+composer underneath. It defaults **closed** — a modal over the transcript on
+every session attach would be noise; the welcome panel carries the `alt+h`
+discovery hint instead. The renderer (`render/help.rs`) is another
+`centered_popup(PopupSize::LIST)` block drawn over the Chat page, its content
+built by the pure `help_lines()`: turn-control, navigation/settings, editing and
+slash-command rows. Every command chord it prints is read from the Chat page's
+single shortcut table via `state::shortcut_label_for`, so the page and dispatch
+cannot disagree about which key runs which command; only the non-`Alt+` chords
+(`Esc`, the readline `Ctrl+` editing keys) are spelled out locally, because they
+are not in the table. The modal and the Terminal page are mutually exclusive:
+opening either closes the other.
+
 ### Hosted panes: reporting status to the workspace manager
 
 A workspace manager hosting the client in a pane is told what the attached

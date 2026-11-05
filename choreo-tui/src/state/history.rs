@@ -36,15 +36,15 @@ use super::{App, Marker, SessionDisplayState, selector_list_layout, turn_image_c
 pub(crate) enum ViewportChange {
     /// Nothing that affects the rendered content changed.  The history viewport
     /// height can still shrink or grow (the status/error line appeared or
-    /// disappeared, the help overlay toggled, the input box grew) but no line
-    /// re-wraps, so the render caches and the selection must be left alone.
+    /// disappeared, the input box grew) but no line re-wraps, so the render
+    /// caches and the selection must be left alone.
     None,
     /// The rendered width changed, so every line re-wraps: the width-keyed
     /// render caches are stale and the selection's stored column anchors no
     /// longer point at the same text.
     Rewrap,
     /// Only the height changed — a real vertical resize, or the chrome (the
-    /// status/error line, the help overlay, the input box) growing or shrinking.
+    /// status/error line, the input box) growing or shrinking.
     /// Nothing re-wraps, so the caches and the selection stay valid, but the
     /// heights must be recomputed because the image-block height the height
     /// prefix reserves derives from the viewport height.  That recompute is a
@@ -284,7 +284,7 @@ pub(crate) struct HistoryScrollState {
 /// The reading position captured when a session is left, so the next visit can
 /// restore the same *content* even though the raw scroll offset (a distance
 /// from the bottom) is only meaningful for the viewport height it was taken at:
-/// the help/status bands reflow the history viewport on attach, and background
+/// the status band reflows the history viewport on attach, and background
 /// sessions keep streaming, so both the viewport height and the total content
 /// height can differ by the time the user returns.
 #[derive(Clone, Copy)]
@@ -400,7 +400,7 @@ impl App {
         // terminals too small for the fixed chrome to fit, where the solver
         // shrinks chunks — so the history-box mouse arm can never swallow
         // clicks that the renderer drew as part of the input box.
-        let [history_area, _, _, _, _] = self.chat_page_layout(width, height);
+        let [history_area, _, _, _] = self.chat_page_layout(width, height);
         let old_width = self.history_viewport.width;
         let old_height = self.history_viewport.height;
         let new_width = history_area.width.saturating_sub(1);
@@ -414,10 +414,10 @@ impl App {
         // Classify the viewport change and invalidate only what it warrants.  A
         // width change re-wraps every line, so the render caches and the
         // selection's column anchors go.  A height change — a real vertical
-        // resize, OR the chrome (the status/error line, the help overlay, the
-        // input box) growing or shrinking — re-wraps nothing, so the caches and
-        // the selection survive; only the HEIGHTS are recomputed, because the
-        // image-block height the prefix reserves derives from the viewport
+        // resize, OR the chrome (the status/error line, the input box) growing
+        // or shrinking — re-wraps nothing, so the caches and the selection
+        // survive; only the HEIGHTS are recomputed, because the image-block
+        // height the prefix reserves derives from the viewport
         // height.  The old code cleared every session's render cache on any
         // height change, which forced a full O(session) re-render the instant
         // any status line was set or cleared (the input delay a large session

@@ -234,6 +234,7 @@ pub(crate) fn handle_shell_command(
         | Command::OpenAccounts
         | Command::OpenModelSelector
         | Command::OpenTerminalHelp
+        | Command::OpenHelp
         | Command::ReasoningCycle
         | Command::ReasoningList
         | Command::Quit => {}

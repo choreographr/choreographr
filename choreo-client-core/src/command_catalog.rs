@@ -99,6 +99,12 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::Session,
         },
         CommandSpec {
+            name: "help",
+            summary: "Show the keyboard-shortcut help",
+            arg_hint: None,
+            group: CommandGroup::System,
+        },
+        CommandSpec {
             name: "lock",
             summary: "Lock the daemon keystore",
             arg_hint: None,
@@ -281,6 +287,18 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), count, "catalog command names must be unique");
+    }
+
+    #[test]
+    fn the_help_modal_is_a_system_command() {
+        // `help` is the discoverable spelling of the Chat page's `Alt+H`
+        // modal, so it has to be in the catalog the palette lists.
+        let spec = command_catalog()
+            .iter()
+            .find(|spec| spec.name == "help")
+            .expect("the help command belongs in the catalog");
+        assert_eq!(spec.group, CommandGroup::System);
+        assert_eq!(spec.arg_hint, None);
     }
 
     #[test]

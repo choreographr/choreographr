@@ -80,7 +80,7 @@ impl ImageSlot {
 /// `call_id`) on every call.  The RENDER loop needs the identities and calls it
 /// once per visible turn per frame; the HEIGHT accounting only needs the count
 /// and uses [`turn_image_count`] instead, so a height rebuild (which runs on
-/// every viewport-height change — a real resize, or a status/help/input row
+/// every viewport-height change — a real resize, or a status/input row
 /// appearing) allocates nothing per turn.
 pub(crate) fn turn_image_slots(turn: &Turn) -> Vec<ImageSlot> {
     let mut slots: Vec<ImageSlot> = (0..turn.displayed_images.len())

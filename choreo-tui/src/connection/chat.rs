@@ -26,13 +26,6 @@ pub(super) fn handle_chat_event(
             // Any keypress clears transient status/error messages.
             app.clear_status();
             app.clear_error();
-            // Don't clear help on the help-toggle chord itself — let the
-            // toggle arm below handle it.
-            let help_toggle = key.modifiers.contains(KeyModifiers::ALT)
-                && matches!(key.code, KeyCode::Char('h' | 'H'));
-            if !help_toggle {
-                app.show_help_overlay = false;
-            }
             // A plain (unmodified) keypress predicate, used by the command-line
             // arms below so Ctrl/Alt chords still fall through to the shortcut
             // handler rather than the palette.
@@ -113,13 +106,6 @@ pub(super) fn handle_chat_event(
                 // inside a command line) it is literal too.  Nothing special is
                 // needed here — it falls through to the editing arm below.
                 //
-                // Alt+H toggles the help overlay.  It is not a catalog command
-                // (so it is absent from the shortcut table) and is handled here,
-                // before the generic `Char` editing arm below.
-                KeyCode::Char('h' | 'H') if key.modifiers.contains(KeyModifiers::ALT) => {
-                    tracing::debug!("Alt+H toggling help overlay");
-                    app.show_help_overlay = !app.show_help_overlay;
-                }
                 // All Ctrl+ combinations that are NOT command shortcuts are
                 // delegated to a dedicated handler.  (Alt+Enter's `continue`
                 // binding is handled by the shortcut table at the top of this

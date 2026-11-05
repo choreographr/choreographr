@@ -29,9 +29,7 @@
 use crate::markdown_render::display_width;
 use crate::scrollbar::{SmoothScrollbar, SmoothScrollbarState};
 use crate::selection;
-use crate::state::{
-    App, HELP_LINE1, HELP_LINE2, INPUT_PAD, Page, cached_visual_lines, input_inner_width,
-};
+use crate::state::{App, INPUT_PAD, Page, cached_visual_lines, input_inner_width};
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -108,6 +106,7 @@ pub(crate) fn display_text_owned(text: &str) -> String {
 mod ai_providers;
 mod command_palette;
 mod format;
+mod help;
 mod history;
 mod image;
 mod login;
@@ -122,6 +121,7 @@ mod tests;
 
 use self::ai_providers::render_ai_providers;
 use self::command_palette::render_command_palette;
+use self::help::render_help;
 use self::login::render_login_modal;
 use self::model_selector::render_model_selector;
 use self::session_manager::render_session_manager;
@@ -211,6 +211,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
         render_terminal_help(frame, app);
     }
 
+    // The Help modal (Alt+H / `/help`) is another read-only overlay over the
+    // Chat page, drawing beside the Terminal page it mirrors; `handle_terminal_event`
+    // swallows input while it is open, so nothing reaches the composer beneath.
+    if app.show_help_modal {
+        render_help(frame);
+    }
+
     // The OAuth login modal is the topmost overlay: it covers whatever page is
     // beneath and swallows input until the flow ends or the user cancels.
     if app.login.is_some() {
@@ -224,13 +231,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
     // history viewport (update_viewport_from_terminal_size) all use identical
     // math — they can never drift apart, even on tiny terminals where the
     // layout solver shrinks the fixed-height chunks.
-    let [
-        history_area,
-        status_error_area,
-        help_area,
-        input_area,
-        status_bar_area,
-    ] = app.chat_page_layout(frame.area().width, frame.area().height);
+    let [history_area, status_error_area, input_area, status_bar_area] =
+        app.chat_page_layout(frame.area().width, frame.area().height);
 
     // Reserve 1 column on the right for the scrollbar
     let history_chunks = Layout::default()
@@ -299,20 +301,6 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
             .style(Style::default().fg(Color::Green))
             .wrap(Wrap { trim: false });
         frame.render_widget(status_para, notify_area);
-    }
-
-    // ── Help overlay (2 lines, conditional) ───────────────────
-    if app.show_help_overlay {
-        let help_inner = Rect {
-            x: help_area.x + 1,
-            width: help_area.width.saturating_sub(2),
-            ..help_area
-        };
-        let help = Paragraph::new(Text::from(vec![
-            Line::from(Span::styled(HELP_LINE1, Style::default().fg(Color::Cyan))),
-            Line::from(Span::styled(HELP_LINE2, Style::default().fg(Color::Cyan))),
-        ]));
-        frame.render_widget(help, help_inner);
     }
 
     // ── Command input box ──────────────────────────────────────
