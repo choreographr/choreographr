@@ -38,7 +38,9 @@ mod providers;
 mod session;
 mod session_manager;
 mod streaming;
+mod subsession;
 mod terminal_advice;
+mod terminal_notice;
 mod terminal_status;
 mod turn;
 
@@ -61,20 +63,21 @@ pub(crate) use keymap::*;
 pub(crate) use layout::*;
 pub(crate) use login::*;
 pub(crate) use model_selector::*;
-// `onboarding` is mostly inherent `App` methods, but the welcome panel's
-// terminal advice needs its type and derivation at the launch site and in the
-// renderer.
-pub(crate) use onboarding::{TerminalNotice, terminal_notice};
+// The welcome panel's terminal advice needs its type and derivation at the
+// launch site (`run_app`) and in the renderer; `onboarding` stays purely setup
+// glue.
 pub(crate) use pages::*;
 pub(crate) use pin::*;
+pub(crate) use terminal_notice::{TerminalNotice, terminal_notice};
 // `pointer` declares only inherent `App` methods, so there is nothing to
 // re-export: its `mod` declaration above is the whole wiring.
 pub(crate) use providers::*;
 pub(crate) use session::*;
 pub(crate) use session_manager::*;
 pub(crate) use streaming::StreamingResponseCache;
+pub(crate) use subsession::*;
 // The terminal advice tables are read by the welcome notice derivation
-// (`state/onboarding.rs`) and by the Terminal page renderer
+// (`state/terminal_notice.rs`) and by the Terminal page renderer
 // (`render/terminal_help.rs`), so they are re-exported here like every other
 // item that moved into a sibling module.
 pub(crate) use terminal_advice::{
@@ -374,6 +377,12 @@ pub(crate) struct App {
     /// by `Alt+T` / `/terminal`; the page is a view over [`Self::terminal`], so
     /// nothing is copied or derived into this flag beyond `true`/`false`.
     pub(crate) show_terminal_page: bool,
+    /// Scroll offset (in rows) of the Terminal page's body. The page can be
+    /// taller than a short terminal's popup, so the overlay guard's
+    /// `Up`/`Down`/`PgUp`/`PgDn` drive this and the renderer clamps it to the
+    /// content (the same contract as the Help modal's scroll). Reset to 0 when
+    /// the page opens so it always starts at the top.
+    pub(crate) terminal_page_scroll: u16,
     /// Persistent latch of whether the daemon's credential keystore is locked.
     /// Latched from the daemon's lock-state broadcasts (`Locked`/`Unlocked`)
     /// and the subscribe-time lock-state push in `handle_daemon_message`;
@@ -533,6 +542,7 @@ impl App {
             terminal: crate::terminal::profile::TerminalProfile::default(),
             terminal_notice: None,
             show_terminal_page: false,
+            terminal_page_scroll: 0,
             // Assume locked until the daemon tells us otherwise (via the
             // subscribe-time lock-state push or a transition broadcast).
             keystore_locked: true,

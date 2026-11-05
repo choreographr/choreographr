@@ -2548,14 +2548,20 @@ broadcast names the currently attached session as the parent **and** exactly one
 `ToolCallStarted`/`Finished`/`Failed`, keyed by `tool_name`), it enters the child.
 The in-flight-count gate is what separates the user's own session's spawn from a
 sub-session created by another client (no local call → no navigation) and keeps
-parallel spawns in one turn from thrashing the view. Entering the child records a
-summary-independent `SpawnedChildNav { child_id, parent_id, seen_active }` from
-the creation event's authoritative ids; the child's first **active** status
-latches `seen_active`, so the daemon's creation-time `Inactive` broadcast cannot
-bounce the view back, and the subsequent active→idle transition switches back to
-the parent (the same `switch_back_to_parent` notification the manual-open path
-uses). The record is consumed on finish or abandoned when the user attaches
-elsewhere. See `choreo-tui`'s `state/session.rs`.
+parallel spawns in one turn from thrashing the view; the tally is reconciled at
+request end and on session deletion so a lost `ToolCallFinished` cannot poison it.
+Entering the child records a summary-independent
+`SpawnedChildNav { child_id, parent_id, seen_active }` from the creation event's
+authoritative ids. The child finishes by one of **two signals, both consuming the
+one record** so exactly one switches back: the child's own active→idle status
+transition (its first **active** status latches `seen_active`, so the daemon's
+creation-time `Inactive` broadcast cannot bounce the view back), or — for a child
+that finished before ever being observed active — the parent's blocking
+`spawn_subsession` tool returning, which is a definitive completion signal. Either
+switches back to the parent with the same `switch_back_to_parent` notification the
+manual-open path uses; the record is also abandoned when the user attaches
+elsewhere or the parent/child is deleted. See `choreo-tui`'s
+`state/subsession.rs`.
 
 ---
 
@@ -3168,10 +3174,13 @@ withholds, while `Some(true)` and an unasserted `None` emit; requiring
 `Some(true)` would keep the bar off every terminal identified by a
 version-less marker, kitty first among them (its `KITTY_WINDOW_ID` carries no
 version, so the 0.47 floor cannot be evaluated and the row stays unasserted).
-A `Hosted(_)` pane suppresses the write because the workspace manager owns the
-pane's progress surface, and a GNU screen pane suppresses it because screen
-forwards none of the client's sequences (the same fact the shared screen advice
-states). tmux and zellij pass the sequence through and do not suppress.
+A GNU screen pane suppresses the write because screen forwards none of the
+client's sequences (the same fact the shared screen advice states); tmux and
+zellij pass the sequence through and do not suppress. A `Hosted(_)` pane defers
+to the host's own answer: because the workspace manager owns the pane's progress
+surface, an unasserted row suppresses the write, but a host that itself asserts
+it renders OSC 9;4 (the merged capability is then `Some(true)`) emits — so the
+drawn bar and the Terminal page's "supported (host)" row stay in agreement.
 
 ### Welcome-screen terminal advice
 
@@ -3182,9 +3191,10 @@ the disambiguated modified keys (`Shift+Enter` and friends). The reporting
 extras — the OSC 9;4 progress bar, OSC 7501 program status, OSC 22 pointer
 shape — are silent when unsupported, so their absence never warrants advice.
 
-`state::onboarding::terminal_notice` is a **pure function over `&TerminalProfile`**
-(the same shape as the capability table), so every rule of the advice matrix is
-unit-tested from synthetic profiles: a `Direct` terminal with an asserted gap
+`state::terminal_notice::terminal_notice` (in `state/terminal_notice.rs`, split
+from the first-run setup glue that stays in `state/onboarding.rs`) is a **pure
+function over `&TerminalProfile`** (the same shape as the capability table), so
+every rule of the advice matrix is unit-tested from synthetic profiles: a `Direct` terminal with an asserted gap
 gets a headline naming that gap plus the terminals recommended for its platform
 (and nothing at all on Android, where no alternative is offered); tmux gets its
 `extended-keys` / `allow-passthrough` lines and a 3.7 version floor; zellij gets
@@ -3221,10 +3231,11 @@ re-detects nothing. `App::show_terminal_page` is a single flag, toggled from the
 Chat page's shortcut table (so the key and its typed spelling run one command,
 as every other `Alt+` binding does) and closed by `Esc` or the same chord in the
 modifier guard `handle_terminal_event` applies before page dispatch, which also
-swallows every other key so nothing reaches the composer underneath. The
-renderer (`render/terminal_help.rs`) draws over the Chat page through the same
-content-fitted reference-popup chrome as the Help modal (`render/popup.rs`), and
-its content is built by the pure
+swallows every other key so nothing reaches the composer underneath (and drives
+`App::terminal_page_scroll` with `Up`/`Down`/`PgUp`/`PgDn`, the renderer clamping
+the offset to the content). The renderer (`render/terminal_help.rs`) draws over
+the Chat page through the same content-fitted, scrollable reference-popup chrome
+as the Help modal (`render/popup.rs`), and its content is built by the pure
 `terminal_page_lines(&TerminalProfile)`: an identity line (terminal, version,
 platform, negotiated image protocol, host layer), the seven-row capability
 checklist rendered in the table's own three states — an unasserted capability
@@ -3237,9 +3248,10 @@ cannot drift into recommending different things; that module also holds the
 single GNU screen sentence both surfaces print for a screen pane (screen
 forwards none of the client's sequences, so the advice is another multiplexer
 rather than a setting, and the page prints no recommendations block for it).
-Each platform's terminals are **one table of rows** — identity, display name and
-install command — and both the recommendation lines and the "keeps every
-feature" filter are derived from it, so the two cannot name different terminals;
+Each platform's terminals are **one table of rows** — identity and install
+command, with the display name from the single `TerminalKind::display_name` — and
+both the recommendation lines and the "keeps every feature" filter are derived
+from it, so the two cannot name different terminals;
 the filter reads the capability table alone (`table_capabilities`), never what
 this launch negotiated. The in-source rustdoc of that module is the reference for
 each rule.

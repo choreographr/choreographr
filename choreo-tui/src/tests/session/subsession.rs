@@ -1,6 +1,7 @@
 use crate::connection::handle_daemon_message;
 use crate::state::*;
 use crate::tests::support::{make_session_full, test_app};
+use choreo_client_core::TurnEventHandler;
 use choreo_proto::{
     ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent, SessionStatus, TokenUsage,
 };
@@ -694,4 +695,138 @@ fn non_spawn_tool_calls_do_not_affect_inflight_count() {
 
     handle_daemon_message(tool_call_started(42, "c1", "read_file"), &mut app, &tx).unwrap();
     assert_eq!(app.spawn_subsession_inflight_count(42), 0);
+}
+
+#[test]
+fn spawned_child_tool_finish_switches_back_without_an_active_status() {
+    // A child that finishes before the TUI ever observes it active emits no
+    // active→idle status, so the status path alone would never switch back. The
+    // parent's blocking `spawn_subsession` tool returning is the definitive
+    // completion signal and closes that gap.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).unwrap();
+    assert_eq!(app.attached_session_id, Some(99));
+
+    handle_daemon_message(
+        tool_call_finished(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+
+    assert_eq!(
+        app.attached_session_id,
+        Some(42),
+        "a blocking spawn completing switches back even with no active status"
+    );
+    assert!(app.spawned_child_nav.is_none(), "the record is consumed");
+    assert_eq!(
+        app.spawn_subsession_inflight_count(42),
+        0,
+        "the terminal event decrements the tally"
+    );
+}
+
+#[test]
+fn status_finish_then_tool_finish_does_not_double_switch() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).unwrap();
+    // The normal path: the child runs, then its idle status switches back and
+    // consumes the record.
+    handle_daemon_message(status_changed(99, SessionStatus::Responding), &mut app, &tx).unwrap();
+    handle_daemon_message(status_changed(99, SessionStatus::Inactive), &mut app, &tx).unwrap();
+    assert_eq!(app.attached_session_id, Some(42));
+
+    // The tool finishing afterwards must not move the view a second time.
+    handle_daemon_message(
+        tool_call_finished(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    assert_eq!(app.attached_session_id, Some(42));
+    assert!(app.spawned_child_nav.is_none());
+}
+
+#[test]
+fn deleting_the_parent_clears_the_nav_record_and_tally() {
+    // A deleted session cannot still be running a blocking spawn, and a round
+    // trip through it can never complete: both must be dropped, not linger to
+    // poison a later spawn's "exactly one in flight" gate.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    handle_daemon_message(session_created(99, Some(42)), &mut app, &tx).unwrap();
+    assert_eq!(app.spawn_subsession_inflight_count(42), 1);
+    assert!(app.spawned_child_nav.is_some());
+
+    app.handle_session_deleted(42);
+
+    assert_eq!(
+        app.spawn_subsession_inflight_count(42),
+        0,
+        "the tally is reconciled on delete"
+    );
+    assert!(
+        app.spawned_child_nav.is_none(),
+        "the nav record is dropped on delete"
+    );
+}
+
+#[test]
+fn a_request_ending_clears_a_stale_spawn_tally() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.attached_session_id = Some(42);
+    app.active_session_id = Some(42);
+    app.page = Page::Chat;
+
+    // A spawn starts but its terminal event is lost; the request then ends. The
+    // request-end teardown must clear the stale tally so a later genuine spawn
+    // still reads as exactly one in flight.
+    handle_daemon_message(
+        tool_call_started(42, "c1", "spawn_subsession"),
+        &mut app,
+        &tx,
+    )
+    .unwrap();
+    assert_eq!(app.spawn_subsession_inflight_count(42), 1);
+
+    app.handle_cancelled(Some(42), 1);
+    assert_eq!(
+        app.spawn_subsession_inflight_count(42),
+        0,
+        "a request ending clears the tally"
+    );
 }

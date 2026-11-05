@@ -22,23 +22,23 @@ use crate::terminal::profile::{
 /// redraws tear.
 const TMUX_FRAME_SYNC: Version = Version::new(3, 7, 0);
 
-/// One terminal a platform offers: how it is identified, the name a person
-/// reads, and how to install it there.
+/// One terminal a platform offers: how it is identified and how to install it
+/// there.
 ///
-/// One row per terminal, so the short user-facing name and the install command
-/// cannot disagree about which terminals a platform has — the recommendation
-/// list and the "keeps every feature" filter are both derived from this table
-/// rather than hand-kept beside it.
+/// One row per terminal, so the user-facing name (from
+/// [`TerminalKind::display_name`]) and the install command cannot disagree
+/// about which terminals a platform has — the recommendation list and the
+/// "keeps every feature" filter are both derived from this table rather than
+/// hand-kept beside it.
 struct Recommendation {
     kind: TerminalKind,
-    name: &'static str,
     install: &'static str,
 }
 
 impl Recommendation {
     /// The line the Terminal page prints: `<name> — <install>`.
     fn line(&self) -> String {
-        format!("{} — {}", self.name, self.install)
+        format!("{} — {}", self.kind.display_name(), self.install)
     }
 }
 
@@ -46,12 +46,10 @@ impl Recommendation {
 const MACOS_TERMINALS: &[Recommendation] = &[
     Recommendation {
         kind: TerminalKind::Ghostty,
-        name: "Ghostty",
         install: "brew install --cask ghostty",
     },
     Recommendation {
         kind: TerminalKind::ItTerm,
-        name: "iTerm2",
         install: "brew install --cask iterm2",
     },
 ];
@@ -60,17 +58,14 @@ const MACOS_TERMINALS: &[Recommendation] = &[
 const LINUX_TERMINALS: &[Recommendation] = &[
     Recommendation {
         kind: TerminalKind::Ghostty,
-        name: "Ghostty",
         install: "install from your distribution or ghostty.org",
     },
     Recommendation {
         kind: TerminalKind::Kitty,
-        name: "kitty",
         install: "apt install kitty (or dnf install kitty)",
     },
     Recommendation {
         kind: TerminalKind::WezTerm,
-        name: "WezTerm",
         install: "install from your distribution or wezterm.org",
     },
 ];
@@ -79,12 +74,10 @@ const LINUX_TERMINALS: &[Recommendation] = &[
 const WINDOWS_TERMINALS: &[Recommendation] = &[
     Recommendation {
         kind: TerminalKind::WindowsTerminal,
-        name: "Windows Terminal",
         install: "winget install Microsoft.WindowsTerminal",
     },
     Recommendation {
         kind: TerminalKind::WezTerm,
-        name: "WezTerm",
         install: "winget install wez.wezterm",
     },
 ];
@@ -113,7 +106,7 @@ pub(crate) fn full_support_terminals(platform: Platform) -> Vec<&'static str> {
     platform_terminals(platform)
         .iter()
         .filter(|recommendation| loses_nothing(recommendation.kind))
-        .map(|recommendation| recommendation.name)
+        .map(|recommendation| recommendation.kind.display_name())
         .collect()
 }
 
@@ -320,14 +313,18 @@ mod tests {
             let lines = recommendations(platform);
             assert_eq!(lines.len(), table.len(), "{platform}");
             for (line, row) in lines.iter().zip(table) {
-                assert!(line.starts_with(row.name), "{line:?} names {:?}", row.name);
-                assert!(!row.install.is_empty(), "{} has no installer", row.name);
+                let name = row.kind.display_name();
+                assert!(line.starts_with(name), "{line:?} names {name:?}");
+                assert!(!row.install.is_empty(), "{name} has no installer");
                 assert!(line.contains(row.install), "{line:?}");
             }
             // Every terminal promised as "keeps every feature" is one of the
             // platform's own rows.
             for name in full_support_terminals(platform) {
-                assert!(table.iter().any(|row| row.name == name), "{name:?}");
+                assert!(
+                    table.iter().any(|row| row.kind.display_name() == name),
+                    "{name:?}"
+                );
             }
         }
         // Android offers nothing at all.

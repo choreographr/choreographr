@@ -323,18 +323,19 @@ pub(super) fn terminal_page_lines(profile: &TerminalProfile) -> Vec<Line<'static
     lines
 }
 
-/// Draw the Terminal page centered over the Chat page, sized to its content.
-pub(super) fn render_terminal_help(frame: &mut Frame<'_>, app: &crate::state::App) {
-    // The Terminal page does not scroll: the overlay guard only closes it, and
-    // its content is short. A local offset lets the shared popup content-fit the
-    // page without adding scroll state the guard never drives.
-    let mut scroll = 0u16;
+/// Draw the Terminal page centered over the Chat page, sized to its content and
+/// scrolled by the overlay guard's `App::terminal_page_scroll`.
+pub(super) fn render_terminal_help(frame: &mut Frame<'_>, app: &mut crate::state::App) {
+    // Build the lines before borrowing the scroll field mutably: the shared
+    // popup measures the wrapped content, clamps the offset to it, and writes
+    // the corrected value back for the next frame.
+    let lines = terminal_page_lines(&app.terminal);
     render_reference_popup(
         frame,
         "Terminal",
         PopupSize::LIST,
-        terminal_page_lines(&app.terminal),
-        &mut scroll,
+        lines,
+        &mut app.terminal_page_scroll,
     );
 }
 

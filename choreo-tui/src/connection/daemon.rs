@@ -1,5 +1,5 @@
 use super::route_session_update;
-use crate::state::{App, Page, ProviderInfo, merge_token_usage};
+use crate::state::{App, Page, ProviderInfo, SPAWN_SUBSESSION_TOOL, merge_token_usage};
 use crate::terminal::progress;
 use choreo_client_core::SetupFollow;
 use choreo_client_core::{
@@ -999,6 +999,23 @@ pub(crate) fn handle_daemon_message(
             }
             // Never falls through to the generic dispatch (nothing to render).
             return Ok(());
+        }
+        DaemonMessageType::Session {
+            session_id: Some(session_id),
+            event:
+                SessionEvent::ToolCallFinished { tool_name, .. }
+                | SessionEvent::ToolCallFailed { tool_name, .. },
+        } if tool_name.as_str() == SPAWN_SUBSESSION_TOOL => {
+            // `spawn_subsession` blocks until the child it created completes, so
+            // the parent's tool-call terminal event is a summary-independent
+            // "child finished" signal. It catches a child that finished before
+            // the TUI ever observed it active (whose active→idle status never
+            // arrives), which the status-only path misses. Both finish paths
+            // consume the single nav record, so exactly one switches back.
+            if let Some((child_id, parent_id)) = app.note_spawned_child_tool_finished(*session_id) {
+                app.switch_back_to_parent(child_id, parent_id, client_tx)?;
+            }
+            // No early return: fall through so the tool result still renders.
         }
         _ => {}
     }

@@ -571,6 +571,7 @@ pub(super) fn run_command(
             // chord and closes it, so the pair reads as a toggle.
             tracing::debug!("[choreo-tui] dispatching /terminal (open the Terminal page)");
             app.show_help_modal = false;
+            app.terminal_page_scroll = 0;
             app.show_terminal_page = true;
         }
         Command::OpenHelp => {

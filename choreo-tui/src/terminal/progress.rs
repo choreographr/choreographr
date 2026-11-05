@@ -35,20 +35,30 @@ use super::{osc, write};
 ///   invert this: requiring `Some(true)` is what silently disabled the bar on
 ///   every terminal identified by a version-less marker, kitty first among
 ///   them.
-/// - **A hosted pane suppresses it regardless.** Under [`Host::Hosted`] a
-///   workspace manager owns the pane's progress surface (it reports state for
-///   the block itself), so writing our own bar would fight it.
-/// - **A GNU screen pane suppresses it too.** Screen forwards none of the
-///   client's sequences through its pane — the same fact the shared
+/// - **A GNU screen pane suppresses it.** Screen forwards none of the client's
+///   sequences through its pane — the same fact the shared
 ///   `terminal_advice::screen_sentence` states — so the sequence would be
 ///   written into a void. tmux and zellij pass it through and do not suppress.
+/// - **A hosted pane defers to the host's own answer.** A workspace manager owns
+///   the pane's progress surface, so writing our own bar would fight it — unless
+///   the host itself asserts it renders OSC 9;4. Under [`Host::Hosted`] the
+///   merged `progress` answer can only be `Some(true)` because the host says so
+///   (the terminal identity never reaches us), and then the host maps the
+///   sequence onto its own surface. That keeps the drawn bar and the Terminal
+///   page's "supported (host)" row in agreement.
 fn should_emit(cap: Option<bool>, host: &Host) -> bool {
-    cap != Some(false) && !owns_progress_surface(host)
-}
-
-/// Whether `host` presents its own progress surface, leaving no bar to draw.
-fn owns_progress_surface(host: &Host) -> bool {
-    matches!(host, Host::Hosted(_) | Host::Mux(Mux::Screen))
+    // GNU screen forwards none of the client's sequences through its pane.
+    if matches!(host, Host::Mux(Mux::Screen)) {
+        return false;
+    }
+    // A workspace manager owns the pane's progress surface: emit only when the
+    // host itself asserts the sequence (the merged `cap` is then `Some(true)`),
+    // never on the default unasserted answer.
+    if matches!(host, Host::Hosted(_)) {
+        return cap == Some(true);
+    }
+    // Direct or a forwarding multiplexer: only a settled "no" withholds.
+    cap != Some(false)
 }
 
 /// Build the OSC 9;4 escape sequence string without writing to stdout.
@@ -135,22 +145,28 @@ mod tests {
     /// emulator, both multiplexers that pass 9;4 through, GNU screen (which
     /// forwards nothing), and both workspace managers that own the pane's
     /// progress surface.
-    fn hosts() -> Vec<(Host, bool)> {
+    fn hosts() -> Vec<Host> {
         vec![
-            (Host::Direct, true),
-            (Host::Mux(Mux::Tmux { version: None }), true),
-            (Host::Mux(Mux::Zellij), true),
-            (Host::Mux(Mux::Screen), false),
-            (Host::Hosted(HostedKind::Herdr), false),
-            (Host::Hosted(HostedKind::Rex), false),
+            Host::Direct,
+            Host::Mux(Mux::Tmux { version: None }),
+            Host::Mux(Mux::Zellij),
+            Host::Mux(Mux::Screen),
+            Host::Hosted(HostedKind::Herdr),
+            Host::Hosted(HostedKind::Rex),
         ]
     }
 
     #[test]
     fn every_capability_host_combination_agrees_with_the_rule() {
         for cap in [Some(true), Some(false), None] {
-            for (host, host_allows) in hosts() {
-                let expected = cap != Some(false) && host_allows;
+            for host in hosts() {
+                let expected = match &host {
+                    // Screen forwards nothing; a hosted pane emits only when the
+                    // host itself asserts the sequence.
+                    Host::Mux(Mux::Screen) => false,
+                    Host::Hosted(_) => cap == Some(true),
+                    Host::Direct | Host::Mux(_) => cap != Some(false),
+                };
                 assert_eq!(
                     should_emit(cap, &host),
                     expected,
@@ -158,6 +174,16 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_host_that_provides_progress_emits_and_one_that_does_not_suppresses() {
+        // A workspace manager that asserts it renders OSC 9;4 maps it onto its
+        // own surface: the bar is drawn. One that asserts nothing (or a settled
+        // no) keeps our bar off its surface.
+        assert!(should_emit(Some(true), &Host::Hosted(HostedKind::Herdr)));
+        assert!(!should_emit(Some(false), &Host::Hosted(HostedKind::Herdr)));
+        assert!(!should_emit(None, &Host::Hosted(HostedKind::Rex)));
     }
 
     #[test]
@@ -187,9 +213,8 @@ mod tests {
     }
 
     #[test]
-    fn screen_and_a_hosted_pane_suppress_even_a_supported_row() {
+    fn screen_suppresses_even_a_supported_row() {
         assert!(!should_emit(Some(true), &Host::Mux(Mux::Screen)));
-        assert!(!should_emit(Some(true), &Host::Hosted(HostedKind::Herdr)));
         // A multiplexer that forwards does not.
         assert!(should_emit(Some(true), &Host::Mux(Mux::Zellij)));
     }

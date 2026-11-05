@@ -29,9 +29,10 @@ use super::daemon::handle_daemon_message;
 use super::model_selector::handle_model_selector_event;
 use super::session_manager::handle_session_manager_event;
 
-/// Rows the Help modal scrolls per `PgUp`/`PgDn`: a page-sized jump so a full
-/// reference page can be paged through quickly, larger than one transcript line.
-const HELP_MODAL_PAGE: u16 = 10;
+/// Rows the read-only reference overlays (the Help modal and the Terminal page)
+/// scroll per `PgUp`/`PgDn`: a page-sized jump so a full reference page can be
+/// paged through quickly, larger than one transcript line.
+const OVERLAY_SCROLL_PAGE: u16 = 10;
 
 /// Keyboard enhancements requested from the terminal via the kitty keyboard
 /// protocol (`CSI > flags u`), pushed at startup and re-pushed after resume.
@@ -253,8 +254,10 @@ pub(crate) fn handle_terminal_event(
     }
     // The Terminal page is a read-only modal over the Chat page and takes the
     // same overlay priority: while it is open every event stops here, so a
-    // keystroke can never reach the composer underneath.  `Esc` and its own
-    // `Alt+T` toggle close it; a mouse event is inert because the page has no
+    // keystroke can never reach the composer underneath. `Esc` and its own
+    // `Alt+T` toggle close it; `Up`/`Down`/`PgUp`/`PgDn` scroll its body (the
+    // page can be taller than a short terminal, and the renderer clamps the
+    // offset to the content); a mouse event is inert because the page has no
     // clickable rows (Alt+Q still quits from above).
     if app.show_terminal_page {
         if let Event::Key(key) = &event
@@ -262,9 +265,26 @@ pub(crate) fn handle_terminal_event(
         {
             let alt_t = key.modifiers.contains(KeyModifiers::ALT)
                 && matches!(key.code, KeyCode::Char('t' | 'T'));
-            if key.code == KeyCode::Esc || alt_t {
-                tracing::debug!("[choreo-tui] closing the terminal page");
-                app.show_terminal_page = false;
+            match key.code {
+                KeyCode::Up => {
+                    app.terminal_page_scroll = app.terminal_page_scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    app.terminal_page_scroll = app.terminal_page_scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    app.terminal_page_scroll =
+                        app.terminal_page_scroll.saturating_sub(OVERLAY_SCROLL_PAGE);
+                }
+                KeyCode::PageDown => {
+                    app.terminal_page_scroll =
+                        app.terminal_page_scroll.saturating_add(OVERLAY_SCROLL_PAGE);
+                }
+                _ if key.code == KeyCode::Esc || alt_t => {
+                    tracing::debug!("[choreo-tui] closing the terminal page");
+                    app.show_terminal_page = false;
+                }
+                _ => {}
             }
         }
         return Ok(());
@@ -289,10 +309,12 @@ pub(crate) fn handle_terminal_event(
                     app.help_modal_scroll = app.help_modal_scroll.saturating_add(1);
                 }
                 KeyCode::PageUp => {
-                    app.help_modal_scroll = app.help_modal_scroll.saturating_sub(HELP_MODAL_PAGE);
+                    app.help_modal_scroll =
+                        app.help_modal_scroll.saturating_sub(OVERLAY_SCROLL_PAGE);
                 }
                 KeyCode::PageDown => {
-                    app.help_modal_scroll = app.help_modal_scroll.saturating_add(HELP_MODAL_PAGE);
+                    app.help_modal_scroll =
+                        app.help_modal_scroll.saturating_add(OVERLAY_SCROLL_PAGE);
                 }
                 _ if key.code == KeyCode::Esc || alt_h => {
                     tracing::debug!("[choreo-tui] closing the help modal");

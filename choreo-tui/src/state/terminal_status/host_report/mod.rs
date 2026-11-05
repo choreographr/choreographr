@@ -44,8 +44,9 @@ mod config;
 mod invoke;
 
 use std::thread;
+use std::time::Duration;
 
-use crossbeam_channel::{self as channel, Receiver, Sender};
+use crossbeam_channel::{self as channel, Receiver, Sender, select};
 
 use argv::{Seq, now_ms, release_argv, report_argv};
 pub use config::ReporterConfig;
@@ -55,6 +56,15 @@ use crate::state::App;
 
 /// The log/report name of the host this reporter talks to.
 const HOST_NAME: &str = "herdr";
+
+/// How long [`Reporter::shutdown`] waits for the serving thread to finish (run
+/// its release and exit) before detaching it.
+///
+/// A host that is local IPC answers in milliseconds, so this is generous; the
+/// bound exists so a wedged host can never keep the client from quitting. Past
+/// it the release is left best-effort and the thread is left to finish on its
+/// own as the process exits.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// A state word the hosting workspace manager understands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +139,9 @@ impl HostReportSink {
 pub struct Reporter {
     tx: Sender<HostReport>,
     rx: Receiver<HostReport>,
+    /// Signalled by the serving thread once it has run the release and is about
+    /// to exit, so [`Self::shutdown`] can bound its wait.
+    done: Receiver<()>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
@@ -149,9 +162,15 @@ impl Reporter {
         // The receiver is cloned so this side can drain an unsent report when
         // the sink overwrites it; the serving thread owns its own handle.
         let serve_rx = rx.clone();
+        let (done_tx, done_rx) = channel::bounded::<()>(1);
         let handle = thread::Builder::new()
             .name("host-report".to_string())
-            .spawn(move || serve(&config, &serve_rx))
+            .spawn(move || {
+                serve(&config, &serve_rx);
+                // Signal teardown completion so `shutdown` can stop waiting for a
+                // host that has already released.
+                let _ = done_tx.send(());
+            })
             .map_err(|error| {
                 tracing::debug!(kind = ?error.kind(), "hosting workspace manager reporter could not start");
             })
@@ -159,6 +178,7 @@ impl Reporter {
         Some(Self {
             tx,
             rx,
+            done: done_rx,
             handle: Some(handle),
         })
     }
@@ -183,11 +203,28 @@ impl Reporter {
     /// clears its handle in teardown); this one's drop is then what lets the
     /// serving loop end.
     pub fn shutdown(self) {
-        let Self { tx, rx, handle } = self;
+        let Self {
+            tx,
+            rx,
+            done,
+            handle,
+        } = self;
+        // Dropping our senders ends the serving loop, which then runs the release
+        // and signals `done`.
         drop((tx, rx));
-        if let Some(handle) = handle {
+        // Wait for that, but never let a wedged host stall quitting: past the
+        // bound the thread is detached and the release is best-effort.
+        let finished = select! {
+            recv(done) -> _ => true,
+            recv(channel::after(SHUTDOWN_TIMEOUT)) -> _ => false,
+        };
+        if let Some(handle) = handle
+            && finished
+        {
             let _ = handle.join();
         }
+        // On timeout the `JoinHandle` is dropped (detached): the process is
+        // already exiting, so the detached release is harmless.
     }
 }
 
@@ -195,7 +232,16 @@ impl Reporter {
 fn serve(config: &ReporterConfig, rx: &Receiver<HostReport>) {
     let mut seq = Seq::default();
     let mut reported = false;
+    let mut last: Option<HostReport> = None;
     while let Ok(report) = rx.recv() {
+        // The host already shows the previous state, so re-sending an identical
+        // report would only cost another process spawn. The terminal-record
+        // publisher dedupes the same way; a state or session change still goes
+        // out.
+        if last.as_ref() == Some(&report) {
+            continue;
+        }
+        last = Some(report.clone());
         let argv = report_argv(config, &report, seq.next(now_ms()));
         reported |= invoke(config, &argv, "report-agent");
     }

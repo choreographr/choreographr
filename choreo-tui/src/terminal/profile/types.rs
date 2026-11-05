@@ -67,6 +67,35 @@ impl fmt::Display for TerminalKind {
     }
 }
 
+impl TerminalKind {
+    /// The terminal's name as a person reads it: the user-facing spelling the
+    /// welcome notice and the Terminal page print.
+    ///
+    /// Distinct from the machine [`Display`](fmt::Display) name used in logs and
+    /// reports (e.g. `Windows Terminal` here versus `windows-terminal` there).
+    /// `Unknown` reads as the neutral "this terminal" so a caller can name it
+    /// without inventing an identity.
+    #[must_use]
+    pub(crate) const fn display_name(self) -> &'static str {
+        match self {
+            Self::Ghostty => "Ghostty",
+            Self::Kitty => "kitty",
+            Self::WezTerm => "WezTerm",
+            Self::Alacritty => "Alacritty",
+            Self::Foot => "foot",
+            Self::ItTerm => "iTerm2",
+            Self::WindowsTerminal => "Windows Terminal",
+            Self::Konsole => "Konsole",
+            Self::Ptyxis => "Ptyxis",
+            Self::Vte => "a VTE terminal",
+            Self::AppleTerminal => "Terminal.app",
+            Self::Termux => "Termux",
+            Self::Rex => "Rex",
+            Self::Unknown => "this terminal",
+        }
+    }
+}
+
 /// The operating system this client runs on.
 ///
 /// Android is separated from Linux because the two have different terminal

@@ -1,6 +1,7 @@
 //! The read-only Terminal page's input path: `Alt+T` / `/terminal` open it,
-//! `Esc` and `Alt+T` close it, and while it is open no keystroke (or mouse
-//! event) reaches the Chat page underneath.
+//! `Esc` and `Alt+T` close it, `Up`/`Down`/`PgUp`/`PgDn` scroll its body, and
+//! while it is open no keystroke (or mouse event) reaches the Chat page
+//! underneath.
 
 use crate::connection::handle_terminal_event;
 use crate::tests::support::test_app;
@@ -128,4 +129,53 @@ fn the_mouse_is_inert_over_the_page() {
     handle_terminal_event(click, &mut app, &tx).expect("handle click");
     assert!(app.text_selection.is_none(), "no row is clickable");
     assert!(app.show_terminal_page, "a click never closes the page");
+}
+
+#[test]
+fn arrows_and_page_keys_scroll_the_page_body() {
+    // The page is taller than a short terminal, so the overlay guard scrolls it.
+    // The offset is stored raw and clamped to the content at draw time.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    key(&mut app, &tx, alt_char('t'));
+    assert_eq!(app.terminal_page_scroll, 0, "opens at the top");
+
+    let arrow = |code| Event::Key(KeyEvent::new(code, KeyModifiers::NONE));
+    key(&mut app, &tx, arrow(KeyCode::Down));
+    assert_eq!(app.terminal_page_scroll, 1, "Down scrolls one row");
+    key(&mut app, &tx, arrow(KeyCode::PageDown));
+    assert_eq!(app.terminal_page_scroll, 11, "PageDown scrolls a page");
+    key(&mut app, &tx, arrow(KeyCode::Up));
+    assert_eq!(app.terminal_page_scroll, 10, "Up scrolls back one row");
+    key(&mut app, &tx, arrow(KeyCode::PageUp));
+    assert_eq!(app.terminal_page_scroll, 0, "PageUp scrolls back a page");
+    // Already at the top: PageUp/Up saturate rather than wrap.
+    key(&mut app, &tx, arrow(KeyCode::Up));
+    key(&mut app, &tx, arrow(KeyCode::PageUp));
+    assert_eq!(app.terminal_page_scroll, 0, "scrolling up saturates at 0");
+    assert!(app.show_terminal_page, "scrolling never closes the page");
+}
+
+#[test]
+fn reopening_the_page_resets_the_scroll() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    key(&mut app, &tx, alt_char('t'));
+    key(
+        &mut app,
+        &tx,
+        Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+    );
+    assert!(app.terminal_page_scroll > 0);
+
+    key(
+        &mut app,
+        &tx,
+        Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+    );
+    assert!(!app.show_terminal_page, "Esc closes the page");
+
+    key(&mut app, &tx, alt_char('t'));
+    assert!(app.show_terminal_page, "Alt+T reopens it");
+    assert_eq!(app.terminal_page_scroll, 0, "reopening resets the scroll");
 }

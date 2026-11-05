@@ -75,6 +75,11 @@ impl App {
     /// active-request set, the live token estimates, and the streaming slot)
     /// is reset here before the content is marked changed.
     fn finish_request(&mut self, session_id: u64, stream_id: u64) {
+        // A request that ends cannot still have a blocking spawn tool running,
+        // so any residual tally for it is stale (a `ToolCallStarted` whose
+        // terminal event was lost). Clear it before the display borrow so the
+        // "exactly one spawn in flight" navigation gate is never poisoned.
+        self.clear_spawn_inflight(session_id);
         let display = self.display_for(session_id);
         // The request→turn bookkeeping is shared with the GUI's `SessionView`.
         display.view.finish_request(stream_id);
@@ -376,32 +381,12 @@ impl TurnEventHandler for App {
     }
 
     fn handle_tool_call_event(&mut self, session_id: u64, stream_id: u64, event: ToolCallEvent) {
-        // Track in-flight `spawn_subsession` calls per session BEFORE folding the
-        // event into the display: the broadcast `SessionCreated` path only
-        // auto-enters a spawned child when exactly one such call is in flight for
-        // the attached session (see `App::spawned_child_should_navigate`). The
-        // start arrives before the child is created and the terminal event only
-        // after the tool returns, so the count is 1 throughout the child's run.
-        match &event {
-            ToolCallEvent::Started { tool_name, .. } if tool_name == SPAWN_SUBSESSION_TOOL => {
-                *self
-                    .spawn_subsession_inflight
-                    .entry(session_id)
-                    .or_insert(0) += 1;
-            }
-            ToolCallEvent::Finished { tool_name, .. } | ToolCallEvent::Failed { tool_name, .. }
-                if tool_name == SPAWN_SUBSESSION_TOOL =>
-            {
-                if let Some(count) = self.spawn_subsession_inflight.get_mut(&session_id) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.spawn_subsession_inflight.remove(&session_id);
-                    }
-                }
-            }
-            _ => {}
-        }
-        let display = self.display_for(session_id);
+        // The `spawn_subsession` tally is folded in each arm BEFORE the display
+        // borrow, so the whole event is matched exactly once. The start arrives
+        // before the child is created and the terminal event only after the
+        // blocking tool returns, so the count is 1 throughout the child's run;
+        // the broadcast `SessionCreated` path uses that to auto-enter the child
+        // (see `App::spawned_child_should_navigate`).
         match event {
             ToolCallEvent::Started {
                 call_id,
@@ -409,6 +394,10 @@ impl TurnEventHandler for App {
                 arguments_json,
                 invocation_description,
             } => {
+                if tool_name == SPAWN_SUBSESSION_TOOL {
+                    self.note_spawn_tool_started(session_id);
+                }
+                let display = self.display_for(session_id);
                 // A tool call is content streaming after the assistant response:
                 // release any pin the response took so the tool call and its
                 // output are followed from the bottom.
@@ -431,8 +420,16 @@ impl TurnEventHandler for App {
                 display.resolve_streaming_turn_index(stream_id);
                 display.mark_streaming_changed();
             }
-            ToolCallEvent::Finished { .. } => {}
-            ToolCallEvent::Failed { .. } => {}
+            ToolCallEvent::Finished { tool_name, .. } => {
+                if tool_name == SPAWN_SUBSESSION_TOOL {
+                    self.note_spawn_tool_finished(session_id);
+                }
+            }
+            ToolCallEvent::Failed { tool_name, .. } => {
+                if tool_name == SPAWN_SUBSESSION_TOOL {
+                    self.note_spawn_tool_finished(session_id);
+                }
+            }
         }
     }
 
