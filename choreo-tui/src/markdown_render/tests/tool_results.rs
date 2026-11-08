@@ -893,3 +893,105 @@ fn markdown_tool_with_non_sgr_escape_is_normalized_once_by_the_markdown_renderer
     // code block — the ordinary markdown reading of four leading spaces.
     assert!(text.contains("indented"), "{text:?}");
 }
+
+/// Build a one-off turn whose single tool result carries `desc` as its
+/// invocation description and no output — the shape the daemon produces for a
+/// running tool, and the shape the tool-row header renders from.
+fn turn_with_description(desc: &str) -> Turn {
+    Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![choreo_proto::ToolResultRecord {
+            call_id: "call1".into(),
+            name: "sh".into(),
+            content: String::new(),
+            is_error: false,
+            invocation_description: desc.into(),
+            image: None,
+        }],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
+#[test]
+fn tool_description_rows_after_the_first_use_the_full_width() {
+    // The collapse triangle opens the header row and so must cost that row two
+    // columns — but only that row.  Wrapping the whole description two columns
+    // narrower made every continuation row stop short of the right edge its
+    // plain output rows reach, leaving a visible three-column gap before the
+    // scrollbar.  `aaa bbb …` at width 40 packs a 37-column header row
+    // ("▶ " + nine 3-column words) and 39-column continuation rows (ten words);
+    // a wrap budget of 38 would cap the continuations at 35.
+    let desc = "abc ".repeat(40);
+    let (lines, _joins, _chrome) = markdown_header_lines(
+        desc.trim_end(),
+        40,
+        Span::styled("▶ ".to_string(), Style::default()),
+    );
+    assert!(lines[0].to_string().starts_with("▶ abc"), "{:?}", lines[0]);
+    for line in &lines {
+        assert!(line.width() <= 40, "row overflows the width: {line:?}");
+    }
+    let widest_continuation = lines.iter().skip(1).map(Line::width).max().unwrap_or(0);
+    assert_eq!(
+        widest_continuation, 39,
+        "continuation rows must wrap to the full width: {lines:?}"
+    );
+}
+
+#[test]
+fn tool_description_prefix_never_overflows_a_non_flowing_block() {
+    // A description that opens with a fenced code box has no flowing first row
+    // for the triangle to join, so the prefix's columns are reserved on the
+    // box's own rows and laid out in front of its first row.  The box's framed
+    // row is exactly `width` wide before the prefix; the two together must
+    // still fit.
+    let (lines, _joins, _chrome) = markdown_header_lines(
+        "```\naaaa bbbb cccc dddd eeee ffff gggg hhhh\n```",
+        40,
+        Span::styled("▶ ".to_string(), Style::default()),
+    );
+    assert!(lines[0].to_string().starts_with("▶ "), "{:?}", lines[0]);
+    for line in &lines {
+        assert!(line.width() <= 40, "row overflows the width: {line:?}");
+    }
+}
+
+#[test]
+fn tool_description_continuation_rows_reach_the_tool_content_width() {
+    // End-to-end through the turn assembler: the tool rows' content intervals
+    // (what the selection may copy) must reach the full tool content width, so
+    // the rendered text shares the right edge of the plain output rows instead
+    // of stopping short of it.
+    let desc = "Running shell command: `cargo build --release`. ".repeat(4);
+    let lines = render_turn_lines(
+        &turn_with_description(desc.trim_end()),
+        130,
+        138,
+        false,
+        &[],
+    );
+    let tool_ends: Vec<usize> = lines
+        .content_ranges
+        .iter()
+        .flatten()
+        .map(|&(_, end)| end)
+        .collect();
+    assert_eq!(
+        tool_ends.iter().copied().max(),
+        Some(138),
+        "a tool row must fill the tool content width: {tool_ends:?}"
+    );
+    assert!(
+        tool_ends.iter().all(|&end| end <= 138),
+        "no tool row may exceed the tool content width: {tool_ends:?}"
+    );
+}

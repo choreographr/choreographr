@@ -342,14 +342,42 @@ pub(crate) fn markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     markdown_lines_joined(markdown, width).0
 }
 
-/// [`markdown_lines`] plus the per-line [`LineJoin`] copy metadata (see the
-/// enum docs) and the aligned per-line [`LineChrome`] buffer.  Wrapped
-/// continuations of one paragraph rejoin with a space; paragraph/section
-/// boundaries, list items, code lines, and table rows are fresh lines.
-pub(crate) fn markdown_lines_joined(
-    markdown: &str,
-    width: u16,
-) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
+/// Document-wide options for the block renderer, threaded unchanged through
+/// every level of its recursion.
+///
+/// Only `indent` and `width` vary with nesting — a list item or a block quote
+/// renders its children at a narrower `width` — so those stay explicit
+/// parameters, while the options below hold for the whole document.
+#[derive(Clone, Default)]
+pub(crate) struct DocRender {
+    /// Shift applied to every heading level so the document's first heading
+    /// always renders as level 1 (see [`markdown_lines_joined`]).
+    pub heading_shift: usize,
+    /// Span that opens the document's first text row — a tool row's collapse
+    /// triangle plus its space.  It is text of that row, so the row wraps
+    /// `prefix.width()` columns narrower while every continuation row keeps
+    /// the full `width`; `None` for an ordinary document render.
+    pub first_row_prefix: Option<Span<'static>>,
+}
+
+impl DocRender {
+    /// Options for an ordinary render: `heading_shift`, no first-row prefix.
+    pub(crate) fn plain(heading_shift: usize) -> Self {
+        Self {
+            heading_shift,
+            first_row_prefix: None,
+        }
+    }
+
+    /// The same options carrying no first-row prefix — what every block after
+    /// the document's first, and every nested block, renders with.
+    pub(crate) fn without_prefix(&self) -> Self {
+        Self::plain(self.heading_shift)
+    }
+}
+
+/// Parse `markdown` for rendering, deriving the heading shift it renders under.
+fn parse_document(markdown: &str) -> (MarkdownDocument, usize) {
     // Normalize the source before the document is parsed, so every block
     // renderer measures exactly what ratatui draws (see
     // [`normalize_display_text`]): tabs are expanded instead of silently
@@ -367,7 +395,48 @@ pub(crate) fn markdown_lines_joined(
     // `## First / ### Sub` document renders as level 1 + level 2.
     let heading_shift =
         first_heading_level(&document.blocks).map_or(0, |level| (level.saturating_sub(1)) as usize);
-    render_document_lines(&document, width, heading_shift)
+    (document, heading_shift)
+}
+
+/// [`markdown_lines`] plus the per-line [`LineJoin`] copy metadata (see the
+/// enum docs) and the aligned per-line [`LineChrome`] buffer.  Wrapped
+/// continuations of one paragraph rejoin with a space; paragraph/section
+/// boundaries, list items, code lines, and table rows are fresh lines.
+pub(crate) fn markdown_lines_joined(
+    markdown: &str,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
+    let (document, heading_shift) = parse_document(markdown);
+    render_document_lines(&document, width, &DocRender::plain(heading_shift))
+}
+
+/// [`markdown_lines_joined`] for a tool row's header, where `prefix` (the
+/// collapse triangle and its space) opens the block's first text row.
+///
+/// The prefix is text of that row, so it costs the first row `prefix.width()`
+/// columns and nothing on the rows below: every continuation row wraps to the
+/// full `width` and so shares the right edge of the plain tool-output rows it
+/// sits above.  Reserving the prefix's columns on *every* row instead leaves
+/// those rows short of that edge by the prefix's width.
+///
+/// A description whose first block does not flow (a code box, list, table, or
+/// quote) has no first text row the prefix can join; the prefix's columns are
+/// then reserved on that block's own rows and the span is laid out in front of
+/// its first row (see [`render_markdown_blocks`]).
+pub(crate) fn markdown_header_lines(
+    markdown: &str,
+    width: u16,
+    prefix: Span<'static>,
+) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
+    let (document, heading_shift) = parse_document(markdown);
+    render_document_lines(
+        &document,
+        width,
+        &DocRender {
+            heading_shift,
+            first_row_prefix: Some(prefix),
+        },
+    )
 }
 
 /// Render an already-parsed, heading-shift-normalized [`MarkdownDocument`] into
@@ -382,10 +451,9 @@ pub(crate) fn markdown_lines_joined(
 pub(crate) fn render_document_lines(
     document: &MarkdownDocument,
     width: u16,
-    heading_shift: usize,
+    opts: &DocRender,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
-    let (mut lines, mut joins, mut chrome) =
-        render_blocks_untrimmed(document, width, heading_shift);
+    let (mut lines, mut joins, mut chrome) = render_blocks_untrimmed(document, width, opts);
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(String::new(), Style::default())));
         joins.push(LineJoin::Break);
@@ -415,7 +483,7 @@ pub(crate) fn render_document_lines(
 pub(crate) fn render_blocks_untrimmed(
     document: &MarkdownDocument,
     width: u16,
-    heading_shift: usize,
+    opts: &DocRender,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     let mut lines = Vec::new();
     let mut joins = Vec::new();
@@ -427,7 +495,7 @@ pub(crate) fn render_blocks_untrimmed(
         &mut chrome,
         0,
         width as usize,
-        heading_shift,
+        opts,
     );
     (lines, joins, chrome)
 }

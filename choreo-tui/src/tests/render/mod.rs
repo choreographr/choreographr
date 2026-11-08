@@ -6,14 +6,16 @@
 //! covers the account wizard and the credential modal; `session_list` covers
 //! the session-list table as one subject — its columns, the selected-row
 //! highlight, the three scroll/highlight sections and the archived/pin view;
-//! `palette` covers the inline command palette; `sinks` pins that untrusted
-//! daemon text is normalized at every widget sink it reaches.
+//! `palette` covers the inline command palette; `tool_rows` pins where a tool
+//! row's text ends relative to the scrollbar column; `sinks` pins that
+//! untrusted daemon text is normalized at every widget sink it reaches.
 
 mod format;
 mod model_selector;
 mod palette;
 mod session_list;
 mod sinks;
+mod tool_rows;
 mod wizard;
 
 use ratatui::buffer::Cell;

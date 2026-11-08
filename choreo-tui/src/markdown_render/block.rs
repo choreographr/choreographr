@@ -5,7 +5,7 @@
 //! `list.rs`.
 
 use super::{
-    Line, LineChrome, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR, QUOTE_BAR_COLOR,
+    DocRender, Line, LineChrome, LineJoin, MarkdownBlock, Modifier, QUOTE_BAR, QUOTE_BAR_COLOR,
     QUOTE_BAR_WIDTH, Span, Style, ensure_blank_line_joined, heading_prefix, inlines_to_lines,
     next_table_id, render_code_block, render_list, render_table_lines,
 };
@@ -19,7 +19,7 @@ pub(crate) fn render_markdown_blocks(
     chrome: &mut Vec<LineChrome>,
     indent: usize,
     width: usize,
-    heading_shift: usize,
+    opts: &DocRender,
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
@@ -35,8 +35,49 @@ pub(crate) fn render_markdown_blocks(
             joins.push(LineJoin::Break);
             chrome.push(LineChrome::default());
         }
-        render_markdown_block(block, lines, joins, chrome, indent, width, heading_shift);
+        // The first-row prefix belongs to the document's opening block alone.
+        let block_opts = if index == 0 {
+            opts.clone()
+        } else {
+            opts.without_prefix()
+        };
+        // A flowing block (paragraph or heading) joins the prefix into its own
+        // first text row, which is what lets every continuation row keep the
+        // full width.  A first block that lays out fixed rows (a code box,
+        // list, or table) or its own gutter (a quote) has no such row, so the
+        // prefix's columns are reserved on that block's rows instead and the
+        // span is laid out in front of its first row — the only arrangement
+        // that neither drops the prefix nor pushes a row past `width`.
+        match (&block_opts.first_row_prefix, block) {
+            (Some(prefix), block) if !flows_into_first_row(block) => {
+                let start = lines.len();
+                let shrunk = width.saturating_sub(prefix.width());
+                render_markdown_block(
+                    block,
+                    lines,
+                    joins,
+                    chrome,
+                    indent,
+                    shrunk,
+                    &block_opts.without_prefix(),
+                );
+                if let Some(row) = lines.get_mut(start) {
+                    row.spans.insert(0, prefix.clone());
+                }
+            }
+            _ => render_markdown_block(block, lines, joins, chrome, indent, width, &block_opts),
+        }
     }
+}
+
+/// Whether a block's own text flows into wrapped rows that a leading span can
+/// join — a paragraph or a heading — as opposed to a block whose rows are laid
+/// out by rules of their own.
+fn flows_into_first_row(block: &MarkdownBlock) -> bool {
+    matches!(
+        block,
+        MarkdownBlock::Paragraph(_) | MarkdownBlock::Heading { .. }
+    )
 }
 
 pub(crate) fn render_markdown_block(
@@ -46,12 +87,17 @@ pub(crate) fn render_markdown_block(
     chrome: &mut Vec<LineChrome>,
     indent: usize,
     width: usize,
-    heading_shift: usize,
+    opts: &DocRender,
 ) {
     match block {
         MarkdownBlock::Paragraph(content) => {
-            let (para_lines, para_joins, para_chrome) =
-                inlines_to_lines(content, indent, None, width, Modifier::empty());
+            let (para_lines, para_joins, para_chrome) = inlines_to_lines(
+                content,
+                indent,
+                opts.first_row_prefix.clone(),
+                width,
+                Modifier::empty(),
+            );
             lines.extend(para_lines);
             joins.extend(para_joins);
             chrome.extend(para_chrome);
@@ -59,13 +105,23 @@ pub(crate) fn render_markdown_block(
         MarkdownBlock::Heading { level, content } => {
             // Normalize the raw markdown level by the document-wide shift so
             // the first heading always renders as level 1 (see markdown_lines).
-            let normalized = (*level as usize).saturating_sub(heading_shift).max(1);
-            let prefix = heading_prefix(normalized);
+            let normalized = (*level as usize).saturating_sub(opts.heading_shift).max(1);
+            let heading_deco = heading_prefix(normalized);
+            // A document that opens with a heading carries the first-row
+            // prefix in front of the heading's own decoration.
+            let prefix = match (opts.first_row_prefix.clone(), heading_deco) {
+                (Some(lead), Some(deco)) => {
+                    Some(Span::styled(format!("{}{deco}", lead.content), lead.style))
+                }
+                (Some(lead), None) => Some(lead),
+                (None, Some(deco)) => Some(Span::styled(deco, Style::default())),
+                (None, None) => None,
+            };
             // Headings are rendered bold + underlined for visual distinction.
             let (heading_lines, heading_joins, heading_chrome) = inlines_to_lines(
                 content,
                 indent,
-                prefix.as_deref(),
+                prefix,
                 width,
                 Modifier::BOLD | Modifier::UNDERLINED,
             );
@@ -100,7 +156,7 @@ pub(crate) fn render_markdown_block(
                 &mut quoted_chrome,
                 0,
                 width.saturating_sub(indent + 2),
-                heading_shift,
+                &opts.without_prefix(),
             );
             for ((line, _inner_join), inner_chrome) in
                 quoted.into_iter().zip(quoted_joins).zip(quoted_chrome)
@@ -153,8 +209,14 @@ pub(crate) fn render_markdown_block(
         } => {
             // List layout (the shared marker column, the per-pair item spacing,
             // and the delimited-list margins) lives in `list.rs`.
-            let (list_lines, list_joins, list_chrome) =
-                render_list(*ordered, *start, items, indent, width, heading_shift);
+            let (list_lines, list_joins, list_chrome) = render_list(
+                *ordered,
+                *start,
+                items,
+                indent,
+                width,
+                &opts.without_prefix(),
+            );
             lines.extend(list_lines);
             joins.extend(list_joins);
             chrome.extend(list_chrome);

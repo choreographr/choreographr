@@ -2,8 +2,8 @@
 //! rendering, the per-pair item spacing, and the delimited-list margins.
 
 use super::{
-    Line, LineChrome, LineJoin, ListItem, Span, Style, display_width, ensure_blank_line_joined,
-    indented_line, ordered_marker, render_markdown_blocks,
+    DocRender, Line, LineChrome, LineJoin, ListItem, Span, Style, display_width,
+    ensure_blank_line_joined, indented_line, ordered_marker, render_markdown_blocks,
 };
 
 /// One rendered list item: its padded marker, its rendered rows, and the
@@ -22,7 +22,7 @@ pub(crate) fn render_list(
     items: &[ListItem],
     indent: usize,
     width: usize,
-    heading_shift: usize,
+    opts: &DocRender,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     // Build the list into its own buffers: every item is rendered before any
     // output is emitted, so each item's row count is known when its pair is
@@ -97,7 +97,7 @@ pub(crate) fn render_list(
             &mut rendered_chrome,
             0,
             width.saturating_sub(indent + max_marker_width),
-            heading_shift,
+            &opts.without_prefix(),
         );
         rendered_items.push((marker, rendered, rendered_joins, rendered_chrome));
     }

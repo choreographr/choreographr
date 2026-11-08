@@ -8,7 +8,7 @@
 
 use super::{
     IncrementalMarkdown, LineChrome, LineJoin, RenderedTurnLines, RowContent, ansi_lines_joined,
-    classify_row_content, markdown_lines_joined, plain_text_lines_joined,
+    classify_row_content, markdown_header_lines, markdown_lines_joined, plain_text_lines_joined,
 };
 use crate::render::{BG_SHADE, format_timestamp};
 use crate::text_filter::{normalize_ansi_text, normalize_display_text};
@@ -509,36 +509,37 @@ fn render_turn_lines_impl(
         let mut body_chrome: Vec<LineChrome> = Vec::new();
 
         // Invocation description rendered as markdown so inline code and
-        // emphasis highlight properly.  Its first line becomes the header
-        // row (triangle + description); any continuation lines are part of
-        // the always-visible summary (see below).  Wrapped two columns
-        // narrower than the content width because the header prepends the
-        // triangle glyph ("▶ ") to the first line — wrapping at the full
-        // width would push the header row past the right edge.
+        // emphasis highlight properly.  Its first line becomes the header row
+        // (triangle + description); any continuation lines are part of the
+        // always-visible summary (see below).  The triangle is folded into the
+        // description as the block's first-row prefix, so it costs the header
+        // row its two columns and every continuation row wraps to the full
+        // content width — the same right edge as the plain output rows below.
+        let arrow_span = Span::styled(format!("{arrow} "), Style::default().fg(Color::Gray));
         let (desc_lines, desc_joins, desc_chrome) = if tr.invocation_description.is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
         } else {
-            markdown_lines_joined(
+            markdown_header_lines(
                 &tr.invocation_description,
-                tool_content_width.saturating_sub(2),
+                tool_content_width,
+                arrow_span.clone(),
             )
         };
         let desc_len = desc_lines.len();
 
         // Header row — always rendered so its position is stable across
         // collapse/expand (mirroring the reasoning header).  The triangle
-        // sits left of the description; when no description exists (common
-        // while streaming) the standard label carries the row instead.
+        // opens the description's first row; when no description exists
+        // (common while streaming) the standard label carries the row and the
+        // triangle is laid out here.  The tool name is MCP-supplied (any
+        // string a server chooses), so it is normalized like every other
+        // displayed value.
         let header_idx_in_body = body.len();
-        let mut header_spans = vec![Span::styled(
-            format!("{arrow} "),
-            Style::default().fg(Color::Gray),
-        )];
+        let mut header_spans = Vec::new();
         if let Some(first) = desc_lines.first() {
             header_spans.extend(first.spans.iter().cloned());
         } else {
-            // The tool name is MCP-supplied (any string a server chooses), so
-            // it is normalized like every other displayed value.
+            header_spans.push(arrow_span);
             header_spans.push(Span::styled(
                 format!("{label}: {}", normalize_display_text(&tr.name)),
                 Style::default().fg(accent),

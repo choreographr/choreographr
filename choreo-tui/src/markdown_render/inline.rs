@@ -8,7 +8,7 @@ use super::{
 pub(crate) fn inlines_to_lines(
     inlines: &[MarkdownInline],
     indent: usize,
-    prefix: Option<&str>,
+    prefix: Option<Span<'static>>,
     width: usize,
     modifier: Modifier,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
@@ -21,9 +21,14 @@ pub(crate) fn inlines_to_lines(
         current_spans.push(Span::styled(" ".repeat(indent), Style::default()));
         current_width += indent;
     }
+    // The prefix (a heading's decoration, or a tool row's collapse triangle)
+    // opens the *first* row only: it is charged against this row's width, so
+    // the row wraps narrower by the prefix's own width while every row after
+    // it — flushed by `flush_line_with_next`, which re-applies only `indent` —
+    // gets the full `width`.
     if let Some(prefix) = prefix {
-        current_spans.push(Span::styled(prefix.to_string(), Style::default()));
-        current_width += display_width(prefix);
+        current_width += prefix.width();
+        current_spans.push(prefix);
     }
     let mut needs_separator = false;
     let final_join = {

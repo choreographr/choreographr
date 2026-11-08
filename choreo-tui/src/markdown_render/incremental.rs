@@ -261,9 +261,9 @@ impl Committed {
         };
         let effective = shift.unwrap_or(0);
         let (lines, joins, chrome) = if trim {
-            render_document_lines(&document, width, effective)
+            render_document_lines(&document, width, &super::DocRender::plain(effective))
         } else {
-            render_blocks_untrimmed(&document, width, effective)
+            render_blocks_untrimmed(&document, width, &super::DocRender::plain(effective))
         };
         SegmentRender {
             lines,
