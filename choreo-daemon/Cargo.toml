@@ -22,6 +22,11 @@ base64.workspace = true
 arc-swap.workspace = true
 crossbeam-channel.workspace = true
 dirs.workspace = true
+# Glob/walker built from Zig (`-Dstatic-only`). Held on 1.7.1: 1.8.0's bundled
+# Zig sources use `@backingInt`/`@fromBackingInt`, builtins added in Zig 0.17, so
+# 1.8+ needs Zig 0.17.1+ to build. Bump once the build toolchain is Zig 0.17.1 or
+# newer (0.17.1 is released; the current environment still ships 0.16.0, which
+# zlob 1.8 rejects and zlob 1.7.1 accepts).
 zlob = "1.7.1"
 grep-regex = "0.1"
 grep-searcher = "0.1"
