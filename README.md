@@ -375,7 +375,7 @@ listening.
 
 ## Build from source
 
-Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.99** — and a [Zig toolchain](https://ziglang.org/) (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
+Requires a [Rust toolchain](https://rustup.rs/) — minimum supported Rust version (MSRV) is **1.99** — and a [Zig toolchain](https://ziglang.org/) **0.17.1 or newer** (`brew install zig`), which `choreographr` needs to compile the `zlob` glob/walker dependency.
 
 The repo builds on **nightly** Rust by default (`rust-toolchain.toml` pins `nightly`), which lets every `cargo` command — including per-crate ones like `cargo check -p choreo-proto` or `cargo test -p choreo-sanitize` — automatically apply the fast per-profile `-Z` compiler flags (`-Zshare-generics` in dev, parallel rustc frontend in dev and release). No opting in or remembering of flags is needed: a bare `cargo` command just builds fast. `rustup` auto-installs the pinned channel the first time you run `cargo` in the checkout:
 

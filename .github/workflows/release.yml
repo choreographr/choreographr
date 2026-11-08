@@ -62,12 +62,13 @@
 #                   daemon-smoke.sh run the binaries natively in the VM.
 #
 # Zig version pin: every job installs Zig via mlugg/setup-zig@v2 with an
-# explicit `version: 0.16.0`. zlob (a choreo-daemon dependency) compiles its
-# Zig source in build.rs on EVERY target and passes `--global-cache-dir`, a flag
-# that Zig 0.17.0's reworked build system removed — so the action's default
-# unpinned "latest" aborts zlob's build on every platform the moment a new Zig
-# lands (observed: 0.16.0 passed, 0.17.0 failed all jobs). Pin the last release
-# zlob accepts; bump it once zlob ships Zig 0.17 support.
+# explicit `version: 0.17.1`. zlob (a choreo-daemon dependency) compiles its Zig
+# source in build.rs on EVERY target; zlob 1.8.0 requires Zig 0.17.1+ (its
+# sources use the `@backingInt` builtin added in Zig 0.17, and its build.rs uses
+# the 0.17 build system's ZIG_GLOBAL_CACHE_DIR rather than the removed
+# `--global-cache-dir` flag). Keep the pin explicit — the action's unpinned
+# "latest" aborts zlob's build the moment a newer Zig lands that zlob does not
+# yet accept. Bump it together with the zlob dependency.
 #
 # The windows-msvc build ships in the published release: the release job
 # downloads its zip, folds it into the combined SHA256SUMS, and attaches it
@@ -140,9 +141,8 @@ jobs:
           tool: cargo-zigbuild
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
-          # `--global-cache-dir` flag its build.rs passes (see the header note).
-          version: 0.16.0
+          # zlob 1.8.0 needs Zig 0.17.1+ (see the header note).
+          version: 0.17.1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -232,9 +232,8 @@ jobs:
           tool: cargo-zigbuild
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
-          # `--global-cache-dir` flag its build.rs passes (see the header note).
-          version: 0.16.0
+          # zlob 1.8.0 needs Zig 0.17.1+ (see the header note).
+          version: 0.17.1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -297,9 +296,8 @@ jobs:
       # zlob's direct zig dependency.
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
-          # `--global-cache-dir` flag its build.rs passes (see the header note).
-          version: 0.16.0
+          # zlob 1.8.0 needs Zig 0.17.1+ (see the header note).
+          version: 0.17.1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -395,9 +393,8 @@ jobs:
       # see the macos job comment) — the Windows zip build is no exception.
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
-          # `--global-cache-dir` flag its build.rs passes (see the header note).
-          version: 0.16.0
+          # zlob 1.8.0 needs Zig 0.17.1+ (see the header note).
+          version: 0.17.1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -506,9 +503,8 @@ jobs:
       # satisfy it.
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
-          # `--global-cache-dir` flag its build.rs passes (see the header note).
-          version: 0.16.0
+          # zlob 1.8.0 needs Zig 0.17.1+ (see the header note).
+          version: 0.17.1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -697,9 +693,8 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         with:
-          # Pin the last Zig release zlob 1.7.1 accepts: Zig 0.17.0 rejects the
-          # `--global-cache-dir` flag its build.rs passes (see the header note).
-          version: 0.16.0
+          # zlob 1.8.0 needs Zig 0.17.1+ (see the header note).
+          version: 0.17.1
         # The macOS aarch64 job above documents the same need: zlob (via
         # choreo-daemon) compiles its Zig source with `zig cc` in build.rs on
         # EVERY host — and since choreo-daemon entered the iOS build (step 5
@@ -827,9 +822,9 @@ jobs:
     # 2026-11-03 (daemon booted, fingerprint computed, clean SIGTERM exit).
     # Host parity without a VM: `just check-freebsd` type-checks every library
     # for x86_64-unknown-freebsd from any host.
-    # NOTE: `pkg install zig` may lag the Zig 0.16.0 that zlob 1.7.1 requires;
+    # NOTE: `pkg install zig` may lag the Zig 0.17.1 that zlob 1.8.0 requires;
     # if a future build fails on zlob, pin the Zig version here (download the
-    # 0.16.0 tarball into PATH).
+    # 0.17.1 tarball into PATH).
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:

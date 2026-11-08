@@ -79,7 +79,7 @@ jobs:
       # pinned for the reason given in release.yml's header note.
       - uses: mlugg/setup-zig@v2
         with:
-          version: 0.16.0
+          version: 0.17.1
 
       # `just coverage-lcov` refuses a cargo-llvm-cov older than 0.9.1 (older
       # releases miss the nextest binaries in the nightly build-dir layout).

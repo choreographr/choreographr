@@ -1107,7 +1107,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
  "x11rb",
 ]
 
@@ -2042,7 +2042,7 @@ dependencies = [
  "bitflags 2.13.2",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.13.0",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -2060,8 +2060,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "90dbd31c98227229239363921e60fcf5e558e43ec69094d46fc4996f08d1d5bc"
 dependencies = [
  "bitcoin_hashes",
- "rand 0.7.3",
- "rand_core 0.5.1",
+ "rand 0.8.8",
+ "rand_core 0.6.4",
  "serde",
  "unicode-normalization",
 ]
@@ -2996,7 +2996,7 @@ dependencies = [
  "heifer",
  "heifer-isobmff",
  "image",
- "moxcms 0.9.2",
+ "moxcms",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -4709,7 +4709,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5047,7 +5047,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6088,7 +6088,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7518b930f6aeb75e871d32ce873c2ae46e35cef19b5a0b039d4337f651d897cd"
 dependencies = [
  "bstr",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -6770,7 +6770,7 @@ dependencies = [
  "log",
  "presser",
  "thiserror 2.0.21",
- "windows 0.58.0",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -7291,7 +7291,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -7506,7 +7506,7 @@ dependencies = [
  "exr",
  "gif",
  "image-webp",
- "moxcms 0.8.1",
+ "moxcms",
  "mp4parse",
  "num-traits",
  "png",
@@ -8865,16 +8865,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "moxcms"
-version = "0.9.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "561875e11b3d8618524f974f85e4bbd05a64a112b8f7541ffcc236b5166c0564"
-dependencies = [
- "num-traits",
- "pxfm",
-]
-
-[[package]]
 name = "mp4parse"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9122,7 +9112,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10759,7 +10749,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11582,7 +11572,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -11662,7 +11652,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 1.0.11",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13672,10 +13662,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -13693,7 +13683,7 @@ version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8c27177b12a6399ffc08b98f76f7c9a1f4fe9fc967c784c5a071fa8d93cf7e1"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -14292,7 +14282,7 @@ checksum = "97fee6b57c6a41524a810daee9286c02d7752c4253064d0b05472833a438f675"
 dependencies = [
  "cfg-if",
  "digest 0.10.7",
- "rand 0.7.3",
+ "rand 0.8.8",
  "static_assertions",
 ]
 
@@ -15774,7 +15764,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16372,7 +16362,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -16751,9 +16741,9 @@ checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 
 [[package]]
 name = "zlob"
-version = "1.7.1"
+version = "1.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b87ec8c6fa7d706ea81f68659a7b1de38516d91ba5bde4c97077ad07b30c1b2"
+checksum = "92267b5d21aa2e070fb858fb0e42e23ae91688641eebfbdd343b0841edd2b0b8"
 dependencies = [
  "bindgen",
  "bitflags 2.13.2",
