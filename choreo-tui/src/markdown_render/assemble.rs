@@ -515,15 +515,16 @@ fn render_turn_lines_impl(
         // description as the block's first-row prefix, so it costs the header
         // row its two columns and every continuation row wraps to the full
         // content width — the same right edge as the plain output rows below.
+        //
+        // A description with no visible text (empty, or only whitespace while a
+        // tool streams) takes the label fallback instead: the markdown path
+        // would otherwise yield a blank first row, dropping the triangle and the
+        // label both.
         let arrow_span = Span::styled(format!("{arrow} "), Style::default().fg(Color::Gray));
-        let (desc_lines, desc_joins, desc_chrome) = if tr.invocation_description.is_empty() {
+        let (desc_lines, desc_joins, desc_chrome) = if tr.invocation_description.trim().is_empty() {
             (Vec::new(), Vec::new(), Vec::new())
         } else {
-            markdown_header_lines(
-                &tr.invocation_description,
-                tool_content_width,
-                arrow_span.clone(),
-            )
+            markdown_header_lines(&tr.invocation_description, tool_content_width, &arrow_span)
         };
         let desc_len = desc_lines.len();
 

@@ -934,7 +934,7 @@ fn tool_description_rows_after_the_first_use_the_full_width() {
     let (lines, _joins, _chrome) = markdown_header_lines(
         desc.trim_end(),
         40,
-        Span::styled("▶ ".to_string(), Style::default()),
+        &Span::styled("▶ ".to_string(), Style::default()),
     );
     assert!(lines[0].to_string().starts_with("▶ abc"), "{:?}", lines[0]);
     for line in &lines {
@@ -948,21 +948,71 @@ fn tool_description_rows_after_the_first_use_the_full_width() {
 }
 
 #[test]
-fn tool_description_prefix_never_overflows_a_non_flowing_block() {
+fn tool_description_non_flowing_block_stays_aligned_under_the_prefix() {
     // A description that opens with a fenced code box has no flowing first row
-    // for the triangle to join, so the prefix's columns are reserved on the
-    // box's own rows and laid out in front of its first row.  The box's framed
-    // row is exactly `width` wide before the prefix; the two together must
-    // still fit.
+    // for the triangle to join.  The whole block must be shifted right beneath
+    // the triangle — the prefix opens the first row and an equal-width blank pad
+    // opens every later row — so the box keeps one straight frame instead of the
+    // top border jogging two columns right of its sides, and no row overflows.
     let (lines, _joins, _chrome) = markdown_header_lines(
         "```\naaaa bbbb cccc dddd eeee ffff gggg hhhh\n```",
         40,
-        Span::styled("▶ ".to_string(), Style::default()),
+        &Span::styled("▶ ".to_string(), Style::default()),
     );
-    assert!(lines[0].to_string().starts_with("▶ "), "{:?}", lines[0]);
+    let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+    assert!(rows[0].starts_with("▶ ╭"), "{rows:?}");
+    for row in &rows[1..] {
+        assert!(
+            row.starts_with("  "),
+            "block rows must pad under the prefix: {row:?}"
+        );
+    }
     for line in &lines {
         assert!(line.width() <= 40, "row overflows the width: {line:?}");
     }
+}
+
+#[test]
+fn tool_description_list_markers_stay_aligned_under_the_prefix() {
+    // The list case is the same shift: only the first item's first line carries
+    // the triangle, and the rest are padded by its width, so every marker sits
+    // in one column rather than the second item jumping back to column 0.
+    let (lines, _joins, _chrome) = markdown_header_lines(
+        "- alpha\n- beta\n- gamma",
+        40,
+        &Span::styled("▶ ".to_string(), Style::default()),
+    );
+    let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+    assert!(rows[0].starts_with("▶ • "), "{rows:?}");
+    let marker_columns: Vec<Option<usize>> = rows
+        .iter()
+        .filter(|row| row.contains('•'))
+        .map(|row| row.chars().position(|ch| ch == '•'))
+        .collect();
+    assert!(
+        marker_columns.iter().all(|&col| col == Some(2)),
+        "list markers must share one column under the prefix: {rows:?}"
+    );
+    for line in &lines {
+        assert!(line.width() <= 40, "row overflows the width: {line:?}");
+    }
+}
+
+#[test]
+fn whitespace_only_description_falls_back_to_the_label_header() {
+    // A description that is only whitespace parses to a blank row.  Without the
+    // trim guard that blank first row would become the header and drop both the
+    // collapse triangle and the label, leaving an un-clickable empty row.
+    let lines = render_turn_lines(&turn_with_description("   "), 80, 85, false, &[]).lines;
+    let header = lines[0].to_string();
+    assert!(
+        header.starts_with("▼ "),
+        "the triangle must survive: {header:?}"
+    );
+    assert!(
+        header.contains("tool result: sh"),
+        "the label must carry the row: {header:?}"
+    );
 }
 
 #[test]

@@ -22,7 +22,7 @@ pub(crate) fn render_list(
     items: &[ListItem],
     indent: usize,
     width: usize,
-    opts: &DocRender,
+    opts: &DocRender<'_>,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
     // Build the list into its own buffers: every item is rendered before any
     // output is emitted, so each item's row count is known when its pair is

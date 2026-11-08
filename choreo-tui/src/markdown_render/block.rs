@@ -19,7 +19,7 @@ pub(crate) fn render_markdown_blocks(
     chrome: &mut Vec<LineChrome>,
     indent: usize,
     width: usize,
-    opts: &DocRender,
+    opts: &DocRender<'_>,
 ) {
     for (index, block) in blocks.iter().enumerate() {
         if index > 0 {
@@ -35,37 +35,37 @@ pub(crate) fn render_markdown_blocks(
             joins.push(LineJoin::Break);
             chrome.push(LineChrome::default());
         }
-        // The first-row prefix belongs to the document's opening block alone.
+        // The first-row prefix belongs to the document's opening block alone;
+        // every later block and every nested block renders without it.
         let block_opts = if index == 0 {
-            opts.clone()
+            *opts
         } else {
             opts.without_prefix()
         };
-        // A flowing block (paragraph or heading) joins the prefix into its own
-        // first text row, which is what lets every continuation row keep the
-        // full width.  A first block that lays out fixed rows (a code box,
-        // list, or table) or its own gutter (a quote) has no such row, so the
-        // prefix's columns are reserved on that block's rows instead and the
-        // span is laid out in front of its first row — the only arrangement
-        // that neither drops the prefix nor pushes a row past `width`.
-        match (&block_opts.first_row_prefix, block) {
-            (Some(prefix), block) if !flows_into_first_row(block) => {
+        match (block_opts.first_row_prefix, block) {
+            // A flowing block (paragraph or heading) joins the prefix into its
+            // own first text row, which is what lets every continuation row
+            // keep the full width.
+            (Some(_), block) if flows_into_first_row(block) => {
+                render_markdown_block(block, lines, joins, chrome, indent, width, &block_opts);
+            }
+            // A first block that lays out fixed rows (a code box, list, or
+            // table) or its own gutter (a quote) has no text row the prefix can
+            // join.  Its rows are rendered `prefix.width()` narrower, then the
+            // *whole block* is shifted right: the prefix opens the first row and
+            // an equal-width blank pad opens every later row, so the block keeps
+            // its internal alignment (a box's frame, a table's columns, a list's
+            // markers, a quote's bar) while the prefix never overflows `width`.
+            (Some(prefix), block) => {
                 let start = lines.len();
                 let shrunk = width.saturating_sub(prefix.width());
-                render_markdown_block(
-                    block,
-                    lines,
-                    joins,
-                    chrome,
-                    indent,
-                    shrunk,
-                    &block_opts.without_prefix(),
-                );
-                if let Some(row) = lines.get_mut(start) {
-                    row.spans.insert(0, prefix.clone());
-                }
+                let plain = block_opts.without_prefix();
+                render_markdown_block(block, lines, joins, chrome, indent, shrunk, &plain);
+                shift_rows_right(lines, chrome, start, prefix);
             }
-            _ => render_markdown_block(block, lines, joins, chrome, indent, width, &block_opts),
+            (None, block) => {
+                render_markdown_block(block, lines, joins, chrome, indent, width, &block_opts);
+            }
         }
     }
 }
@@ -80,6 +80,42 @@ fn flows_into_first_row(block: &MarkdownBlock) -> bool {
     )
 }
 
+/// Shift every row the block at `[start..]` rendered right by `prefix`'s width,
+/// so the block sits in the columns to the right of the prefix instead of under
+/// it.  The prefix itself opens the first row (the collapse triangle); every
+/// later row opens with an equal-width blank pad so the block's rows stay
+/// mutually aligned.  The matching [`LineChrome`] intervals move with the text,
+/// so a shifted block's copy metadata keeps pointing at its real columns.
+fn shift_rows_right(
+    lines: &mut [Line<'static>],
+    chrome: &mut [LineChrome],
+    start: usize,
+    prefix: &Span<'static>,
+) {
+    let pad_width = prefix.width();
+    if pad_width == 0 {
+        return;
+    }
+    let pad = Span::styled(" ".repeat(pad_width), Style::default());
+    if let Some(block_rows) = lines.get_mut(start..) {
+        for (offset, row) in block_rows.iter_mut().enumerate() {
+            let lead = if offset == 0 {
+                prefix.clone()
+            } else {
+                pad.clone()
+            };
+            row.spans.insert(0, lead);
+        }
+    }
+    if let Some(block_chrome) = chrome.get_mut(start..) {
+        for row_chrome in block_chrome {
+            let mut shifted = LineChrome::default();
+            shifted.extend_shifted(row_chrome, pad_width);
+            *row_chrome = shifted;
+        }
+    }
+}
+
 pub(crate) fn render_markdown_block(
     block: &MarkdownBlock,
     lines: &mut Vec<Line<'static>>,
@@ -87,14 +123,14 @@ pub(crate) fn render_markdown_block(
     chrome: &mut Vec<LineChrome>,
     indent: usize,
     width: usize,
-    opts: &DocRender,
+    opts: &DocRender<'_>,
 ) {
     match block {
         MarkdownBlock::Paragraph(content) => {
             let (para_lines, para_joins, para_chrome) = inlines_to_lines(
                 content,
                 indent,
-                opts.first_row_prefix.clone(),
+                opts.first_row_prefix.cloned().into_iter().collect(),
                 width,
                 Modifier::empty(),
             );
@@ -106,17 +142,17 @@ pub(crate) fn render_markdown_block(
             // Normalize the raw markdown level by the document-wide shift so
             // the first heading always renders as level 1 (see markdown_lines).
             let normalized = (*level as usize).saturating_sub(opts.heading_shift).max(1);
-            let heading_deco = heading_prefix(normalized);
             // A document that opens with a heading carries the first-row
-            // prefix in front of the heading's own decoration.
-            let prefix = match (opts.first_row_prefix.clone(), heading_deco) {
-                (Some(lead), Some(deco)) => {
-                    Some(Span::styled(format!("{}{deco}", lead.content), lead.style))
-                }
-                (Some(lead), None) => Some(lead),
-                (None, Some(deco)) => Some(Span::styled(deco, Style::default())),
-                (None, None) => None,
-            };
+            // prefix in front of the heading's own decoration.  The prefix and
+            // the decoration are distinct spans so each keeps its own style
+            // (the triangle's gray, the decoration's inherited style).
+            let mut prefix: Vec<Span<'static>> = Vec::new();
+            if let Some(lead) = opts.first_row_prefix {
+                prefix.push(lead.clone());
+            }
+            if let Some(deco) = heading_prefix(normalized) {
+                prefix.push(Span::styled(deco, Style::default()));
+            }
             // Headings are rendered bold + underlined for visual distinction.
             let (heading_lines, heading_joins, heading_chrome) = inlines_to_lines(
                 content,
@@ -209,14 +245,8 @@ pub(crate) fn render_markdown_block(
         } => {
             // List layout (the shared marker column, the per-pair item spacing,
             // and the delimited-list margins) lives in `list.rs`.
-            let (list_lines, list_joins, list_chrome) = render_list(
-                *ordered,
-                *start,
-                items,
-                indent,
-                width,
-                &opts.without_prefix(),
-            );
+            let (list_lines, list_joins, list_chrome) =
+                render_list(*ordered, *start, items, indent, width, opts);
             lines.extend(list_lines);
             joins.extend(list_joins);
             chrome.extend(list_chrome);

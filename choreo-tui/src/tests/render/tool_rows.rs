@@ -6,10 +6,9 @@
 //! holds, so a wrap budget that leaves the row short of that column (a gap of
 //! several blank columns before the scrollbar) is caught however it arises.
 
+use super::drawn_buffer;
 use crate::tests::support::test_app;
 use choreo_proto::{ToolResultRecord, Turn};
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
 
 #[test]
 fn tool_rows_stop_one_column_before_the_scrollbar() {
@@ -51,11 +50,7 @@ fn tool_rows_stop_one_column_before_the_scrollbar() {
 
     let [history_area, ..] = app.chat_page_layout(W, H);
 
-    let mut terminal = Terminal::new(TestBackend::new(W, H)).expect("test terminal");
-    terminal
-        .draw(|frame| crate::render::render(frame, &mut app))
-        .expect("render a frame");
-    let buffer = terminal.backend().buffer();
+    let buffer = drawn_buffer(&mut app, W, H);
 
     // The rightmost inked column over the whole history pane: every row of the
     // viewport is a wrapped description row, so this is the wrap budget.  The
