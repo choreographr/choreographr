@@ -3086,6 +3086,82 @@ that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
 
 ---
 
+### Keyboard chords are exact modifier sets
+
+The TUI's command layer is one table of `Alt+[Shift+]<key>` chords
+(`choreo-tui/src/state/keymap.rs`), consulted *before* the page's own key
+handling so a chord and its typed `/command` spelling run one implementation.
+A chord matches only its **exact** modifier set: `Alt+Shift+R` (flip the bulk
+reasoning visibility) and `Alt+R` (cycle the reasoning effort) are different
+commands, and no chord aliases its sibling.
+
+Both terminal encodings can express that difference, by different means, and the
+lowering reconciles them in one place. A kitty-protocol terminal reports
+`shift+alt+key` as a CSI-u event with SHIFT in the modifier field
+(`CSI 114;4 u` → `Char('r') + ALT + SHIFT`) — true even under the single
+`DISAMBIGUATE_ESCAPE_CODES` enhancement the client requests, so no stronger
+keyboard mode (and no repeat of the IME text-event regression that
+`REPORT_ALL_KEYS_AS_ESCAPE_CODES` causes) is needed. A legacy terminal has no
+modifier for a printer key at all: it sends `ESC R`, which crossterm reports as
+`Char('R') + ALT`, carrying the shift **in the glyph's case**.
+`chord_from_event` therefore infers SHIFT from an uppercase glyph as well as
+from the modifier bit, so one table entry binds identically on both terminal
+classes. `normalize_kitty_shift` still maps a kitty unshifted codepoint + SHIFT
+to the legacy *glyph* (`r` → `R`, so typing is unchanged) but now **preserves
+the SHIFT modifier** instead of clearing it.
+
+The accepted cost of reading case is that **Caps Lock is indistinguishable from
+Shift** on a legacy terminal (kitty terminals do not report lock modifiers for
+text keys), so a caps-lock user's `Alt+R` reads as `Alt+Shift+R` there. The
+editing kernel stays deliberately shift-**insensitive** (`Ctrl+Shift+D` is still
+`Ctrl+D`): legacy terminals cannot express the distinction for a control chord
+(`Ctrl+Shift+M` was byte 0x0D, same as `Ctrl+M`), and the kernel's contract is
+legacy equivalence.
+
+### Bulk reasoning visibility
+
+Each session display carries a **bulk reasoning-visibility mode**
+(`ReasoningViewMode`, flipped by `Alt+Shift+R` / `/reasoning-toggle`):
+`Expanded` (the default, and the pre-change behaviour) or `Collapsed`. The mode
+is a *fallback*, never an override — a per-turn preference recorded by clicking
+a reasoning header still wins in either mode, so one turn can be open in the
+collapsed mode and closed in the expanded one.
+
+The two modes are deliberately **not mirror images**. `Collapsed` hides every
+body, including one that is still streaming. `Expanded` re-applies the
+content-derived default (`reasoning_expanded_default`: expanded while the turn
+has no response, collapsed once it has one) rather than forcing every body open,
+so a turn that already has an answer stays collapsed, a still-streaming turn
+shows its reasoning live, and a turn whose answer *starts* while it is expanded
+collapses itself at that moment (the existing auto-collapse on the first answer
+chunk, which drops any explicit expansion override, still runs in both modes).
+
+The toggle decision reads the **effective** state of every reasoning-bearing
+non-undone turn in the session — not the viewport — so a turn the user manually
+opened counts as "not collapsed" and the next press collapses the transcript
+again; a session with no reasoning at all is vacuously all-collapsed and so
+switches to expanded. Switching clears every per-turn override, because the mode
+is a statement about the whole transcript, and drops the render cache (the mode
+is not part of `RenderCacheKey`).
+
+The mode is per-session, in-memory view state: it survives switching sessions
+(it hangs off the display, like the overrides) and dies with the process, since
+`choreo-tui` keeps no state on disk. `/reasoning-toggle` is a local-UI command
+(`Command::ReasoningToggle` in `choreo-client-core`) with no daemon message and
+no status line — the transcript's own headers are the feedback.
+
+A reasoning chunk for a turn whose body is effectively **collapsed** and already
+carries text changes no rendered row (the header is present at a fixed height),
+so `handle_request_stream` skips the whole re-render path for it: no
+`bump_turn_version`, no streaming/content dirty mark, no scheduled frame. The
+first chunk of a turn is the exception — it adds the header — and every path that
+can make a body visible (a header click, the bulk mode, undo/redo, a snapshot
+merge) invalidates the cache itself, so the accumulation is never lost: the
+content keeps building on the turn in `choreo-client-core`, and an expand renders
+the full body so far and streams on live from there.
+
+---
+
 ## Terminal integration (`choreo-tui`)
 
 The client talks to whatever terminal it was launched in, and the terminals

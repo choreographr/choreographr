@@ -241,6 +241,7 @@ fn handle_message(bot: &Bot, state: &TelegramState, msg: &crate::tg_api::Message
         | Command::OpenHelp
         | Command::ReasoningCycle
         | Command::ReasoningList
+        | Command::ReasoningToggle
         | Command::Quit => {
             debug!("telegram stub ignores interactive shell command");
         }

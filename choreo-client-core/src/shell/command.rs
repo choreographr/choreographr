@@ -105,6 +105,12 @@ pub enum Command {
     ReasoningCycle,
     /// `/reasoning list` — list the available reasoning levels.
     ReasoningList,
+    /// Bare `/reasoning-toggle` — flip the front-end's bulk reasoning
+    /// visibility mode (expand-all / collapse-all) for the attached session.
+    /// A local-UI command with no daemon message of its own: the mode is view
+    /// state the front-end owns, so nothing about the session on the daemon
+    /// changes.
+    ReasoningToggle,
     /// `/cancel` with a non-numeric argument; carries the offending argument
     /// so the front-end can show a usage error.
     InvalidCancel(String),

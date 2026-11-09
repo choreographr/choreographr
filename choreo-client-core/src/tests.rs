@@ -469,6 +469,20 @@ fn reasoning_list() {
 }
 
 #[test]
+fn reasoning_toggle_is_its_own_command_not_a_reasoning_set() {
+    // The hyphen keeps it clear of `/reasoning`'s exact and `reasoning <level>`
+    // arms: it must never be parsed as an effort slug.
+    assert_eq!(
+        parse_input_line("/reasoning-toggle"),
+        Command::ReasoningToggle
+    );
+    assert!(matches!(
+        parse_input_line("/reasoning-toggle now"),
+        Command::UnknownCommand(_)
+    ));
+}
+
+#[test]
 fn reasoning_set_off() {
     assert_eq!(
         parse_input_line("/reasoning off"),
@@ -661,6 +675,7 @@ const PARSER_COMMAND_NAMES: &[&str] = &[
     "new",
     "model",
     "reasoning",
+    "reasoning-toggle",
     "continue",
     "stop",
     "cancel",

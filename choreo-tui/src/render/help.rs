@@ -80,6 +80,10 @@ pub(super) fn help_lines() -> Vec<Line<'static>> {
     )));
     lines.push(row(&shortcut("model"), "choose the model"));
     lines.push(row(&shortcut("reasoning"), "cycle the reasoning effort"));
+    lines.push(row(
+        &shortcut("reasoning-toggle"),
+        "expand / collapse every reasoning section",
+    ));
     lines.push(row(&shortcut("terminal"), "terminal capabilities page"));
     lines.push(row(&shortcut("account"), "accounts"));
     lines.push(row(&shortcut("session"), "sessions"));
@@ -146,6 +150,7 @@ mod tests {
         for command in [
             "model",
             "reasoning",
+            "reasoning-toggle",
             "continue",
             "undo",
             "redo",

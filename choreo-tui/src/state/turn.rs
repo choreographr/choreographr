@@ -22,6 +22,7 @@ use choreo_proto::{OutputStream, SessionStatus, TokenUsage, Turn};
 use std::borrow::Cow;
 
 use super::{App, ResponsePin, SPAWN_SUBSESSION_TOOL, SessionDisplayState, merge_token_usage};
+use crate::markdown_render::{reasoning_expanded_default, turn_has_reasoning};
 
 /// Invalidate the render cache entry for `turn_id`.
 fn invalidate_turn_cache(display: &mut SessionDisplayState, turn_id: u32) {
@@ -198,25 +199,59 @@ impl TurnEventHandler for App {
                 .and_then(|id| display.view.turns.get(&id))
                 .is_some_and(|t| t.assistant_text.is_none());
 
+        // Whether this Reasoning chunk is invisible to the renderer: the turn's
+        // reasoning section is effectively collapsed AND already carries text,
+        // so the chunk grows a body nobody is shown.  Such a chunk changes no
+        // rendered row — the header is already present, at a fixed height — so
+        // the whole re-render path below is skipped for it, which is what keeps
+        // a collapsed streaming turn from re-rendering on every reasoning token.
+        //
+        // The `already carries text` half is load-bearing: the FIRST reasoning
+        // chunk of a turn adds the header row, so it must still invalidate.  The
+        // content itself is never lost — `stream_chunk` accumulates it on the
+        // turn either way — so a later expand (a header click or the bulk mode)
+        // renders the full body accumulated so far and streams on live from
+        // there, because the expand path invalidates the cache itself.
+        let reasoning_hidden = matches!(stream, OutputStream::Reasoning)
+            && turn_id.is_some_and(|id| {
+                display.view.turns.get(&id).is_some_and(|turn| {
+                    turn_has_reasoning(turn)
+                        && !display
+                            .effective_reasoning_expanded(id, reasoning_expanded_default(turn))
+                })
+            });
+
         display.view.stream_chunk(stream_id, &stream, &data);
 
         // The appended chunk changed the turn's rendered content: bump its
         // version so any rebuild (e.g. one triggered by an interleaved
         // `Done`/`TurnAppended` from another request or session) recomputes
-        // this turn instead of serving the pre-chunk cached lines.
-        if let Some(turn_id) = turn_id {
+        // this turn instead of serving the pre-chunk cached lines.  A hidden
+        // reasoning chunk is the one exception — see `reasoning_hidden`.
+        if let Some(turn_id) = turn_id
+            && !reasoning_hidden
+        {
             display.bump_turn_version(turn_id);
         }
 
         // Auto-collapse reasoning when the response starts — drop any
         // explicit expansion override so the derived default (collapsed once
         // a response exists) takes over.  The user can re-expand it by
-        // clicking the header.
+        // clicking the header.  This holds in both bulk modes: the mode is a
+        // fallback the override sits on top of, so a body the user explicitly
+        // opened still yields to its own answer.
         if first_answer && let Some(turn_id) = turn_id {
             display.reasoning_override.remove(&turn_id);
         }
 
         display.resolve_streaming_turn_index(stream_id);
+
+        // Nothing rendered changed for a hidden reasoning chunk, so do not
+        // schedule a frame for it: no streaming or content mark, and the render
+        // cache entry stays valid because its turn version was not bumped.
+        if reasoning_hidden {
+            return;
+        }
 
         // Arm the response auto-pin on the first Answer chunk: the response is
         // about to fill the turn, and the pin should engage (once) if its top

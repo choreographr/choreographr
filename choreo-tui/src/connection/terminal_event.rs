@@ -65,8 +65,10 @@ const OVERLAY_SCROLL_PAGE: u16 = 10;
 /// which crossterm maps back to `Char(letter)+CONTROL` — so the readline
 /// editing chords still work, and `Ctrl+M`/`Ctrl+I`/`Ctrl+H` arrive as Enter/
 /// Tab/Backspace).  The push is what keeps Shift+Enter distinct from Enter; the
-/// app's command shortcuts are all `Alt+` chords and need no rebinding, so
-/// nothing here is consulted for key dispatch any more.
+/// app's command chords are `Alt+` chords, and a shifted one carries SHIFT as a
+/// modifier here and as the glyph's case on a legacy terminal (see
+/// `state/keymap.rs::chord_from_event`), so both encodings bind the same
+/// command.
 pub(super) const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
     KeyboardEnhancementFlags::from_bits_retain(
         KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES.bits(),
@@ -80,18 +82,25 @@ pub(super) const KITTY_KEYBOARD_FLAGS: KeyboardEnhancementFlags =
 /// of events per frame).
 pub(super) const UI_EVENT_QUEUE_HIGH_WATER_MARK: usize = 16_384;
 
-/// With the kitty protocol's `REPORT_ALL_KEYS_AS_ESCAPE_CODES` enhancement, a
-/// terminal reports text keys as *unshifted* codepoints with an explicit
-/// SHIFT modifier (e.g. `CSI 97;2 u` for Shift+A) instead of sending the
-/// shifted glyph (`'A'`) as plain text.  Reconstruct the legacy view of the
-/// event — apply the US-layout shift mapping and clear the SHIFT bit — so
-/// every downstream handler (chat input, filter boxes, other pages) sees
-/// exactly the `Char` it would have received from a legacy terminal.
+/// A kitty-protocol terminal reports a shifted *text* key as an unshifted
+/// codepoint plus an explicit SHIFT modifier (e.g. `CSI 97;2 u` for Shift+A)
+/// where a legacy terminal sends the shifted glyph (`'A'`) as plain text.
+/// Restore the legacy *glyph* — apply the US-layout shift mapping — so every
+/// downstream handler (chat input, filter boxes, other pages) inserts exactly
+/// the `Char` a legacy terminal would have produced.
 ///
-/// When Ctrl is held the modifier is dropped without remapping: legacy
-/// terminals masked Ctrl+letter to a control byte and lost the shift
-/// distinction anyway (Ctrl+Shift+M was byte 0x0D, same as Ctrl+M).
-/// Non-Char keys (e.g. Shift+Enter, Shift+Tab) pass through untouched.
+/// The SHIFT **modifier is preserved**: it is a real part of a chord, so
+/// `Alt+Shift+R` must stay distinct from `Alt+R` (`state/keymap.rs` reads it,
+/// along with the glyph's case, to decide which chord was pressed).  Dropping it
+/// here would collapse the two on kitty terminals while a legacy terminal —
+/// which carries the shift in the byte's case — kept them apart.
+///
+/// When Ctrl is held the glyph is left alone: legacy terminals masked
+/// `Ctrl+letter` to a control byte with no case to reconstruct from
+/// (`Ctrl+Shift+M` was byte 0x0D, same as `Ctrl+M`), so there is no legacy glyph
+/// to mirror — and for the same reason the editing kernel treats control chords
+/// as shift-insensitive.  Non-Char keys (e.g. Shift+Enter, Shift+Tab) pass
+/// through untouched.
 pub(super) fn normalize_kitty_shift(event: Event) -> Event {
     let Event::Key(mut key) = event else {
         return event;
@@ -102,7 +111,6 @@ pub(super) fn normalize_kitty_shift(event: Event) -> Event {
     let KeyCode::Char(c) = key.code else {
         return Event::Key(key);
     };
-    key.modifiers.remove(KeyModifiers::SHIFT);
     if !key.modifiers.contains(KeyModifiers::CONTROL) {
         key.code = KeyCode::Char(shift_char(c));
     }

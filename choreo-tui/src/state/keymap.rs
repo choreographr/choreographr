@@ -1,4 +1,4 @@
-//! The Chat page's logical keymap: one `Alt+<key>` shortcut per command,
+//! The Chat page's logical keymap: one `Alt+[Shift+]<key>` shortcut per command,
 //! lowered from a crossterm `KeyEvent`.
 //!
 //! **Every app command lives on an `Alt+` chord.**  Emacs/readline owns the
@@ -7,6 +7,18 @@
 //! unambiguous on *both* kitty and legacy terminals: no terminal folds
 //! `Alt+letter` into a control byte, so there is no per-terminal rebinding to
 //! resolve (the old `Ctrl+M` ↔ `Ctrl+O` duality is gone).
+//!
+//! **Shift is part of the chord.**  `Alt+Shift+R` and `Alt+R` are different
+//! commands, and a chord matches only the exact modifier set it was declared
+//! with.  Both terminal encodings can express the distinction, by different
+//! means: a kitty-protocol terminal reports `CSI 114;4 u` (SHIFT in the modifier
+//! field), while a legacy terminal sends `ESC R` — shift lives in the *glyph's
+//! case*.  [`chord_from_event`] therefore infers SHIFT from an uppercase glyph
+//! as well as from the modifier bit, so one chord binds identically on both.
+//! The consequence of reading case is that Caps Lock is indistinguishable from
+//! Shift on a legacy terminal (kitty terminals do not report lock modifiers for
+//! text keys), which is accepted: a caps-lock user's `Alt+R` reads as
+//! `Alt+Shift+R` there.
 //!
 //! The table is the single source of truth for both Chat-page shortcut dispatch
 //! (`binding_for`), the command palette's right-aligned shortcut labels
@@ -39,11 +51,13 @@ enum Key {
 
 /// A logical key chord (modifiers + key).
 ///
-/// Constructed with the `alt` helper so the shortcut table reads as the logical
-/// binding; `label` renders the human-facing form (e.g. `Alt+Enter`, `Alt+M`).
-/// The `ctrl`/`shift` flags are still recorded from the incoming event so a
+/// Constructed with the `alt` / `alt_shift` helpers so the shortcut table reads
+/// as the logical binding; `label` renders the human-facing form (e.g.
+/// `Alt+Enter`, `Alt+Shift+R`).  The `ctrl`/`alt`/`shift` flags are all recorded
+/// from the incoming event, so a chord matches only its exact modifier set: a
 /// `Ctrl+<letter>` chord can never be mistaken for its `Alt+<letter>` command
-/// (and vice-versa) — that is the whole point of moving commands off `Ctrl`.
+/// (that is the whole point of moving commands off `Ctrl`), and a shifted chord
+/// can never be mistaken for its unshifted sibling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Chord {
     ctrl: bool,
@@ -63,7 +77,17 @@ impl Chord {
         }
     }
 
-    /// Human-facing label, e.g. `"Alt+Enter"`, `"Alt+M"`.
+    /// `Alt+Shift+<key>`.
+    const fn alt_shift(key: Key) -> Self {
+        Self {
+            ctrl: false,
+            alt: true,
+            shift: true,
+            key,
+        }
+    }
+
+    /// Human-facing label, e.g. `"Alt+Enter"`, `"Alt+Shift+R"`.
     fn label(self) -> String {
         let mut label = String::new();
         if self.ctrl {
@@ -94,7 +118,7 @@ fn key_label(key: Key) -> String {
     }
 }
 
-/// One logical shortcut per command, all on `Alt+<key>`.
+/// One logical shortcut per command, on `Alt+[Shift+]<key>`.
 ///
 /// The bindings are chosen to avoid readline's `Meta` (Alt) set — `b f d u l c
 /// y . < > { } ~ $ @ ! # & * / ? = \ ^` and the digits — so every `Alt+`
@@ -103,9 +127,16 @@ fn key_label(key: Key) -> String {
 /// but the shortcut table is consulted *before* the editing arm in
 /// `connection/chat.rs`, so the command chord wins and `Ctrl+T` (the editing
 /// transpose) is untouched.
+///
+/// `Alt+Shift+R` (`reasoning-toggle`) sits next to `Alt+R` (the reasoning-effort
+/// cycle) on purpose: the two are the reasoning pair, and Shift is what tells
+/// them apart.  Note the editing kernel stays shift-INSENSITIVE (`Ctrl+Shift+D`
+/// is still `Ctrl+D`): legacy terminals cannot express that distinction for
+/// control chords, and the kernel's contract is legacy equivalence.
 const SHORTCUTS: &[(Chord, &str)] = &[
     (Chord::alt(Key::Char('m')), "model"),
     (Chord::alt(Key::Char('r')), "reasoning"),
+    (Chord::alt_shift(Key::Char('r')), "reasoning-toggle"),
     (Chord::alt(Key::Enter), "continue"),
     (Chord::alt(Key::Up), "undo"),
     (Chord::alt(Key::Down), "redo"),
@@ -119,10 +150,21 @@ const SHORTCUTS: &[(Chord, &str)] = &[
 /// Lower a crossterm `KeyEvent` to a logical [`Chord`], or `None` for keys the
 /// shortcut table never binds.
 fn chord_from_event(event: &KeyEvent) -> Option<Chord> {
+    // Whether SHIFT is set, including when it rides on the glyph's case rather
+    // than in the modifier field.  A legacy terminal has no shift bit for a
+    // printer key: `Alt+Shift+r` arrives as `ESC R`, which crossterm reports as
+    // `Char('R')+ALT`.  Reading the case is what lets one chord bind identically
+    // on legacy and kitty terminals (the latter sends SHIFT explicitly).  The
+    // cost is that Caps Lock looks like Shift on a legacy terminal, since both
+    // only change the byte's case.
+    let mut shift = event.modifiers.contains(KeyModifiers::SHIFT);
     let key = match event.code {
-        // Letters fold to lowercase so a kitty Shift-reporting terminal's
-        // `Char('A')+ALT` still matches the lowercase table entry.
-        KeyCode::Char(c) => Key::Char(c.to_ascii_lowercase()),
+        // Letters fold to lowercase so the table's logical key is case-free;
+        // the case itself survives as the inferred SHIFT above.
+        KeyCode::Char(c) => {
+            shift |= c.is_ascii_uppercase();
+            Key::Char(c.to_ascii_lowercase())
+        }
         KeyCode::Up => Key::Up,
         KeyCode::Down => Key::Down,
         KeyCode::Enter => Key::Enter,
@@ -134,7 +176,7 @@ fn chord_from_event(event: &KeyEvent) -> Option<Chord> {
     Some(Chord {
         ctrl: event.modifiers.contains(KeyModifiers::CONTROL),
         alt: event.modifiers.contains(KeyModifiers::ALT),
-        shift: event.modifiers.contains(KeyModifiers::SHIFT),
+        shift,
         key,
     })
 }
@@ -165,6 +207,40 @@ pub(crate) fn shortcut_label_for(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Shift is part of the chord: the shifted form reaches its own command from
+    /// BOTH terminal encodings — kitty's explicit SHIFT modifier, and the legacy
+    /// shifted glyph (`Char('R')+ALT`, what an `ESC R` byte decodes to).
+    #[test]
+    fn shift_is_a_real_modifier_in_a_chord() {
+        let alt_shift =
+            |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        assert_eq!(binding_for(&alt_shift('r')), Some("reasoning-toggle"));
+
+        // The legacy encoding of the same press: the glyph carries the shift.
+        assert_eq!(
+            binding_for(&KeyEvent::new(KeyCode::Char('R'), KeyModifiers::ALT)),
+            Some("reasoning-toggle")
+        );
+
+        // …and the unshifted press is still its own command.
+        assert_eq!(
+            binding_for(&KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+            Some("reasoning")
+        );
+        // A shifted chord never aliases its unshifted sibling.
+        assert_eq!(binding_for(&alt_shift('m')), None);
+    }
+
+    /// The label the Help page and palette render for the shifted chord.
+    #[test]
+    fn shifted_chord_label_reads_as_alt_shift() {
+        assert_eq!(
+            shortcut_label_for("reasoning-toggle").as_deref(),
+            Some("Alt+Shift+R")
+        );
+        assert_eq!(shortcut_label_for("reasoning").as_deref(), Some("Alt+R"));
+    }
 
     #[test]
     fn binding_for_covers_the_shortcut_table() {

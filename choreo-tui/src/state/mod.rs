@@ -130,6 +130,51 @@ pub(crate) fn input_inner_width(term_width: u16) -> usize {
     term_width.saturating_sub(INPUT_PAD * 2) as usize
 }
 
+/// Bulk reasoning-visibility mode for one session — the two-state setting
+/// `Alt+Shift+R` / `/reasoning-toggle` flips.
+///
+/// The mode is the *fallback* a turn's reasoning visibility derives from, never
+/// an override: a per-turn [`SessionDisplayState::reasoning_override`] (set by
+/// clicking a header) still wins in either mode, so a turn can be expanded while
+/// the session is in [`Collapsed`](Self::Collapsed) and collapsed while it is in
+/// [`Expanded`](Self::Expanded).
+///
+/// The two modes are not mirror images, by design:
+///
+/// - [`Collapsed`](Self::Collapsed) hides **every** reasoning body, including a
+///   block that is still streaming (so reasoning is never watched live).
+/// - [`Expanded`](Self::Expanded) re-applies the content-derived default
+///   ([`crate::markdown_render::reasoning_expanded_default`]) rather than forcing
+///   every body open, so a turn that already has a response stays collapsed
+///   (its answer is the primary content) and a turn whose answer *starts* while
+///   it is expanded collapses itself the moment the response arrives.
+///
+/// It is per-session view state with no daemon counterpart: it lives and dies
+/// with the TUI process (choreo-tui keeps no state on disk), and it survives
+/// switching away from the session because it hangs off the display state, not
+/// the active view.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ReasoningViewMode {
+    /// Reasoning follows the content-derived default (expanded while it has no
+    /// response, collapsed once a response exists).
+    #[default]
+    Expanded,
+    /// Reasoning is collapsed everywhere.
+    Collapsed,
+}
+
+impl ReasoningViewMode {
+    /// Resolve the mode against a turn's content-derived default.
+    pub(crate) fn default_expanded(self, content_default: bool) -> bool {
+        match self {
+            // Expanded deliberately defers to the content default: an answered
+            // turn stays collapsed.
+            Self::Expanded => content_default,
+            Self::Collapsed => false,
+        }
+    }
+}
+
 pub(crate) struct SessionDisplayState {
     pub(crate) view: SessionView,
     pub(crate) visible_turn_ids: Vec<u32>,
@@ -149,8 +194,13 @@ pub(crate) struct SessionDisplayState {
     /// Per-turn explicit reasoning visibility (`turn_id` → expanded) set by
     /// clicking the reasoning header.  Absent entries fall back to
     /// [`reasoning_expanded_default`] (expanded while streaming, collapsed
-    /// once a response exists).
+    /// once a response exists), filtered through [`Self::reasoning_mode`].
     pub(crate) reasoning_override: HashMap<u32, bool>,
+    /// Bulk reasoning-visibility mode for this session (`Alt+Shift+R` /
+    /// `/reasoning-toggle`).  Defaults to [`ReasoningViewMode::Expanded`] —
+    /// the pre-existing behaviour — and is reset to the derived default when
+    /// the session's display is dropped.
+    pub(crate) reasoning_mode: ReasoningViewMode,
     /// Per-(turn, tool-call) explicit collapse state (`turn_id` → `call_id` →
     /// collapsed) set by clicking a tool result's header.  Absent entries
     /// fall back to [`tool_result_default_collapsed`] (quiet tools
@@ -221,6 +271,7 @@ impl Default for SessionDisplayState {
             scroll_restore: None,
             turn_layouts: Vec::new(),
             reasoning_override: HashMap::new(),
+            reasoning_mode: ReasoningViewMode::default(),
             tool_collapse_override: HashMap::new(),
             turn_versions: HashMap::new(),
             render_cache: Vec::new(),

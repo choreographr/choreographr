@@ -258,6 +258,11 @@ fn parse_bare_command(rest: &str) -> Option<Command> {
         // Bare `/help` opens the read-only Help modal (`Alt+H` is the same
         // command through the shortcut table); it has no daemon message either.
         "help" => Command::OpenHelp,
+        // Bare `/reasoning-toggle` flips the bulk reasoning-visibility mode
+        // (`Alt+Shift+R` is the same command through the shortcut table).  The
+        // hyphen keeps it clear of `/reasoning`'s exact and `"reasoning "`-
+        // prefixed arms, so the two commands can never shadow one another.
+        "reasoning-toggle" => Command::ReasoningToggle,
         "lock" => Command::Send(ClientMessageType::Lock),
         "undo" => Command::Undo,
         "redo" => Command::Redo,

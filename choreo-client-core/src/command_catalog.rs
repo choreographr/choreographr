@@ -147,6 +147,12 @@ static COMMAND_CATALOG: LazyLock<Vec<CommandSpec>> = LazyLock::new(|| {
             group: CommandGroup::Session,
         },
         CommandSpec {
+            name: "reasoning-toggle",
+            summary: "Expand or collapse every turn's reasoning section",
+            arg_hint: None,
+            group: CommandGroup::Session,
+        },
+        CommandSpec {
             name: "redo",
             summary: "Redo the last undone turn",
             arg_hint: None,

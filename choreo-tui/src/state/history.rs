@@ -22,13 +22,16 @@
 use crate::markdown_render::{
     LineChrome, LineJoin, RenderedTurnLines, compute_visual_offsets, lines_height,
     reasoning_expanded_default, render_turn_lines, tool_result_default_collapsed,
+    turn_has_reasoning,
 };
 use choreo_proto::ToolResultRecord;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use std::sync::Arc;
 
-use super::{App, Marker, SessionDisplayState, selector_list_layout, turn_image_count};
+use super::{
+    App, Marker, ReasoningViewMode, SessionDisplayState, selector_list_layout, turn_image_count,
+};
 
 /// What a recomputed history viewport implies for the per-session render caches
 /// and the in-progress selection.
@@ -805,15 +808,17 @@ impl SessionDisplayState {
     }
 
     /// Effective reasoning visibility for a turn: an explicit override from
-    /// clicking the header wins; otherwise the caller-provided derived
-    /// default is used.  Callers compute the default either from the turn
+    /// clicking the header wins; otherwise the session's bulk mode resolves the
+    /// caller-provided derived default ([`ReasoningViewMode::default_expanded`] —
+    /// the collapsed mode hides every body, the expanded mode defers to the
+    /// content default).  Callers compute the default either from the turn
     /// content (`reasoning_expanded_default`) or from the precomputed
     /// `TurnLayout` when one is available (per-frame render path).
     pub(crate) fn effective_reasoning_expanded(&self, turn_id: u32, default: bool) -> bool {
         self.reasoning_override
             .get(&turn_id)
             .copied()
-            .unwrap_or(default)
+            .unwrap_or_else(|| self.reasoning_mode.default_expanded(default))
     }
 
     /// Toggle the reasoning section's visibility for a turn (clicking the
@@ -829,6 +834,43 @@ impl SessionDisplayState {
         if let Some(idx) = self.visible_turn_ids.iter().position(|id| *id == turn_id)
             && let Some(slot) = self.render_cache.get_mut(idx)
         {
+            *slot = None;
+        }
+        self.mark_content_changed();
+    }
+
+    /// Flip the session's bulk reasoning-visibility mode — the body of
+    /// `Alt+Shift+R` and `/reasoning-toggle`.
+    ///
+    /// The decision is made from the *effective* state of every reasoning-bearing
+    /// turn, so a turn the user manually expanded in the collapsed mode counts as
+    /// not-collapsed and the next press collapses the transcript again:
+    ///
+    /// - any turn showing its reasoning ⇒ switch to collapsed;
+    /// - every turn already collapsed (including a session with no reasoning at
+    ///   all, vacuously) ⇒ switch to expanded.
+    ///
+    /// Switching drops every per-turn override: the mode is a bulk statement of
+    /// intent, so a header-clicked preference from the previous mode must not
+    /// survive it and leave one turn contradicting the mode.  Clicks made after
+    /// the switch still override individual turns, in either mode.
+    pub(crate) fn toggle_all_reasoning(&mut self) {
+        let any_expanded = self.view.turns.iter().any(|(&turn_id, turn)| {
+            !turn.undone
+                && turn_has_reasoning(turn)
+                && self.effective_reasoning_expanded(turn_id, reasoning_expanded_default(turn))
+        });
+        self.reasoning_mode = if any_expanded {
+            ReasoningViewMode::Collapsed
+        } else {
+            ReasoningViewMode::Expanded
+        };
+        self.reasoning_override.clear();
+        // Every cached rendering was built with the previous visibility, so drop
+        // the whole cache rather than trusting the per-key comparison (the mode
+        // is not part of `RenderCacheKey`; the key's `reasoning_expanded` flag is,
+        // but a turn whose reasoning is hidden either way would compare equal).
+        for slot in &mut self.render_cache {
             *slot = None;
         }
         self.mark_content_changed();

@@ -53,6 +53,48 @@ pub fn add_user_text(app: &mut App, content: &str) {
     app.rebuild_height_prefix();
 }
 
+/// Add an assistant turn that carries reasoning but no response yet — the shape
+/// a request has while its reasoning is still streaming, and the one that
+/// derives "expanded" by default (`reasoning_expanded_default`).
+pub fn add_reasoning_turn(app: &mut App, reasoning: &str) {
+    add_assistant_turn(app, Some(reasoning), None);
+}
+
+/// Add an assistant turn that carries BOTH reasoning and a response — the shape
+/// that derives "collapsed" by default, and that the bulk expand action must
+/// leave collapsed.
+pub fn add_answered_turn(app: &mut App, reasoning: &str, answer: &str) {
+    add_assistant_turn(app, Some(reasoning), Some(answer));
+}
+
+/// Shared body of the assistant-turn fixtures: mint the next turn id and insert
+/// a turn carrying the given reasoning/response text.
+fn add_assistant_turn(app: &mut App, reasoning: Option<&str>, answer: Option<&str>) {
+    let turn_id = app
+        .display_for(0)
+        .view
+        .turns
+        .keys()
+        .next_back()
+        .map_or(0, |k| k + 1);
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: Some("q".to_string()),
+        assistant_text: answer.map(str::to_string),
+        assistant_reasoning: reasoning.map(str::to_string),
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    app.display_for(0).view.insert_or_replace(turn_id, turn);
+    app.rebuild_height_prefix();
+}
+
 /// Build a minimal session-summary fixture: the shape tests that only need a
 /// session's identity (id, title, status) seed the session manager with.
 ///

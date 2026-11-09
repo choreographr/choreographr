@@ -562,6 +562,17 @@ pub(super) fn run_command(
             tracing::debug!("[choreo-tui] dispatching /reasoning list");
             reasoning_list(app);
         }
+        Command::ReasoningToggle => {
+            // Purely client-side view state: flip the attached session's bulk
+            // reasoning-visibility mode.  No daemon message, and no status line
+            // — the transcript's own headers are the feedback. `Alt+Shift+R`
+            // reaches this same arm through the shortcut table, so the chord
+            // and its typed `/reasoning-toggle` spelling are one path.
+            tracing::debug!("[choreo-tui] dispatching /reasoning-toggle");
+            if let Some(display) = app.active_display() {
+                display.toggle_all_reasoning();
+            }
+        }
         Command::OpenTerminalHelp => {
             // The page is a read-only view over the launch-time profile, so
             // opening it is the whole effect. `Alt+T` reaches this same arm

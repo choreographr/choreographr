@@ -237,6 +237,7 @@ pub(crate) fn handle_shell_command(
         | Command::OpenHelp
         | Command::ReasoningCycle
         | Command::ReasoningList
+        | Command::ReasoningToggle
         | Command::Quit => {}
     }
 }

@@ -319,22 +319,33 @@ pub(crate) fn tool_result_default_collapsed(record: &ToolResultRecord) -> bool {
     record.name.starts_with(MCP_TOOL_NAME_PREFIX) || QUIET_TOOLS.contains(&record.name.as_str())
 }
 
+/// Whether a turn carries any reasoning text worth a collapsible header.
+///
+/// Whitespace-only reasoning does not count: the renderer trims the body and
+/// skips the section entirely, so a turn whose reasoning is blank has nothing to
+/// expand and must not be treated as an expandable block (that would let it
+/// decide [`SessionDisplayState::toggle_all_reasoning`](crate::state) while
+/// showing no header to click).
+pub(crate) fn turn_has_reasoning(turn: &Turn) -> bool {
+    turn.assistant_reasoning
+        .as_deref()
+        .is_some_and(|r| !r.trim().is_empty())
+}
+
 /// Whether a turn's reasoning section should be shown expanded by default.
 ///
 /// Reasoning defaults to expanded only while no response text exists yet
 /// (e.g. while it is still streaming); once a response arrives it defaults
 /// to collapsed so the response is the primary content.  The user can
-/// override this per turn by clicking the reasoning header.
+/// override this per turn by clicking the reasoning header, and the session's
+/// bulk mode ([`ReasoningViewMode`](crate::state::ReasoningViewMode)) can hide
+/// every body or defer to this default.
 pub(crate) fn reasoning_expanded_default(turn: &Turn) -> bool {
-    let has_reasoning = turn
-        .assistant_reasoning
-        .as_deref()
-        .is_some_and(|r| !r.trim().is_empty());
     let has_response = turn
         .assistant_text
         .as_deref()
         .is_some_and(|t| !t.trim().is_empty());
-    has_reasoning && !has_response
+    turn_has_reasoning(turn) && !has_response
 }
 
 #[cfg(test)]

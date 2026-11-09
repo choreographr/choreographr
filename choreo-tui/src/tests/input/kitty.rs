@@ -1,23 +1,20 @@
 use crate::connection::handle_terminal_event;
-use crate::tests::support::test_app;
-use choreo_proto::ClientMessageType;
+use crate::tests::support::{add_reasoning_turn, test_app};
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 
 // ── Kitty keyboard protocol shift normalisation (end-to-end) ──
 //
-// With REPORT_ALL_KEYS_AS_ESCAPE_CODES enabled, kitty-protocol terminals
-// report shifted text keys as unshifted codepoints + SHIFT modifier.  The
-// normalisation in handle_terminal_event must restore legacy-equivalent
-// behaviour everywhere.
+// A kitty-protocol terminal reports shifted text keys as unshifted codepoints
+// + SHIFT, and a legacy terminal sends the shifted glyph.  Both must reach the
+// same command, and shift must stay a real part of the chord.
 
 #[test]
-fn alt_shift_m_opens_selector_like_alt_m() {
+fn alt_shift_m_is_its_own_chord_not_alt_m() {
     let (tx, rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
 
-    // Alt+Shift+M arrives as Char('M') + ALT under the kitty protocol (the
-    // normaliser maps the shifted glyph and keeps ALT); the shortcut table
-    // folds the letter to lowercase, so it opens the selector like Alt+M.
+    // Alt+Shift+M arrives as Char('m') + ALT + SHIFT under the kitty protocol;
+    // shift is part of the chord, so this is NOT the model-selector binding.
     handle_terminal_event(
         Event::Key(KeyEvent::new(
             KeyCode::Char('m'),
@@ -29,11 +26,62 @@ fn alt_shift_m_opens_selector_like_alt_m() {
     .expect("handle alt+shift+m");
 
     assert!(
-        app.model_selector.is_open(),
-        "alt+shift+m opens the selector"
+        !app.model_selector.is_open(),
+        "alt+shift+m must not run the alt+m binding"
     );
-    let msg = rx.recv().expect("sent message");
-    assert_eq!(msg.inner, ClientMessageType::ListModels);
+    assert!(
+        rx.try_recv().is_err(),
+        "an unbound shifted chord sends nothing"
+    );
+}
+
+#[test]
+fn alt_shift_r_toggles_all_reasoning_like_its_legacy_encoding() {
+    // The same press reaches the command from both encodings: a kitty terminal
+    // sends SHIFT in the modifier field, a legacy one sends the shifted glyph.
+    // A reasoning-only turn derives "expanded", so the press collapses it.
+    for key in [
+        KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT | KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::Char('R'), KeyModifiers::ALT),
+    ] {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut app = test_app();
+        add_reasoning_turn(&mut app, "thinking...");
+        assert!(app.display_for(0).effective_reasoning_expanded(0, true));
+
+        handle_terminal_event(Event::Key(key), &mut app, &tx).expect("handle alt+shift+r");
+
+        assert_eq!(
+            app.display_for(0).reasoning_mode,
+            crate::state::ReasoningViewMode::Collapsed,
+            "alt+shift+r collapses every reasoning section"
+        );
+        assert!(
+            !app.display_for(0).effective_reasoning_expanded(0, true),
+            "the reasoning-only turn is now collapsed"
+        );
+    }
+}
+
+#[test]
+fn alt_r_still_cycles_reasoning_effort_not_the_visibility_mode() {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let mut app = test_app();
+    app.display_for(0).reasoning_mode = crate::state::ReasoningViewMode::Collapsed;
+
+    // Alt+R alone is the effort cycle: it must not touch the bulk mode.
+    handle_terminal_event(
+        Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::ALT)),
+        &mut app,
+        &tx,
+    )
+    .expect("handle alt+r");
+
+    assert_eq!(
+        app.display_for(0).reasoning_mode,
+        crate::state::ReasoningViewMode::Collapsed,
+        "alt+r leaves the bulk reasoning mode alone"
+    );
 }
 
 #[test]

@@ -265,17 +265,17 @@ mod tests {
     }
 
     #[test]
-    fn normalize_kitty_shift_applies_mapping_and_clears_shift() {
+    fn normalize_kitty_shift_applies_mapping_and_keeps_shift() {
         // Shift+A arrives as Char('a') + SHIFT (kitty CSI 97;2 u); the
-        // normaliser must produce the legacy-equivalent Char('A') with no
-        // modifiers.
+        // normaliser must produce the legacy-equivalent glyph Char('A') while
+        // keeping SHIFT, which is a real part of a chord.
         let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
             KeyCode::Char('a'),
             KeyModifiers::SHIFT,
         )));
         assert_eq!(
             out,
-            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE))
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
         );
 
         // Shift+1 → '!'.
@@ -285,36 +285,44 @@ mod tests {
         )));
         assert_eq!(
             out,
-            Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE))
+            Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT))
         );
     }
 
     #[test]
-    fn normalize_kitty_shift_drops_shift_when_ctrl_held() {
+    fn normalize_kitty_shift_keeps_shift_and_leaves_the_glyph_when_ctrl_held() {
         // Ctrl+Shift+M arrives as Char('m') + CONTROL + SHIFT (CSI 109;6 u).
-        // Legacy Ctrl+Shift+M was byte 0x0D — identical to Ctrl+M — so the
-        // normaliser drops SHIFT without remapping the char.
+        // Legacy Ctrl+Shift+M was byte 0x0D — identical to Ctrl+M — so there is
+        // no legacy glyph to mirror and the char is left alone; SHIFT survives
+        // so the chord stays distinguishable from Ctrl+M on this terminal.
         let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
             KeyCode::Char('m'),
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         )));
         assert_eq!(
             out,
-            Event::Key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::CONTROL))
+            Event::Key(KeyEvent::new(
+                KeyCode::Char('m'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ))
         );
     }
 
     #[test]
-    fn normalize_kitty_shift_keeps_alt() {
+    fn normalize_kitty_shift_keeps_alt_and_shift() {
         // Alt+Shift+A arrives as Char('a') + ALT + SHIFT; legacy sent ESC 'A'
-        // (Char('A') + ALT).  The mapping must keep the ALT modifier.
+        // (Char('A') + ALT).  The mapping must apply the glyph and keep BOTH
+        // modifiers, so the chord reads the same as the legacy one.
         let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
             KeyCode::Char('a'),
             KeyModifiers::ALT | KeyModifiers::SHIFT,
         )));
         assert_eq!(
             out,
-            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::ALT))
+            Event::Key(KeyEvent::new(
+                KeyCode::Char('A'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            ))
         );
     }
 
