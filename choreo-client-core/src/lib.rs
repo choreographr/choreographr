@@ -19,8 +19,9 @@
 //!   local match/dispatch helpers.
 //! - [`dispatch`] — the daemon-message dispatch layer ([`TurnEventHandler`])
 //!   that turns protocol events into UI callbacks.
-//! - [`shell`] — the shared command-line parser ([`parse_input_line`]) for the
-//!   TUI's input box.
+//! - [`shell`] — the shared command-line parser ([`parse_input_line`]) and the
+//!   predicate behind command-ness ([`is_command_line`]) for the TUI's input
+//!   box.
 //! - [`pending`] — the client's pending-request table ([`PendingReplies`]),
 //!   the single outbound path plus the reply-correlation side table every
 //!   front-end routes its requests through.
@@ -87,7 +88,8 @@ pub use oauth::{
 pub use onboarding::{FEATURED_PROVIDERS, SetupFollow, SetupProgress, suggest_account_name};
 pub use pending::{Pending, PendingContext, PendingReplies, Timeout, deadline_for};
 pub use shell::{
-    Command, McpCommand, UnlockMethod, command_echo, is_valid_account_name, parse_input_line,
+    Command, McpCommand, UnlockMethod, command_echo, is_command_line, is_valid_account_name,
+    parse_input_line,
 };
 
 #[cfg(test)]

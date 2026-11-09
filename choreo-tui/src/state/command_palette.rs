@@ -4,14 +4,21 @@
 //! resolution) lives in [`crate::state::keymap`].
 //!
 //! There is **no separate "command mode" flag**: a line is a COMMAND LINE iff
-//! the shared composer buffer (`App::input`) starts with `/`, and the palette
-//! is shown exactly when it is (and no higher-priority overlay — the model
-//! selector — is open).  The `/` therefore lives IN the buffer, verbatim as
-//! the user typed it and exactly as `parse_input_line` expects (it strips one
-//! leading `/` and parses the remainder as a command).  The palette thus
-//! appears the moment a `/` starts the line and disappears when the user
-//! deletes it — there is no latched flag that can fall out of sync with the
-//! buffer (the historical bug where a second `/` produced `//acl`).
+//! [`is_command_line`] says so — the buffer starts with `/` and its first token
+//! is not a filesystem path — and the palette is shown exactly when it is (and
+//! no higher-priority overlay — the model selector — is open).  The `/`
+//! therefore lives IN the buffer, verbatim as the user typed it and exactly as
+//! `parse_input_line` expects (it strips one leading `/` and parses the
+//! remainder as a command).  The palette thus appears the moment a `/` starts
+//! the line and disappears when the user deletes it — there is no latched flag
+//! that can fall out of sync with the buffer (the historical bug where a second
+//! `/` produced `//acl`).
+//!
+//! The predicate is the shared [`is_command_line`], not a bare `starts_with('/')`
+//! test, so a path — which is what a file dragged onto the terminal pastes, and
+//! which always begins with `/` — stays a prompt: the drop lands in the composer
+//! as text the user can wrap a question around, and Enter sends it to the model
+//! instead of trying to run `/home/me/notes.md` as a command.
 //!
 //! While the palette is shown the buffer holds the command line WITH its
 //! leading slash (`/model`, `/model gpt-4o`), `Enter` RUNS the line (see
@@ -19,7 +26,7 @@
 //! highlighted name into the buffer, and `↑`/`↓` move the palette highlight.
 
 use crate::state::App;
-use choreo_client_core::{CommandMatch, command_catalog, match_commands};
+use choreo_client_core::{CommandMatch, command_catalog, is_command_line, match_commands};
 
 /// Transient selection state for the inline command palette.
 pub(crate) struct CommandPaletteState {
@@ -53,8 +60,14 @@ impl App {
     /// Command-line-ness is derived here — there is NO `command_mode` flag — so
     /// the palette tracks the buffer exactly: typing the leading `/` shows it,
     /// deleting the `/` hides it, and a paste of a `/…` line shows it for free.
+    /// The test itself is the shared [`is_command_line`], the same predicate the
+    /// parser consults, so the palette can never label a line a command that the
+    /// parser would then send as a prompt (a dropped file's path is the case
+    /// that matters: it starts with `/` but is not a command).
     fn command_line(&self) -> Option<&str> {
-        self.input.text.strip_prefix('/')
+        let text = &self.input.text;
+        let rest = text.strip_prefix('/')?;
+        is_command_line(text).then_some(rest)
     }
 
     /// The first whitespace-delimited token of the command line

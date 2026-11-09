@@ -363,9 +363,10 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         })
         .collect();
 
-    // A command line (the buffer starts with `/`) gets a block title as the
-    // visible affordance telling the user Enter will RUN the command rather
-    // than submit a prompt; the `/` itself is drawn from the buffer text above.
+    // A command line (see `App::command_palette_active`) gets a block title as
+    // the visible affordance telling the user Enter will RUN the command rather
+    // than submit a prompt; the `/` itself is drawn from the buffer text above,
+    // and a path that merely starts with one gets no title — it is a prompt.
     // Read the derived predicate before the text borrow above is consumed so
     // the block can be built without a borrow conflict.
     let mut input_block = Block::default()

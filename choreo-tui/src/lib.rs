@@ -46,7 +46,7 @@ mod syntax;
 mod terminal;
 mod text_filter;
 
-pub use choreo_client_core::{ClientError, Command, parse_input_line};
+pub use choreo_client_core::{ClientError, Command, is_command_line, parse_input_line};
 pub use choreo_markdown::{
     ListItem, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline,
 };

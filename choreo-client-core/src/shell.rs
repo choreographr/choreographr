@@ -391,14 +391,50 @@ fn parse_mcp_command(rest: &str) -> Option<Command> {
     None
 }
 
+/// Whether `line` is a slash-command invocation rather than a prompt.
+///
+/// A line is a command line when it starts with `/` **and** its first token is
+/// not a filesystem path.  The second test exists because a path is the one
+/// thing a chat composer routinely receives that begins with a slash: a file
+/// dragged onto the terminal arrives as a paste of its own absolute path
+/// (`/home/me/notes.md`), and reading that as a command would make the drop
+/// useless — the user wanted the path in a prompt.
+///
+/// It cannot misfire on a real command.  No command name contains a path
+/// separator, so a separator *inside* the first token — after its leading
+/// `/`s, which are the command marker plus a doubled-slash slip — is a positive
+/// path signature, never a command.  Only that first token is inspected: an
+/// argument may hold slashes freely (`/add-key svc /etc/key.pem` is still a
+/// command).
+///
+/// A one-component absolute path (`/tmp`) has no inner separator and so still
+/// reads as a command line; a bare top-level name is not what a drag-and-drop
+/// delivers (it drops a file, not `/`'s own children), and the resulting
+/// `unknown command: /tmp` echo names the offending text, so the ambiguity
+/// costs a clear error rather than a silent drop.
+///
+/// This is the single predicate behind command-ness: the parser below and the
+/// TUI's command-line/palette state both derive from it, so what the composer
+/// shows as a command and what the parser runs can never disagree.
+#[must_use]
+pub fn is_command_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('/') else {
+        return false;
+    };
+    let first = rest.split(char::is_whitespace).next().unwrap_or("");
+    !first.trim_start_matches('/').contains('/')
+}
+
 /// Parse a line of user input into a [`Command`].
 ///
-/// A plain (non-slash) non-empty line becomes a `ClientMessageType::RunInput`.
-/// The run's `stream_id` is NOT chosen here: the daemon assigns it when it
-/// accepts the run and reports it in the acceptance reply (`SessionEvent::
-/// Started`), so the parser needs no counter. Slash commands (`/name …`) are
-/// parsed by the internal slash-command parser; unknown ones come back as
-/// [`Command::UnknownCommand`].
+/// A non-empty line that is not a command line (see [`is_command_line`], which
+/// admits a slash-led `unknown command` typo but not a dropped file's path)
+/// becomes a `ClientMessageType::RunInput` carrying the line **verbatim**, a
+/// leading `/` included.  The run's `stream_id` is NOT chosen here: the daemon
+/// assigns it when it accepts the run and reports it in the acceptance reply
+/// (`SessionEvent::Started`), so the parser needs no counter. Slash commands
+/// (`/name …`) are parsed by the internal slash-command parser; unknown ones
+/// come back as [`Command::UnknownCommand`].
 #[must_use]
 pub fn parse_input_line(line: &str) -> Command {
     let line = line.trim();
@@ -406,7 +442,11 @@ pub fn parse_input_line(line: &str) -> Command {
         return Command::Empty;
     }
 
-    if let Some(rest) = line.strip_prefix('/') {
+    if is_command_line(line) {
+        // `is_command_line` already proved the leading `/` is there; the
+        // fallback is the whole line so a caller can never see a silent `/`
+        // prepend or strip.
+        let rest = line.strip_prefix('/').unwrap_or(line);
         let cmd = parse_command(rest);
         debug!("parsed command: {cmd:?}");
         return cmd;
@@ -744,6 +784,81 @@ pub fn command_echo(command: &Command) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── is_command_line: the slash-in-the-first-token rule ────────────
+
+    #[test]
+    fn a_bare_slash_and_a_command_name_are_command_lines() {
+        assert!(is_command_line("/"));
+        assert!(is_command_line("/model"));
+        assert!(is_command_line("/model gpt-4o"));
+        // An argument may hold slashes: only the first token is inspected.
+        assert!(is_command_line("/add-key svc /etc/key.pem"));
+        // A doubled slash is a typing slip, not a path: the leading run of
+        // slashes is the marker, so `//acl` still reaches the parser (which
+        // reports `unknown command: //acl` rather than silently sending it).
+        assert!(is_command_line("//acl"));
+    }
+
+    #[test]
+    fn a_slash_inside_the_first_token_marks_a_path() {
+        // The absolute path a dragged-and-dropped file pastes.
+        assert!(!is_command_line("/home/jbrown/veday_tiles.md"));
+        // …and the multi-line paste a drop sometimes produces.
+        assert!(!is_command_line(
+            "/home/jbrown/veday_tiles.md\nexamine this file"
+        ));
+        // A space-escaped drop (`/home/me/My\\ File.md`): the first token still
+        // carries the separator.
+        assert!(!is_command_line("/home/me/My\\ File.md"));
+    }
+
+    #[test]
+    fn prose_is_never_a_command_line() {
+        assert!(!is_command_line("hello"));
+        assert!(!is_command_line(""));
+        assert!(!is_command_line(" /model"));
+        // A one-component absolute path is a documented blind spot: it has no
+        // inner separator, so it reads as a command line and lands on the
+        // `unknown command: /tmp` echo, which names the text that was rejected.
+        assert!(is_command_line("/tmp"));
+    }
+
+    #[test]
+    fn a_dropped_path_parses_as_a_prompt_verbatim() {
+        // The bug this guards: a dropped file's path is not a command, so it
+        // must reach the daemon as prompt text — leading `/` and all — instead
+        // of an `unknown command` error.
+        let path = "/home/jbrown/veday_tiles.md";
+        assert_eq!(
+            parse_input_line(path),
+            Command::Send(ClientMessageType::RunInput {
+                input: path.as_bytes().to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_multi_line_dropped_path_is_a_prompt() {
+        let line = "/home/jbrown/veday_tiles.md\nexamine this file";
+        assert_eq!(
+            parse_input_line(line),
+            Command::Send(ClientMessageType::RunInput {
+                input: line.as_bytes().to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn a_command_typo_still_reports_unknown_command() {
+        // The path rule is narrow on purpose: a mistyped command name has no
+        // separator, so it stays a command line and the user gets the error
+        // instead of burning a turn on an accidental prompt.
+        assert_eq!(
+            parse_input_line("/modl"),
+            Command::UnknownCommand("unknown command: /modl".to_string())
+        );
+    }
 
     #[test]
     fn refresh_models_parses_plain() {

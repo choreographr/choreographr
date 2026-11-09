@@ -501,3 +501,69 @@ fn quit_command_sets_should_quit() {
 
     assert!(app.should_quit, "/quit exits the TUI");
 }
+
+// ── A dropped file's path is a prompt, not a command ───────────────────
+//
+// A file dragged onto the terminal arrives as a bracketed paste of its own
+// absolute path, so the composer sees text that starts with `/`.  The path is
+// what the user wants to say something ABOUT ("examine this file"), so it must
+// stay prompt text: no palette, no `command` title, and Enter sends it to the
+// daemon verbatim instead of reporting `unknown command`.
+
+#[test]
+fn a_dropped_file_path_is_a_prompt() {
+    let mut app = test_app();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let path = "/home/jbrown/veday_tiles.md";
+
+    handle_terminal_event(Event::Paste(path.to_string()), &mut app, &tx).expect("handle paste");
+
+    assert_eq!(app.input.text, path, "the drop lands in the composer");
+    assert!(
+        !app.command_palette_active(),
+        "a path is not a command line, so no palette and no command title"
+    );
+
+    press_enter(&mut app, &tx);
+
+    assert_eq!(
+        rx.recv().expect("RunInput").inner,
+        ClientMessageType::RunInput {
+            input: path.as_bytes().to_vec(),
+        },
+        "the path is sent as prompt text, leading slash and all"
+    );
+    assert!(
+        app.input.is_empty(),
+        "the composer is cleared after sending"
+    );
+}
+
+#[test]
+fn a_dropped_path_with_prose_on_the_next_line_stays_a_prompt() {
+    // Some terminals append a newline to a dropped path, so the buffer holds
+    // the path and the user's question on separate lines.  It is still one
+    // prompt — the first token is the path.
+    let mut app = test_app();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let path = "/home/jbrown/veday_tiles.md";
+
+    handle_terminal_event(Event::Paste(format!("{path}\n")), &mut app, &tx).expect("handle paste");
+    for c in "examine this file".chars() {
+        press(&mut app, &tx, KeyCode::Char(c));
+    }
+    assert!(
+        !app.command_palette_active(),
+        "the path on the first line keeps it a prompt"
+    );
+
+    press_enter(&mut app, &tx);
+
+    let expected = format!("{path}\nexamine this file");
+    assert_eq!(
+        rx.recv().expect("RunInput").inner,
+        ClientMessageType::RunInput {
+            input: expected.as_bytes().to_vec(),
+        }
+    );
+}

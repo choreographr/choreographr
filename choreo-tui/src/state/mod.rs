@@ -415,8 +415,9 @@ pub(crate) struct App {
     pub(crate) model_selector: ModelSelectorState,
     /// Transient selection state for the inline command palette (Chat page).
     /// The palette's highlight and scroll window; its visible/hidden condition
-    /// is whether the input buffer starts with `/` (see `command_palette_active`)
-    /// — there is no separate mode flag to keep in sync with the buffer.
+    /// is whether the input buffer is a command line (see
+    /// `command_palette_active`) — there is no separate mode flag to keep in
+    /// sync with the buffer.
     pub(crate) command_palette: CommandPaletteState,
     /// The live provider list for the new-account wizard's provider picker
     /// (S4). Initialized from the static `PROVIDER_OPTIONS` default and

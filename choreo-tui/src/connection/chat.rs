@@ -2,7 +2,7 @@ use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column};
 use crate::state::{App, INPUT_PAD, PAGE_SCROLL_LINES, find_turn_at_row, input_inner_width};
 use crate::terminal::clipboard;
 use crate::{parse_input_line, selection};
-use choreo_client_core::ClientError;
+use choreo_client_core::{ClientError, is_command_line};
 use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -42,8 +42,8 @@ pub(super) fn handle_chat_event(
             if let Some(name) = crate::state::binding_for(key) {
                 return run_named(name, false, app, client_tx);
             }
-            // A command line is any buffer that starts with `/` — there is no
-            // separate mode flag (see `App::command_palette_active`), so the
+            // A command line is any buffer [`is_command_line`] accepts — there is
+            // no separate mode flag (see `App::command_palette_active`) — so the
             // palette appears the instant a `/` starts the line and disappears
             // when the user deletes it.  Read once here, before the match, so
             // the arms below and the normal prompt bindings agree on which
@@ -134,15 +134,18 @@ pub(super) fn handle_chat_event(
                 }
                 KeyCode::Enter => {
                     let line = app.input.text.trim().to_string();
-                    // A plain prompt (any non-empty line not starting with `/`)
-                    // begins a new inference turn, so it goes through the shared
-                    // client-side submit guard (`App::new_turn_rejection`) — idle
-                    // and keystore checks in one place.  Running it *before* the
-                    // input buffer is cleared and the per-session draft forgotten
-                    // (`clear_current_draft`) is what keeps a rejected prompt in
-                    // the input bar to resubmit instead of silently vanishing.
-                    // Slash-commands bypass the guard so the user can still e.g.
-                    // `/cancel` the in-flight request.
+                    // A plain prompt (any non-empty line that is not a command
+                    // line) begins a new inference turn, so it goes through the
+                    // shared client-side submit guard (`App::new_turn_rejection`)
+                    // — idle and keystore checks in one place.  Running it
+                    // *before* the input buffer is cleared and the per-session
+                    // draft forgotten (`clear_current_draft`) is what keeps a
+                    // rejected prompt in the input bar to resubmit instead of
+                    // silently vanishing.  Command lines bypass the guard so the
+                    // user can still e.g. `/cancel` the in-flight request; the
+                    // test is `is_command_line`, not a leading `/`, so a prompt
+                    // that merely starts with a slash (a dropped file's path) is
+                    // gated like any other prompt.
                     //
                     // A `None` status (fresh client, or the brief window before
                     // the daemon reports one) fails open inside the guard: the
@@ -153,7 +156,7 @@ pub(super) fn handle_chat_event(
                     // prompt submitted mid-turn is held and dispatched when the
                     // session returns to idle instead of being refused.
                     if !line.is_empty()
-                        && !line.starts_with('/')
+                        && !is_command_line(&line)
                         && let Some(reason) = app.new_turn_rejection()
                     {
                         tracing::debug!(reason, "[choreo-tui] prompt rejected client-side");
