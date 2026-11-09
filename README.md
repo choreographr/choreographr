@@ -1289,7 +1289,7 @@ live connections rather than reconnecting them (and cancels nothing).
 
 In `choreo-tui`:
 
-Typing a line that starts with `/` opens the **inline command palette** — a
+Typing a line that names a command opens the **inline command palette** — a
 keyboard-only overlay (it floats above the input box, never covering the input
 or the status bar) listing every command. The `/` stays in the input exactly as
 you typed it, so the line reads `/model` or `/model gpt-4o`; deleting the `/`
@@ -1297,6 +1297,14 @@ closes the palette and returns to a plain prompt. While the palette is shown,
 `↑`/`↓` move the highlight, `Tab` completes the highlighted command's name into
 the input (a trailing space is added) and keeps the palette open, **`Enter`
 runs the command**, and `Esc` discards the line without cancelling anything.
+
+A line is a command only when it starts with `/` **and** its first word carries
+no path separator, so **a file dropped onto the terminal stays a prompt**: the
+drop pastes the file's absolute path (`/home/me/notes.md`) into the composer as
+ordinary text, no palette appears, and `Enter` sends it to the model — so you
+can write "/home/me/notes.md summarise this" or just drop the file and press
+`Enter` to ask about it. A mistyped command name (no separator) still reports
+`unknown command: …` rather than being sent as a prompt.
 
 - `/ping` — health check
 - `/help` — open the keyboard-shortcut **Help modal** (same as `Alt+H`)

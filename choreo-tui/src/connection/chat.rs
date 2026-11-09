@@ -1,8 +1,8 @@
 use crate::render::{mouse_in_history_box, mouse_in_scrollbar_column};
+use crate::selection;
 use crate::state::{App, INPUT_PAD, PAGE_SCROLL_LINES, find_turn_at_row, input_inner_width};
 use crate::terminal::clipboard;
-use crate::{parse_input_line, selection};
-use choreo_client_core::{ClientError, is_command_line};
+use choreo_client_core::{ClientError, is_command_line, parse_input_line};
 use choreo_proto::{ClientMessage, ClientMessageType};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
@@ -44,10 +44,10 @@ pub(super) fn handle_chat_event(
             }
             // A command line is any buffer [`is_command_line`] accepts — there is
             // no separate mode flag (see `App::command_palette_active`) — so the
-            // palette appears the instant a `/` starts the line and disappears
-            // when the user deletes it.  Read once here, before the match, so
-            // the arms below and the normal prompt bindings agree on which
-            // regime the keystroke belongs to.
+            // palette appears the instant the buffer becomes one (a leading `/`
+            // outside a path) and disappears when the user deletes it.  Read
+            // once here, before the match, so the arms below and the normal
+            // prompt bindings agree on which regime the keystroke belongs to.
             let command_active = app.command_palette_active();
             match key.code {
                 // ── Command palette ──────────────────────────────────
