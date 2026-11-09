@@ -3106,26 +3106,31 @@ modifier for a printer key at all: it sends `ESC R`, which crossterm reports as
 `Char('R') + ALT`, carrying the shift **in the glyph's case**.
 `chord_from_event` therefore infers SHIFT from an uppercase glyph as well as
 from the modifier bit, so one table entry binds identically on both terminal
-classes. `normalize_kitty_shift` still maps a kitty unshifted codepoint + SHIFT
-to the legacy *glyph* (`r` → `R`, so typing is unchanged) but now **preserves
-the SHIFT modifier** instead of clearing it.
+classes. `normalize_kitty_shift` maps a kitty unshifted codepoint + SHIFT to the
+legacy *glyph* (`r` → `R`, so typing is unchanged) and **preserves the SHIFT
+modifier**, which is what a chord reads.
 
-The accepted cost of reading case is that **Caps Lock is indistinguishable from
+Because this reads the glyph's case, both encodings of a shifted printer key
+reach the same chord. The cost is that **Caps Lock is indistinguishable from
 Shift** on a legacy terminal (kitty terminals do not report lock modifiers for
-text keys), so a caps-lock user's `Alt+R` reads as `Alt+Shift+R` there. The
-editing kernel stays deliberately shift-**insensitive** (`Ctrl+Shift+D` is still
-`Ctrl+D`): legacy terminals cannot express the distinction for a control chord
-(`Ctrl+Shift+M` was byte 0x0D, same as `Ctrl+M`), and the kernel's contract is
-legacy equivalence.
+text keys), so a caps-lock user's `Alt+R` reads as `Alt+Shift+R` there, and any
+shifted chord the table does not bind (e.g. `Alt+Shift+M`) is simply unbound.
+That is accepted: on those terminals the byte's case is the only shift signal
+there is, and deciding by case keeps one rule for every key rather than aliasing
+some chords because their shifted sibling happens to be absent. The editing
+kernel stays deliberately shift-**insensitive** (`Ctrl+Shift+D` is still
+`Ctrl+D`): a legacy terminal encodes that chord as the same byte as `Ctrl+D`
+(`Ctrl+Shift+M` is byte 0x0D, identical to `Ctrl+M`), and the kernel's contract
+is legacy equivalence.
 
 ### Bulk reasoning visibility
 
 Each session display carries a **bulk reasoning-visibility mode**
 (`ReasoningViewMode`, flipped by `Alt+Shift+R` / `/reasoning-toggle`):
-`Expanded` (the default, and the pre-change behaviour) or `Collapsed`. The mode
-is a *fallback*, never an override — a per-turn preference recorded by clicking
-a reasoning header still wins in either mode, so one turn can be open in the
-collapsed mode and closed in the expanded one.
+`Expanded` (the default) or `Collapsed`. The mode is a *fallback*, never an
+override — a per-turn preference recorded by clicking a reasoning header still
+wins in either mode, so one turn can be open in the collapsed mode and closed in
+the expanded one.
 
 The two modes are deliberately **not mirror images**. `Collapsed` hides every
 body, including one that is still streaming. `Expanded` re-applies the
@@ -3135,6 +3140,14 @@ so a turn that already has an answer stays collapsed, a still-streaming turn
 shows its reasoning live, and a turn whose answer *starts* while it is expanded
 collapses itself at that moment (the existing auto-collapse on the first answer
 chunk, which drops any explicit expansion override, still runs in both modes).
+
+The observable effect of the mode is therefore **the reasoning-only turns**: an
+answered turn is collapsed in `Expanded` too, so on a transcript where every
+reasoning block already has its answer the two modes render identically and the
+chord is a no-op. That is the intent — the mode is about whether live thinking is
+watched as it streams, not about reopening finished reasoning — and it is why
+`Expanded` is the default: it needs no recorded state, because it simply defers
+to the content default.
 
 The toggle decision reads the **effective** state of every reasoning-bearing
 non-undone turn in the session — not the viewport — so a turn the user manually

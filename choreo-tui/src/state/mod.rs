@@ -197,9 +197,9 @@ pub(crate) struct SessionDisplayState {
     /// once a response exists), filtered through [`Self::reasoning_mode`].
     pub(crate) reasoning_override: HashMap<u32, bool>,
     /// Bulk reasoning-visibility mode for this session (`Alt+Shift+R` /
-    /// `/reasoning-toggle`).  Defaults to [`ReasoningViewMode::Expanded`] —
-    /// the pre-existing behaviour — and is reset to the derived default when
-    /// the session's display is dropped.
+    /// `/reasoning-toggle`).  Defaults to [`ReasoningViewMode::Expanded`], which
+    /// defers to the content-derived default; a display torn down and rebuilt
+    /// (e.g. the session deleted and re-created) starts from that default again.
     pub(crate) reasoning_mode: ReasoningViewMode,
     /// Per-(turn, tool-call) explicit collapse state (`turn_id` → `call_id` →
     /// collapsed) set by clicking a tool result's header.  Absent entries

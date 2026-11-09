@@ -18,7 +18,8 @@
 //! The consequence of reading case is that Caps Lock is indistinguishable from
 //! Shift on a legacy terminal (kitty terminals do not report lock modifiers for
 //! text keys), which is accepted: a caps-lock user's `Alt+R` reads as
-//! `Alt+Shift+R` there.
+//! `Alt+Shift+R` there, and a shifted chord the table does not bind (e.g.
+//! `Alt+Shift+M`) is simply unbound.
 //!
 //! The table is the single source of truth for both Chat-page shortcut dispatch
 //! (`binding_for`), the command palette's right-aligned shortcut labels
