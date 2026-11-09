@@ -337,6 +337,25 @@ fn keystore_unbound_status_push_auto_binds() {
 
 // ── Turn cancellation vs failure ──────────────────────────────────────
 
+/// An empty stub turn, matching what the daemon's `TurnAppended` seeds for a
+/// turn before its streaming chunks arrive.
+fn stub_turn() -> Turn {
+    Turn {
+        created_at: TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: None,
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    }
+}
+
 #[test]
 fn started_never_rewinds_a_stream_to_an_earlier_turn() {
     let mut state = AppState::new("/tmp/choreographr.sock");
@@ -369,6 +388,14 @@ fn started_never_rewinds_a_stream_to_an_earlier_turn() {
         Some(2),
         "a dropped stale replay must leave the live route on the current turn"
     );
+
+    // The daemon broadcasts `TurnAppended` for a turn before its stream chunks
+    // arrive (the other tests here seed the same stub), so create the turns the
+    // front-end would already hold: this makes the assertion below exercise real
+    // routing — turn 2 collects the chunk, turn 1 (already left) does not —
+    // rather than passing trivially against a missing turn.
+    state.session_view.turns.insert(1, stub_turn());
+    state.session_view.turns.insert(2, stub_turn());
 
     // And the stream's chunks keep landing in that turn.
     dispatch_daemon_message(
