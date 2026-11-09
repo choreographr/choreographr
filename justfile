@@ -369,16 +369,26 @@ test-all: _require-nextest _require-zig
     cargo test-all {{ CARGO_FLAGS }} --locked
 
 # Extra arguments go to cargo-llvm-cov (e.g. `just coverage --html --open`).
-# Line coverage of the `test-all` suite, printed as a per-file table
+# Line coverage of the `test-all` suite, printed as a per-file table.
+#
+# CARGO_PROFILE_DEV_RUSTFLAGS="" clears the dev profile's rustflags for the
+# coverage build. The repo-wide [profile.dev] sets `-C target-cpu=native` (a
+# local-speed default), but a native build embeds the build machine's CPU
+# feature set; on the coverage CI job's heterogeneous ubuntu-24.04 fleet a
+# rust-cache-restored native build from a richer CPU SIGILLs on a plainer one
+# (the JPEG/SIMD codec tests hit exactly that). Clearing the flags makes the
+# instrumented build target a portable baseline, and because cargo's fingerprint
+# includes rustflags it also rebuilds rather than reusing the native artifacts.
 coverage *args: _require-nextest _require-zig _require-llvm-cov
-    cargo coverage {{ CARGO_FLAGS }} --locked {{ args }}
+    CARGO_PROFILE_DEV_RUSTFLAGS="" cargo coverage {{ CARGO_FLAGS }} --locked {{ args }}
 
 # One test run produces both outputs: the summary is derived from the lcov file
 # (see scripts/coverage-summary.sh). This is what the coverage CI workflow runs.
 # Coverage of the `test-all` suite as an lcov file plus a per-crate summary table
+# (portable, non-native build — see the `coverage` recipe's note).
 coverage-lcov out="target/coverage/lcov.info": _require-nextest _require-zig _require-llvm-cov
     mkdir -p "$(dirname '{{ out }}')"
-    cargo coverage {{ CARGO_FLAGS }} --locked --lcov --output-path '{{ out }}'
+    CARGO_PROFILE_DEV_RUSTFLAGS="" cargo coverage {{ CARGO_FLAGS }} --locked --lcov --output-path '{{ out }}'
     ./scripts/coverage-summary.sh '{{ out }}'
 
 # Unit tests via libtest (serialized across binaries; no nextest required)
