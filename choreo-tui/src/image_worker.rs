@@ -87,10 +87,11 @@ impl ImageWorker {
         let (result_tx, result_rx) = channel::unbounded::<ImageResult>();
 
         let handle = thread::spawn(move || {
+            tracing::info!("[choreo-tui] image worker started");
             loop {
                 match job_rx.recv() {
                     Err(_) => {
-                        tracing::debug!("[choreo-tui] image worker shutting down");
+                        tracing::info!("[choreo-tui] image worker shutting down");
                         break;
                     }
                     Ok(job) => process_job(&picker, &result_tx, &job),
@@ -110,8 +111,9 @@ impl ImageWorker {
 /// the target pixel resolution), create a protocol, and run the expensive
 /// terminal-protocol encoding.  Results are sent back on `result_tx`.
 ///
-/// On failure, a result with `protocol: None` is still sent so the caller
-/// can clear `pending_job` and allow a retry on the next frame.
+/// Every outcome produces a result — decode/encode errors and a panicked
+/// encoder alike yield `protocol: None` — so the caller always clears its
+/// pending marker and can retry at a later frame instead of waiting forever.
 fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: &ImageJob) {
     tracing::debug!(
         "[choreo-tui] image worker processing job {} ({} {}x{})",
@@ -121,39 +123,26 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: &
         job.metadata.height,
     );
 
-    let font_size = picker.font_size();
-    // u16 -> u32 is provably lossless, so `From` is preferred over `as`
-    // (an `as` cast would silently truncate if the cell-size type ever
-    // widened/shrunk).
-    let target_px_w = u32::from(job.cell_size.width).saturating_mul(u32::from(font_size.width));
-    let target_px_h = u32::from(job.cell_size.height).saturating_mul(u32::from(font_size.height));
-
-    let image = match decode_image(&job.metadata, &job.data, target_px_w, target_px_h) {
-        Ok(img) => img,
-        Err(e) => {
-            tracing::error!(
-                "[choreo-tui] image worker failed to decode image {}: {e}",
-                job.id
+    let protocol = match guard(|| encode_job(picker, job)) {
+        Ok(protocol) => Some(protocol),
+        Err(failure) => {
+            // One log line covers both failure kinds (a decode/encode error and
+            // a caught panic), so a broken image is visible in the log at the
+            // default level rather than only at `trace`.
+            tracing::warn!(
+                "[choreo-tui] image worker failed on job {} ({} {}x{}): {failure}",
+                job.id,
+                job.metadata.mime_type,
+                job.metadata.width,
+                job.metadata.height,
             );
-            // Send a failure result so the UI thread clears pending_job.
-            let _ = result_tx.send(ImageResult {
-                id: job.id,
-                protocol: None,
-                cell_size: job.cell_size,
-            });
-            return;
+            None
         }
     };
 
-    let mut protocol = picker.new_resize_protocol(image);
-
-    // Trigger terminal-protocol-specific encoding (the expensive part),
-    // which also caches the layout dimensions internally.
-    protocol.resize_encode(&job.resize, job.cell_size);
-
     let result = ImageResult {
         id: job.id,
-        protocol: Some(protocol),
+        protocol,
         cell_size: job.cell_size,
     };
 
@@ -162,6 +151,72 @@ fn process_job(picker: &Picker, result_tx: &channel::Sender<ImageResult>, job: &
             "[choreo-tui] image worker failed to send result for {}: {e}",
             job.id
         );
+    }
+}
+
+/// Decode and encode one job — the span a panic must not be allowed to escape.
+///
+/// Split out from [`process_job`] so [`guard`] wraps exactly this step: the
+/// decode, the protocol construction, and the terminal-protocol encode.
+fn encode_job(picker: &Picker, job: &ImageJob) -> Result<StatefulProtocol, String> {
+    let font_size = picker.font_size();
+    // u16 -> u32 is provably lossless, so `From` is preferred over `as`
+    // (an `as` cast would silently truncate if the cell-size type ever
+    // widened/shrunk).
+    let target_px_w = u32::from(job.cell_size.width).saturating_mul(u32::from(font_size.width));
+    let target_px_h = u32::from(job.cell_size.height).saturating_mul(u32::from(font_size.height));
+
+    let image = decode_image(&job.metadata, &job.data, target_px_w, target_px_h)?;
+
+    let mut protocol = picker.new_resize_protocol(image);
+
+    // Trigger terminal-protocol-specific encoding (the expensive part),
+    // which also caches the layout dimensions internally.
+    protocol.resize_encode(&job.resize, job.cell_size);
+
+    Ok(protocol)
+}
+
+/// Run one encode attempt with panics contained, turning a panic into the same
+/// `Err` a decode or encode failure produces.
+///
+/// The worker is a THREAD-LOCAL single point of failure for the whole process:
+/// it is one thread shared by every image in every session, so a panic that
+/// unwound [`ImageWorker::spawn`]'s receive loop would silently disable inline
+/// images until the client restarts — every later job's `send` would be
+/// discarded and each slot's `pending_job` marker would never clear. The
+/// encoders are third-party code (and the SVG rasteriser) operating on bytes a
+/// model chose to read, so containment belongs here rather than in a
+/// best-effort `unwrap`-free review of that code.
+///
+/// `AssertUnwindSafe` is sound for this call: the closure only reads its inputs
+/// (`&Picker`, `&ImageJob`), and nothing it mutates is observed after a panic —
+/// the panic path yields `Err` and the job is simply reported as failed.
+fn guard<T, F>(encode: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode)) {
+        Ok(result) => result,
+        Err(payload) => Err(format!(
+            "panicked while encoding: {}",
+            panic_message(payload.as_ref())
+        )),
+    }
+}
+
+/// The message carried by a caught panic payload, for the failure log line.
+///
+/// A panic payload is `Box<dyn Any + Send>`, conventionally either `&'static
+/// str` (`panic!("literal")`) or `String` (`panic!("{x}")`). Anything else is
+/// reported by kind rather than guessed at.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
     }
 }
 
@@ -377,6 +432,98 @@ mod tests {
             "successful encoding should produce a protocol"
         );
         handle.join().expect("worker thread");
+    }
+
+    #[test]
+    fn guard_turns_a_panicking_encode_into_a_failure() {
+        // The worker is one thread for the whole process, so a panic in the
+        // encoder must become an ordinary failed job instead of unwinding the
+        // receive loop. Containment also has to be reusable: the next attempt
+        // (and the process) must be unaffected.
+        let outcome = guard::<u8, _>(|| panic!("encoder exploded"));
+        let message = outcome.expect_err("a panic must surface as Err");
+        assert!(
+            message.contains("panicked while encoding"),
+            "the failure names the panic path: {message}"
+        );
+        assert!(
+            message.contains("encoder exploded"),
+            "the panic's own message is kept for the log: {message}"
+        );
+
+        // A non-string payload is reported by kind rather than lost.
+        let outcome = guard::<u8, _>(|| std::panic::panic_any(42u32));
+        assert!(
+            outcome.unwrap_err().contains("non-string panic payload"),
+            "an unusual payload is still described"
+        );
+
+        // Ok and Err pass through untouched.
+        assert_eq!(guard(|| Ok(7u8)), Ok(7));
+        assert_eq!(
+            guard(|| Err::<u8, _>("decode failed".to_string())),
+            Err("decode failed".to_string())
+        );
+    }
+
+    #[test]
+    fn worker_keeps_processing_after_a_failed_job() {
+        // End-to-end over the real worker loop: one undecodable job must not
+        // take the thread down, because every later image in every session
+        // would then fail silently.
+        let ImageWorker {
+            job_tx,
+            result_rx,
+            handle,
+        } = ImageWorker::spawn(Picker::halfblocks());
+        let svg = br"<svg xmlns='http://www.w3.org/2000/svg' width='4' height='3'><rect width='4' height='3' fill='blue'/></svg>";
+
+        job_tx
+            .send(ImageJob {
+                id: 1,
+                data: Arc::from(vec![1u8, 2, 3]),
+                metadata: ImageMetadata {
+                    mime_type: "image/png".to_string(),
+                    width: 1,
+                    height: 1,
+                    byte_len: 3,
+                    alt: None,
+                },
+                cell_size: Size::new(20, 16),
+                resize: Resize::Scale(Some(FilterType::Lanczos3)),
+            })
+            .expect("send the corrupt job");
+        job_tx
+            .send(ImageJob {
+                id: 2,
+                data: Arc::from(svg.to_vec()),
+                metadata: ImageMetadata {
+                    mime_type: "image/svg+xml".to_string(),
+                    width: 4,
+                    height: 3,
+                    byte_len: svg.len() as u64,
+                    alt: None,
+                },
+                cell_size: Size::new(20, 16),
+                resize: Resize::Scale(Some(FilterType::Lanczos3)),
+            })
+            .expect("send the valid job");
+
+        // Drop the sender so the worker's receive loop ends and joins cleanly.
+        drop(job_tx);
+
+        let first = result_rx.recv().expect("a result for the corrupt job");
+        assert_eq!(first.id, 1);
+        assert!(first.protocol.is_none(), "the corrupt job fails");
+
+        let second = result_rx.recv().expect("a result for the valid job");
+        assert_eq!(second.id, 2);
+        assert!(
+            second.protocol.is_some(),
+            "the loop survived the failed job and encoded the next one"
+        );
+
+        handle.join().expect("worker thread exits cleanly");
     }
 
     #[test]

@@ -2881,6 +2881,19 @@ plumbing (the `Tool::extract_image` hook, `emit_image`, and the mid-turn
 and `requests` modules, `cargo doc -p choreo-daemon` / `just doc`), held
 complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
+The client side of that flow is one background encode worker per TUI process,
+and its failure model is part of the contract: the terminal-protocol encoders are
+third-party code driven by bytes a model chose to read, so a panic in one image's
+encode is contained (`image_worker::guard`) and reported as that image's failed
+job rather than being allowed to unwind the worker's receive loop — a loop that
+is the whole process's single encoder. A slot whose job never produced a result
+would latch `pending_job` and never be re-submitted, so the state layer also
+fails a slot when the job cannot be handed over at all (a dead worker), latching
+the size exactly as a reported encode failure does. Every submit, successful
+encode and failure is logged at the default level, so a missing image is
+diagnosable from the log alone. Documented in-source (see `choreo-tui`'s
+`image_worker` and `state::images` modules).
+
 `edit_image` inputs may also be **session references** (`@last`,
 `@display:<turn>:<index>`, `@result:<turn>:<call_id>`) naming an image already
 stored in the session; they are resolved through the daemon command loop — a

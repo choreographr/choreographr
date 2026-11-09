@@ -238,21 +238,55 @@ impl App {
 
     pub(crate) fn apply_image_result(&mut self, result: ImageResult) {
         let Some((session_id, turn_id, slot)) = self.pending_job_idx.remove(&result.id) else {
+            tracing::debug!(
+                "[choreo-tui] discarding image job {}: no slot is awaiting it",
+                result.id
+            );
             return;
         };
-        if let Some(session_images) = self.rendered_images.get_mut(&session_id)
-            && let Some(images) = session_images.get_mut(&turn_id)
-            && let Some(img) = images.get_mut(&slot)
-            && img.pending_job == Some(result.id)
-        {
-            tracing::trace!(
-                "[choreo-tui] image job {} completed for session {} turn {} slot {:?}",
+        let Some(img) = self.slot_image_mut(session_id, turn_id, &slot) else {
+            // The turn was re-advertised without this slot (or the session was
+            // closed) while the encode was in flight.
+            tracing::debug!(
+                "[choreo-tui] discarding image job {}: session {} turn {} slot {:?} is gone",
                 result.id,
                 session_id,
                 turn_id,
-                slot,
+                slot
             );
-            img.apply_result(result);
+            return;
+        };
+        if img.pending_job != Some(result.id) {
+            // A newer job for the same slot superseded this one; applying an
+            // older protocol would resurrect a stale layout.
+            tracing::debug!(
+                "[choreo-tui] discarding image job {}: session {} turn {} slot {:?} has moved on",
+                result.id,
+                session_id,
+                turn_id,
+                slot
+            );
+            return;
+        }
+        let id = result.id;
+        let encoded = result.protocol.is_some();
+        let cell_size = result.cell_size;
+        img.apply_result(result);
+        // The two outcomes are logged at the default level so a missing image is
+        // diagnosable from the log alone: an `Ok` protocol draws next frame,
+        // while a failed one leaves the placeholder and latches the size.
+        if encoded {
+            tracing::info!(
+                "[choreo-tui] image job {id} encoded session {session_id} turn {turn_id} slot {slot:?} at {}x{}",
+                cell_size.width,
+                cell_size.height,
+            );
+        } else {
+            tracing::warn!(
+                "[choreo-tui] image job {id} failed for session {session_id} turn {turn_id} slot {slot:?} at {}x{}; the placeholder stays drawn",
+                cell_size.width,
+                cell_size.height,
+            );
         }
     }
 
@@ -369,8 +403,15 @@ impl App {
     }
 
     /// Queue a background encode job for one image, returning its job id (or
-    /// `None` when the worker is absent). The request carries the target slot
-    /// and the already-owned encode inputs; see [`ImageJobRequest`].
+    /// `None` when the image could not be handed to the worker). The request
+    /// carries the target slot and the already-owned encode inputs; see
+    /// [`ImageJobRequest`].
+    ///
+    /// `None` has two causes, both of which leave the slot retryable rather
+    /// than stuck: no worker exists (a headless app, where the caller keeps its
+    /// placeholder), or the worker thread is gone — in which case the size is
+    /// latched as failed so the render path stops asking, because a slot whose
+    /// `pending_job` marker is set can never be re-submitted by itself.
     pub(crate) fn submit_image_job(&mut self, req: ImageJobRequest) -> Option<ImageId> {
         let ImageJobRequest {
             session_id,
@@ -384,7 +425,7 @@ impl App {
         let tx = self.image_job_tx.as_ref()?;
         let id = next_job_id();
 
-        tracing::trace!(
+        tracing::info!(
             "[choreo-tui] submitting image job {} for session {} turn {} slot {:?} ({} {}x{} @ {}x{})",
             id,
             session_id,
@@ -397,24 +438,66 @@ impl App {
             cell_size.height,
         );
 
+        // The job is handed over BEFORE the pending markers are set: a send
+        // into a dead worker is the one failure this function can observe, and
+        // latching `pending_job` for a job that was never queued would leave the
+        // slot permanently un-submittable. Results are only applied on the UI
+        // thread (the thread calling this), so nothing can observe the slot
+        // between the send and the marker.
+        if tx
+            .send(ImageJob {
+                id,
+                data,
+                metadata,
+                cell_size,
+                resize,
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                "[choreo-tui] image worker is gone; failing image job {id} for session {session_id} turn {turn_id} slot {slot:?}"
+            );
+            self.fail_image_slot(session_id, turn_id, &slot, cell_size);
+            return None;
+        }
+
         self.pending_job_idx
             .insert(id, (session_id, turn_id, slot.clone()));
 
-        if let Some(session_images) = self.rendered_images.get_mut(&session_id)
-            && let Some(images) = session_images.get_mut(&turn_id)
-            && let Some(img) = images.get_mut(&slot)
-        {
+        if let Some(img) = self.slot_image_mut(session_id, turn_id, &slot) {
             img.pending_job = Some(id);
         }
-
-        let _ = tx.send(ImageJob {
-            id,
-            data,
-            metadata,
-            cell_size,
-            resize,
-        });
         Some(id)
+    }
+
+    /// The rendered image for one slot, if the turn still exposes it.
+    fn slot_image_mut(
+        &mut self,
+        session_id: u64,
+        turn_id: u32,
+        slot: &ImageSlot,
+    ) -> Option<&mut RenderedImage> {
+        self.rendered_images
+            .get_mut(&session_id)
+            .and_then(|images| images.get_mut(&turn_id))
+            .and_then(|images| images.get_mut(slot))
+    }
+
+    /// Record an encode failure for one slot at `cell_size`: clear the pending
+    /// marker and latch the size, so the render path stops re-submitting it
+    /// (the placeholder stays drawn). The latch is per-size, exactly like a
+    /// worker-reported failure, so a resize retries at the new size.
+    fn fail_image_slot(
+        &mut self,
+        session_id: u64,
+        turn_id: u32,
+        slot: &ImageSlot,
+        cell_size: Size,
+    ) {
+        if let Some(img) = self.slot_image_mut(session_id, turn_id, slot) {
+            img.pending_job = None;
+            img.failed_sizes.insert(cell_size);
+        }
     }
 }
 
@@ -800,5 +883,116 @@ mod tests {
             app.pending_image_fetch,
             vec![(7, 3, ImageSlot::Displayed(0))]
         );
+    }
+
+    #[test]
+    fn submit_image_job_fails_the_slot_when_the_worker_is_gone() {
+        // The worker thread is a single point of failure for the whole process:
+        // if it is gone, a job handed to its closed channel must not leave the
+        // slot latched `pending_job` — the render path's `needs_job` requires
+        // that marker to be clear, so the image would never be submitted again.
+        // The failure latches the SIZE instead, exactly like a worker-reported
+        // encode failure, so a later resize still retries.
+        let mut app = test_app();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.image_job_tx = Some(tx);
+        // Dropping the receiver closes the channel — what a dead worker thread
+        // looks like from the UI thread.
+        drop(rx);
+
+        let turn = turn_with_displayed_image();
+        app.sync_turn_images(3, 9, &turn);
+        let slot = ImageSlot::Displayed(0);
+        let cell_size = Size::new(80, 20);
+
+        let id = app.submit_image_job(ImageJobRequest {
+            session_id: 3,
+            turn_id: 9,
+            slot: slot.clone(),
+            data: Arc::from(b"PNG!".to_vec()),
+            metadata: turn.displayed_images[0].metadata.clone(),
+            cell_size,
+            resize: crate::IMAGE_RESIZE,
+        });
+
+        assert!(id.is_none(), "a job that could not be queued yields no id");
+        let img = &app.rendered_images[&3][&9][&slot];
+        assert!(
+            img.pending_job.is_none(),
+            "the slot must not be left waiting for a result that cannot come"
+        );
+        assert!(
+            img.failed_sizes.contains(&cell_size),
+            "the size is latched so the render path stops re-submitting"
+        );
+        assert!(
+            app.pending_job_idx.is_empty(),
+            "no job-index entry may leak for a job that was never queued"
+        );
+    }
+
+    #[test]
+    fn submit_image_job_queues_and_marks_the_slot_pending() {
+        // The success path: the job reaches the worker, the slot carries the
+        // pending marker, and the id is indexed so the result routes back to
+        // this exact (session, turn, slot).
+        let mut app = test_app();
+        let (tx, rx) = crossbeam_channel::unbounded();
+        app.image_job_tx = Some(tx);
+
+        let turn = turn_with_displayed_image();
+        app.sync_turn_images(3, 9, &turn);
+        let slot = ImageSlot::Displayed(0);
+        let cell_size = Size::new(80, 20);
+
+        let id = app
+            .submit_image_job(ImageJobRequest {
+                session_id: 3,
+                turn_id: 9,
+                slot: slot.clone(),
+                data: Arc::from(b"PNG!".to_vec()),
+                metadata: turn.displayed_images[0].metadata.clone(),
+                cell_size,
+                resize: crate::IMAGE_RESIZE,
+            })
+            .expect("a live worker takes the job");
+
+        assert_eq!(app.rendered_images[&3][&9][&slot].pending_job, Some(id));
+        assert_eq!(
+            app.pending_job_idx.get(&id),
+            Some(&(3u64, 9u32, slot.clone()))
+        );
+        let queued = rx.try_recv().expect("the worker received the job");
+        assert_eq!(queued.id, id);
+        assert_eq!(queued.cell_size, cell_size);
+    }
+
+    /// A one-turn fixture exposing a single displayed image that still has its
+    /// bytes, for the `submit_image_job` tests.
+    fn turn_with_displayed_image() -> Turn {
+        Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: None,
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![choreo_proto::DisplayedImageRecord {
+                metadata: choreo_proto::ImageMetadata {
+                    mime_type: "image/png".to_string(),
+                    width: 4,
+                    height: 4,
+                    byte_len: 4,
+                    alt: None,
+                },
+                data: b"PNG!".to_vec(),
+                tool_call_id: None,
+            }],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        }
     }
 }
