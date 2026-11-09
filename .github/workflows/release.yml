@@ -822,9 +822,10 @@ jobs:
     # 2026-11-03 (daemon booted, fingerprint computed, clean SIGTERM exit).
     # Host parity without a VM: `just check-freebsd` type-checks every library
     # for x86_64-unknown-freebsd from any host.
-    # NOTE: `pkg install zig` may lag the Zig 0.17.1 that zlob 1.8.0 requires;
-    # if a future build fails on zlob, pin the Zig version here (download the
-    # 0.17.1 tarball into PATH).
+    # Zig is installed from the official release tarball, not FreeBSD's
+    # `pkg install zig` — the packaged Zig lags (it still ships 0.16.0), and
+    # zlob 1.8.0 needs Zig 0.17.1+ (0.16 aborts on its `@backingInt` builtins).
+    # The tarball is pinned to the same 0.17.1 the setup-zig jobs use.
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
@@ -839,11 +840,23 @@ jobs:
           mem: 8192
           # Native toolchain inside the VM. `bash` is REQUIRED: release.sh,
           # build-stable.sh and the smoke scripts are bash (arrays, [[ ]]) and
-          # FreeBSD base ships only sh/csh. `zig` is zlob's build dependency;
-          # `git` backs release.sh's dirty-tree guard; `ca_root_nss` lets curl
-          # trust the rustup TLS download.
+          # FreeBSD base ships only sh/csh. `git` backs release.sh's dirty-tree
+          # guard; `ca_root_nss` lets curl trust the rustup TLS download; `xz`
+          # unpacks the Zig tarball below (zig itself is not from pkg — see the
+          # job comment).
           prepare: |
-            pkg install -y bash curl ca_root_nss git zig gmake
+            set -eu
+            pkg install -y bash curl ca_root_nss git gmake xz
+            # FreeBSD's packaged Zig lags (0.16.0), which cannot build zlob
+            # 1.8.0 (it uses the `@backingInt` builtin added in Zig 0.17).
+            # Fetch the pinned official release tarball and put it on PATH.
+            ZIG_VERSION=0.17.1
+            curl -fsSL -o /tmp/zig.tar.xz \
+              "https://ziglang.org/download/${ZIG_VERSION}/zig-x86_64-freebsd-${ZIG_VERSION}.tar.xz"
+            mkdir -p /usr/local/zig
+            xz -dc /tmp/zig.tar.xz | tar -xf - -C /usr/local/zig --strip-components=1
+            ln -sf /usr/local/zig/zig /usr/local/bin/zig
+            zig version
           run: |
             set -eu
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
