@@ -2894,6 +2894,14 @@ encode and failure is logged at the default level, so a missing image is
 diagnosable from the log alone. Documented in-source (see `choreo-tui`'s
 `image_worker` and `state::images` modules).
 
+Because the TUI owns the terminal (alternate screen + raw mode), the client
+installs one process-wide panic hook rather than letting the default hook write a
+panic line to stderr where it would spray across the live UI and never be cleared
+by the diff renderer. The hook routes every panic — message, location, thread —
+to the log file, and restores the terminal only for a panic on the **main**
+thread (the UI loop, hence fatal); a panic on any other thread leaves the terminal
+alone so a contained encode panic never tears down a UI that keeps running.
+
 `edit_image` inputs may also be **session references** (`@last`,
 `@display:<turn>:<index>`, `@result:<turn>:<call_id>`) naming an image already
 stored in the session; they are resolved through the daemon command loop — a

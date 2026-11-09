@@ -13,8 +13,8 @@ use image::{DynamicImage, RgbaImage};
 use ratatui::layout::Size;
 use ratatui_image::{Resize, ResizeEncodeRender, picker::Picker, protocol::StatefulProtocol};
 use resvg::{tiny_skia, usvg};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::thread;
 
 /// Identifier pairing an [`ImageJob`] with the [`ImageResult`] it produces.
@@ -210,7 +210,11 @@ where
 /// A panic payload is `Box<dyn Any + Send>`, conventionally either `&'static
 /// str` (`panic!("literal")`) or `String` (`panic!("{x}")`). Anything else is
 /// reported by kind rather than guessed at.
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+///
+/// Shared with the process-wide panic hook (see [`crate::install_panic_hook`]),
+/// which routes every panic's payload through the same projection so a caught
+/// encode panic and a fatal client panic read alike in the log.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
@@ -252,11 +256,25 @@ fn decode_image(
     }
 }
 
-/// Parse SVG bytes into a `usvg::Tree` with system fonts loaded.
-fn parse_svg(data: &[u8]) -> Result<usvg::Tree, String> {
+/// Process-wide `usvg` options with the system font database loaded once.
+///
+/// `load_system_fonts` scans the OS font directories, which costs far more than
+/// parsing a single SVG. Loading it on every image would rescan the filesystem
+/// per render; `Options` holds its database behind an `Arc`, so one scan shared
+/// through this `LazyLock` (read-only during parsing) removes that per-image
+/// cost. The catalogue is fixed for the life of the process — a font installed
+/// while the client runs is picked up only on restart, which is the right
+/// trade for a TUI.
+static SVG_OPTIONS: LazyLock<usvg::Options<'static>> = LazyLock::new(|| {
     let mut options = usvg::Options::default();
     Arc::make_mut(&mut options.fontdb).load_system_fonts();
-    usvg::Tree::from_data(data, &options).map_err(|e| format!("failed to parse svg: {e}"))
+    options
+});
+
+/// Parse SVG bytes into a `usvg::Tree` with system fonts loaded (once, see
+/// [`SVG_OPTIONS`]).
+fn parse_svg(data: &[u8]) -> Result<usvg::Tree, String> {
+    usvg::Tree::from_data(data, &SVG_OPTIONS).map_err(|e| format!("failed to parse svg: {e}"))
 }
 
 /// Rasterize an SVG at a target pixel resolution, preserving aspect ratio.
@@ -467,10 +485,12 @@ mod tests {
     }
 
     #[test]
-    fn worker_keeps_processing_after_a_failed_job() {
+    fn worker_keeps_processing_after_a_failed_decode() {
         // End-to-end over the real worker loop: one undecodable job must not
         // take the thread down, because every later image in every session
-        // would then fail silently.
+        // would then fail silently. This exercises the ordinary error path; the
+        // panic span that shares the same loop is covered by
+        // `guard_turns_a_panicking_encode_into_a_failure`.
         let ImageWorker {
             job_tx,
             result_rx,

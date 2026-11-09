@@ -441,6 +441,65 @@ fn confirm_first_contact(
     Ok(answer == "y" || answer == "yes")
 }
 
+/// Install a process-wide panic hook that keeps a panic from corrupting the
+/// TUI and routes its diagnostic to the log file instead of stderr.
+///
+/// The TUI owns the terminal (alternate screen + raw mode), so the default
+/// hook's stderr line (`thread '…' panicked at …`) sprays across the live UI,
+/// where ratatui's diff renderer will not clear it. Worse, the image worker
+/// *contains* encoder panics and keeps running (see
+/// [`image_worker::guard`](image_worker::guard)), so a caught panic must neither
+/// garble the display nor tear the terminal down under the surviving UI.
+///
+/// This hook therefore never writes to stderr. It logs every panic — message,
+/// location, thread — through [`tracing`] to the per-process log file (the
+/// crate's only diagnostic sink), and restores the terminal only for a panic on
+/// the **main** thread, which is the UI loop and therefore fatal. A panic on
+/// any other thread leaves the terminal alone so the UI keeps rendering.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string);
+        let message = image_worker::panic_message(info.payload());
+        let on_main = std::thread::current().name() == Some("main");
+        // Restore the terminal BEFORE logging so even a fatal panic's log line
+        // (and whatever the runtime prints afterwards) lands on a usable
+        // screen, never inside the alternate buffer.
+        if on_main {
+            restore_terminal_after_panic();
+        }
+        tracing::error!(
+            location = %location,
+            thread = std::thread::current().name().unwrap_or("<unnamed>"),
+            fatal = on_main,
+            "panic: {message}"
+        );
+    }));
+}
+
+/// Best-effort return of the terminal to its normal state after a fatal panic.
+///
+/// Every step is deliberately infallible-in-practice and its error ignored: this
+/// runs while the process is already unwinding, so a failed escape sequence must
+/// not turn one panic into an abort. Mouse capture and bracketed paste are
+/// disabled too, since a panic can land after they were enabled and leaving
+/// either set would strand the user's shell in the wrong input mode.
+fn restore_terminal_after_panic() {
+    use std::io::Write as _;
+    let _ = crossterm::terminal::disable_raw_mode();
+    let mut stdout = std::io::stdout();
+    let _ = crossterm::execute!(
+        stdout,
+        crossterm::terminal::LeaveAlternateScreen,
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::DisableMouseCapture,
+        crossterm::style::ResetColor,
+        crossterm::cursor::Show,
+    );
+    let _ = stdout.flush();
+}
+
 /// Entry point for the `choreo-tui` binary wrapper.
 ///
 /// The root `choreographr` package declares `choreo-tui` as a thin binary
@@ -475,6 +534,12 @@ pub fn main() -> anyhow::Result<()> {
         with_target: true,
         extra_directives: &[],
     });
+
+    // Install the panic hook now that the log sink exists: every panic this
+    // process takes (a contained image-encode panic, or a fatal UI panic) is
+    // reported to the log file and kept off the terminal (see
+    // `install_panic_hook`).
+    install_panic_hook();
 
     let mode = if let Some(addr) = cli.tcp_addr {
         resolve_connect_mode(
