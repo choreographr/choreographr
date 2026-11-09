@@ -870,9 +870,7 @@ impl SessionDisplayState {
         // the whole cache rather than trusting the per-key comparison (the mode
         // is not part of `RenderCacheKey`; the key's `reasoning_expanded` flag is,
         // but a turn whose reasoning is hidden either way would compare equal).
-        for slot in &mut self.render_cache {
-            *slot = None;
-        }
+        self.render_cache.fill(None);
         self.mark_content_changed();
     }
 

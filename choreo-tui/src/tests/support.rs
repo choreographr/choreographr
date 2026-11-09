@@ -22,62 +22,60 @@ pub fn test_app() -> App {
     app
 }
 
-/// Add a `UserText` turn to the session, mimicking what the daemon sends after
-/// processing a `RunInput`.
-pub fn add_user_text(app: &mut App, content: &str) {
-    // The test harness mints its own turn ids; in production the daemon assigns
-    // them. Derive the next id from the display's existing turns so repeated
-    // calls stay increasing (no client-side counter exists any more).
-    let turn_id = app
-        .display_for(0)
+/// Mint the next turn id for the harness's default session.
+///
+/// The harness mints its own turn ids; in production the daemon assigns them.
+/// Deriving the next id from the display's existing turns keeps repeated
+/// fixture calls increasing without a client-side counter (there is none).
+fn next_turn_id(app: &mut App) -> u32 {
+    app.display_for(0)
         .view
         .turns
         .keys()
         .next_back()
-        .map_or(0, |k| k + 1);
-    let turn = Turn {
-        created_at: choreo_proto::TimestampMs::now(),
-        undone: false,
-        error: None,
-        user_text: Some(content.to_string()),
-        assistant_text: None,
-        assistant_reasoning: None,
-        tool_calls: vec![],
-        token_usage: None,
-        tool_results: vec![],
-        displayed_images: vec![],
-        reasoning_artifact: None,
-        reasoning_producer: None,
-    };
+        .map_or(0, |k| k + 1)
+}
+
+/// Append a hand-built fixture turn under the session's next id and refresh the
+/// height model, so the layouts a test asserts on are the ones the renderer
+/// would build for it.  (The explicit-id [`insert_turn`] below is the sibling
+/// for a test that lays out a sparse sequence on purpose.)
+fn append_turn(app: &mut App, turn: Turn) {
+    let turn_id = next_turn_id(app);
     app.display_for(0).view.insert_or_replace(turn_id, turn);
     app.rebuild_height_prefix();
 }
 
-/// Add an assistant turn that carries reasoning but no response yet — the shape
-/// a request has while its reasoning is still streaming, and the one that
-/// derives "expanded" by default (`reasoning_expanded_default`).
-pub fn add_reasoning_turn(app: &mut App, reasoning: &str) {
-    add_assistant_turn(app, Some(reasoning), None);
+/// Add a `UserText` turn to the session, mimicking what the daemon sends after
+/// processing a `RunInput`.
+pub fn add_user_text(app: &mut App, content: &str) {
+    append_turn(
+        app,
+        Turn {
+            created_at: choreo_proto::TimestampMs::now(),
+            undone: false,
+            error: None,
+            user_text: Some(content.to_string()),
+            assistant_text: None,
+            assistant_reasoning: None,
+            tool_calls: vec![],
+            token_usage: None,
+            tool_results: vec![],
+            displayed_images: vec![],
+            reasoning_artifact: None,
+            reasoning_producer: None,
+        },
+    );
 }
 
-/// Add an assistant turn that carries BOTH reasoning and a response — the shape
-/// that derives "collapsed" by default, and that the bulk expand action must
-/// leave collapsed.
-pub fn add_answered_turn(app: &mut App, reasoning: &str, answer: &str) {
-    add_assistant_turn(app, Some(reasoning), Some(answer));
-}
-
-/// Shared body of the assistant-turn fixtures: mint the next turn id and insert
-/// a turn carrying the given reasoning/response text.
-fn add_assistant_turn(app: &mut App, reasoning: Option<&str>, answer: Option<&str>) {
-    let turn_id = app
-        .display_for(0)
-        .view
-        .turns
-        .keys()
-        .next_back()
-        .map_or(0, |k| k + 1);
-    let turn = Turn {
+/// Build an assistant-turn fixture **without** inserting it: user text `"q"`
+/// plus the given reasoning and response text (both optional).
+///
+/// The `add_*` helpers below cover the two shapes the derive logic distinguishes;
+/// a test that needs a different combination — or its own turn id — builds the
+/// turn here and inserts it itself, so the fixture shape lives in one place.
+pub fn assistant_turn(reasoning: Option<&str>, answer: Option<&str>) -> Turn {
+    Turn {
         created_at: choreo_proto::TimestampMs::now(),
         undone: false,
         error: None,
@@ -90,9 +88,21 @@ fn add_assistant_turn(app: &mut App, reasoning: Option<&str>, answer: Option<&st
         displayed_images: vec![],
         reasoning_artifact: None,
         reasoning_producer: None,
-    };
-    app.display_for(0).view.insert_or_replace(turn_id, turn);
-    app.rebuild_height_prefix();
+    }
+}
+
+/// Add an assistant turn that carries reasoning but no response yet — the shape
+/// a request has while its reasoning is still streaming, and the one that
+/// derives "expanded" by default (`reasoning_expanded_default`).
+pub fn add_reasoning_turn(app: &mut App, reasoning: &str) {
+    append_turn(app, assistant_turn(Some(reasoning), None));
+}
+
+/// Add an assistant turn that carries BOTH reasoning and a response — the shape
+/// that derives "collapsed" by default, and that the bulk expand action must
+/// leave collapsed.
+pub fn add_answered_turn(app: &mut App, reasoning: &str, answer: &str) {
+    append_turn(app, assistant_turn(Some(reasoning), Some(answer)));
 }
 
 /// Build a minimal session-summary fixture: the shape tests that only need a

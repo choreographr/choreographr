@@ -9,6 +9,7 @@
 use super::{
     IncrementalMarkdown, LineChrome, LineJoin, RenderedTurnLines, RowContent, ansi_lines_joined,
     classify_row_content, markdown_header_lines, markdown_lines_joined, plain_text_lines_joined,
+    turn_has_reasoning,
 };
 use crate::render::{BG_SHADE, format_timestamp};
 use crate::text_filter::{normalize_ansi_text, normalize_display_text};
@@ -388,10 +389,10 @@ fn render_turn_lines_impl(
         let mut body_joins: Vec<LineJoin> = Vec::new();
         let mut body_chrome: Vec<LineChrome> = Vec::new();
 
-        let has_reasoning = turn
-            .assistant_reasoning
-            .as_deref()
-            .is_some_and(|r| !r.trim().is_empty());
+        // Same predicate the collapse state and the streaming fast path use, so
+        // a turn can never render a header the visibility logic does not see (or
+        // vice versa) — a whitespace-only body counts as no reasoning anywhere.
+        let has_reasoning = turn_has_reasoning(turn);
         let response_present = turn
             .assistant_text
             .as_deref()

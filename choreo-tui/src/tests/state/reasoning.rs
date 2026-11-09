@@ -4,7 +4,7 @@
 
 use crate::markdown_render::{LineChrome, LineJoin};
 use crate::state::{App, ReasoningViewMode, RenderCacheKey, RenderedCache, RenderedTurn};
-use crate::tests::support::{add_answered_turn, add_reasoning_turn, test_app};
+use crate::tests::support::{add_answered_turn, add_reasoning_turn, assistant_turn, test_app};
 use choreo_client_core::TurnEventHandler;
 use choreo_proto::{OutputStream, Turn};
 use ratatui::text::Line;
@@ -351,25 +351,6 @@ fn reasoning_chunk_keeps_expansion_override() {
 // streams live); Expanded re-applies the content default, so an answered turn
 // stays collapsed and a still-streaming one shows its reasoning.
 
-/// A turn whose reasoning is `reasoning` and, when `answer` is set, has already
-/// produced response text.
-fn reasoning_turn(reasoning: &str, answer: Option<&str>) -> Turn {
-    Turn {
-        created_at: choreo_proto::TimestampMs::now(),
-        undone: false,
-        error: None,
-        user_text: Some("q".into()),
-        assistant_text: answer.map(str::to_string),
-        assistant_reasoning: Some(reasoning.to_string()),
-        tool_calls: vec![],
-        token_usage: None,
-        tool_results: vec![],
-        displayed_images: vec![],
-        reasoning_artifact: None,
-        reasoning_producer: None,
-    }
-}
-
 #[test]
 fn toggle_all_reasoning_expands_only_turns_without_a_response() {
     let mut app = test_app();
@@ -403,10 +384,10 @@ fn toggle_all_reasoning_collapses_when_any_turn_is_expanded() {
     let display = app.active_display().unwrap();
     display
         .view
-        .insert_or_replace(1, reasoning_turn("think", None));
+        .insert_or_replace(1, assistant_turn(Some("think"), None));
     display
         .view
-        .insert_or_replace(2, reasoning_turn("think", Some("answer")));
+        .insert_or_replace(2, assistant_turn(Some("think"), Some("answer")));
     assert_eq!(display.reasoning_mode, ReasoningViewMode::Expanded);
 
     // Turn 1 derives "expanded", so the transcript is not all-collapsed.
@@ -442,7 +423,7 @@ fn toggle_all_reasoning_clears_manual_overrides() {
     let display = app.active_display().unwrap();
     display
         .view
-        .insert_or_replace(1, reasoning_turn("think", None));
+        .insert_or_replace(1, assistant_turn(Some("think"), None));
     // Collapsed mode, but the user clicked turn 1 open: not all collapsed.
     display.reasoning_mode = ReasoningViewMode::Collapsed;
     display.reasoning_override.insert(1, true);
@@ -465,7 +446,7 @@ fn manual_click_overrides_the_collapsed_mode() {
     let display = app.active_display().unwrap();
     display
         .view
-        .insert_or_replace(1, reasoning_turn("think", None));
+        .insert_or_replace(1, assistant_turn(Some("think"), None));
     display.reasoning_mode = ReasoningViewMode::Collapsed;
 
     // Clicking the header still opens one turn in the collapsed mode.
@@ -484,7 +465,7 @@ fn collapsed_mode_hides_a_streaming_reasoning_body() {
     // A turn still waiting for its answer: the content default is EXPANDED.
     display
         .view
-        .insert_or_replace(1, reasoning_turn("think", None));
+        .insert_or_replace(1, assistant_turn(Some("think"), None));
     display.reasoning_mode = ReasoningViewMode::Collapsed;
 
     assert!(
@@ -514,7 +495,7 @@ fn whitespace_reasoning_is_not_an_expandable_block() {
     // it would otherwise make the transcript "not all collapsed" forever.
     display
         .view
-        .insert_or_replace(1, reasoning_turn("   ", None));
+        .insert_or_replace(1, assistant_turn(Some("   "), None));
     display.reasoning_mode = ReasoningViewMode::Collapsed;
 
     display.toggle_all_reasoning();
@@ -532,7 +513,7 @@ fn streaming_reasoning_turn(app: &mut App) {
     let display = app.display_for(0);
     display
         .view
-        .insert_or_replace(1, reasoning_turn("thinking", None));
+        .insert_or_replace(1, assistant_turn(Some("thinking"), None));
     assert!(display.view.start_request(7, 1));
 }
 
@@ -580,10 +561,11 @@ fn first_reasoning_chunk_invalidates_even_when_collapsed() {
     app.history_viewport.width = 80;
     {
         let display = app.display_for(0);
-        // No reasoning text yet, so this chunk ADDS the header row.
+        // Neither reasoning nor response yet — the placeholder the daemon seeds
+        // for an in-flight request, so this chunk ADDS the header row.
         display
             .view
-            .insert_or_replace(1, reasoning_turn_placeholder());
+            .insert_or_replace(1, assistant_turn(None, None));
         assert!(display.view.start_request(7, 1));
         display.reasoning_mode = ReasoningViewMode::Collapsed;
         display.content_dirty = false;
@@ -623,23 +605,4 @@ fn expanded_reasoning_chunk_still_streams() {
         "a visible body grows live"
     );
     assert!(display.streaming_dirty);
-}
-
-/// A turn with neither reasoning nor response text — the placeholder the daemon
-/// seeds for an in-flight request before the first chunk lands.
-fn reasoning_turn_placeholder() -> Turn {
-    Turn {
-        created_at: choreo_proto::TimestampMs::now(),
-        undone: false,
-        error: None,
-        user_text: Some("q".into()),
-        assistant_text: None,
-        assistant_reasoning: None,
-        tool_calls: vec![],
-        token_usage: None,
-        tool_results: vec![],
-        displayed_images: vec![],
-        reasoning_artifact: None,
-        reasoning_producer: None,
-    }
 }
