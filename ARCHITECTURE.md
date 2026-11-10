@@ -2728,6 +2728,28 @@ A value of `0` means *unlimited* — the agent loop runs until the model
 produces a final answer, is cancelled, or hits an error. This is a daemon-wide
 cap; individual sessions no longer carry their own `max_turns`.
 
+**A turn that yields nothing runnable is recovered, not dispatched.** Two
+conditions make a turn unrunnable: a tool call the provider cut off at its
+output-token limit mid-arguments (unsafe to execute), and a reply whose tool
+calls carry **no tool name** (empty or whitespace-only — the loop would
+dispatch it under that blank name, the registry would answer "no such tool",
+and the model would retry the same malformed call). With `max_turns = 0`
+nothing else bounds that, so the daemon bounds it: the calls are never recorded
+or dispatched, the turn keeps the model's prose plus a bracketed note saying
+what was discarded, and the model is told in the next **user** message what went
+wrong and how to retry. Each cause has its own small budget of consecutive
+recoveries (`truncated_tool_call`, `unidentified_tool_calls`) and the request
+ends once one is spent; **both budgets reset whenever a turn produces runnable
+output**, so they bound a stuck model rather than a long productive request. A
+reply mixing valid calls with an unnamed one runs the valid calls and gets the
+same notice, taking no strike. The recovery deliberately answers with a
+user-role instruction and no synthesized tool result (there is no call id to
+answer, and an unpaired tool result is invalid on several wire formats), drops
+the response-id chain (chaining the retry would replay an unanswered call, which
+providers reject), and never lists the tool catalog (a blank name usually comes
+from a model imitating tool-call markup it read in data). No sentinel name and
+no synthesized call id is ever invented, so nothing new reaches the wire.
+
 **Logging:** every binary uses `tracing` with `tracing-subscriber`. Default level is `info`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and
 **explicit flags take precedence over `RUST_LOG`** (the Unix convention; `RUST_LOG`
@@ -3711,6 +3733,15 @@ pane that never reported is never released.
     reach that verdict through one shared assembler (`openai::turn::assemble_turn`), fed by
     adapter-specific parts, so the tool-call / truncated-call / empty-response decision tree
     exists once rather than once per path.
+
+    **An unnamed tool call is reported, not adjudicated.** Every adapter passes the provider's
+    function name through verbatim, so a nameless `tool_use` / `functionCall` block reaches the
+    daemon as an unnamed call rather than being dropped, repaired or errored on inside the
+    adapter — the Anthropic and Google paths hand-roll their own turn assembly and would
+    otherwise need the rule a third and fourth time. Whether such a reply is runnable is decided
+    once, in the daemon's agent loop (see **A turn that yields nothing runnable is recovered, not
+    dispatched** under **Session architecture**), which is the single convergence point for all
+    four wire formats.
 
 
 

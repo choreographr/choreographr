@@ -161,6 +161,39 @@ fn response_to_turn_result_with_tool_use() {
 }
 
 #[test]
+fn response_to_turn_result_passes_an_unnamed_tool_use_through() {
+    // The adapter reports the provider's tool name verbatim, blank or not: it
+    // does not drop, repair or reject a nameless call, because whether such a
+    // reply is runnable is a decision the daemon makes once for every wire
+    // format. This pins the precondition that decision relies on — a nameless
+    // `tool_use` block reaches the daemon as an unnamed call rather than
+    // vanishing here.
+    let resp = MessagesResponse {
+        id: "msg_unnamed".into(),
+        r#type: "message".into(),
+        role: "assistant".into(),
+        content: vec![ContentBlock::ToolUse {
+            id: "tu_unnamed".into(),
+            name: String::new(),
+            input: json!({"q": "weather"}),
+        }],
+        stop_reason: Some("tool_use".into()),
+        stop_sequence: None,
+        model: "claude-sonnet-4-20250514".into(),
+        usage: None,
+    };
+    let result = response_to_turn_result(resp).unwrap();
+    match result {
+        ChatTurnResult::ToolUse(tu) => {
+            assert_eq!(tu.tool_calls.len(), 1);
+            assert_eq!(tu.tool_calls[0].name, "");
+            assert_eq!(tu.tool_calls[0].id, "tu_unnamed");
+        }
+        other => panic!("expected ToolUse, got {other:?}"),
+    }
+}
+
+#[test]
 fn response_to_turn_result_with_thinking() {
     let resp = MessagesResponse {
         id: "msg_3".into(),

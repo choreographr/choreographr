@@ -178,6 +178,42 @@ fn response_to_turn_result_with_tool_call() {
 }
 
 #[test]
+fn response_to_turn_result_passes_an_unnamed_function_call_through() {
+    // The adapter reports the `functionCall` name verbatim, blank or not: it
+    // does not drop, repair or reject a nameless call, because whether such a
+    // reply is runnable is a decision the daemon makes once for every wire
+    // format. This pins the precondition that decision relies on — a nameless
+    // `functionCall` part reaches the daemon as an unnamed call rather than
+    // vanishing here.
+    let resp = GenerateContentResponse {
+        candidates: vec![Candidate {
+            content: Some(ContentBlock {
+                parts: vec![ResponsePart::FunctionCall {
+                    function_call: FunctionCallResponse {
+                        name: String::new(),
+                        args: json!({"q": "weather"}),
+                    },
+                    thought_signature: None,
+                }],
+                role: Some("model".to_string()),
+            }),
+            finish_reason: Some("STOP".to_string()),
+            index: 0,
+        }],
+        usage_metadata: None,
+    };
+    let result = response_to_turn_result(resp).unwrap();
+    match result {
+        ChatTurnResult::ToolUse(tu) => {
+            assert_eq!(tu.tool_calls.len(), 1);
+            assert_eq!(tu.tool_calls[0].name, "");
+            assert!(tu.tool_calls[0].arguments_json.contains("weather"));
+        }
+        other => panic!("expected ToolUse, got {other:?}"),
+    }
+}
+
+#[test]
 fn response_to_turn_result_empty_error() {
     let resp = GenerateContentResponse {
         candidates: vec![],

@@ -491,3 +491,161 @@ pub(crate) fn make_scripted_stream_provider(
         image_client: None,
     }
 }
+
+/// One scripted reply for [`ScriptedTurnProviderClient`].
+#[derive(Debug, Clone)]
+pub(crate) enum ScriptedTurn {
+    /// A tool-use reply carrying one call per listed name, in order. An empty
+    /// name is the shape a provider produces when it never names the function
+    /// — the reply the daemon must refuse to dispatch.
+    ToolCalls(Vec<&'static str>),
+    /// A [`ScriptedTurn::ToolCalls`] reply that also carries a reasoning payload
+    /// (display text plus an opaque round-trip artifact), so a test can prove
+    /// the recovery preserves both for the next request.
+    ToolCallsWithReasoning {
+        /// The calls to request; see [`ScriptedTurn::ToolCalls`].
+        names: Vec<&'static str>,
+        /// The display reasoning text to report.
+        reasoning: &'static str,
+        /// The opaque artifact bytes to report.
+        artifact_bytes: &'static [u8],
+    },
+    /// A normal final answer ("done").
+    FinalAnswer,
+}
+
+/// Provider client that plays a scripted sequence of replies, one per streaming
+/// call, so a test can pin a whole multi-turn outcome (e.g. recover, recover,
+/// make progress, recover again) without a real provider.
+///
+/// The last scripted reply repeats once the script runs out, which lets a test
+/// express "and then it keeps doing X" with one final entry — the shape the
+/// all-unnamed loop test needs to prove the recovery budget bounds the
+/// request.
+#[derive(Debug)]
+pub(crate) struct ScriptedTurnProviderClient {
+    script: Vec<ScriptedTurn>,
+    served: std::sync::atomic::AtomicUsize,
+}
+
+impl ScriptedTurnProviderClient {
+    /// The reply for the next streaming call.
+    fn next_reply(&self) -> ScriptedTurn {
+        let index = self
+            .served
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.script
+            .get(index)
+            .or_else(|| self.script.last())
+            .cloned()
+            .unwrap_or(ScriptedTurn::FinalAnswer)
+    }
+}
+
+impl ProviderClient for ScriptedTurnProviderClient {
+    // &'static str is the trait's required lifetime, not an over-bound literal.
+    #[expect(clippy::unnecessary_literal_bound)]
+    fn provider_slug(&self) -> &str {
+        "test-scripted-turn"
+    }
+
+    fn chat_completion_turn(
+        &self,
+        _params: ChatTurnRequest<'_>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        // The agent loop always drives the streaming path; a non-streaming call
+        // here is a bug.
+        Err(InferenceError::ClientError {
+            status: 500,
+            detail: "ScriptedTurnProviderClient is streaming-only".to_string(),
+        })
+    }
+
+    fn chat_completion_turn_streaming(
+        &self,
+        params: ChatTurnRequest<'_>,
+        _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        // A real provider reports the upload boundary before any output.
+        if let Some(cb) = &params.on_uploaded {
+            cb();
+        }
+        let reply = self.next_reply();
+        let (names, reasoning, artifact_bytes) = match reply {
+            ScriptedTurn::ToolCalls(names) => (names, None, None),
+            ScriptedTurn::ToolCallsWithReasoning {
+                names,
+                reasoning,
+                artifact_bytes,
+            } => (names, Some(reasoning), Some(artifact_bytes)),
+            ScriptedTurn::FinalAnswer => {
+                return Ok(ChatTurnResult::FinalText(
+                    choreo_ai_protocols::FinalTextResult {
+                        content: "done".to_string(),
+                        truncated: false,
+                        reasoning: None,
+                        usage: None,
+                        response_id: None,
+                        reasoning_artifact: None,
+                    },
+                ));
+            }
+        };
+        let tool_calls = names
+            .iter()
+            .map(|name| choreo_ai_protocols::ChatToolCall {
+                // Ids only need to be unique within a turn for the recording
+                // path; the served count keeps them distinct across turns too.
+                id: format!(
+                    "call_{}_{}",
+                    self.served.load(std::sync::atomic::Ordering::SeqCst),
+                    name
+                ),
+                name: (*name).to_string(),
+                arguments_json: "{}".to_string(),
+                caller: None,
+            })
+            .collect();
+        Ok(ChatTurnResult::ToolUse(
+            choreo_ai_protocols::ChatAssistantToolUse {
+                content: Some("working".to_string()),
+                tool_calls,
+                reasoning: reasoning.map(str::to_string),
+                usage: None,
+                response_id: None,
+                reasoning_artifact: artifact_bytes.map(|bytes| {
+                    choreo_proto::ReasoningArtifact::ChatReasoning {
+                        field: choreo_proto::ChatReasoningField::ReasoningContent,
+                        bytes: bytes.to_vec(),
+                    }
+                }),
+            },
+        ))
+    }
+
+    fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Build a provider that plays `script` one reply per streaming call (see
+/// [`ScriptedTurnProviderClient`]).
+pub(crate) fn make_scripted_turn_provider(script: Vec<ScriptedTurn>) -> InferenceProvider {
+    make_scripted_turn_provider_with_slug(script, "test-scripted-turn")
+}
+
+/// Like [`make_scripted_turn_provider`], but with a caller-chosen catalog slug
+/// so a test can select a specific reasoning-passback policy.
+pub(crate) fn make_scripted_turn_provider_with_slug(
+    script: Vec<ScriptedTurn>,
+    slug: &str,
+) -> InferenceProvider {
+    InferenceProvider {
+        client: Arc::new(ScriptedTurnProviderClient {
+            script,
+            served: std::sync::atomic::AtomicUsize::new(0),
+        }),
+        slug: slug.to_string(),
+        image_client: None,
+    }
+}
