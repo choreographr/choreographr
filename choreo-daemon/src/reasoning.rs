@@ -20,27 +20,16 @@ use crate::metrics;
 use crate::sessions::SessionState;
 use crate::wire::{RepairCounts, repair_replayed_calls};
 
-/// Build the provider request messages for a session, applying the reasoning
-/// passback policy (phase 4b): the opaque artifact captured on a previous
-/// turn is replayed only when BOTH gates pass — same-model provenance (the
-/// artifact is model-bound; a turn produced by a different model must not
-/// have its payload replayed) and the provider's `reasoning_passback` policy
-/// for this request (`ToolLoop` → tool-involving turns only, `AllTurns` →
-/// every turn, `Signature` → every turn, `ResponseId`/`None` → never via the
-/// message).
+/// Build the provider request messages for a session without recording the
+/// wire-repair counts — the bytes-only view the tests assert on. A production
+/// send uses [`build_chat_request_messages_recording`], which returns the same
+/// bytes plus the metric; both go through [`assemble_request_messages`], so the
+/// test view cannot drift from the wire.
 ///
-/// Public for the daemon integration tests (the `test-utils` feature); the
-/// production caller is `run_agent_loop`.
-///
-/// `in_flight_from_turn` carries the image-decay marker: the turn id of the
-/// FIRST turn of the request currently in flight (captured by the agent loop
-/// before its first `start_turn`), or `None` when no request is in flight
-/// (session load / dry-run). Turns with id >= the marker belong to the
-/// current request and attach image bytes; every OLDER turn decays to a text
-/// placeholder (see `tool_result_image_messages`). This is purely a request-
-/// builder parameter — nothing is persisted on the turn, and after the request
-/// finishes the next request's window simply starts at a newer turn id, so
-/// all earlier images naturally decay without any cleanup.
+/// Compiled only for test builds (`cfg(test)`) and for the integration tests,
+/// which reach it through the crate root's `test-utils` re-export. A production
+/// build therefore carries no entry point that nothing calls.
+#[cfg(any(test, feature = "test-utils"))]
 #[must_use]
 pub fn build_chat_request_messages(
     session: &SessionState,
@@ -59,10 +48,11 @@ pub fn build_chat_request_messages(
     .0
 }
 
-/// Build the request copy AND record the wire-repair counts against
-/// `provider_slug`/`model` — the agent loop's per-send path. Recording lives
-/// only here, so a diagnostic build (`session_inspect`) never inflates the
-/// counter. See [`assemble_request_messages`].
+/// Build the provider request messages for a session AND record the
+/// wire-repair counts against `provider_slug`/`model` — the agent loop's
+/// per-send path. Recording lives only here, so a diagnostic build
+/// (`session_inspect`) and the tests never inflate the counter. See
+/// [`assemble_request_messages`].
 #[must_use]
 pub fn build_chat_request_messages_recording(
     session: &SessionState,
@@ -82,12 +72,29 @@ pub fn build_chat_request_messages_recording(
     messages
 }
 
-/// The shared assembly behind the two public builders: build the message list,
-/// apply the reasoning passback policy, and run the mechanical wire repair.
-/// Returns the repaired copy together with what the repair changed, so the
-/// caller decides whether to record it. Pure and deterministic — no metrics and
-/// no side effects — so the request bytes (and the prompt-cache prefix) never
-/// depend on which wrapper was called.
+/// The one assembly behind every request build: build the message list, apply
+/// the reasoning passback policy, and run the mechanical wire repair. Returns
+/// the repaired copy together with what the repair changed, so the caller
+/// decides whether to record it. Pure and deterministic — no metrics and no side
+/// effects — so the request bytes (and the prompt-cache prefix) never depend on
+/// which caller asked.
+///
+/// The reasoning passback policy (phase 4b) replays the opaque artifact captured
+/// on a previous turn only when BOTH gates pass — same-model provenance (the
+/// artifact is model-bound; a turn produced by a different model must not have
+/// its payload replayed) and the provider's `reasoning_passback` policy for this
+/// request (`ToolLoop` → tool-involving turns only, `AllTurns` → every turn,
+/// `Signature` → every turn, `ResponseId`/`None` → never via the message).
+///
+/// `in_flight_from_turn` carries the image-decay marker: the turn id of the
+/// FIRST turn of the request currently in flight (captured by the agent loop
+/// before its first `start_turn`), or `None` when no request is in flight
+/// (session load / dry-run). Turns with id >= the marker belong to the current
+/// request and attach image bytes; every OLDER turn decays to a text placeholder
+/// (see `tool_result_image_messages`). This is purely a request-builder
+/// parameter — nothing is persisted on the turn, and after the request finishes
+/// the next request's window simply starts at a newer turn id, so all earlier
+/// images naturally decay without any cleanup.
 ///
 /// This is the entry point for a caller that needs the repair counts themselves
 /// rather than only the repaired bytes: `session_inspect` calls it directly so

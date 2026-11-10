@@ -3055,7 +3055,7 @@ tool messages (preserving `tool_use → tool_result` adjacency), under two gates
 older turns replay a path-naming placeholder, never converting back) and
 **vision** (`catalog::model_supports_vision` — no bytes on a text-only model).
 The normalization (`choreo-daemon`'s `image_prep`) and the decay/vision gates
-(`reasoning.rs`'s `build_chat_request_messages` / `tool_result_image_messages`)
+(`reasoning.rs`'s `assemble_request_messages` / `tool_result_image_messages`)
 are documented in-source (see `choreo-daemon`'s `image_prep` and `reasoning`
 modules and `choreo-image`, `cargo doc -p choreo-daemon` / `just doc`), held
 complete by the `#![warn(missing_docs)]` + `doc-check` gate.
@@ -3752,7 +3752,7 @@ pane that never reported is never released.
     `caller` in the streaming loop), the daemon persists it on the turn as
     `AssistantToolCallRecord::caller` (a proto-side `ToolCallCaller`, because
     `choreo-proto` sits below `choreo-ai-protocols` and cannot name its `CallerInfo`),
-    and `build_chat_request_messages` re-emits it onto the rebuilt call. The Responses
+    and `assemble_request_messages` re-emits it onto the rebuilt call. The Responses
     lowering writes it on both replayed item kinds, resolving the output's attribution
     through an index built over the **full** message history — a chained tool round sends
     only the outputs, so the assistant message that holds the call (and with it the
