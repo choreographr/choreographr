@@ -2731,24 +2731,56 @@ cap; individual sessions no longer carry their own `max_turns`.
 **A turn that yields nothing runnable is recovered, not dispatched.** Two
 conditions make a turn unrunnable: a tool call the provider cut off at its
 output-token limit mid-arguments (unsafe to execute), and a reply whose tool
-calls carry **no tool name** (empty or whitespace-only — the loop would
-dispatch it under that blank name, the registry would answer "no such tool",
-and the model would retry the same malformed call). With `max_turns = 0`
-nothing else bounds that, so the daemon bounds it: the calls are never recorded
-or dispatched, the turn keeps the model's prose plus a bracketed note saying
-what was discarded, and the model is told in the next **user** message what went
-wrong and how to retry. Each cause has its own small budget of consecutive
-recoveries (`truncated_tool_call`, `unidentified_tool_calls`) and the request
-ends once one is spent; **both budgets reset whenever a turn produces runnable
-output**, so they bound a stuck model rather than a long productive request. A
-reply mixing valid calls with an unnamed one runs the valid calls and gets the
-same notice, taking no strike. The recovery deliberately answers with a
-user-role instruction and no synthesized tool result (there is no call id to
-answer, and an unpaired tool result is invalid on several wire formats), drops
-the response-id chain (chaining the retry would replay an unanswered call, which
-providers reject), and never lists the tool catalog (a blank name usually comes
-from a model imitating tool-call markup it read in data). No sentinel name and
-no synthesized call id is ever invented, so nothing new reaches the wire.
+calls carry a **name no provider will accept** — an empty or whitespace-only
+name, but also a non-blank one a strict endpoint rejects (`multi_tool_use.parallel`,
+a long shell command a weak model emitted as a name), which would otherwise be
+dispatched under that name, answered "no such tool", and (with `max_turns = 0`,
+no loop limit at all) never bounded. The gate is
+`is_provider_safe_function_name`, deliberately wider than the adapters'
+blank-only merge rule: an adapter *reports* what the provider sent, and the
+daemon *governs* whether it may run. The calls are never recorded or dispatched,
+the turn keeps the model's prose plus a bracketed note naming what was
+discarded, and the model is told in the next **user** message what went wrong
+and how to retry. Each cause has its own small budget of consecutive recoveries
+(`truncated_tool_call`, `unidentified_tool_calls` — the label keeps its name and
+its alignment with `InferenceError::UnidentifiedToolCalls::metric_label()` even
+though the cause now covers any unacceptable name) and the request ends once one
+is spent; **both budgets reset whenever a turn produces runnable output**, so
+they bound a stuck model rather than a long productive request. A reply mixing
+valid calls with a bad one runs the valid calls and gets the same notice, taking
+no strike. The recovery deliberately answers with a user-role instruction and no
+synthesized tool result (there is no call id to answer, and an unpaired tool
+result is invalid on several wire formats), drops the response-id chain
+(chaining the retry would replay an unanswered call, which providers reject),
+and never lists the tool catalog (a blank name usually comes from a model
+imitating tool-call markup it read in data). A blank provider call id is minted
+into a deterministic id **before the turn is recorded** — `seed_tool_results`
+keys placeholders by id and the streaming update matches by id, so two blank ids
+in one reply would otherwise collide on `""` — but names and arguments are
+recorded exactly as the provider sent them; repairing those is the wire layer's
+job.
+
+**The request copy is repaired, never the transcript.** A stored turn keeps
+whatever bytes a reply carried, but a stored call is not always one a later
+request can legally replay: a strict endpoint rejects the *whole* request when a
+replayed call carries an empty or provider-invalid name, an empty id, or
+arguments that are not a JSON object, so one bad reply would poison the session
+for good. The request builder (`choreo-daemon`'s `wire` module — `reasoning`
+owns replay *policy*, `wire` owns mechanical repair) therefore passes its
+fully-assembled message list through `wire::repair_replayed_calls` as the last
+step, working only on that throwaway copy. Names are coerced to a provider-safe
+form (an unsalvageable one becomes the `invalid_tool_call` sentinel — a legal
+name that labels a *past* call whose result the transcript already holds, so
+nothing is dispatched under it), a blank id becomes a deterministic
+`call_<12 hex>` minted from the call's name, arguments and position, and
+non-object arguments become `{}`. Calls and results are then paired so every
+recorded call is answered by exactly one `tool` message — an unanswered call
+gets a stub result, a result that answers no call is dropped, and an assistant
+message left with nothing is dropped too. The repair is byte-deterministic and
+never re-serializes a valid object, so it does not churn the prompt-cache
+prefix. A chained Responses route keeps its non-blank ids byte-identical (it
+sends only the post-assistant tail, and the `function_call_output`'s `call_id`
+must match the id the service minted) while still minting a blank one.
 
 **Logging:** every binary uses `tracing` with `tracing-subscriber`. Default level is `info`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and
@@ -3734,14 +3766,15 @@ pane that never reported is never released.
     adapter-specific parts, so the tool-call / truncated-call / empty-response decision tree
     exists once rather than once per path.
 
-    **An unnamed tool call is reported, not adjudicated.** Every adapter passes the provider's
-    function name through verbatim, so a nameless `tool_use` / `functionCall` block reaches the
-    daemon as an unnamed call rather than being dropped, repaired or errored on inside the
+    **A tool call is reported, not adjudicated.** Every adapter passes the provider's
+    function name through verbatim, so a nameless or provider-invalid `tool_use` / `functionCall`
+    block reaches the daemon as-is rather than being dropped, repaired or errored on inside the
     adapter — the Anthropic and Google paths hand-roll their own turn assembly and would
     otherwise need the rule a third and fourth time. Whether such a reply is runnable is decided
     once, in the daemon's agent loop (see **A turn that yields nothing runnable is recovered, not
     dispatched** under **Session architecture**), which is the single convergence point for all
-    four wire formats.
+    four wire formats; replay repair of an already-recorded call is likewise the daemon's job (see
+    **The request copy is repaired, never the transcript**), on the request copy only.
 
 
 

@@ -57,6 +57,7 @@ mod requests;
 pub mod server;
 mod sessions;
 pub mod tools;
+mod wire;
 
 pub use crate::daemon::{DaemonCommand, DaemonState, OpenOptions};
 pub use crate::embedded::{EmbeddedDaemon, EmbeddedLink, EmbeddedOptions, spawn_embedded};

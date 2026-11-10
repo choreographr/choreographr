@@ -1131,11 +1131,11 @@ mod tests {
     }
 
     #[test]
-    fn wire_empty_turn_without_artifact_is_dropped_from_the_projection() {
+    fn wire_empty_turn_without_artifact_is_dropped_by_the_builder() {
         // Same reasoning-only shape but NO artifact to fill the message: the
-        // projection drops the empty assistant message, so it never reaches the
-        // wire at all — and the guard still reports the turn, because it left the
-        // model's view of the conversation.
+        // request builder drops the empty assistant message, so it never reaches
+        // the wire at all — and the guard still reports the turn, because it left
+        // the model's view of the conversation.
         let (_dir, ctx) = seed(
             42,
             42,
@@ -1144,8 +1144,8 @@ mod tests {
         );
         let out = run(&ctx, inspect_args(None));
         assert!(
-            out.contains("projection dropped 1 assistant message(s)"),
-            "the drop is reported: {out}"
+            out.contains("assistant_messages_on_wire=0 dropped=0"),
+            "the builder dropped the wire-empty message before projection: {out}"
         );
         assert!(
             out.contains("empty assistant message(s) on the wire: none"),
@@ -1192,9 +1192,9 @@ mod tests {
 
     #[test]
     fn wire_empty_turn_without_artifact_dropped_on_non_requires_rc_provider() {
-        // Same reasoning-only shape on groq but NO artifact: the projection drops
-        // the empty assistant message on any chat route, and the guard flags the
-        // turn — the DeepSeek-only behaviour generalized to every chat provider.
+        // Same reasoning-only shape on groq but NO artifact: the request builder
+        // drops the empty assistant message on any chat route, and the guard flags
+        // the turn — the DeepSeek-only behaviour generalized to every chat provider.
         let (_dir, ctx) = seed(
             42,
             42,
@@ -1203,8 +1203,8 @@ mod tests {
         );
         let out = run(&ctx, inspect_args(None));
         assert!(
-            out.contains("projection dropped 1 assistant message(s)"),
-            "the drop is reported: {out}"
+            out.contains("assistant_messages_on_wire=0 dropped=0"),
+            "the builder dropped the wire-empty message before projection: {out}"
         );
         assert!(
             out.contains("empty assistant message(s) on the wire: none"),

@@ -126,6 +126,77 @@ fn build_chat_request_messages_with_tool_calls() {
     assert_eq!(result[2].tool_call_id.as_deref(), Some("call_1"));
 }
 
+#[test]
+fn build_chat_request_messages_repairs_a_provider_rejected_turn() {
+    // The incident shape: an assistant call with a blank name and a blank id,
+    // answered `unknown tool: `. The stored transcript keeps those exact bytes,
+    // but the built request copy must be one a strict provider accepts.
+    let mut session = SessionState::empty();
+    let bad = vec![AssistantToolCallRecord {
+        call_id: String::new(),
+        name: String::new(),
+        arguments_json: String::new(),
+        caller: None,
+    }];
+    let (tid0, _) = session.start_turn(Some("do the thing".into()));
+    session.set_assistant_response(
+        tid0,
+        AssistantResponse {
+            text: Some("working".into()),
+            tool_calls: bad.clone(),
+            ..Default::default()
+        },
+    );
+    session.seed_tool_results(tid0, &bad, &[String::new()]);
+    session.update_tool_result(
+        tid0,
+        "",
+        String::new(),
+        &ToolOutput {
+            content: "unknown tool: ".into(),
+            is_error: true,
+            invocation_description: String::new(),
+            ..Default::default()
+        },
+    );
+    // A second, normal turn so the repair runs against a real transcript.
+    let (tid1, _) = session.start_turn(Some("thanks".into()));
+    session.set_assistant_response(
+        tid1,
+        AssistantResponse {
+            text: Some("done".into()),
+            ..Default::default()
+        },
+    );
+
+    // The stored transcript is never modified.
+    assert_eq!(
+        session.turns.get(&tid0).expect("turn 0").tool_calls[0].name,
+        ""
+    );
+
+    let result = build_chat_request_messages(&session, None, TEST_PROVIDER, TEST_MODEL, None);
+    let index = result
+        .iter()
+        .position(|m| m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
+        .expect("the repaired assistant message is present");
+    let calls = result[index].tool_calls.as_ref().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].function.name, "invalid_tool_call",
+        "a blank call name is repaired to the sentinel"
+    );
+    assert!(!calls[0].id.trim().is_empty(), "a blank call id is minted");
+    assert_eq!(calls[0].function.arguments, "{}");
+
+    // The result still answers the call, now by its repaired id.
+    assert_eq!(result[index + 1].role, "tool");
+    assert_eq!(
+        result[index + 1].tool_call_id.as_deref(),
+        Some(calls[0].id.as_str())
+    );
+}
+
 /// Write a tiny opaque PNG to a temp file and return the handle plus its path.
 fn write_temp_png() -> tempfile::NamedTempFile {
     let buf = image::ImageBuffer::from_fn(3, 2, |x, y| {
@@ -997,11 +1068,13 @@ fn builder_requires_rc_empty_content_turn_foreign_artifact_not_replayed() {
 
     let result = build_chat_request_messages(&session, None, "deepseek", "deepseek-v4-pro", None);
     let assistants = assistant_messages(&result);
-    assert_eq!(assistants.len(), 1);
-    assert_eq!(assistants[0].reasoning_artifact, None);
+    assert!(
+        assistants.is_empty(),
+        "the wire-empty assistant message is dropped from the request copy itself"
+    );
     // Nothing is on the wire for this turn: the foreign payload is never
     // replayed, and a required-field empty string is not a payload, so the
-    // projection drops the empty message rather than sending it.
+    // request builder drops the empty message rather than sending it.
     let wire = wire_json(&result, "deepseek", "deepseek-v4-pro");
     assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
     assert_eq!(wire[0]["role"], "user");
@@ -1136,11 +1209,13 @@ fn guard_wire_empty_turn_without_artifact_flagged_on_non_requires_rc() {
     );
     let result = build_chat_request_messages(&session, None, "groq", GROQ_MODEL, None);
     let assistants = assistant_messages(&result);
-    assert_eq!(assistants.len(), 1);
-    assert_eq!(assistants[0].reasoning_artifact, None);
+    assert!(
+        assistants.is_empty(),
+        "the wire-empty assistant message is dropped from the request copy itself"
+    );
     // groq declares no echo field and nothing was captured, so the empty
-    // assistant message is dropped from the projection (the hazard the guard
-    // just reported never reaches the wire).
+    // assistant message never reaches the wire (the hazard the guard
+    // just reported is dropped by the request builder).
     let wire = wire_json(&result, "groq", GROQ_MODEL);
     assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
     assert_eq!(wire[0]["role"], "user");
@@ -1166,11 +1241,13 @@ fn builder_wire_empty_turn_never_echoes_under_none_passback() {
 
     let result = build_chat_request_messages(&session, None, "cerebras", "gpt-oss-120b", None);
     let assistants = assistant_messages(&result);
-    assert_eq!(assistants.len(), 1);
-    assert_eq!(assistants[0].reasoning_artifact, None);
+    assert!(
+        assistants.is_empty(),
+        "the wire-empty assistant message is dropped from the request copy itself"
+    );
     // The never-replay pin means the wire-empty message cannot be filled at
-    // all, so the projection drops it instead of sending an empty assistant
-    // message (which the gateway would reject just as hard).
+    // all, so the request builder drops it instead of sending an empty
+    // assistant message (which the gateway would reject just as hard).
     let wire = wire_json(&result, "cerebras", "gpt-oss-120b");
     assert_eq!(wire.len(), 1, "only the user message survives: {wire:?}");
     assert_eq!(
@@ -2639,7 +2716,7 @@ fn agent_loop_unnamed_tool_call_recovery_seeds_the_instruction() {
         "the model's prose is kept, got {text:?}"
     );
     assert!(
-        text.contains("Unnamed tool calls in the reply: 1"),
+        text.contains("Tool calls the provider will not accept: 1"),
         "the note counts the discarded call, got {text:?}"
     );
 
@@ -2806,7 +2883,7 @@ fn agent_loop_keeps_reasoning_across_an_unnamed_tool_call_recovery() {
             .content
             .as_deref()
             .unwrap_or_default()
-            .contains("Unnamed tool calls"),
+            .contains("Tool calls the provider will not accept"),
         "the recovered turn's note rides the next request too"
     );
 }

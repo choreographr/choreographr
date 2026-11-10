@@ -17,6 +17,7 @@ use choreo_proto::{ReasoningArtifact, Turn};
 use tracing::{debug, warn};
 
 use crate::sessions::SessionState;
+use crate::wire::repair_replayed_calls;
 
 /// Build the provider request messages for a session, applying the reasoning
 /// passback policy (phase 4b): the opaque artifact captured on a previous
@@ -168,6 +169,20 @@ pub fn build_chat_request_messages(
         let attach_images = in_flight_from_turn.is_some_and(|first| *turn_id >= first);
         messages.extend(tool_result_image_messages(turn, vision, attach_images));
     }
+
+    // Mechanical wire repair (see `crate::wire`): the stored transcript keeps
+    // whatever bytes a provider reply carried, but a blank or provider-invalid
+    // call name, a blank call id, or arguments that are not a JSON object make
+    // a strict endpoint reject the whole request. The repair rewrites only
+    // this throwaway request copy, never the transcript.
+    //
+    // `rewrite_ids` is off for a chained Responses route: it sends only the
+    // post-assistant tail, and the `call_id` in a `function_call_output` must
+    // stay byte-identical to the id the service minted, or the output answers
+    // nothing. A blank id is still minted there, since a service never mints
+    // one.
+    let rewrite_ids = !chains_via_response_id(provider_slug, model);
+    repair_replayed_calls(&mut messages, rewrite_ids);
     messages
 }
 
