@@ -34,7 +34,14 @@ use tracing::{debug, warn};
 mod recovery;
 mod system_content;
 mod tool_execution;
-pub(crate) use recovery::*;
+// Named, not globbed: the recovery unit is driven from the agent loop and a
+// handful of tests, so spelling out its surface keeps an accidental rename from
+// silently re-exporting (or hiding) one of its items.
+pub(crate) use recovery::{
+    RecoveryBudget, RecoveryOutcome, TRUNCATION_RECOVERY, TurnRecoveryParams,
+    UNNAMED_TOOL_CALL_RECOVERY, UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION, recover_unrunnable_turn,
+    recovery_detail,
+};
 pub(crate) use system_content::*;
 pub(crate) use tool_execution::*;
 /// Resolve the effective reasoning effort for a turn, disabling it if the
@@ -927,7 +934,7 @@ pub(crate) fn run_agent_loop(
                         turn_id: current_turn_id,
                         stream_id,
                         cause: UNNAMED_TOOL_CALL_RECOVERY,
-                        detail: &recovery_detail(&unnamed_calls, unnamed_call_count),
+                        detail: &recovery_detail(&unnamed_calls),
                         budget: &mut recovery_budget,
                         prose: content,
                         reasoning,
@@ -1658,7 +1665,11 @@ pub(crate) fn run_agent_loop(
                     // carry a name no provider accepts (a provider stub cut off
                     // before a valid function name arrived); drop those so the
                     // joined list never renders as a bare ", " and the empty
-                    // check inside the note builder stays meaningful.
+                    // check inside the note builder stays meaningful. What
+                    // survives `tool_call_is_unrunnable` is provider-safe by
+                    // construction — at most 64 bytes of `[A-Za-z0-9_-]` per
+                    // name — so this note can never be bloated or carry control
+                    // characters from a hostile reply.
                     let names = discarded
                         .iter()
                         .map(|d| d.name.as_str())

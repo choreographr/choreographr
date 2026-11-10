@@ -13,6 +13,12 @@
 // the AGENTS.md test allowances are spelled out here instead.
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 use super::*;
+// Test-only handles into the recovery unit: the loop itself never reads these
+// constants, so they are not re-exported from `requests` — the budget tests
+// assert against the exact numbers the recovery constants carry.
+use super::recovery::{
+    MAX_TRUNCATION_RECOVERIES, MAX_UNNAMED_TOOL_CALL_RECOVERIES, TRUNCATION_RECOVERY_INSTRUCTION,
+};
 use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;

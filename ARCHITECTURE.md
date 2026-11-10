@@ -2789,7 +2789,15 @@ per-cause consecutive-recovery bookkeeping — lives in its own module
 single `RecoveryBudget` state machine: `note_progress` resets every cause on a
 turn that produced runnable output, and `note_recovery` advances one cause and
 reports `Continue`/`Stop` at its budget, so the reset-on-progress rule is
-structural rather than a bare assignment a new branch could forget.
+structural rather than a bare assignment a new branch could forget. Its buckets
+are a fixed two-slot array indexed by a typed `RecoveryCause`, not a map keyed
+by the log label — the identity of a cause is the enum, so two causes can never
+collide on one bucket and the budget never allocates. The recovery warning
+reports the cause label, the consecutive count, the budget and the **length** of
+the note detail, never the detail text itself: that detail echoes tool names the
+model authored, which is assistant-response content that could carry control
+characters into the log file, while the transcript note keeps the text so what
+was discarded stays visible to the user.
 
 **The request copy is repaired, never the transcript.** A stored turn keeps
 whatever bytes a reply carried, but a stored call is not always one a later
