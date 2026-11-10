@@ -454,28 +454,68 @@ fn confirm_first_contact(
 /// This hook therefore never writes to stderr. It logs every panic — message,
 /// location, thread — through [`tracing`] to the per-process log file (the
 /// crate's only diagnostic sink), and restores the terminal only for a panic on
-/// the **main** thread, which is the UI loop and therefore fatal. A panic on
-/// any other thread leaves the terminal alone so the UI keeps rendering.
+/// the **UI loop's own thread**, which is fatal. A panic on any other thread
+/// leaves the terminal alone so the UI keeps rendering.
+///
+/// The rule is enforced on thread *identity*: the thread that calls this
+/// installer **is** the UI loop thread — [`main`] calls it before
+/// [`connection::run_app`], which runs the UI loop on its calling thread — so
+/// its [`std::thread::ThreadId`] is captured here and compared against the
+/// panicking thread's. A thread *name* would not do: `"main"` is a convention
+/// a runtime may or may not honour (a worker could carry it, and not every
+/// first thread is reported under it), while the id is what the standard
+/// library assigned and no naming choice can change.
 fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
+    // Captured before `set_hook` from the installing thread, which is the UI
+    // loop's (see above). `ThreadId` is `Copy` and comparable, so the closure
+    // holds a plain value: no locking, no allocation at install time.
+    let ui_thread = std::thread::current().id();
+    std::panic::set_hook(Box::new(move |info| {
+        // The hook runs on the panicking thread, so `current()` here names that
+        // thread — the fact the classification turns on. Reading the id (rather
+        // than the name below) is what makes a contained panic on another
+        // thread impossible to mistake for the UI loop, and the reverse.
+        let panicking = std::thread::current();
+        let (fatal, thread) = classify_panic(panicking.id(), ui_thread, panicking.name());
         let location = info
             .location()
             .map_or_else(|| "unknown".to_string(), std::string::ToString::to_string);
         let message = image_worker::panic_message(info.payload());
-        let on_main = std::thread::current().name() == Some("main");
         // Restore the terminal BEFORE logging so even a fatal panic's log line
         // (and whatever the runtime prints afterwards) lands on a usable
         // screen, never inside the alternate buffer.
-        if on_main {
+        if fatal {
             restore_terminal_after_panic();
         }
         tracing::error!(
             location = %location,
-            thread = std::thread::current().name().unwrap_or("<unnamed>"),
-            fatal = on_main,
+            thread = %thread,
+            fatal,
             "panic: {message}"
         );
     }));
+}
+
+/// Whether a panic raised on `panicking` is fatal — it landed on the UI loop's
+/// thread — together with the thread label to log for it.
+///
+/// Fatalness is judged by thread **identity**, never by the thread's name: a
+/// name is a convention the platform or runtime sets for itself, so a worker
+/// thread someone happened to call `main` would read as the UI loop (and tear
+/// down a terminal that was still rendering), while a runtime that does not
+/// report its first thread as `main` would read as a worker (and leave the
+/// user's terminal in raw mode after a fatal panic).
+///
+/// The label is the panicking thread's name, or `<unnamed>` when it carries
+/// none — the placeholder the log line uses for a nameless thread.
+fn classify_panic(
+    panicking: std::thread::ThreadId,
+    ui_thread: std::thread::ThreadId,
+    name: Option<&str>,
+) -> (bool, String) {
+    let fatal = panicking == ui_thread;
+    let thread = name.unwrap_or("<unnamed>").to_string();
+    (fatal, thread)
 }
 
 /// Best-effort return of the terminal to its normal state after a fatal panic.

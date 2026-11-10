@@ -40,6 +40,7 @@ mod input;
 mod lib_api;
 mod login;
 mod model_selector;
+mod panic_hook;
 mod render;
 mod session;
 mod state;

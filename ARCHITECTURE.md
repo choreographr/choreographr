@@ -3028,8 +3028,10 @@ Because the TUI owns the terminal (alternate screen + raw mode), the client
 installs one process-wide panic hook rather than letting the default hook write a
 panic line to stderr where it would spray across the live UI and never be cleared
 by the diff renderer. The hook routes every panic — message, location, thread —
-to the log file, and restores the terminal only for a panic on the **main**
-thread (the UI loop, hence fatal); a panic on any other thread leaves the terminal
+to the log file, and restores the terminal only for a panic on the **UI loop's own
+thread** (hence fatal); that thread is identified by the `ThreadId` captured when
+it installs the hook, not by its name, because a name is a convention a runtime
+may or may not honour. A panic on any other thread leaves the terminal
 alone so a contained encode panic never tears down a UI that keeps running.
 
 `edit_image` inputs may also be **session references** (`@last`,
