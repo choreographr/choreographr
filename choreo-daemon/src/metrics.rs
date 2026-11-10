@@ -38,6 +38,7 @@ mod backend {
         evictions_total: IntCounter,
         cache_warm_attempts_total: IntCounter,
         cache_warm_skips_total: IntCounterVec,
+        wire_repairs_total: IntCounterVec,
         prompt_cache_hit_ratio: HistogramVec,
         request_duration_seconds: HistogramVec,
         tool_execution_duration_seconds: HistogramVec,
@@ -109,6 +110,11 @@ mod backend {
                 "choreo_cache_warm_skips_total",
                 "Total number of prompt-cache warm attempts skipped, by reason",
                 &["reason"]
+            )?,
+            wire_repairs_total: prometheus::register_int_counter_vec!(
+                "choreo_wire_repairs_total",
+                "Total number of repairs applied to the per-request message copy before it is sent, by repair kind",
+                &["kind"]
             )?,
             prompt_cache_hit_ratio: prometheus::register_histogram_vec!(
                 "choreo_prompt_cache_hit_ratio",
@@ -291,6 +297,19 @@ mod backend {
     pub fn record_cache_warm_skip(reason: &str) {
         if let Some(m) = METRICS.get() {
             m.cache_warm_skips_total.with_label_values(&[reason]).inc();
+        }
+    }
+
+    /// Count `count` repairs of one `kind` applied to a request copy. The kinds
+    /// are a fixed set (`names`, `ids`, `arguments`, `stubbed`, `dropped`), so
+    /// the series stays cardinality-bounded. Only counts are recorded — never a
+    /// tool name, a call id or any message content. Silently a no-op before
+    /// [`init`].
+    pub fn record_wire_repair(kind: &str, count: u64) {
+        if let Some(m) = METRICS.get() {
+            m.wire_repairs_total
+                .with_label_values(&[kind])
+                .inc_by(count);
         }
     }
 
@@ -540,6 +559,7 @@ mod backend {
             record_eviction();
             record_cache_warm_attempt();
             record_cache_warm_skip("no_ttl");
+            record_wire_repair("names", 2);
             record_prompt_cache_hit_ratio("zai", "test_model", 100, 40);
             // Gather and encode all metrics via the text encoder, verify
             // that the output contains expected HELP/TYPE lines.
@@ -559,6 +579,8 @@ mod backend {
             assert!(output.contains("# TYPE choreo_cache_warm_attempts_total counter"));
             assert!(output.contains("# HELP choreo_cache_warm_skips_total"));
             assert!(output.contains("# TYPE choreo_cache_warm_skips_total counter"));
+            assert!(output.contains("# HELP choreo_wire_repairs_total"));
+            assert!(output.contains("# TYPE choreo_wire_repairs_total counter"));
             assert!(output.contains("# HELP choreo_prompt_cache_hit_ratio"));
             assert!(output.contains("# TYPE choreo_prompt_cache_hit_ratio histogram"));
             assert!(output.contains("# HELP choreo_request_duration_seconds"));
@@ -630,6 +652,9 @@ mod backend {
 
     /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_cache_warm_skip(_reason: &str) {}
+
+    /// No-op: metrics support is compiled out, so there is nothing to record.
+    pub fn record_wire_repair(_kind: &str, _count: u64) {}
 
     /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_prompt_cache_hit_ratio(

@@ -363,6 +363,133 @@ fn intake_and_wire_agree_on_every_name() {
     }
 }
 
+// ── repair counts ──
+
+#[test]
+fn clean_messages_report_no_repairs() {
+    let mut messages = vec![
+        ChatRequestMessage::simple("user", "hi".to_string()),
+        assistant(vec![call("call_1", "sh", r#"{"cmd":"ls"}"#)]),
+        tool_result("call_1"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts, RepairCounts::default());
+    assert!(counts.is_empty());
+    // Nothing was rewritten, so nothing was removed or added either.
+    assert_eq!(messages.len(), 3);
+}
+
+#[test]
+fn a_coerced_name_is_counted() {
+    let mut messages = vec![
+        assistant(vec![call("call_1", "", "{}")]),
+        tool_result("call_1"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.names, 1);
+    assert_eq!(counts.ids, 0);
+    assert_eq!(counts.arguments, 0);
+    assert_eq!(counts.stubbed, 0);
+    assert_eq!(counts.dropped, 0);
+}
+
+#[test]
+fn a_minted_id_is_counted() {
+    let mut messages = vec![assistant(vec![call("", "sh", "{}")]), tool_result("")];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.ids, 1);
+    assert_eq!(counts.names, 0);
+    assert_eq!(counts.arguments, 0);
+    // The blank-id result still pairs positionally, so nothing is stubbed.
+    assert_eq!(counts.stubbed, 0);
+    assert_eq!(counts.dropped, 0);
+}
+
+#[test]
+fn non_object_arguments_are_counted() {
+    let mut messages = vec![
+        assistant(vec![call("call_1", "sh", "{")]),
+        tool_result("call_1"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.arguments, 1);
+    assert_eq!(counts.names, 0);
+    assert_eq!(counts.ids, 0);
+    assert_eq!(counts.stubbed, 0);
+    assert_eq!(counts.dropped, 0);
+}
+
+#[test]
+fn an_inserted_stub_is_counted() {
+    let mut messages = vec![assistant(vec![call("call_1", "sh", "{}")])];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.stubbed, 1);
+    assert_eq!(counts.dropped, 0);
+    assert_eq!(counts.names, 0);
+    assert_eq!(counts.ids, 0);
+    assert_eq!(counts.arguments, 0);
+}
+
+#[test]
+fn an_orphan_result_is_counted_as_dropped() {
+    let mut messages = vec![
+        ChatRequestMessage::simple("assistant", "no calls here".to_string()),
+        tool_result("call_ghost"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.dropped, 1);
+    assert_eq!(counts.stubbed, 0);
+    assert_eq!(counts.names, 0);
+    assert_eq!(counts.ids, 0);
+    assert_eq!(counts.arguments, 0);
+}
+
+#[test]
+fn an_emptied_assistant_message_counts_as_dropped_too() {
+    // One emptied assistant message plus one orphan result: both are drops.
+    let mut messages = vec![
+        ChatRequestMessage {
+            role: "assistant",
+            content: Some("   ".to_string()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: None,
+        },
+        ChatRequestMessage::simple("assistant", "no calls here".to_string()),
+        tool_result("call_ghost"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.dropped, 2);
+    assert_eq!(messages.len(), 1);
+}
+
+#[test]
+fn counts_aggregate_every_site_of_a_kind() {
+    // Two of each: blank names, blank ids, unusable arguments, unanswered calls
+    // (two stubs) and two drops (one emptied assistant message, one orphan).
+    let mut messages = vec![
+        ChatRequestMessage::simple("user", "hi".to_string()),
+        assistant(vec![call("", "", "{"), call("", "", "{")]),
+        ChatRequestMessage {
+            role: "assistant",
+            content: Some("   ".to_string()),
+            images: Vec::new(),
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: None,
+        },
+        ChatRequestMessage::simple("assistant", "no calls here".to_string()),
+        tool_result("call_ghost"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.names, 2);
+    assert_eq!(counts.ids, 2);
+    assert_eq!(counts.arguments, 2);
+    assert_eq!(counts.stubbed, 2);
+    assert_eq!(counts.dropped, 2);
+}
+
 // ── determinism ──
 
 #[test]
@@ -382,7 +509,10 @@ fn repair_is_deterministic() {
     // Repair a clone twice and compare the rendered forms — the second pass
     // must be byte-identical to the first, or the cache prefix would churn.
     let mut second = build();
-    repair_replayed_calls(&mut first, true);
-    repair_replayed_calls(&mut second, true);
+    let first_counts = repair_replayed_calls(&mut first, true);
+    let second_counts = repair_replayed_calls(&mut second, true);
     assert_eq!(format!("{first:?}"), format!("{second:?}"));
+    // The reported counts are part of that determinism: two identical inputs
+    // must report identical repairs, or the metric would drift per request.
+    assert_eq!(first_counts, second_counts);
 }

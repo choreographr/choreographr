@@ -2803,7 +2803,11 @@ byte-deterministic and never re-serializes a valid object, so it does not churn
 the prompt-cache prefix. A chained Responses route keeps its non-blank ids
 byte-identical (it sends only the post-assistant tail, and the
 `function_call_output`'s `call_id` must match the id the service minted) while
-still minting a blank one.
+still minting a blank one. The repair reports what it changed per request — the
+counts are its return value, never a side effect — which the builder logs once at
+`debug` (numbers only, never a name, an id or message content) and exports as the
+labelled counter `choreo_wire_repairs_total{kind}`, so a provider or model that
+emits unusable tool calls is visible without reading a log.
 
 **Logging:** every binary uses `tracing` with `tracing-subscriber`. Default level is `info`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and

@@ -12,12 +12,16 @@
 //!
 //! ## Purity and determinism
 //!
-//! These functions are pure and deterministic: no I/O, no locks, no shared
-//! state, and the same input always produces the same bytes. That property is
-//! load-bearing, because the request bytes double as the provider prompt-cache
-//! prefix — a cache warmer snapshots `messages` before the tool window and
-//! re-sends it, so a repair that varied between two builds of the same request
-//! would silently invalidate the cached prefix on every turn.
+//! These functions are pure transformations: no I/O, no locks, no shared state.
+//! [`repair_replayed_calls`] mutates the list it is handed and *also returns
+//! what it changed* ([`RepairCounts`]); the counts are its return value, never a
+//! side effect, so the module stays free of any observer to notify. The
+//! transformation is deterministic as well — the same input always produces the
+//! same bytes and the same counts. That property is load-bearing, because the
+//! request bytes double as the provider prompt-cache prefix — a cache warmer
+//! snapshots `messages` before the tool window and re-sends it, so a repair that
+//! varied between two builds of the same request would silently invalidate the
+//! cached prefix on every turn.
 //!
 //! ## What the repair guarantees
 //!
@@ -236,6 +240,41 @@ fn disambiguate(used: &mut HashSet<String>, id: String) -> String {
     }
 }
 
+/// What one [`repair_replayed_calls`] pass changed, per repair kind.
+///
+/// Pure data: the caller decides what to do with it (log a line, bump a metric),
+/// so the repair itself keeps no side effect and stays byte-deterministic. Each
+/// counter aggregates every site of its kind in the request — a pass that
+/// repaired two names reports `2`, not `1`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RepairCounts {
+    /// Calls whose emitted name differs from the recorded one (coerced into a
+    /// provider-safe name, or replaced by [`INVALID_TOOL_CALL_NAME`]).
+    pub names: u64,
+    /// Calls whose emitted id differs from the recorded one (minted for a blank
+    /// id, normalized, or suffixed to break a duplicate).
+    pub ids: u64,
+    /// Calls whose emitted argument string differs from the recorded one (the
+    /// `{}` replacement — a valid object is never re-serialized).
+    pub arguments: u64,
+    /// Synthetic results inserted for calls the transcript holds no answer for.
+    pub stubbed: u64,
+    /// `role: "tool"` messages removed because they answer no call, plus
+    /// assistant messages removed because they were left empty.
+    pub dropped: u64,
+}
+
+impl RepairCounts {
+    /// Whether the pass changed nothing at all (every counter is zero).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.names == 0
+            && self.ids == 0
+            && self.arguments == 0
+            && self.stubbed == 0
+            && self.dropped == 0
+    }
+}
+
 /// One repaired call, tracked so the tool messages can be re-paired to it.
 struct CallSlot {
     /// The id the transcript recorded, before repair — the pairing key.
@@ -264,7 +303,15 @@ struct CallSlot {
 ///   answer (in call order, immediately after the assistant message), a `tool`
 ///   message that answers no call is dropped, and an assistant message left
 ///   with no text, no calls and no artifact is dropped too.
-pub(crate) fn repair_replayed_calls(messages: &mut Vec<ChatRequestMessage>, rewrite_ids: bool) {
+///
+/// Returns what each pass changed (see [`RepairCounts`]). Counting is
+/// observation only: it never alters which messages are emitted or their order,
+/// so the same input yields the same messages *and* the same counts.
+pub(crate) fn repair_replayed_calls(
+    messages: &mut Vec<ChatRequestMessage>,
+    rewrite_ids: bool,
+) -> RepairCounts {
+    let mut counts = RepairCounts::default();
     // ── Pass A ──
     let mut used: HashSet<String> = HashSet::new();
     let mut slots: HashMap<usize, Vec<CallSlot>> = HashMap::new();
@@ -295,6 +342,18 @@ pub(crate) fn repair_replayed_calls(messages: &mut Vec<ChatRequestMessage>, rewr
                 )
             };
             let final_id = disambiguate(&mut used, id);
+            // Count the divergence from the recorded bytes before overwriting
+            // them: a blank id counts as repaired (minted), and a duplicate id
+            // counts because the suffix changed it.
+            if name != call.function.name {
+                counts.names = counts.names.saturating_add(1);
+            }
+            if final_id != original_id {
+                counts.ids = counts.ids.saturating_add(1);
+            }
+            if arguments_json != call.function.arguments {
+                counts.arguments = counts.arguments.saturating_add(1);
+            }
             call.id.clone_from(&final_id);
             call.function.name = name;
             call.function.arguments = arguments_json;
@@ -370,6 +429,9 @@ pub(crate) fn repair_replayed_calls(messages: &mut Vec<ChatRequestMessage>, rewr
                 let keep = paired.get(i).copied().unwrap_or(false);
                 if keep && let Some(answer) = original.get(i) {
                     out.push(answer.clone());
+                } else {
+                    // An unpaired result inside the block answers no call.
+                    counts.dropped = counts.dropped.saturating_add(1);
                 }
                 i += 1;
             }
@@ -379,6 +441,7 @@ pub(crate) fn repair_replayed_calls(messages: &mut Vec<ChatRequestMessage>, rewr
                 for slot in message_slots {
                     if !slot.answered {
                         out.push(tool_stub(&slot.final_id));
+                        counts.stubbed = counts.stubbed.saturating_add(1);
                     }
                 }
             }
@@ -386,6 +449,7 @@ pub(crate) fn repair_replayed_calls(messages: &mut Vec<ChatRequestMessage>, rewr
             // A `tool` message not consumed by an assistant block answers no
             // call in the message it follows — an ornament a strict provider
             // rejects. Drop it.
+            counts.dropped = counts.dropped.saturating_add(1);
             i += 1;
         } else {
             out.push(msg.clone());
@@ -394,9 +458,16 @@ pub(crate) fn repair_replayed_calls(messages: &mut Vec<ChatRequestMessage>, rewr
     }
     // An assistant message that lost everything (no text, no calls, no
     // reasoning artifact, no image) is itself invalid on the wire.
+    let before_retain = out.len();
     out.retain(assistant_message_is_nonempty);
+    // Only assistant messages can fail the predicate, so every removed message
+    // here is an emptied assistant message; it counts as dropped too.
+    counts.dropped = counts
+        .dropped
+        .saturating_add((before_retain - out.len()) as u64);
 
     *messages = out;
+    counts
 }
 
 /// A synthetic `tool` message answering `call_id` with the unavailable-result

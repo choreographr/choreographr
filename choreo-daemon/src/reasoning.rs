@@ -16,6 +16,7 @@ use choreo_ai_protocols::{
 use choreo_proto::{ReasoningArtifact, Turn};
 use tracing::{debug, warn};
 
+use crate::metrics;
 use crate::sessions::SessionState;
 use crate::wire::repair_replayed_calls;
 
@@ -182,7 +183,35 @@ pub fn build_chat_request_messages(
     // nothing. A blank id is still minted there, since a service never mints
     // one.
     let rewrite_ids = !chains_via_response_id(provider_slug, model);
-    repair_replayed_calls(&mut messages, rewrite_ids);
+    let counts = repair_replayed_calls(&mut messages, rewrite_ids);
+    // The repair reports what it changed (counts only — never a tool name, a
+    // call id or any message content) and the agent loop exports it as a
+    // labelled counter, so a provider or model that produces unusable tool
+    // calls is visible without reading a log. This builder also runs for the
+    // `session_inspect` tool and the cache-warming path; recording there is
+    // correct, because the repair really did run on that copy too — do not
+    // special-case those callers.
+    if !counts.is_empty() {
+        debug!(
+            names = counts.names,
+            ids = counts.ids,
+            arguments = counts.arguments,
+            stubbed = counts.stubbed,
+            dropped = counts.dropped,
+            "wire repair applied to the request copy",
+        );
+        for (kind, count) in [
+            ("names", counts.names),
+            ("ids", counts.ids),
+            ("arguments", counts.arguments),
+            ("stubbed", counts.stubbed),
+            ("dropped", counts.dropped),
+        ] {
+            if count > 0 {
+                metrics::record_wire_repair(kind, count);
+            }
+        }
+    }
     messages
 }
 
