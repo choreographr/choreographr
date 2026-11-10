@@ -9,6 +9,7 @@ mod requests;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::io;
 use tracing::{debug, warn};
 
@@ -713,7 +714,9 @@ fn google_inline_image(image: &ChatImagePart) -> Option<PartPayload<'_>> {
 
 /// Assistant messages use role "model" (Gemini's term for the model, matching
 /// the API's role enum). Tool results use role "user" with functionResponse parts
-/// because Gemini requires tool responses to be sent under the user role.
+/// because Gemini requires tool responses to be sent under the user role. A call
+/// turn's results are emitted together in one content, each named after the call
+/// it answers, and a result that answers no declared call is dropped.
 fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
 ) -> Result<(Vec<ContentPayload<'a>>, Option<String>), GoogleError> {
@@ -723,25 +726,68 @@ fn build_message_payloads<'a>(
     let mut system_texts: Vec<&str> = Vec::new();
     let mut payloads: Vec<ContentPayload<'a>> = Vec::new();
 
+    // First pass: index every function call an assistant turn declared, so a
+    // tool result can be named after the call it answers. Gemini matches a
+    // `functionResponse` against the `functionCall` by NAME, not by id, so the
+    // id alone is useless on the wire. The name is resolved here from the
+    // declaring message rather than copied onto the result, so the two can
+    // never drift apart.
+    let mut call_names: HashMap<&'a str, &'a str> = HashMap::new();
     for msg in messages {
+        if let Some(calls) = &msg.tool_calls {
+            for tc in calls {
+                call_names.insert(tc.id.as_str(), tc.function.name.as_str());
+            }
+        }
+    }
+
+    // Tool results accumulate here so a call turn's whole response set is
+    // emitted as ONE user content. Gemini requires the content immediately
+    // after a `functionCall` turn to carry exactly one `functionResponse` per
+    // call of that turn; splitting them across contents violates that count.
+    let mut pending_tool_parts: Vec<PartPayload<'a>> = Vec::new();
+
+    for msg in messages {
+        // Tool results are grouped, not emitted inline: hold this one until the
+        // run of tool messages ends, then flush the batch as a single content.
+        if msg.role == "tool" {
+            // Resolve the answering call's name through the first-pass index. A
+            // result that answers no declared call is dropped rather than sent
+            // nameless (Gemini rejects a `functionResponse` with no name, and a
+            // mismatched name is an INVALID_ARGUMENT).
+            let name = msg
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| call_names.get(id).copied());
+            let Some(name) = name else {
+                debug!("dropping a tool result that answers no declared call");
+                continue;
+            };
+            let text = msg.content.as_deref().unwrap_or("");
+            pending_tool_parts.push(PartPayload::FunctionResponse {
+                function_response: FunctionResponsePayload {
+                    name,
+                    response: serde_json::json!({"content": text}),
+                },
+            });
+            continue;
+        }
+
+        // Any non-tool message ends the run of tool results: flush the batch
+        // immediately BEFORE the current message's own content, preserving the
+        // call-turn-then-response-turn adjacency Gemini requires.
+        if !pending_tool_parts.is_empty() {
+            payloads.push(ContentPayload {
+                role: "user",
+                parts: std::mem::take(&mut pending_tool_parts),
+            });
+        }
+
         match msg.role {
             "system" => {
                 if let Some(ref content) = msg.content {
                     system_texts.push(content);
                 }
-            }
-            "tool" => {
-                let text = msg.content.as_deref().unwrap_or("");
-                let name = msg.tool_call_id.as_deref().unwrap_or("");
-                payloads.push(ContentPayload {
-                    role: "user",
-                    parts: vec![PartPayload::FunctionResponse {
-                        function_response: FunctionResponsePayload {
-                            name,
-                            response: serde_json::json!({"content": text}),
-                        },
-                    }],
-                });
             }
             "assistant" => {
                 let mut parts: Vec<PartPayload<'a>> = Vec::new();
@@ -753,8 +799,15 @@ fn build_message_payloads<'a>(
                 }
                 if let Some(ref calls) = msg.tool_calls {
                     for tc in calls {
+                        // Gemini requires `args` to be a JSON object (a Struct);
+                        // a malformed or non-object payload would serialize as
+                        // `null`/a scalar and be rejected, so fall back to an
+                        // empty object instead.
                         let args: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+                            match serde_json::from_str(&tc.function.arguments) {
+                                Ok(value @ serde_json::Value::Object(_)) => value,
+                                Ok(_) | Err(_) => serde_json::json!({}),
+                            };
                         parts.push(PartPayload::FunctionCall {
                             function_call: FunctionCallPayload {
                                 name: &tc.function.name,
@@ -802,6 +855,15 @@ fn build_message_payloads<'a>(
                 payloads.push(ContentPayload { role, parts });
             }
         }
+    }
+
+    // A conversation that ends on a tool result never reaches the mid-loop
+    // flush, so drain any trailing batch here.
+    if !pending_tool_parts.is_empty() {
+        payloads.push(ContentPayload {
+            role: "user",
+            parts: pending_tool_parts,
+        });
     }
 
     let system_instruction = if system_texts.is_empty() {

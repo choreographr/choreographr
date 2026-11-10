@@ -3776,6 +3776,14 @@ pane that never reported is never released.
     four wire formats; replay repair of an already-recorded call is likewise the daemon's job (see
     **The request copy is repaired, never the transcript**), on the request copy only.
 
+    **A tool result is named and grouped as Gemini requires.** The Gemini adapter resolves each
+    tool result's wire name from the assistant message that declared the call it answers (matched
+    by call id, never copied onto the result, so the two cannot drift), because the API matches a
+    `functionResponse` against its `functionCall` by **name**, not id. A call turn's whole response
+    set is emitted together in **one** user content — the content after a `functionCall` turn must
+    carry exactly one `functionResponse` per call, so results are never split across contents — and
+    a result that answers no declared call is **dropped** rather than sent nameless.
+
 
 
 

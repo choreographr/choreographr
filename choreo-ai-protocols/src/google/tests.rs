@@ -57,25 +57,140 @@ fn build_message_payloads_with_system() {
     }
 }
 
-#[test]
-fn build_message_payloads_tool_result() {
-    let msgs = vec![ChatRequestMessage {
-        role: "tool",
-        content: Some("Temperature is 72°F".to_string()),
+/// Build an assistant message that declared a set of `(id, name, args)` tool
+/// calls, for exercising the call-id → tool-name resolution a tool result needs.
+fn assistant_with_calls(calls: &[(&str, &str, &str)]) -> ChatRequestMessage {
+    ChatRequestMessage {
+        role: "assistant",
+        content: None,
         images: Vec::new(),
-        tool_call_id: Some("call_abc".to_string()),
+        tool_call_id: None,
+        tool_calls: Some(
+            calls
+                .iter()
+                .map(|(id, name, args)| AssistantToolCall {
+                    id: (*id).to_string(),
+                    kind: "function".to_string(),
+                    function: AssistantToolFunction {
+                        name: (*name).to_string(),
+                        arguments: (*args).to_string(),
+                    },
+                    caller: None,
+                })
+                .collect(),
+        ),
+        reasoning_artifact: None,
+    }
+}
+
+/// Build a bare `role: "tool"` result message answering `call_id`.
+fn tool_result(call_id: &str, content: &str) -> ChatRequestMessage {
+    ChatRequestMessage {
+        role: "tool",
+        content: Some(content.to_string()),
+        images: Vec::new(),
+        tool_call_id: Some(call_id.to_string()),
         tool_calls: None,
         reasoning_artifact: None,
-    }];
+    }
+}
+
+#[test]
+fn build_message_payloads_tool_result_dropped_when_it_answers_no_call() {
+    // A result with no declaring call cannot be named, so it is dropped rather
+    // than sent nameless (Gemini rejects a functionResponse with no name).
+    let msgs = vec![tool_result("call_abc", "Temperature is 72°F")];
     let (payloads, system) = build_message_payloads(&msgs).unwrap();
     assert!(system.is_none());
-    assert_eq!(payloads.len(), 1);
-    assert_eq!(payloads[0].role, "user");
-    // Serialize and verify functionResponse structure
-    let json_val = serde_json::to_value(&payloads[0]).unwrap();
+    assert!(payloads.is_empty());
+}
+
+#[test]
+fn build_message_payloads_tool_result_is_named_after_its_call() {
+    // The wire name is the CALLED tool's name ("get_temp"), not the call id
+    // ("call_1") — Gemini matches a functionResponse to its functionCall by name.
+    let msgs = vec![
+        assistant_with_calls(&[("call_1", "get_temp", r#"{"city":"NYC"}"#)]),
+        tool_result("call_1", "Temperature is 72°F"),
+    ];
+    let (payloads, _) = build_message_payloads(&msgs).unwrap();
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0].role, "model");
+    assert_eq!(payloads[1].role, "user");
+    let json_val = serde_json::to_value(&payloads[1]).unwrap();
     let fr = &json_val["parts"][0]["function_response"];
-    assert_eq!(fr["name"], "call_abc");
+    assert_eq!(fr["name"], "get_temp");
     assert_eq!(fr["response"]["content"], "Temperature is 72°F");
+}
+
+#[test]
+fn build_message_payloads_groups_call_turn_results_into_one_content() {
+    // Two calls may be answered by two separate tool messages; Gemini requires
+    // ONE content after the functionCall turn carrying one functionResponse per
+    // call, in call order — not one content per result.
+    let msgs = vec![
+        assistant_with_calls(&[
+            ("call_1", "get_temp", r#"{"city":"NYC"}"#),
+            ("call_2", "get_humidity", r#"{"city":"NYC"}"#),
+        ]),
+        tool_result("call_1", "72°F"),
+        tool_result("call_2", "40%"),
+    ];
+    let (payloads, _) = build_message_payloads(&msgs).unwrap();
+    // Exactly two contents: the model turn, then one grouped user turn.
+    assert_eq!(payloads.len(), 2);
+    assert_eq!(payloads[0].role, "model");
+    assert_eq!(payloads[1].role, "user");
+    let json_val = serde_json::to_value(&payloads[1]).unwrap();
+    let parts = json_val["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 2);
+    assert_eq!(parts[0]["function_response"]["name"], "get_temp");
+    assert_eq!(parts[0]["function_response"]["response"]["content"], "72°F");
+    assert_eq!(parts[1]["function_response"]["name"], "get_humidity");
+    assert_eq!(parts[1]["function_response"]["response"]["content"], "40%");
+}
+
+#[test]
+fn build_message_payloads_drops_orphan_result_in_a_group() {
+    // A result naming no call is dropped while its sibling still resolves, so
+    // the grouped content carries only the answerable results.
+    let msgs = vec![
+        assistant_with_calls(&[("call_1", "get_temp", "{}")]),
+        tool_result("call_1", "72°F"),
+        tool_result("call_orphan", "stray"),
+    ];
+    let (payloads, _) = build_message_payloads(&msgs).unwrap();
+    assert_eq!(payloads.len(), 2);
+    let json_val = serde_json::to_value(&payloads[1]).unwrap();
+    let parts = json_val["parts"].as_array().unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0]["function_response"]["name"], "get_temp");
+}
+
+#[test]
+fn build_message_payloads_malformed_arguments_become_empty_object() {
+    // Gemini requires `args` to be a JSON object (a Struct); a malformed or
+    // non-object payload is sent as `{}` rather than `null`/a scalar, and a
+    // valid object passes through unchanged.
+    for (args, expected) in [
+        ("{", serde_json::json!({})),
+        ("null", serde_json::json!({})),
+        ("[1]", serde_json::json!({})),
+        ("", serde_json::json!({})),
+        (r#"{"city":"NYC"}"#, serde_json::json!({"city": "NYC"})),
+    ] {
+        let msgs = vec![assistant_with_calls(&[("call_1", "get_temp", args)])];
+        let (payloads, _) = build_message_payloads(&msgs).unwrap();
+        let json_val = serde_json::to_value(&payloads[0]).unwrap();
+        assert_eq!(
+            json_val["parts"][0]["function_call"]["args"], expected,
+            "arguments {args:?} should serialize as {expected}"
+        );
+        assert_ne!(
+            json_val["parts"][0]["function_call"]["args"],
+            serde_json::Value::Null
+        );
+    }
 }
 
 #[test]
