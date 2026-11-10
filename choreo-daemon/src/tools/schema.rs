@@ -92,11 +92,11 @@ pub(crate) use choreo_ai_protocols::tool_name::MAX_FUNCTION_NAME_LEN;
 /// request, so the request-assembly path drops any definition that fails this
 /// predicate rather than sending it.
 ///
-/// Thin alias of [`choreo_ai_protocols::tool_name::is_provider_safe`], the single
-/// owner of the rule (see that module for why it does not trim).
-pub(crate) fn is_provider_safe_function_name(name: &str) -> bool {
-    choreo_ai_protocols::tool_name::is_provider_safe(name)
-}
+/// A re-export, not a wrapper: the rule has one owner,
+/// [`choreo_ai_protocols::tool_name::is_provider_safe`] (see that module for why
+/// it does not trim), and a second name for it here would only invite the two
+/// copies to drift.
+pub(crate) use choreo_ai_protocols::tool_name::is_provider_safe as is_provider_safe_function_name;
 
 /// Whether a tool call carries a name no provider will accept — the ingest
 /// gate's runnability rule, and the exact negation of
@@ -177,38 +177,6 @@ mod tests {
     #[test]
     fn mcp_tool_name_cap_matches_the_provider_cap() {
         assert_eq!(choreo_mcp::MAX_TOOL_NAME_LEN, MAX_FUNCTION_NAME_LEN);
-    }
-
-    #[test]
-    fn provider_safe_function_name_accepts_provider_names() {
-        for name in [
-            "read_file",
-            "mcp__filesystem__read_text_file",
-            "a-b_c9",
-            "x",
-        ] {
-            assert!(
-                is_provider_safe_function_name(name),
-                "{name} should be accepted"
-            );
-        }
-        // Exactly at the cap is fine; one byte over is not.
-        assert!(is_provider_safe_function_name(
-            &"a".repeat(MAX_FUNCTION_NAME_LEN)
-        ));
-        assert!(!is_provider_safe_function_name(
-            &"a".repeat(MAX_FUNCTION_NAME_LEN + 1)
-        ));
-    }
-
-    #[test]
-    fn provider_safe_function_name_rejects_bad_names() {
-        // A path-style slash (the regression this guards), the empty name, and
-        // any character outside the provider alphabet.
-        assert!(!is_provider_safe_function_name(""));
-        assert!(!is_provider_safe_function_name("mcp/x/y"));
-        assert!(!is_provider_safe_function_name("has space"));
-        assert!(!is_provider_safe_function_name("has.dot"));
     }
 
     #[test]

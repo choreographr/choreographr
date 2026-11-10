@@ -2760,8 +2760,10 @@ calls carry a **name no provider will accept** — an empty or whitespace-only
 name, but also a non-blank one a strict endpoint rejects (`multi_tool_use.parallel`,
 a long shell command a weak model emitted as a name), which would otherwise be
 dispatched under that name, answered "no such tool", and (with `max_turns = 0`,
-no loop limit at all) never bounded. The gate is
-`is_provider_safe_function_name`, deliberately wider than the adapters'
+no loop limit at all) never bounded. The gate is the shared
+`choreo_ai_protocols::tool_name::is_provider_safe` rule, which the daemon
+re-exports under the name `is_provider_safe_function_name` (one owner, so the
+daemon cannot drift from it), deliberately wider than the adapters'
 blank-only merge rule: an adapter *reports* what the provider sent, and the
 daemon *governs* whether it may run. The calls are never recorded or dispatched,
 the turn keeps the model's prose plus a bracketed note naming what was
