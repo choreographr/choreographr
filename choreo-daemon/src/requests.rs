@@ -6,11 +6,11 @@ use crate::reasoning::{
     reasoning_artifact_tokens, warn_on_uncaptured_reasoning,
 };
 use crate::sessions::{AssistantResponse, RequestContext, SessionCommand, SessionState};
-use crate::tools::ToolOutput;
 use crate::tools::context::ToolContext;
 use crate::tools::load_tools::{LoadToolsArgs, apply_load_tools};
 use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path};
 use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
+use crate::tools::{ToolOutput, tool_call_is_unrunnable};
 use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition};
 use choreo_ai_protocols::{
     ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, model_reasoning_capability,
@@ -408,7 +408,7 @@ const TRUNCATION_RECOVERY: TurnRecovery = TurnRecovery {
 
 /// The unnamed cause: a reply whose tool calls carry a name the provider will
 /// not accept, so nothing in it can be dispatched (see
-/// [`tool_call_is_unrunnable`]).
+/// [`crate::tools::tool_call_is_unrunnable`]).
 ///
 /// The label stays `unidentified_tool_calls` even though the cause now covers
 /// any provider-unacceptable name, not only a blank one: it is deliberately
@@ -443,25 +443,6 @@ fn truncation_note(names: &str) -> String {
 /// the same for a single straggler and for a reply that named nothing usable.
 fn unnamed_tool_call_note(detail: &str) -> String {
     format!("[Tool calls the provider will not accept: {detail}. None were run.]")
-}
-
-/// Whether a tool call carries a name no provider will accept — see
-/// [`crate::tools::is_provider_safe_function_name`].
-///
-/// Blank is a *subset* of this: an empty or whitespace-only name is unrunnable,
-/// but so is a non-blank name a strict endpoint rejects — `multi_tool_use.parallel`,
-/// a 340-character shell command a weak model put in `name`, a dotted or
-/// path-style name. Such a call passes a blank-only check, is dispatched, is
-/// answered `unknown tool:`, and poisons the transcript with a call no later
-/// request can replay (see `crate::wire`), exactly like a blank one.
-///
-/// The adapters apply a narrower rule when merging streamed call deltas, where
-/// only a blank name counts as "absent" so an empty fragment does not clobber a
-/// name split across chunks. That asymmetry is intentional: the adapter
-/// *reports* what the provider sent, and the daemon *governs* whether it may be
-/// dispatched. Do not narrow this back to `is_empty` to match the adapter.
-fn tool_call_is_unrunnable(name: &str) -> bool {
-    !crate::tools::is_provider_safe_function_name(name)
 }
 
 /// Detail for the recovery note of a reply whose calls name a tool the provider

@@ -279,6 +279,90 @@ fn blank_named_call_is_repaired_and_keeps_its_result() {
     assert_eq!(messages[1].tool_call_id.as_deref(), Some(id));
 }
 
+// ── cross-layer agreement ──
+
+/// Every name shape the three rules meet in practice: the stream placeholders,
+/// ordinary provider names, the exact byte cap and one past it, a dotted
+/// multi-tool name, a whitespace-prefixed name, a non-ASCII name, and a long
+/// shell command a weak model emitted as a "tool".
+fn name_corpus() -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        String::new(),
+        "  ".to_string(),
+        "multi_tool_use.parallel".to_string(),
+        " sh".to_string(),
+        "x".repeat(MAX_FUNCTION_NAME_LEN),
+        "x".repeat(MAX_FUNCTION_NAME_LEN + 1),
+        "日本語".to_string(),
+        format!("rm -rf {} && echo done", "/tmp/some/path ".repeat(20)),
+    ]
+}
+
+/// The ingest gate, the provider-validity predicate, and the replay normalizer
+/// must give the *same* verdict on every name — and the blank merge rule must
+/// be strictly subsumed by them.
+///
+/// This is the invariant the shared `choreo_ai_protocols::tool_name` module
+/// exists to hold: a name the ingest gate lets through but the normalizer
+/// rewrites (or vice versa) is a call dispatched under one name and replayed
+/// under another, which poisons the transcript and the prompt-cache prefix.
+#[test]
+fn intake_and_wire_agree_on_every_name() {
+    for name in name_corpus() {
+        // 1. The daemon's re-export and the crate-level rule are one rule.
+        let safe = crate::tools::is_provider_safe_function_name(&name);
+        assert_eq!(
+            safe,
+            choreo_ai_protocols::tool_name::is_provider_safe(&name),
+            "daemon and crate disagree about {name:?}",
+        );
+
+        // 2. The ingest gate's runnability rule is its exact negation, so a
+        //    call the loop prunes is precisely one this predicate rejects.
+        assert_eq!(
+            crate::tools::tool_call_is_unrunnable(&name),
+            !safe,
+            "ingest gate disagrees with the validity rule about {name:?}",
+        );
+
+        // 3. The replay normalizer passes a valid name through byte-identically
+        //    (the cache prefix depends on it) and repairs anything else into a
+        //    name a strict provider accepts.
+        let normalized = normalize_call(&name, "call_1", "{}", 0, true);
+        if safe {
+            assert_eq!(normalized.name, name, "valid name was rewritten");
+        } else {
+            assert_ne!(normalized.name, name, "invalid name was left as-is");
+            assert!(
+                !normalized.name.is_empty() && normalized.name.len() <= MAX_FUNCTION_NAME_LEN,
+                "repaired name {:?} violates the byte cap",
+                normalized.name,
+            );
+            assert!(
+                normalized
+                    .name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-'),
+                "repaired name {:?} keeps an illegal byte",
+                normalized.name,
+            );
+            assert!(
+                choreo_ai_protocols::tool_name::is_provider_safe(&normalized.name),
+                "repaired name {:?} is still not provider-safe",
+                normalized.name,
+            );
+        }
+
+        // 4. Blank is a strict subset of not-provider-safe: a caller that only
+        //    rejects blank names accepts names a provider refuses.
+        if choreo_ai_protocols::tool_name::is_blank(&name) {
+            assert!(!safe, "blank name {name:?} must not be provider-safe");
+            assert_ne!(normalized.name, name, "blank name was not rewritten");
+        }
+    }
+}
+
 // ── determinism ──
 
 #[test]

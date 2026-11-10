@@ -2769,18 +2769,21 @@ for good. The request builder (`choreo-daemon`'s `wire` module — `reasoning`
 owns replay *policy*, `wire` owns mechanical repair) therefore passes its
 fully-assembled message list through `wire::repair_replayed_calls` as the last
 step, working only on that throwaway copy. Names are coerced to a provider-safe
-form (an unsalvageable one becomes the `invalid_tool_call` sentinel — a legal
-name that labels a *past* call whose result the transcript already holds, so
-nothing is dispatched under it), a blank id becomes a deterministic
-`call_<12 hex>` minted from the call's name, arguments and position, and
-non-object arguments become `{}`. Calls and results are then paired so every
-recorded call is answered by exactly one `tool` message — an unanswered call
-gets a stub result, a result that answers no call is dropped, and an assistant
-message left with nothing is dropped too. The repair is byte-deterministic and
-never re-serializes a valid object, so it does not churn the prompt-cache
-prefix. A chained Responses route keeps its non-blank ids byte-identical (it
-sends only the post-assistant tail, and the `function_call_output`'s `call_id`
-must match the id the service minted) while still minting a blank one.
+form by the shared `choreo_ai_protocols::tool_name` rules — the single owner of
+both the blank stream-merge rule and the provider-safe validity rule, of which
+blank is a strict subset — an unsalvageable name becomes the `invalid_tool_call`
+sentinel, a legal name that labels a *past* call whose result the transcript
+already holds, so nothing is dispatched under it. A blank id becomes a
+deterministic `call_<12 hex>` minted from the call's name, arguments and
+position, and non-object arguments become `{}`. Calls and results are then
+paired so every recorded call is answered by exactly one `tool` message — an
+unanswered call gets a stub result, a result that answers no call is dropped,
+and an assistant message left with nothing is dropped too. The repair is
+byte-deterministic and never re-serializes a valid object, so it does not churn
+the prompt-cache prefix. A chained Responses route keeps its non-blank ids
+byte-identical (it sends only the post-assistant tail, and the
+`function_call_output`'s `call_id` must match the id the service minted) while
+still minting a blank one.
 
 **Logging:** every binary uses `tracing` with `tracing-subscriber`. Default level is `info`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and

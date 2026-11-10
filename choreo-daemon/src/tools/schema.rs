@@ -76,13 +76,13 @@ fn resolve_refs(value: &mut serde_json::Value, defs: &serde_json::Map<String, se
     }
 }
 
-/// The provider's function-name byte cap (`OpenAI`'s ceiling; Anthropic is more
-/// generous, so 64 is the safe common limit).
+/// The provider's function-name byte cap.
 ///
-/// Kept numerically in step with `choreo_mcp::MAX_TOOL_NAME_LEN` — this module
-/// compiles with the `mcp` feature off, so it cannot reference that
-/// feature-gated constant and restates the same provider limit here.
-pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
+/// A re-export, not a definition: the cap and the validity rule live in
+/// [`choreo_ai_protocols::tool_name`], which always compiles, so this module
+/// reads them on the `mcp` feature off too (unlike the feature-gated
+/// `choreo_mcp::MAX_TOOL_NAME_LEN`, which a test pins to this constant).
+pub(crate) use choreo_ai_protocols::tool_name::MAX_FUNCTION_NAME_LEN;
 
 /// Whether `name` is a provider-safe function name.
 ///
@@ -92,14 +92,32 @@ pub(crate) const MAX_FUNCTION_NAME_LEN: usize = 64;
 /// request, so the request-assembly path drops any definition that fails this
 /// predicate rather than sending it.
 ///
-/// Iterates bytes (ASCII classes only), so it needs no regex dependency and no
-/// Unicode handling.
+/// Thin alias of [`choreo_ai_protocols::tool_name::is_provider_safe`], the single
+/// owner of the rule (see that module for why it does not trim).
 pub(crate) fn is_provider_safe_function_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= MAX_FUNCTION_NAME_LEN
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    choreo_ai_protocols::tool_name::is_provider_safe(name)
+}
+
+/// Whether a tool call carries a name no provider will accept — the ingest
+/// gate's runnability rule, and the exact negation of
+/// [`is_provider_safe_function_name`].
+///
+/// Blank is a *subset* of this: an empty or whitespace-only name is unrunnable,
+/// but so is a non-blank name a strict endpoint rejects — `multi_tool_use.parallel`,
+/// a 340-character shell command a weak model put in `name`, a dotted or
+/// path-style name. Such a call passes a blank-only check, is dispatched, is
+/// answered `unknown tool:`, and poisons the transcript with a call no later
+/// request can replay (see `crate::wire`), exactly like a blank one.
+///
+/// The adapters apply a narrower rule when merging streamed call deltas
+/// ([`choreo_ai_protocols::tool_name::is_blank`]), where only a blank name counts
+/// as "absent" so an empty fragment does not clobber a name split across
+/// chunks. That asymmetry is intentional: the adapter *reports* what the
+/// provider sent, and the daemon *governs* whether it may be dispatched. Do not
+/// narrow this back to `is_empty` to match the adapter.
+#[must_use]
+pub(crate) fn tool_call_is_unrunnable(name: &str) -> bool {
+    !is_provider_safe_function_name(name)
 }
 
 /// Whether `def` is a valid provider tool definition: a provider-safe function
@@ -150,6 +168,16 @@ pub(crate) fn retain_valid_tool_definitions(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The MCP tool-name builder caps at the same number. Its crate is an
+    /// optional dependency, so this only compiles with the `mcp` feature on —
+    /// but then a bump on either side fails a test instead of relying on a
+    /// comment promising the two match.
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn mcp_tool_name_cap_matches_the_provider_cap() {
+        assert_eq!(choreo_mcp::MAX_TOOL_NAME_LEN, MAX_FUNCTION_NAME_LEN);
+    }
 
     #[test]
     fn provider_safe_function_name_accepts_provider_names() {

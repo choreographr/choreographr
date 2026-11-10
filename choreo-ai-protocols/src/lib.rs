@@ -26,6 +26,9 @@
 //! - [`videos`] — video-generation clients ([`VideoGenerationClient`]) over
 //!   fal's queue protocol.
 //! - [`retry`] — shared HTTP retry machinery used by all clients.
+//! - [`tool_name`] — the two predicates that decide whether a tool-call name
+//!   is usable: [`tool_name::is_blank`] for merging stream deltas and
+//!   [`tool_name::is_provider_safe`] for what a provider will accept.
 //! - [`ProviderClient`], [`ChatTurnRequest`], [`ChatTurnResult`] — the trait
 //!   and shared types every client implements/uses.
 //! - [`ProviderError`], [`ContextWindowConfig`], [`ProviderOverrides`] —
@@ -44,6 +47,7 @@ pub mod images;
 pub mod oauth;
 pub mod openai;
 pub mod retry;
+pub mod tool_name;
 pub mod videos;
 
 // Test-only helpers (scripted HTTP mock provider for the integration tests);

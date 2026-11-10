@@ -25,6 +25,7 @@ use super::{
 use crate::openai::OpenAiError;
 use crate::openai::turn::{TurnParts, assemble_turn};
 use crate::shared::MAX_TOOL_CALLS;
+use crate::tool_name::is_blank;
 use crate::types::{ChatToolCall, ChatTurnResult, StreamEvent};
 
 // ── Chat Completions tool call accumulation ─────────────────────────────
@@ -40,7 +41,8 @@ struct AccumulatingToolCall {
 
 /// Accumulate tool call deltas from streaming SSE chunks into ordered tool
 /// calls. Deltas with the same index are combined: the **first non-blank** `id`
-/// and `name` win, and `arguments` is concatenated.
+/// and `name` win, and `arguments` is concatenated. "Blank" is
+/// [`is_blank`] — the shared stream-delta merge rule.
 ///
 /// The wire contract is why the first value wins and not the last: a provider
 /// sends a call's `function.name` and `id` once, on the first delta for that
@@ -51,21 +53,24 @@ struct AccumulatingToolCall {
 ///
 /// This is a report, not a repair: a provider that never sends a name produces
 /// an empty [`ChatToolCall::name`]. Deciding what an unnamed call means is the
-/// caller's policy, so no name is invented here.
+/// caller's policy, so no name is invented here. The daemon's *validity* rule
+/// ([`crate::tool_name::is_provider_safe`]) is a superset of this blank rule,
+/// and that asymmetry is deliberate: the adapter reports what the provider sent,
+/// while the daemon decides what is runnable.
 pub(crate) fn accumulate_tool_calls_from_deltas(
     deltas: impl IntoIterator<Item = StreamToolCallDelta>,
 ) -> Vec<ChatToolCall> {
     let mut map: HashMap<u32, AccumulatingToolCall> = HashMap::new();
     for tc_delta in deltas {
         let entry = map.entry(tc_delta.index).or_default();
-        // Empty-or-whitespace-only is a continuation placeholder, i.e. absent —
-        // the two key lookups below share that one definition of "blank".
-        if let Some(id) = tc_delta.id.filter(|id| !id.trim().is_empty()) {
+        // Blank is a continuation placeholder, i.e. absent — the two key lookups
+        // below share the shared merge rule (`crate::tool_name::is_blank`).
+        if let Some(id) = tc_delta.id.filter(|id| !is_blank(id)) {
             // `entry.id` never holds a blank, so "unset" is the whole rule.
             entry.id.get_or_insert(id);
         }
         if let Some(func) = tc_delta.function {
-            if let Some(name) = func.name.filter(|name| !name.trim().is_empty()) {
+            if let Some(name) = func.name.filter(|name| !is_blank(name)) {
                 // A kept name is stored verbatim — no trimming, so the caller
                 // sees exactly what the provider sent.
                 match entry.name.as_deref() {
