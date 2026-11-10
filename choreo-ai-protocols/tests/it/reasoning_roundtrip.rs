@@ -547,7 +547,7 @@ fn gemini_thought_signatures_reemitted() {
         .expect("model content on turn 2");
     let parts = model_content["parts"].as_array().expect("parts array");
     assert_eq!(parts.len(), 1, "only the functionCall part is re-emitted");
-    assert_eq!(parts[0]["function_call"]["name"], "get_weather");
+    assert_eq!(parts[0]["functionCall"]["name"], "get_weather");
     assert_eq!(
         parts[0]["thoughtSignature"].as_str(),
         Some("encrypted-sig-2"),

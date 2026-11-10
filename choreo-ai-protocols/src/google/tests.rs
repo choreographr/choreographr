@@ -118,7 +118,10 @@ fn build_message_payloads_tool_result_is_named_after_its_call() {
     assert_eq!(payloads[0].role, "model");
     assert_eq!(payloads[1].role, "user");
     let json_val = serde_json::to_value(&payloads[1]).unwrap();
-    let fr = &json_val["parts"][0]["function_response"];
+    // The wire key is camelCase (`functionResponse`); a snake_case key would be
+    // an unknown field to the API.
+    assert!(json_val["parts"][0].get("function_response").is_none());
+    let fr = &json_val["parts"][0]["functionResponse"];
     assert_eq!(fr["name"], "get_temp");
     assert_eq!(fr["response"]["content"], "Temperature is 72°F");
 }
@@ -144,10 +147,10 @@ fn build_message_payloads_groups_call_turn_results_into_one_content() {
     let json_val = serde_json::to_value(&payloads[1]).unwrap();
     let parts = json_val["parts"].as_array().unwrap();
     assert_eq!(parts.len(), 2);
-    assert_eq!(parts[0]["function_response"]["name"], "get_temp");
-    assert_eq!(parts[0]["function_response"]["response"]["content"], "72°F");
-    assert_eq!(parts[1]["function_response"]["name"], "get_humidity");
-    assert_eq!(parts[1]["function_response"]["response"]["content"], "40%");
+    assert_eq!(parts[0]["functionResponse"]["name"], "get_temp");
+    assert_eq!(parts[0]["functionResponse"]["response"]["content"], "72°F");
+    assert_eq!(parts[1]["functionResponse"]["name"], "get_humidity");
+    assert_eq!(parts[1]["functionResponse"]["response"]["content"], "40%");
 }
 
 #[test]
@@ -164,7 +167,7 @@ fn build_message_payloads_drops_orphan_result_in_a_group() {
     let json_val = serde_json::to_value(&payloads[1]).unwrap();
     let parts = json_val["parts"].as_array().unwrap();
     assert_eq!(parts.len(), 1);
-    assert_eq!(parts[0]["function_response"]["name"], "get_temp");
+    assert_eq!(parts[0]["functionResponse"]["name"], "get_temp");
 }
 
 #[test]
@@ -183,11 +186,11 @@ fn build_message_payloads_malformed_arguments_become_empty_object() {
         let (payloads, _) = build_message_payloads(&msgs).unwrap();
         let json_val = serde_json::to_value(&payloads[0]).unwrap();
         assert_eq!(
-            json_val["parts"][0]["function_call"]["args"], expected,
+            json_val["parts"][0]["functionCall"]["args"], expected,
             "arguments {args:?} should serialize as {expected}"
         );
         assert_ne!(
-            json_val["parts"][0]["function_call"]["args"],
+            json_val["parts"][0]["functionCall"]["args"],
             serde_json::Value::Null
         );
     }
@@ -215,13 +218,14 @@ fn build_message_payloads_tool_call() {
     assert!(system.is_none());
     assert_eq!(payloads.len(), 1);
     assert_eq!(payloads[0].role, "model");
-    // Serialize and verify: should have text + function_call
+    // Serialize and verify: should have text + a camelCase `functionCall` part
     let json_val = serde_json::to_value(&payloads[0]).unwrap();
     let parts = json_val["parts"].as_array().unwrap();
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["text"], "I'll check the weather.");
-    assert_eq!(parts[1]["function_call"]["name"], "get_weather");
-    assert_eq!(parts[1]["function_call"]["args"]["location"], "NYC");
+    assert!(parts[1].get("function_call").is_none());
+    assert_eq!(parts[1]["functionCall"]["name"], "get_weather");
+    assert_eq!(parts[1]["functionCall"]["args"]["location"], "NYC");
 }
 
 // ── response_to_turn_result tests ─────────────────────────────────────
@@ -1039,7 +1043,7 @@ fn build_message_payloads_attaches_thought_signature_to_last_part() {
     // Only the last part carries the final signature; the text part is clean.
     assert!(parts[0].get("thoughtSignature").is_none());
     assert_eq!(parts[1]["thoughtSignature"], "encrypted-sig-2");
-    assert_eq!(parts[1]["function_call"]["name"], "get_weather");
+    assert_eq!(parts[1]["functionCall"]["name"], "get_weather");
 }
 
 #[test]
@@ -1100,7 +1104,7 @@ fn build_message_payloads_foreign_artifact_variant_is_dropped() {
 
 #[test]
 fn build_message_payloads_user_image_renders_inline_data() {
-    // A user message carrying a vision image renders a Gemini `inline_data`
+    // A user message carrying a vision image renders a Gemini `inlineData`
     // part with a base64 payload; the text rides ahead of it.
     use crate::openai::ChatImagePart;
     let msgs = vec![ChatRequestMessage {
@@ -1120,8 +1124,9 @@ fn build_message_payloads_user_image_renders_inline_data() {
     let parts = json_val["parts"].as_array().unwrap();
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["text"], "what");
-    assert_eq!(parts[1]["inline_data"]["mime_type"], "image/png");
-    assert_eq!(parts[1]["inline_data"]["data"], "iVBORy1mYWtl");
+    assert!(parts[1].get("inline_data").is_none());
+    assert_eq!(parts[1]["inlineData"]["mimeType"], "image/png");
+    assert_eq!(parts[1]["inlineData"]["data"], "iVBORy1mYWtl");
 }
 
 #[test]
@@ -1146,6 +1151,84 @@ fn request_body_carries_generation_config_output_cap() {
 
     let no_cap = build(None);
     assert!(no_cap.get("generationConfig").is_none(), "{no_cap}");
+}
+
+#[test]
+fn request_body_carries_system_instruction_under_its_camel_case_key() {
+    // The system prompt rides the documented top-level `systemInstruction`; a
+    // snake_case `system_instruction` key is an unknown field to the API, so
+    // its absence is asserted alongside the camelCase presence.
+    let msgs = vec![ChatRequestMessage::simple(
+        "system",
+        "Be terse.".to_string(),
+    )];
+    let (payloads, system_instruction) = build_message_payloads(&msgs).unwrap();
+    let body = serde_json::to_value(&GenerateContentRequest {
+        contents: payloads,
+        system_instruction: system_instruction.map(|s| serde_json::json!({"parts": [{"text": s}]})),
+        tools: None,
+        thinking_config: None,
+        generation_config: None,
+    })
+    .unwrap();
+    assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be terse.");
+    assert!(body.get("system_instruction").is_none(), "{body}");
+}
+
+#[test]
+fn request_body_uses_the_api_camel_case_field_names_end_to_end() {
+    // Every field `build_message_payloads` feeds into `GenerateContentRequest`
+    // must serialize under the API's own camelCase key, end to end through the
+    // whole body: a snake_case key is an unknown field to Gemini, so a tool
+    // call, a tool result or an image part would be rejected.
+    use crate::openai::ChatImagePart;
+    let msgs = vec![
+        ChatRequestMessage {
+            role: "user",
+            content: Some("what is this?".to_string()),
+            images: vec![ChatImagePart {
+                data: b"\x89PNG-fake".to_vec(),
+                mime_type: "image/png".to_string(),
+            }],
+            tool_call_id: None,
+            tool_calls: None,
+            reasoning_artifact: None,
+        },
+        assistant_with_calls(&[("call_1", "get_temp", r#"{"city":"NYC"}"#)]),
+        tool_result("call_1", "72°F"),
+    ];
+    let (payloads, system_instruction) = build_message_payloads(&msgs).unwrap();
+    assert!(system_instruction.is_none());
+    let body = serde_json::to_value(&GenerateContentRequest {
+        contents: payloads,
+        system_instruction: None,
+        tools: None,
+        thinking_config: None,
+        generation_config: None,
+    })
+    .unwrap();
+
+    let contents = body["contents"].as_array().unwrap();
+    // The user turn, the model's call turn, then the grouped tool result.
+    assert_eq!(contents.len(), 3);
+
+    let image_part = &contents[0]["parts"][1];
+    assert!(image_part.get("inline_data").is_none());
+    assert_eq!(image_part["inlineData"]["mimeType"], "image/png");
+    assert_eq!(image_part["inlineData"]["data"], "iVBORy1mYWtl");
+
+    let call_part = &contents[1]["parts"][0];
+    assert!(call_part.get("function_call").is_none());
+    assert_eq!(call_part["functionCall"]["name"], "get_temp");
+    assert_eq!(call_part["functionCall"]["args"]["city"], "NYC");
+
+    let result_part = &contents[2]["parts"][0];
+    assert!(result_part.get("function_response").is_none());
+    assert_eq!(result_part["functionResponse"]["name"], "get_temp");
+    assert_eq!(
+        result_part["functionResponse"]["response"]["content"],
+        "72°F"
+    );
 }
 
 #[test]

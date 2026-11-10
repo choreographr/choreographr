@@ -350,7 +350,9 @@ const KNOWN_GEMINI_MODELS: &[&str] = &[
 #[derive(Debug, Serialize)]
 struct GenerateContentRequest<'a> {
     contents: Vec<ContentPayload<'a>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// The API's own field name is `systemInstruction`; the Rust identifier is
+    /// `snake_case`, so the rename is what puts the documented key on the wire.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "systemInstruction")]
     system_instruction: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<serde_json::Value>,
@@ -393,21 +395,27 @@ enum PartPayload<'a> {
         thought_signature: Option<String>,
     },
     FunctionCall {
+        #[serde(rename = "functionCall")]
         function_call: FunctionCallPayload<'a>,
         #[serde(skip_serializing_if = "Option::is_none", rename = "thoughtSignature")]
         thought_signature: Option<String>,
     },
     FunctionResponse {
+        #[serde(rename = "functionResponse")]
         function_response: FunctionResponsePayload<'a>,
     },
-    /// Gemini vision image: `{"inline_data":{"mime_type":…,"data":<base64>}}`.
+    /// Gemini vision image: `{"inlineData":{"mimeType":…,"data":<base64>}}`.
     /// `data` is owned (the base64 string is built at request time);
-    /// `mime_type` borrows from the message.
-    InlineData { inline_data: InlineDataPayload<'a> },
+    /// `mime_type` borrows from the message and serializes as `mimeType`.
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: InlineDataPayload<'a>,
+    },
 }
 
 #[derive(Debug, Serialize)]
 struct InlineDataPayload<'a> {
+    #[serde(rename = "mimeType")]
     mime_type: &'a str,
     data: String,
 }
@@ -680,16 +688,10 @@ fn attach_thought_signatures(
     Ok(())
 }
 
-/// Convert a list of messages into Gemini contents format.
-///
-/// System messages are collected into the `system_instruction` field and are
-/// NOT added to `contents` because Gemini (unlike `OpenAI`) uses a separate
-/// top-level field for system instructions, and putting them in contents would
-/// cause a rejection.
-/// Build a Gemini `inline_data` part from a vision image part, or `None` for
+/// Build a Gemini `inlineData` part from a vision image part, or `None` for
 /// an unsupported MIME type (the caller keeps the text it already emitted).
-/// Gemini's `inline_data` is the user-role image carrier; `data` is the
-/// base64 payload (owned), `mime_type` borrows from the message.
+/// Gemini's `inlineData` is the user-role image carrier; `data` is the
+/// base64 payload (owned), `mimeType` borrows from the `mime_type` field.
 fn google_inline_image(image: &ChatImagePart) -> Option<PartPayload<'_>> {
     // Gemini accepts PNG/JPEG/WEBP/GIF/HEIC/HEIF inline. The allowlist below is
     // a superset of what the daemon's `image_prep` normalization can produce
@@ -712,11 +714,19 @@ fn google_inline_image(image: &ChatImagePart) -> Option<PartPayload<'_>> {
     })
 }
 
+/// Convert a list of messages into Gemini contents format.
+///
+/// System messages are collected into the top-level `systemInstruction` field
+/// and are NOT added to `contents` because Gemini (unlike `OpenAI`) uses a
+/// separate top-level field for system instructions, and putting them in
+/// contents would cause a rejection.
+///
 /// Assistant messages use role "model" (Gemini's term for the model, matching
-/// the API's role enum). Tool results use role "user" with functionResponse parts
-/// because Gemini requires tool responses to be sent under the user role. A call
-/// turn's results are emitted together in one content, each named after the call
-/// it answers, and a result that answers no declared call is dropped.
+/// the API's role enum). Tool results use role "user" with functionResponse
+/// parts because Gemini requires tool responses to be sent under the user
+/// role. A call turn's results are emitted together in one content, each named
+/// after the call it answers, and a result that answers no declared call is
+/// dropped.
 fn build_message_payloads<'a>(
     messages: &'a [ChatRequestMessage],
 ) -> Result<(Vec<ContentPayload<'a>>, Option<String>), GoogleError> {
@@ -836,7 +846,7 @@ fn build_message_payloads<'a>(
                 });
             }
             role => {
-                // User or other roles: text parts, plus an inline_data part
+                // User or other roles: text parts, plus an `inlineData` part
                 // per attached image (vision). Images ride user messages (the
                 // daemon defers tool-result images to synthetic user messages).
                 let mut parts: Vec<PartPayload<'a>> = Vec::new();
