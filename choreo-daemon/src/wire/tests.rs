@@ -26,15 +26,19 @@ fn assistant(calls: Vec<AssistantToolCall>) -> ChatRequestMessage {
     }
 }
 
-fn tool_result(id: &str) -> ChatRequestMessage {
+fn tool_result_with(id: &str, content: &str) -> ChatRequestMessage {
     ChatRequestMessage {
         role: "tool",
-        content: Some("ok".to_string()),
+        content: Some(content.to_string()),
         images: Vec::new(),
         tool_call_id: Some(id.to_string()),
         tool_calls: None,
         reasoning_artifact: None,
     }
+}
+
+fn tool_result(id: &str) -> ChatRequestMessage {
+    tool_result_with(id, "ok")
 }
 
 fn ids_of(msg: &ChatRequestMessage) -> Vec<&str> {
@@ -91,7 +95,7 @@ fn overlong_name_is_truncated() {
     let name = "x".repeat(MAX_FUNCTION_NAME_LEN + 1);
     let out = normalize_name(&name);
     assert_eq!(out.len(), MAX_FUNCTION_NAME_LEN);
-    assert!(is_provider_safe_function_name(&out));
+    assert!(tool_name::is_provider_safe(&out));
 }
 
 #[test]
@@ -105,7 +109,7 @@ fn long_shell_command_name_is_sanitized() {
     let out = normalize_name(&name);
     assert_ne!(out, "");
     assert!(out.len() <= MAX_FUNCTION_NAME_LEN);
-    assert!(is_provider_safe_function_name(&out));
+    assert!(tool_name::is_provider_safe(&out));
 }
 
 // ── id normalization ──
@@ -284,6 +288,71 @@ fn a_nonblank_orphan_does_not_steal_a_legitimate_result() {
         Some("ok"),
         "the genuine answer must survive, not the orphan's content"
     );
+}
+
+#[test]
+fn a_lone_unmatched_result_still_answers_the_only_call() {
+    // The common single-call turn whose recorded id no longer matches — a
+    // mangling proxy, or a transcript recorded before ids were minted. Exactly
+    // one call is open, so the pairing is unambiguous: the tool's real output
+    // must survive instead of being replaced by a stub.
+    let mut messages = vec![
+        assistant(vec![call("call_1", "sh", "{}")]),
+        tool_result_with("call_rewritten", "real output"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.stubbed, 0, "the result answers the call, so no stub");
+    assert_eq!(counts.dropped, 0, "the result is not an orphan");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].role, "tool");
+    assert_eq!(
+        messages[1].tool_call_id.as_deref(),
+        Some("call_1"),
+        "the result is relabelled with the call's final id"
+    );
+    assert_eq!(messages[1].content.as_deref(), Some("real output"));
+}
+
+#[test]
+fn an_unmatched_result_answers_the_last_open_call() {
+    // Two calls, the genuine answer for call_1, then a result whose id matches
+    // nothing. By the time the fallback runs only call_2 is open, so the choice
+    // is unambiguous and the second tool's output is preserved rather than
+    // stubbed.
+    let mut messages = vec![
+        assistant(vec![call("call_1", "sh", "{}"), call("call_2", "sh", "{}")]),
+        tool_result_with("call_1", "first output"),
+        tool_result_with("call_mangled", "second output"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.stubbed, 0);
+    assert_eq!(counts.dropped, 0);
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages[1].content.as_deref(), Some("first output"));
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_2"));
+    assert_eq!(messages[2].content.as_deref(), Some("second output"));
+}
+
+#[test]
+fn a_nonblank_orphan_with_two_calls_open_is_dropped() {
+    // The anti-stealing rule as its own case: an orphan processed FIRST in a
+    // two-call turn. Two candidates are open, so the fallback declines, and the
+    // genuine answers still claim their calls by id.
+    let mut messages = vec![
+        assistant(vec![call("call_1", "sh", "{}"), call("call_2", "sh", "{}")]),
+        tool_result_with("call_ghost", "ghost content"),
+        tool_result_with("call_1", "first output"),
+        tool_result_with("call_2", "second output"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.dropped, 1, "only the orphan is dropped");
+    assert_eq!(counts.stubbed, 0);
+    assert_eq!(messages.len(), 3, "assistant + the two genuine results");
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(messages[1].content.as_deref(), Some("first output"));
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("call_2"));
+    assert_eq!(messages[2].content.as_deref(), Some("second output"));
 }
 
 #[test]

@@ -2812,12 +2812,21 @@ form by the shared `choreo_ai_protocols::tool_name` rules — the single owner o
 both the blank stream-merge rule and the provider-safe validity rule, of which
 blank is a strict subset — an unsalvageable name becomes the `invalid_tool_call`
 sentinel, a legal name that labels a *past* call whose result the transcript
-already holds, so nothing is dispatched under it. A blank id becomes a
+already holds, so nothing is dispatched under it. A call id is judged by that
+same validity rule — a call id draws on the same `[A-Za-z0-9_-]` alphabet and the
+same byte cap as a function name because it is an opaque token the provider must
+accept and echo back, not a name looked up in the catalog. A blank id becomes a
 deterministic `call_<12 hex>` minted from the call's name, arguments and
 position, and non-object arguments become `{}`. Calls and results are then
 paired so every recorded call is answered by exactly one `tool` message — an
 unanswered call gets a stub result, a result that answers no call is dropped,
-and an assistant message left with nothing is dropped too. The repair is
+and an assistant message left with nothing is dropped too. Pairing tries the
+recorded id first, for every result in the block, before any fallback runs; then
+a blank id answers the first open call, and an unmatched non-blank id answers
+the only open call when exactly one is left (a mangling proxy or a pre-mint
+transcript costs the tool's output otherwise). With two or more candidates open
+it declines, so a stray result can never take a call a genuine answer later in
+the block still claims by id. The repair is
 byte-deterministic and never re-serializes a valid object, so it does not churn
 the prompt-cache prefix. A chained Responses route keeps its non-blank ids
 byte-identical (it sends only the post-assistant tail, and the

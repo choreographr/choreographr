@@ -29,15 +29,18 @@
 //! provider-safe name, a non-blank id unique within the request, and a JSON
 //! object for its arguments; every call is answered by exactly one `tool`
 //! message (a stub when the transcript holds no result), and a `tool` message
-//! that answers no call is dropped.
+//! that answers no call is dropped. A result whose recorded id no longer names
+//! its call still answers it when the choice is unambiguous, so a mangled or
+//! pre-mint id costs neither the tool's output nor a stub.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
 use choreo_ai_protocols::openai::ChatRequestMessage;
+use choreo_ai_protocols::tool_name;
 use serde_json::Value;
 
-use crate::tools::{MAX_FUNCTION_NAME_LEN, is_provider_safe_function_name, sha256_hex};
+use crate::tools::{MAX_FUNCTION_NAME_LEN, sha256_hex};
 
 /// Function name given to a replayed call whose recorded name cannot be
 /// coerced into a provider-accepted one.
@@ -123,7 +126,9 @@ fn normalize_arguments(arguments_json: &str) -> Cow<'_, str> {
 /// result is trimmed of `_` and capped at [`MAX_FUNCTION_NAME_LEN`]; if nothing
 /// survives, [`INVALID_TOOL_CALL_NAME`] labels the call.
 fn normalize_name(name: &str) -> Cow<'_, str> {
-    if is_provider_safe_function_name(name) {
+    // A call *name* is looked up in the tool catalog, so it is judged by the
+    // provider's function-name rule itself.
+    if tool_name::is_provider_safe(name) {
         return Cow::Borrowed(name);
     }
     // `sanitize_name` yields an ASCII, charset-clean, underscore-collapsed
@@ -185,7 +190,12 @@ fn normalize_id<'a>(
     if id.trim().is_empty() {
         return Cow::Owned(mint_call_id(name, arguments_json, position));
     }
-    if !rewrite_id || is_provider_safe_function_name(id) {
+    // A call *id* draws on the same `[A-Za-z0-9_-]` alphabet and the same byte
+    // cap as a function name, because it is an opaque token the provider must
+    // accept and echo back — never a name looked up in the catalog. That is why
+    // the shared function-name rule is the right predicate here: it is what the
+    // provider enforces on the id bytes, not a claim that an id is a tool name.
+    if !rewrite_id || tool_name::is_provider_safe(id) {
         return Cow::Borrowed(id);
     }
     let sanitized = sanitize_name(id);
@@ -224,9 +234,10 @@ fn disambiguate(used: &mut HashSet<String>, id: String) -> String {
     let mut n = 2u32;
     loop {
         let suffix = format!("_d{n}");
-        // Keep the suffixed id within the provider's id length ceiling by
-        // trimming the base, never the suffix (the suffix is what makes it
-        // unique).
+        // Keep the suffixed id inside the provider ceiling by trimming the base,
+        // never the suffix (the suffix is what makes it unique). The ceiling is
+        // the shared function-name cap because a call id is bounded by exactly
+        // the same byte limit and the same alphabet (see [`normalize_id`]).
         let base_len = MAX_FUNCTION_NAME_LEN.saturating_sub(suffix.len());
         // Truncate by BYTES on a char boundary so the suffixed id stays within
         // the byte ceiling even for a non-ASCII id (a chained Responses route
@@ -296,6 +307,108 @@ struct CallSlot {
     answered: bool,
 }
 
+/// The still-open call whose recorded id is exactly `original_id`.
+///
+/// Only a **non-blank** id can select a call by equality: a blank id is a
+/// placeholder carrying no information, and two blank ids would compare equal,
+/// so equality would pair an arbitrary call rather than the one the result
+/// answers.
+fn slot_with_id(slots: &[CallSlot], original_id: &str) -> Option<usize> {
+    if original_id.trim().is_empty() {
+        return None;
+    }
+    slots
+        .iter()
+        .position(|slot| !slot.answered && slot.original_id == original_id)
+}
+
+/// Choose the still-open call an *unpaired* `tool` message answers, in three
+/// tiers, most informative first.
+///
+/// The tiers exist because a result's recorded id is not always usable: a
+/// mangling proxy can rewrite it, and a transcript recorded before ids were
+/// minted carries a blank one. Dropping such a result loses the tool's real
+/// output and replaces it with a stub, so the fallbacks below recover it where
+/// the answer is unambiguous; where it is not, they decline and let pass C drop
+/// the message.
+#[must_use]
+fn next_slot(slots: &[CallSlot], original_id: &str) -> Option<usize> {
+    // Tier 1 — the id identifies the call outright. This is the only tier that
+    // can be trusted unconditionally, so it always wins.
+    if let Some(pos) = slot_with_id(slots, original_id) {
+        return Some(pos);
+    }
+    // Tier 2 — a blank id is a placeholder carrying no information, so the first
+    // open call is the best guess available and cannot be contradicted by
+    // anything the result itself says.
+    if original_id.trim().is_empty() {
+        return slots.iter().position(|slot| !slot.answered);
+    }
+    // Tier 3 — an unmatched non-blank id, with exactly one call still open: the
+    // choice is unambiguous, so no other call can be the one this result
+    // answers. Pairing here is what keeps the tool's output instead of a stub.
+    //
+    // Only callers that reach this point after every exact id match has been
+    // attempted may use it (see [`pair_results`]): with two or more candidates
+    // still open a stray result could take the slot a genuine answer later needs,
+    // so this tier declines rather than guess.
+    let mut open = slots.iter().enumerate().filter(|(_, slot)| !slot.answered);
+    match (open.next(), open.next()) {
+        (Some((pos, _)), None) => Some(pos),
+        _ => None,
+    }
+}
+
+/// Pair the still-unpaired `tool` messages to the calls of the assistant
+/// message each one follows, picking the call with `choose`.
+///
+/// The whole observable effect is the plumbing: the chosen slot is marked
+/// `answered`, the message's `tool_call_id` is rewritten to that call's *final*
+/// id, and `paired[idx]` records that the message now answers a call. `choose`
+/// only decides *which* slot — see [`slot_with_id`] for the exact-id sweep and
+/// [`next_slot`] for the fallback sweep.
+fn pair_results(
+    messages: &mut [ChatRequestMessage],
+    slots: &mut HashMap<usize, Vec<CallSlot>>,
+    paired: &mut [bool],
+    choose: fn(&[CallSlot], &str) -> Option<usize>,
+) {
+    let mut owner: Option<usize> = None;
+    for (idx, msg) in messages.iter_mut().enumerate() {
+        if msg.role == "tool" {
+            let Some(owner_idx) = owner else { continue };
+            // A message an earlier sweep already paired keeps its answer, and
+            // cannot be paired a second time.
+            if paired.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let original = msg.tool_call_id.clone().unwrap_or_default();
+            let Some(message_slots) = slots.get_mut(&owner_idx) else {
+                continue;
+            };
+            let chosen =
+                choose(message_slots, &original).and_then(|pos| message_slots.get_mut(pos));
+            if let Some(slot) = chosen {
+                slot.answered = true;
+                msg.tool_call_id = Some(slot.final_id.clone());
+                if let Some(flag) = paired.get_mut(idx) {
+                    *flag = true;
+                }
+            }
+        } else {
+            // Only an assistant message that declares calls owns the `tool`
+            // messages immediately after it; any other message closes the
+            // pairing window.
+            owner = (msg.role == "assistant"
+                && msg
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty()))
+            .then_some(idx);
+        }
+    }
+}
+
 /// Apply the wire repair to a fully-assembled request message list.
 ///
 /// `rewrite_ids` is passed straight to [`normalize_call`] (see its doc for why
@@ -308,8 +421,11 @@ struct CallSlot {
 ///   request (the duplicate suffix is applied here).
 /// * **B — pair results.** Each `role: "tool"` message is matched to the call
 ///   it answers and its `tool_call_id` is rewritten to that call's *final* id.
-///   Matching is by original id first, then positionally within the immediately
-///   preceding assistant message, consuming each call at most once.
+///   Every result is first given the chance to claim a call by its recorded id;
+///   only then do the fallbacks run (a blank id answers the first open call, an
+///   unmatched non-blank id the only open call) — see [`next_slot`] for the
+///   ordering rationale and the unambiguity each fallback requires. Each call is
+///   consumed at most once.
 /// * **C — complete the turn.** Every declared call with no result gets a stub
 ///   answer (in call order, immediately after the assistant message), a `tool`
 ///   message that answers no call is dropped, and an assistant message left
@@ -381,47 +497,15 @@ pub(crate) fn repair_replayed_calls(
     // `paired[i]` marks a tool message that was matched to a call; an unpaired
     // tool message is an orphan and is dropped in pass C.
     let mut paired = vec![false; messages.len()];
-    let mut owner: Option<usize> = None;
-    for (idx, msg) in messages.iter_mut().enumerate() {
-        if msg.role == "tool" {
-            let Some(owner_idx) = owner else { continue };
-            let original = msg.tool_call_id.clone().unwrap_or_default();
-            let Some(message_slots) = slots.get_mut(&owner_idx) else {
-                continue;
-            };
-            let nonblank = !original.trim().is_empty();
-            // Prefer the call whose original id matches. Only a BLANK id falls
-            // back to the first unanswered call: a non-blank id that matches no
-            // call is a genuine orphan, and pairing it positionally would let it
-            // steal the slot from a later result that answers a real call (the
-            // real answer would then be dropped as the orphan).
-            let chosen = message_slots
-                .iter()
-                .position(|slot| !slot.answered && nonblank && slot.original_id == original)
-                .or_else(|| {
-                    (!nonblank)
-                        .then(|| message_slots.iter().position(|slot| !slot.answered))
-                        .flatten()
-                });
-            if let Some(slot) = chosen.and_then(|pos| message_slots.get_mut(pos)) {
-                slot.answered = true;
-                msg.tool_call_id = Some(slot.final_id.clone());
-                if let Some(flag) = paired.get_mut(idx) {
-                    *flag = true;
-                }
-            }
-        } else {
-            // Only an assistant message that declares calls owns the `tool`
-            // messages immediately after it; any other message closes the
-            // pairing window.
-            owner = (msg.role == "assistant"
-                && msg
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|calls| !calls.is_empty()))
-            .then_some(idx);
-        }
-    }
+    // Two sweeps: every exact id match claims its call first, then the fallback
+    // tiers pick up the leftovers. Running the exact matches to completion over
+    // the whole list first is what stops a fallback from taking a call that a
+    // genuine answer later in the same block can still claim by id — the genuine
+    // answer would otherwise find the slot gone and be dropped as the orphan.
+    // `next_slot` re-checks the id, so the second sweep leaves a message the
+    // first one paired untouched (it skips already-paired messages outright).
+    pair_results(messages, &mut slots, &mut paired, slot_with_id);
+    pair_results(messages, &mut slots, &mut paired, next_slot);
 
     // ── Pass C ──
     // Walk the (now owned) list once, MOVING each kept message into `out`
