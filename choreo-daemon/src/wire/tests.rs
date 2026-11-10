@@ -591,6 +591,38 @@ fn counts_aggregate_every_site_of_a_kind() {
     assert_eq!(counts.dropped, 2);
 }
 
+// ── summary rendering ──
+
+#[test]
+fn summary_renders_the_counters_in_a_fixed_order() {
+    // The diagnostic line is greppable, so the order and the labels are part of
+    // its contract: a `session_inspect` reader matches `names=1` positionally.
+    let counts = RepairCounts {
+        names: 1,
+        ids: 2,
+        arguments: 3,
+        stubbed: 4,
+        dropped: 5,
+    };
+    assert_eq!(
+        counts.summary(),
+        "names=1 ids=2 arguments=3 stubbed=4 dropped=5"
+    );
+}
+
+#[test]
+fn summary_of_a_clean_pass_still_names_every_counter() {
+    // All-zero must render the five zeroes rather than an empty string: the
+    // report prints `none` itself for a clean pass, so an empty summary would
+    // silently hide a counter a future kind added.
+    let counts = RepairCounts::default();
+    assert!(counts.is_empty());
+    assert_eq!(
+        counts.summary(),
+        "names=0 ids=0 arguments=0 stubbed=0 dropped=0"
+    );
+}
+
 // ── determinism ──
 
 #[test]

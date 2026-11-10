@@ -88,7 +88,11 @@ pub fn build_chat_request_messages_recording(
 /// caller decides whether to record it. Pure and deterministic — no metrics and
 /// no side effects — so the request bytes (and the prompt-cache prefix) never
 /// depend on which wrapper was called.
-fn assemble_request_messages(
+///
+/// This is the entry point for a caller that needs the repair counts themselves
+/// rather than only the repaired bytes: `session_inspect` calls it directly so
+/// it can *report* what the repair rewrote without going near the metric.
+pub(crate) fn assemble_request_messages(
     session: &SessionState,
     system_prompt: Option<&str>,
     provider_slug: &str,

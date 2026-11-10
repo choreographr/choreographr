@@ -280,6 +280,22 @@ impl RepairCounts {
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Render every counter as one stable, greppable line fragment:
+    /// `names=1 ids=0 arguments=0 stubbed=1 dropped=0`.
+    ///
+    /// This is the **diagnostic** rendering, for a human reading a report
+    /// (`session_inspect`) — the order is fixed and a zero counter is still
+    /// printed, so two reports of the same request are directly comparable.
+    /// The metric path keeps using the structured fields instead, because it
+    /// labels each kind separately in `choreo_wire_repairs_total`.
+    #[must_use]
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "names={} ids={} arguments={} stubbed={} dropped={}",
+            self.names, self.ids, self.arguments, self.stubbed, self.dropped
+        )
+    }
 }
 
 /// Truncate `s` to at most `max` bytes without splitting a UTF-8 char, so a

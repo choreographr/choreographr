@@ -8,14 +8,16 @@
 //! back to the API".
 //!
 //! Everything is computed from the persisted session record + turns using the
-//! SAME code paths the agent loop uses (`build_chat_request_messages`,
+//! SAME code paths the agent loop uses (`assemble_request_messages`,
 //! `chat_reasoning_echo`, `warn_on_uncaptured_reasoning`,
 //! `model_reasoning_passback`), so the report is a faithful dry-run rather than
 //! a reimplementation that can drift. The messages are lowered by the chat
 //! adapter's own `chat_wire_messages`, and its reasoning-key scan and
 //! empty-message drop rule come from the adapter's `CHAT_REASONING_WIRE_KEYS`
 //! and `chat_assistant_payload_is_empty`, so the per-message keys and the ledger
-//! are exactly what the upstream would see. Read-only: only redb read
+//! are exactly what the upstream would see. The mechanical wire repair's counts
+//! are reported too, because a stored call the repair has to rewrite changes
+//! what the model receives on every send. Read-only: only redb read
 //! transactions are opened; session state is never mutated.
 //!
 //! Privacy mirrors the codebase's thinking-content invariant: artifact
@@ -29,7 +31,7 @@ use super::ToolExecError;
 use crate::daemon::DaemonCommand;
 use crate::db::{read_session, read_turns};
 use crate::reasoning::{
-    build_chat_request_messages, include_reasoning_artifact, warn_on_uncaptured_reasoning,
+    assemble_request_messages, include_reasoning_artifact, warn_on_uncaptured_reasoning,
 };
 use crate::sessions::SessionState;
 use crate::tools::Tool;
@@ -198,7 +200,7 @@ fn build_report(
     // is nothing to echo).
     let echo = chat_reasoning_echo(&provider, &model);
 
-    // Reconstruct the state the builder reads. `build_chat_request_messages`
+    // Reconstruct the state the builder reads. `assemble_request_messages`
     // only consults `turns` (and the optional system prompt, which we pass as
     // None); setting `selected_model` keeps the reconstruction honest for any
     // future provenance reads that consult config.
@@ -211,7 +213,12 @@ fn build_report(
     // marker is `None`: every historical tool-result image renders as a text
     // placeholder here, exactly as it would on the request a freshly-loaded
     // session would build (only a live agent loop's own turns carry pixels).
-    let messages = build_chat_request_messages(&state, None, &provider, &model, None);
+    //
+    // This calls the non-recording assembly directly (not
+    // `build_chat_request_messages_recording`) because a diagnostic must never
+    // inflate `choreo_wire_repairs_total`, and it keeps the returned counts:
+    // they are what this report exists to surface.
+    let (messages, repairs) = assemble_request_messages(&state, None, &provider, &model, None);
 
     // Wire accounting: lower the messages with the chat adapter's own policy
     // application, so this dry-run cannot invent a different key than the real
@@ -512,6 +519,19 @@ fn build_report(
         out,
         "  wire dry-run: {wire_reasoning_count}/{assistant_count} assistant messages carry a reasoning field; ledger vs wire: {mismatch}"
     );
+    // What the mechanical repair rewrote on the request copy this report just
+    // rebuilt. Silent here would make a poisoned stored call read as a clean
+    // session while every real send is being rewritten, so the counts are part
+    // of the wire accounting.
+    if repairs.is_empty() {
+        out.push_str("  wire repair for this request: none\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "  wire repair for this request: {} (the request copy is repaired; the stored transcript keeps its bytes)",
+            repairs.summary()
+        );
+    }
     if echo.require_present {
         let _ = writeln!(
             out,
@@ -1276,6 +1296,94 @@ mod tests {
             "raw reasoning leaked across sessions: {out}"
         );
         assert!(out.contains("art=chat[reasoning_content;"), "{out}");
+    }
+
+    #[test]
+    fn clean_session_reports_no_wire_repair() {
+        // A transcript the repair cannot touch (plain assistant text, no tool
+        // calls) must report `none` — the line exists so a repaired session is
+        // distinguishable from a clean one at a glance.
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            GROQ_MODEL,
+            vec![(
+                0,
+                text_turn("answer", None, Some(groq_producer(GROQ_MODEL))),
+            )],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(
+            out.contains("  wire repair for this request: none\n"),
+            "a clean request must report no repair: {out}"
+        );
+        assert!(!out.contains("the request copy is repaired"), "{out}");
+    }
+
+    #[test]
+    fn invalid_recorded_tool_name_is_reported_and_coerced_on_the_wire() {
+        // A provider-invalid recorded name (OpenAI's dotted multi-tool name) is
+        // silently rewritten on every send, so the report must say so — and the
+        // call must still be on the wire under its coerced name.
+        let model = GROQ_MODEL;
+        let turn = tool_turn(
+            "c1",
+            "multi_tool_use.parallel",
+            None,
+            Some(groq_producer(model)),
+            None,
+        );
+        let (_dir, ctx) = seed(42, 42, model, vec![(0, turn.clone())]);
+        let out = run(&ctx, inspect_args(None));
+        assert!(
+            out.contains(
+                "wire repair for this request: names=1 ids=0 arguments=0 stubbed=1 dropped=0"
+            ),
+            "the coerced name (and the stub the turn needs) is reported: {out}"
+        );
+        assert!(
+            out.contains("the request copy is repaired; the stored transcript keeps its bytes"),
+            "the line must say the transcript itself is untouched: {out}"
+        );
+        // The same request copy the report built, inspected directly for the name
+        // the wire actually carries (the report never prints tool names).
+        let mut state = SessionState::empty();
+        state.turns.insert(0, turn);
+        let (messages, _) = assemble_request_messages(&state, None, "groq", model, None);
+        let names: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flatten()
+            .map(|call| call.function.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["multi_tool_use_parallel"],
+            "the call is still on the wire, under its coerced name"
+        );
+    }
+
+    #[test]
+    fn recorded_call_without_a_result_is_stubbed_and_reported() {
+        // A stored call the transcript holds no result for gets a synthetic
+        // answer on every send; the report must expose that as `stubbed=1`.
+        let model = GROQ_MODEL;
+        let (_dir, ctx) = seed(
+            42,
+            42,
+            model,
+            vec![(
+                0,
+                tool_turn("c1", "exec", None, Some(groq_producer(model)), None),
+            )],
+        );
+        let out = run(&ctx, inspect_args(None));
+        assert!(
+            out.contains(
+                "wire repair for this request: names=0 ids=0 arguments=0 stubbed=1 dropped=0"
+            ),
+            "the missing answer is reported as a stub: {out}"
+        );
     }
 
     #[test]

@@ -2840,7 +2840,14 @@ logs the counts at `debug` (numbers only, never a name, an id or message
 content) and exports them as the labelled counter
 `choreo_wire_repairs_total{provider,model,kind}`; the diagnostic build
 (`session_inspect`) and the tests use the non-recording builder so they cannot
-inflate it. Because the whole transcript is re-repaired on every send, the
+inflate it. That non-recording build returns the counts too, and
+`session_inspect` reports them: it rebuilds the exact request the model would
+receive, so a `wire repair for this request:` line names what the repair rewrote
+for that copy (per-kind counts, or `none` when nothing changed) and states that
+only the request copy is repaired while the stored transcript keeps its
+bytes — otherwise a session whose stored call is unusable would read as clean
+while every real send is being rewritten. Because the whole transcript is
+re-repaired on every send, the
 counter measures repair *work per send*, not distinct bad replies — a single
 unusable recorded call accumulates one increment per later turn — but the
 provider/model labels still make a model that emits unusable tool calls visible
