@@ -331,6 +331,21 @@ pub(crate) fn broadcast_token_usage(ctx: &RequestContext, session: &SessionState
     });
 }
 
+/// Status label shown while a batch of concurrent tool calls executes.
+///
+/// Every non-session-config tool call lands in the concurrent dispatch
+/// bucket, even a lone one — so the label must not claim parallelism for a
+/// single call. Show the real tool name for `len == 1` and reserve
+/// "(parallel)" for genuine multi-tool batches.
+pub(crate) fn concurrent_tool_status_label(tools: &[ChatToolCall]) -> String {
+    if tools.len() == 1 {
+        // Single-element slice per the len() check above; fallback is unreachable.
+        tools.first().map_or_default(|t| t.name.clone())
+    } else {
+        "(parallel)".into()
+    }
+}
+
 /// Resolve the execution timeout for a tool by name and arguments.
 ///
 /// Returns `None` for sub-sessions (run indefinitely) and `Some(duration)`

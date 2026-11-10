@@ -2503,16 +2503,21 @@ tools regardless of group state.
 (session-config)** phase — `load_tools`, `unload_tools`, `set_working_dir`, and
 the other session-config mutators — and a **concurrent** phase holding every
 remaining tool (shell, filesystem, VM, HTTP, Git, `spawn_subsession`, …) whose
-execution is independent of session state. The partition, the typed
-`PendingConfigChange` capture, and the Phase-3 worker-copy mirror that carries
-successful session-config mutations onto the request worker's config copy are
-documented in-source (`choreo-daemon`'s `requests` module).
+execution is independent of session state. The typed `PendingConfigChange`
+capture, the `is_session_config_tool` predicate, and the Phase-3 worker-copy
+mirror that carries successful session-config mutations onto the request
+worker's config copy live in `requests/config_tools.rs`.
 
 The dispatch and execution machinery (channel wiring, per-tool timeout
 resolution, the wait loops, the streaming forwarder, and per-tool result
 recording) lives in `requests/tool_execution.rs`, and the system-prompt /
-tool-result side-effect helpers live in `requests/system_content.rs`; both are
-re-exported from `requests.rs`. Each concurrent tool runs on a dedicated
+tool-result side-effect helpers live in `requests/system_content.rs`. The
+forward-only streaming phase and its chunk/status broadcasters live in
+`requests/stream.rs`, and the prompt-size estimate the context-window display
+uses in `requests/tokens.rs`. Every one of them is re-exported from
+`requests.rs` (a `pub(crate) use <mod>::*;` glob, or an explicit named list where
+the surface is small), so `requests.rs` itself holds
+`run_agent_loop` and its direct helpers. Each concurrent tool runs on a dedicated
 execution thread, a forwarding thread, and a wait-loop thread — see the
 `requests/tool_execution.rs` module docs for the thread topology and the
 per-tool timeout budgets.

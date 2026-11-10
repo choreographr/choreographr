@@ -3,15 +3,11 @@ use crate::context::{self, SkillMeta};
 use crate::providers::InferenceProvider;
 use crate::reasoning::{
     build_chat_request_messages_recording, chains_via_response_id, initial_prev_resp_id,
-    reasoning_artifact_tokens, warn_on_uncaptured_reasoning,
+    warn_on_uncaptured_reasoning,
 };
 use crate::sessions::{AssistantResponse, RequestContext, SessionCommand, SessionState};
 use crate::tools::context::ToolContext;
-use crate::tools::load_tools::{LoadToolsArgs, apply_load_tools};
-use crate::tools::set_working_dir::{SetWorkingDirArgs, resolve_working_dir_path};
-use crate::tools::unload_tools::{UnloadToolsArgs, apply_unload_tools};
-use crate::tools::{ToolOutput, tool_call_is_unrunnable};
-use choreo_ai_protocols::openai::{ChatRequestMessage, ChatToolDefinition};
+use crate::tools::tool_call_is_unrunnable;
 use choreo_ai_protocols::{
     ChatToolCall, ChatTurnRequest, ChatTurnResult, StreamEvent, model_reasoning_capability,
 };
@@ -24,16 +20,20 @@ use itertools::Itertools;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::time::Instant;
 use tracing::{debug, warn};
 
+mod config_tools;
 mod recovery;
+mod stream;
 mod system_content;
+mod tokens;
 mod tool_execution;
+pub(crate) use config_tools::*;
 // Named, not globbed: the recovery unit is driven from the agent loop and a
 // handful of tests, so spelling out its surface keeps an accidental rename from
 // silently re-exporting (or hiding) one of its items.
@@ -42,7 +42,9 @@ pub(crate) use recovery::{
     UNNAMED_TOOL_CALL_RECOVERY, UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION, recover_unrunnable_turn,
     recovery_detail,
 };
+pub(crate) use stream::*;
 pub(crate) use system_content::*;
+pub(crate) use tokens::*;
 pub(crate) use tool_execution::*;
 /// Resolve the effective reasoning effort for a turn, disabling it if the
 /// model/provider combination does not support it.
@@ -83,350 +85,12 @@ fn resolve_reasoning_effort(
     }
 }
 
-/// Estimate the number of prompt tokens for the current request using
-/// tiktoken.  Returns a (encoding, `estimated_tokens`) pair so the caller
-/// can reuse the encoding for output-token counting during streaming.
-///
-/// The estimate counts the `messages` slice as-is, which is the FULL visible
-/// conversation. For a chained request (`previous_response_id` set) that is
-/// deliberate: the adapter trims only the *wire* payload to the chain tail,
-/// but the provider bills the whole context it holds server-side — and the
-/// full conversation in `messages` IS that chained context plus the new tail,
-/// so counting it already reflects the real billed input (the only thing it
-/// misses is the previous system prompt, which stays in the chain while the
-/// rebuilt one is sent afresh — a bounded, sub-request-sized undercount).
-/// There is therefore NO chained-context addend here: adding the last
-/// request's actual `prompt_tokens` (from usage) would count the conversation
-/// twice, roughly doubling the estimate.
-fn estimate_prompt_tokens(
-    model: &str,
-    messages: &[ChatRequestMessage],
-    tools: &[ChatToolDefinition],
-) -> (Option<&'static tiktoken::CoreBpe>, u32) {
-    let encoding =
-        tiktoken::encoding_for_model(model).or_else(|| tiktoken::get_encoding("cl100k_base"));
-    let estimated = if let Some(enc) = &encoding {
-        // Reasoning artifacts are NOT excluded: since phase 4b the builder
-        // attaches them to assistant messages under echo policies
-        // (ToolLoop/AllTurns/Signature), and providers bill replayed
-        // reasoning as input tokens (the round-trip payload is part of the
-        // context on keep-all models). The legacy string fields
-        // (reasoning_content/reasoning/reasoning_text) are still never
-        // populated by the daemon, so only `reasoning_artifact` is counted.
-        let content_tokens: u32 = messages
-            .iter()
-            .filter_map(|m| m.content.as_deref())
-            // u128→u32 token counts: real conversations are far below u32::MAX,
-            // and the estimate is informational (billing uses provider usage).
-            .map(|text| {
-                let n = enc.count(text);
-                #[expect(clippy::cast_possible_truncation)]
-                {
-                    n as u32
-                }
-            })
-            .sum();
-
-        // Vision images are billed by the provider as tokens based on their
-        // (resized) dimensions. We don't know the exact per-provider
-        // tokenizer for images, so use a fixed estimate (~1000 tokens/image):
-        // the estimate feeds the
-        // context-window display and compaction weighting, not billing.
-        let image_tokens: u32 = messages
-            .iter()
-            .map(|m| {
-                #[expect(clippy::cast_possible_truncation)]
-                // usize→u32 image count: turns never carry 4 billion images
-                (m.images.len() as u32).saturating_mul(IMAGE_TOKEN_ESTIMATE)
-            })
-            .sum();
-
-        let tool_call_tokens: u32 = messages
-            .iter()
-            .filter_map(|m| m.tool_calls.as_ref())
-            .flat_map(|calls| calls.iter())
-            .map(|tc| {
-                #[expect(clippy::cast_possible_truncation)]
-                // u128→u32 token counts, informational only
-                let tc_tokens = (enc.count(&tc.id) + enc.count(&tc.kind)) as u32
-                    + (enc.count(&tc.function.name) + enc.count(&tc.function.arguments)) as u32;
-                tc_tokens
-            })
-            .sum();
-
-        let tool_def_tokens: u32 = tools
-            .iter()
-            .filter_map(|def| match serde_json::to_string(def) {
-                Ok(s) => {
-                    #[expect(clippy::cast_possible_truncation)]
-                    // u128→u32 token counts, informational only
-                    Some(enc.count(&s) as u32)
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to serialize tool definition for token estimation");
-                    None
-                }
-            })
-            .sum();
-
-        let artifact_tokens: u32 = messages
-            .iter()
-            .filter_map(|m| m.reasoning_artifact.as_ref())
-            .map(|artifact| reasoning_artifact_tokens(enc, artifact))
-            .sum();
-
-        content_tokens + tool_call_tokens + tool_def_tokens + artifact_tokens + image_tokens
-    } else {
-        // Effectively unreachable — `get_encoding("cl100k_base")` above
-        // always succeeds — but kept as defense-in-depth: if the fallback
-        // encoding ever fails to load, report 0 rather than panic or reuse
-        // a stale estimate. The estimate is informational only (billing
-        // uses the provider-reported usage).
-        tracing::warn!("no tiktoken encoding available for {model}");
-        0
-    };
-    (encoding, estimated)
-}
-
-/// A successful session-config tool mutation, captured in Phase 1 and
-/// applied to the worker's config copy in Phase 3.
-///
-/// The authoritative mutation is applied by the session main loop (via
-/// `DaemonCommand` → `SessionCommand` routing); this worker copy must be updated
-/// as well so the NEXT agent-loop iteration observes the change when it
-/// rebuilds tool definitions, system content, and working-dir-relative file
-/// operations.
-enum PendingConfigChange {
-    LoadTools(Vec<String>),
-    UnloadTools(Vec<String>),
-    /// The canonical path the tool resolved and the session main loop applied
-    /// verbatim, taken from the tool's EXECUTED result (so no re-resolution
-    /// and therefore no TOCTOU window).  `None` only when the executed result
-    /// was unavailable AND re-resolution failed — the worker then skips the
-    /// path update but still invalidates its skill cache so a stale cache
-    /// never survives the request boundary.
-    SetWorkingDir(Option<PathBuf>),
-}
-
-/// Whether `name` is one of the session-config tools that must run serially
-/// and whose successful mutations are mirrored onto the worker config copy.
-/// Single source of truth for the tool-name list used by the dispatch
-/// partition and the mirror capture.
-fn is_session_config_tool(name: &str) -> bool {
-    matches!(name, "load_tools" | "unload_tools" | "set_working_dir")
-}
-
-/// Status label shown while a batch of concurrent tool calls executes.
-///
-/// Every non-session-config tool call lands in the concurrent dispatch
-/// bucket, even a lone one — so the label must not claim parallelism for a
-/// single call. Show the real tool name for `len == 1` and reserve
-/// "(parallel)" for genuine multi-tool batches.
-fn concurrent_tool_status_label(tools: &[ChatToolCall]) -> String {
-    if tools.len() == 1 {
-        // Single-element slice per the len() check above; fallback is unreachable.
-        tools.first().map_or_default(|t| t.name.clone())
-    } else {
-        "(parallel)".into()
-    }
-}
-
-/// Capture a successful session-config tool's mutation into a typed
-/// [`PendingConfigChange`] for later application.  Called only for tools that
-/// actually executed without error.
-///
-/// `base_working_dir` is the working directory in effect when the response
-/// was planned — every `set_working_dir` call in the response resolved
-/// against it, so the (rare) re-resolution fallback must too (chaining
-/// relative resolutions against the mutated copy would diverge from the
-/// canonical paths the tools sent to the main loop, which applies them
-/// verbatim in call order).
-fn pending_config_change(
-    tool_call: &ChatToolCall,
-    output: &ToolOutput,
-    base_working_dir: Option<&Path>,
-) -> Option<PendingConfigChange> {
-    if !is_session_config_tool(&tool_call.name) {
-        return None;
-    }
-    match tool_call.name.as_str() {
-        "load_tools" => {
-            let Ok(args) = serde_json::from_str::<LoadToolsArgs>(&tool_call.arguments_json) else {
-                warn!(
-                    tool_call_id = %tool_call.id,
-                    "load_tools: could not parse args to mirror onto worker config",
-                );
-                return None;
-            };
-            Some(PendingConfigChange::LoadTools(args.groups))
-        }
-        "unload_tools" => {
-            let Ok(args) = serde_json::from_str::<UnloadToolsArgs>(&tool_call.arguments_json)
-            else {
-                warn!(
-                    tool_call_id = %tool_call.id,
-                    "unload_tools: could not parse args to mirror onto worker config",
-                );
-                return None;
-            };
-            Some(PendingConfigChange::UnloadTools(args.groups))
-        }
-        "set_working_dir" => {
-            // Prefer the canonical path from the tool's EXECUTED result: it
-            // matches byte-for-byte what the session main loop applied, with
-            // no re-resolution (and therefore no TOCTOU window in which the
-            // directory could vanish between the tool's resolution and this
-            // mirror).
-            if let Some(path) = output
-                .result_json
-                .as_ref()
-                .and_then(|v| v.get("path"))
-                .and_then(|v| v.as_str())
-            {
-                return Some(PendingConfigChange::SetWorkingDir(Some(PathBuf::from(
-                    path,
-                ))));
-            }
-            // Fallback (practically unreachable — result_json is populated on
-            // every successful execution): re-run the tool's own shared
-            // resolution.  If even that fails, still return a None-path change
-            // so the caller invalidates the worker's skill cache — a stale
-            // cache must never survive the request boundary.
-            let Ok(args) = serde_json::from_str::<SetWorkingDirArgs>(&tool_call.arguments_json)
-            else {
-                warn!(
-                    tool_call_id = %tool_call.id,
-                    "set_working_dir: could not parse args to mirror onto worker config",
-                );
-                return Some(PendingConfigChange::SetWorkingDir(None));
-            };
-            let path = resolve_working_dir_path(&args.path, base_working_dir).ok();
-            Some(PendingConfigChange::SetWorkingDir(path))
-        }
-        _ => None,
-    }
-}
-
-/// Apply a captured session-config mutation to the worker's config copy.
-fn apply_pending_config_change(
-    session: &mut SessionState,
-    change: &PendingConfigChange,
-    protected: &HashSet<String>,
-) {
-    match change {
-        PendingConfigChange::LoadTools(groups) => {
-            apply_load_tools(&mut session.config.active_tool_groups, groups);
-            debug!(groups = ?groups, "mirrored load_tools onto worker session config");
-        }
-        PendingConfigChange::UnloadTools(groups) => {
-            apply_unload_tools(&mut session.config.active_tool_groups, groups, protected);
-            debug!(groups = ?groups, "mirrored unload_tools onto worker session config");
-        }
-        PendingConfigChange::SetWorkingDir(path) => {
-            if let Some(path) = path {
-                session.config.working_dir = Some(path.clone());
-            }
-            // Always invalidate the skill cache: even when we could not
-            // determine the new path, the authoritative state changed and a
-            // stale cache would leak across the request boundary
-            // (RequestFinished merges the worker's discovered_skills over the
-            // main loop's invalidated None).  The main-loop handler does the
-            // same for the authoritative state.
-            session.discovered_skills = None;
-            debug!(path = ?path, "mirrored set_working_dir onto worker session config");
-        }
-    }
-}
-
 /// Whether a provider's catalog protocol is the Anthropic Messages wire
 /// format. Used by the cache-warming arm: an Anthropic request with thinking
 /// enabled is the one non-replayable shape (a 1-token cap changes the thinking
 /// budget, hence the prompt-cache key) — see [`is_replayable`].
 fn protocol_is_anthropic(slug: &str) -> bool {
     lookup_provider(slug).is_some_and(|p| matches!(p.protocol, ProviderProtocol::AnthropicMessages))
-}
-
-/// The forward-only streaming phase a single model call moves through, in
-/// order: `Sending` (the request is dispatched and we are awaiting the first
-/// token) → `Reasoning` (the model's reasoning tokens are streaming) →
-/// `Responding` (the answer tokens are streaming).  Modeled as an ordered enum
-/// so "only ever move forward" is the derived `Ord` comparison rather than a
-/// pair of hand-written inverse guards that could drift apart.
-///
-/// The `Waiting` boundary — the request payload has been fully uploaded but
-/// the first token has not arrived — is broadcast directly by the
-/// request-uploaded callback rather than tracked here: it is a one-shot event
-/// that fires before any delta, so it never needs to participate in the
-/// forward-only comparison.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum StreamPhase {
-    Sending,
-    Reasoning,
-    Responding,
-}
-
-impl StreamPhase {
-    /// The [`SessionStatus`] this phase broadcasts to clients.
-    fn status(self) -> SessionStatus {
-        match self {
-            StreamPhase::Sending => SessionStatus::Sending,
-            StreamPhase::Reasoning => SessionStatus::Reasoning,
-            StreamPhase::Responding => SessionStatus::Responding,
-        }
-    }
-}
-
-/// Advance a turn's live streaming phase to `target`, broadcasting the new
-/// status to subscribers — but only when it moves FORWARD along [`StreamPhase`].
-/// A later chunk of an earlier kind therefore never demotes the phase back (a
-/// trailing reasoning delta after the answer has begun does not flip
-/// `Responding` back to `Reasoning`), so one model call emits at most two
-/// *advances* — two `StatusChanged` broadcasts on top of the initial `Sending`
-/// — no matter how the provider interleaves its deltas.  `Sending` is broadcast
-/// once before the call, so it is the initial value here and this never
-/// re-emits it.
-fn advance_stream_phase(phase: &mut StreamPhase, target: StreamPhase, ctx: &RequestContext) {
-    if target > *phase {
-        *phase = target;
-        // Best-effort: the `Sending` broadcast that began the turn already gated
-        // the loop (its failure ends the turn), so a dropped mid-stream phase
-        // update only means a client keeps the previous label until the next
-        // one — not worth aborting the model call over.
-        let _ = ctx
-            .cmd_tx
-            .send(SessionCommand::StatusChanged(target.status()));
-    }
-}
-
-/// Forward one streamed model chunk to subscribers: the chunk itself on its
-/// answer/reasoning stream, then the running output-token estimate so the UI's
-/// live token display refreshes on every chunk.
-fn broadcast_stream_chunk(
-    ctx: &RequestContext,
-    stream_id: u64,
-    stream: OutputStream,
-    text: String,
-    output_tokens: u32,
-) {
-    let _ = ctx
-        .cmd_tx
-        .send(SessionCommand::Broadcast(DaemonMessageType::Session {
-            session_id: Some(ctx.session_id),
-            event: SessionEvent::OutputChunk {
-                stream_id,
-                stream,
-                data: text.into_bytes(),
-            },
-        }));
-    let _ = ctx
-        .cmd_tx
-        .send(SessionCommand::Broadcast(DaemonMessageType::Session {
-            session_id: Some(ctx.session_id),
-            event: SessionEvent::LiveOutputTokenCount {
-                stream_id,
-                output_tokens,
-            },
-        }));
 }
 
 pub(crate) fn run_agent_loop(
@@ -1734,14 +1398,6 @@ pub(crate) fn run_agent_loop(
         turn_iter += 1;
     }
 }
-
-/// Fixed per-image token estimate for prompt-token accounting. Providers bill
-/// image input as tokens derived from (resized) dimensions, with no portable
-/// way to compute the exact count client-side; ~1000 tokens/image is a good
-/// middle estimate (`DeepSeek` caps at 384,
-/// Anthropic/OpenAI high-detail run higher). This feeds the context-window
-/// display and compaction weighting, not billing (which uses provider usage).
-pub const IMAGE_TOKEN_ESTIMATE: u32 = 1000;
 
 #[cfg(test)]
 // Every test in this module reads the process-wide `PROVIDER_CATALOG`

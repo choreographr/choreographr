@@ -33,12 +33,16 @@ use crate::reasoning::{
     warn_on_uncaptured_reasoning,
 };
 use crate::tools::context::ToolContext;
-use crate::tools::{Tool, ToolError, ToolExecError, ToolRegistry};
+use crate::tools::{Tool, ToolError, ToolExecError, ToolOutput, ToolRegistry};
 use choreo_ai_protocols::StreamEvent;
 use choreo_ai_protocols::chat_reasoning_echo;
-use choreo_ai_protocols::openai::{AssistantToolCall, AssistantToolFunction, chat_wire_messages};
+use choreo_ai_protocols::openai::{
+    AssistantToolCall, AssistantToolFunction, ChatRequestMessage, ChatToolDefinition,
+    chat_wire_messages,
+};
 use choreo_keystore::ServiceCredential;
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, ToolCallCaller};
+use std::path::Path;
 use std::sync::mpsc;
 
 /// Protected set for the mirror tests: just "core" (no platform tools
