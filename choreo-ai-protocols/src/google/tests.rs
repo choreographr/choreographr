@@ -289,7 +289,7 @@ fn response_to_turn_result_with_tool_call() {
             assert_eq!(tu.content.as_deref(), Some("Let me look that up."));
             assert_eq!(tu.tool_calls.len(), 1);
             assert_eq!(tu.tool_calls[0].name, "search");
-            assert_eq!(tu.tool_calls[0].id, "fc_search");
+            assert_eq!(tu.tool_calls[0].id, "fc_search_0");
             assert!(tu.tool_calls[0].arguments_json.contains("weather"));
         }
         other => panic!("expected ToolUse, got {other:?}"),
@@ -431,7 +431,7 @@ fn response_to_turn_result_function_call_captures_signature() {
         ChatTurnResult::ToolUse(tu) => {
             assert_eq!(tu.tool_calls.len(), 1);
             assert_eq!(tu.tool_calls[0].name, "get_weather");
-            assert_eq!(tu.tool_calls[0].id, "fc_get_weather");
+            assert_eq!(tu.tool_calls[0].id, "fc_get_weather_0");
             assert_eq!(
                 tu.reasoning_artifact,
                 Some(ReasoningArtifact::GoogleSignatures(
@@ -441,6 +441,111 @@ fn response_to_turn_result_function_call_captures_signature() {
         }
         other => panic!("expected ToolUse, got {other:?}"),
     }
+}
+
+#[test]
+fn response_to_turn_result_parallel_calls_to_one_tool_get_distinct_ids() {
+    // Gemini sends no call id, so the adapter mints one — and two `functionCall`
+    // parts naming the same tool in one reply must not share it: the daemon
+    // keys its tool-result bookkeeping by id, so a shared id collapses both
+    // results onto one transcript record and loses one of them.
+    let resp = GenerateContentResponse {
+        candidates: vec![Candidate {
+            content: Some(ContentBlock {
+                parts: vec![
+                    ResponsePart::FunctionCall {
+                        function_call: FunctionCallResponse {
+                            name: "get_temp".to_string(),
+                            args: json!({"city": "Berlin"}),
+                        },
+                        thought_signature: None,
+                    },
+                    ResponsePart::FunctionCall {
+                        function_call: FunctionCallResponse {
+                            name: "get_temp".to_string(),
+                            args: json!({"city": "Lisbon"}),
+                        },
+                        thought_signature: None,
+                    },
+                ],
+                role: Some("model".to_string()),
+            }),
+            finish_reason: Some("STOP".to_string()),
+            index: 0,
+        }],
+        usage_metadata: None,
+    };
+    let result = response_to_turn_result(resp).unwrap();
+    let ChatTurnResult::ToolUse(tu) = result else {
+        panic!("expected ToolUse, got something else");
+    };
+    assert_eq!(tu.tool_calls.len(), 2);
+    assert_eq!(tu.tool_calls[0].name, "get_temp");
+    assert_eq!(tu.tool_calls[0].id, "fc_get_temp_0");
+    assert!(tu.tool_calls[0].arguments_json.contains("Berlin"));
+    assert_eq!(tu.tool_calls[1].name, "get_temp");
+    assert_eq!(tu.tool_calls[1].id, "fc_get_temp_1");
+    assert!(tu.tool_calls[1].arguments_json.contains("Lisbon"));
+}
+
+#[test]
+fn response_to_turn_result_numbers_calls_not_parts() {
+    // The position in the minted id counts the reply's tool calls, not its
+    // parts: a leading text part must not shift the first call's number to 1,
+    // or a replayed turn with a differently-split text part would renumber
+    // every recorded result.
+    let resp = GenerateContentResponse {
+        candidates: vec![Candidate {
+            content: Some(ContentBlock {
+                parts: vec![
+                    ResponsePart::Text {
+                        text: "Checking both.".to_string(),
+                        thought: None,
+                        thought_signature: None,
+                    },
+                    ResponsePart::FunctionCall {
+                        function_call: FunctionCallResponse {
+                            name: "get_weather".to_string(),
+                            args: json!({"city": "Berlin"}),
+                        },
+                        thought_signature: None,
+                    },
+                    ResponsePart::FunctionCall {
+                        function_call: FunctionCallResponse {
+                            name: "get_time".to_string(),
+                            args: json!({"city": "Lisbon"}),
+                        },
+                        thought_signature: None,
+                    },
+                ],
+                role: Some("model".to_string()),
+            }),
+            finish_reason: Some("STOP".to_string()),
+            index: 0,
+        }],
+        usage_metadata: None,
+    };
+    let result = response_to_turn_result(resp).unwrap();
+    let ChatTurnResult::ToolUse(tu) = result else {
+        panic!("expected ToolUse, got something else");
+    };
+    assert_eq!(tu.tool_calls.len(), 2);
+    assert_eq!(tu.tool_calls[0].id, "fc_get_weather_0");
+    assert_eq!(tu.tool_calls[1].id, "fc_get_time_1");
+}
+
+#[test]
+fn function_call_id_is_provider_safe() {
+    // Gemini function names may contain `.` and `:`, which are outside the
+    // `[A-Za-z0-9_-]` alphabet some providers accept for a wire id.
+    assert_eq!(
+        super::function_call_id("pkg.lookup:v2", 3),
+        "fc_pkg_lookup_v2_3"
+    );
+    assert_eq!(
+        super::function_call_id("get_weather", 0),
+        "fc_get_weather_0"
+    );
 }
 
 #[test]
@@ -683,6 +788,56 @@ fn streaming_captures_thought_signatures() {
         artifact,
         ReasoningArtifact::GoogleSignatures(br#"["sig-abc"]"#.to_vec())
     );
+}
+
+#[test]
+fn streaming_parallel_calls_to_one_tool_get_distinct_ids() {
+    use super::requests::handle_stream_part;
+
+    // Two streamed `functionCall` parts naming the same tool. Gemini sends no
+    // call id, so the id minted here is what the daemon keys both results by —
+    // they must differ, or the second result overwrites the first.
+    let input = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_temp\",\"args\":{\"city\":\"Berlin\"}}}]}}]}\n",
+        "\n",
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"functionCall\":{\"name\":\"get_temp\",\"args\":{\"city\":\"Lisbon\"}}}]}}]}\n",
+        "\n",
+        "data: [DONE]\n",
+    );
+    let mut reader = super::requests::GeminiSseReader::from_reader(input.as_bytes());
+
+    let mut has_any_output = false;
+    let mut full_text = String::new();
+    let mut full_reasoning = String::new();
+    let mut pending_tool_calls: Vec<super::ChatToolCall> = Vec::new();
+    let mut signatures: Vec<String> = Vec::new();
+
+    while let Some(data) = reader.next_event().unwrap() {
+        let payload: super::GenerateContentResponse = serde_json::from_str(&data).unwrap();
+        let Some(candidate) = payload.candidates.into_iter().next() else {
+            continue;
+        };
+        let Some(content) = candidate.content else {
+            continue;
+        };
+        for part in content.parts {
+            handle_stream_part(
+                part.classify(),
+                &mut has_any_output,
+                &mut full_text,
+                &mut full_reasoning,
+                &mut pending_tool_calls,
+                &mut signatures,
+            )
+            .unwrap();
+        }
+    }
+
+    assert_eq!(pending_tool_calls.len(), 2);
+    assert_eq!(pending_tool_calls[0].id, "fc_get_temp_0");
+    assert!(pending_tool_calls[0].arguments_json.contains("Berlin"));
+    assert_eq!(pending_tool_calls[1].id, "fc_get_temp_1");
+    assert!(pending_tool_calls[1].arguments_json.contains("Lisbon"));
 }
 
 // ── model_url tests ──────────────────────────────────────────────────

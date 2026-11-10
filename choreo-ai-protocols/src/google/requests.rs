@@ -402,7 +402,10 @@ pub(super) fn handle_stream_part(
                     "too many tool calls (max {MAX_TOOL_CALLS})"
                 ))));
             }
-            let id = format!("fc_{name}");
+            // Number the call by its index among this stream's tool calls, so
+            // two calls to the same function stay distinct and a replayed turn
+            // mints the same ids.
+            let id = super::function_call_id(&name, pending_tool_calls.len());
             let args_json = args.to_string();
             trace!(
                 tool_name = %name,

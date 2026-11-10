@@ -3822,7 +3822,13 @@ pane that never reported is never released.
     `functionResponse` against its `functionCall` by **name**, not id. A call turn's whole response
     set is emitted together in **one** user content — the content after a `functionCall` turn must
     carry exactly one `functionResponse` per call, so results are never split across contents — and
-    a result that answers no declared call is **dropped** rather than sent nameless.
+    a result that answers no declared call is **dropped** rather than sent nameless. Because the wire
+    carries no call id to match on, the adapter mints one per `functionCall` part, and the id
+    carries the call's position **among that reply's tool calls** (`fc_<name>_<position>`, name
+    folded to `[A-Za-z0-9_-]`): parallel function calling lets one reply name the same function
+    twice, and a name-only id would collapse both results onto one transcript record in the
+    daemon's id-keyed bookkeeping. The position is deterministic for a given reply, so a replayed
+    turn mints the ids it recorded under.
 
 
 

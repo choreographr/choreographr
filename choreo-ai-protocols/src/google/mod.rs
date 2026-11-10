@@ -927,6 +927,45 @@ fn thinking_config_payload(slug: &str) -> Option<ThinkingConfigPayload> {
     }
 }
 
+/// Mint the call id for one `functionCall` part.
+///
+/// Gemini sends no call id at all: a `functionResponse` is matched back to its
+/// `functionCall` by **name**, so the wire never carries a token the adapter
+/// could reuse. An id is still required, because the daemon keys its whole
+/// tool-result bookkeeping by it — `seed_tool_results`/`update_tool_result`
+/// fill a placeholder by `call_id`, `executed_tool_calls` is a set of ids, and
+/// the concurrent dispatch batch tracks delivered ids in a set — so two results
+/// sharing an id collapse onto one transcript record and one of them is lost.
+///
+/// The name alone is not unique: Gemini's parallel function calling allows
+/// several `functionCall` parts in one candidate, and they may well name the
+/// same function (two `get_temp` calls for two cities). The id therefore
+/// carries `position`, the call's 0-based index **among that reply's tool
+/// calls** — not its part index, so a text part before the first call does not
+/// shift the numbering.
+///
+/// The position is deterministic for a given reply, so a replayed turn mints
+/// the same ids and a recorded result still matches its call. The shape is kept
+/// to `[A-Za-z0-9_-]` because a session may later switch to a provider that
+/// sends ids on the wire and rejects one outside that alphabet.
+pub(super) fn function_call_id(name: &str, position: usize) -> String {
+    // Gemini function names permit `.` and `:`, which are outside the id
+    // alphabet some providers accept, so any such character folds to `_`.
+    // Position already distinguishes same-reply calls, so folding cannot merge
+    // two ids that position kept apart.
+    let sanitized: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("fc_{sanitized}_{position}")
+}
+
 /// Convert a non-streaming Gemini response into a `ChatTurnResult`.
 fn response_to_turn_result(
     response: GenerateContentResponse,
@@ -965,7 +1004,10 @@ fn response_to_turn_result(
                 signature,
             } => {
                 capture_signature(&mut signatures, signature);
-                let id = format!("fc_{name}");
+                // Number the call by its index among this reply's tool calls,
+                // so parallel calls to one tool stay distinct while a text
+                // part earlier in the parts list cannot shift the numbering.
+                let id = function_call_id(&name, tool_calls.len());
                 let args_json = args.to_string();
                 tool_calls.push(ChatToolCall {
                     id,
