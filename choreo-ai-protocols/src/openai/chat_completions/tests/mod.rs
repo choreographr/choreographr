@@ -536,6 +536,124 @@ fn accumulate_no_function_delta_produces_empty_call() {
     assert_eq!(result[0].arguments_json, "");
 }
 
+#[test]
+fn accumulate_blank_name_in_continuation_keeps_first_real_name() {
+    // The regression: a provider sends the name once and repeats the key as an
+    // empty string on every argument-only continuation delta.
+    let deltas = vec![
+        StreamToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            kind: Some("function".into()),
+            function: Some(StreamToolCallFunctionDelta {
+                name: Some("get_weather".into()),
+                arguments: Some(r#"{"city":"Lon"#.into()),
+            }),
+        },
+        StreamToolCallDelta {
+            index: 0,
+            id: Some(String::new()),
+            kind: None,
+            function: Some(StreamToolCallFunctionDelta {
+                name: Some(String::new()),
+                arguments: Some(r#"don"}"#.into()),
+            }),
+        },
+    ];
+    let result = accumulate_tool_calls_from_deltas(deltas);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "get_weather");
+    assert_eq!(result[0].id, "call_1");
+    assert_eq!(result[0].arguments_json, r#"{"city":"London"}"#);
+}
+
+#[test]
+fn accumulate_whitespace_only_name_is_ignored() {
+    let deltas = vec![
+        StreamToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            kind: None,
+            function: Some(StreamToolCallFunctionDelta {
+                name: Some("get_weather".into()),
+                arguments: Some("{".into()),
+            }),
+        },
+        StreamToolCallDelta {
+            index: 0,
+            id: None,
+            kind: None,
+            function: Some(StreamToolCallFunctionDelta {
+                name: Some("   ".into()),
+                arguments: Some("}".into()),
+            }),
+        },
+    ];
+    let result = accumulate_tool_calls_from_deltas(deltas);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "get_weather");
+    assert_eq!(result[0].arguments_json, "{}");
+}
+
+#[test]
+fn accumulate_blank_id_in_continuation_keeps_first_real_id() {
+    let deltas = vec![
+        StreamToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            kind: None,
+            function: Some(StreamToolCallFunctionDelta {
+                name: Some("get_weather".into()),
+                arguments: Some("{".into()),
+            }),
+        },
+        StreamToolCallDelta {
+            index: 0,
+            id: Some(String::new()),
+            kind: None,
+            function: Some(StreamToolCallFunctionDelta {
+                name: None,
+                arguments: Some("}".into()),
+            }),
+        },
+    ];
+    let result = accumulate_tool_calls_from_deltas(deltas);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].id, "call_1");
+    assert_eq!(result[0].name, "get_weather");
+}
+
+#[test]
+fn accumulate_never_named_call_stays_empty() {
+    // Pins that the merge reports what the provider sent instead of inventing a
+    // name from the id, the index, or anything else.
+    let deltas = vec![
+        StreamToolCallDelta {
+            index: 0,
+            id: Some("call_1".into()),
+            kind: None,
+            function: Some(StreamToolCallFunctionDelta {
+                name: Some(String::new()),
+                arguments: Some(r#"{"city":"London"}"#.into()),
+            }),
+        },
+        StreamToolCallDelta {
+            index: 0,
+            id: None,
+            kind: None,
+            function: Some(StreamToolCallFunctionDelta {
+                name: Some("  ".into()),
+                arguments: Some(String::new()),
+            }),
+        },
+    ];
+    let result = accumulate_tool_calls_from_deltas(deltas);
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].name, "");
+    assert_eq!(result[0].id, "call_1");
+    assert_eq!(result[0].arguments_json, r#"{"city":"London"}"#);
+}
+
 // -- streaming delta deserialisation tests --------------------------
 
 #[test]

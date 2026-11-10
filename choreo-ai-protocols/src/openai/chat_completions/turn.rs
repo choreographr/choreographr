@@ -100,8 +100,9 @@ pub(crate) fn chat_completions_response_to_turn(
     assemble_turn(TurnParts {
         content: choice.message.content,
         tool_calls,
-        // A chat reply always names its calls (`name` is a delta field of the
-        // call itself), so nothing can be unnamed here.
+        // A reply maps each call's `function.name` straight through, without
+        // checking whether the provider actually sent one: an empty name here is
+        // reported as-is, and normalising it is the caller's decision.
         unnamed_calls: 0,
         reasoning: reasoning.display,
         reasoning_artifact: reasoning.artifact,

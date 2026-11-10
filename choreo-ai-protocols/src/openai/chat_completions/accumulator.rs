@@ -2,12 +2,12 @@
 //!
 //! A streamed chat turn arrives as a sequence of SSE chunks whose content,
 //! reasoning, and tool-call fields are all split across deltas: tool calls are
-//! keyed by the API-assigned index and their `name` / `arguments` arrive in
-//! fragments, usage lands on a final chunk with an empty `choices` array, and
-//! the finish reason arrives once at the end. [`ChatCompletionsStreamAccumulator`]
-//! folds those chunks into one turn result, and
-//! [`accumulate_tool_calls_from_deltas`] merges the per-index tool-call deltas
-//! into ordered calls.
+//! keyed by the API-assigned index, each call's `name` / `id` is sent once while
+//! its `arguments` arrive in fragments, usage lands on a final chunk with an
+//! empty `choices` array, and the finish reason arrives once at the end.
+//! [`ChatCompletionsStreamAccumulator`] folds those chunks into one turn result,
+//! and [`accumulate_tool_calls_from_deltas`] merges the per-index tool-call
+//! deltas into ordered calls.
 //!
 //! The concern is split out of the request path so the parse→accumulate→turn
 //! pipeline is unit-testable without an HTTP connection.
@@ -39,20 +39,45 @@ struct AccumulatingToolCall {
 }
 
 /// Accumulate tool call deltas from streaming SSE chunks into ordered tool
-/// calls.  Deltas with the same index are combined — `id` and `name` are taken
-/// from the last chunk that carries them, and `arguments` is concatenated.
+/// calls. Deltas with the same index are combined: the **first non-blank** `id`
+/// and `name` win, and `arguments` is concatenated.
+///
+/// The wire contract is why the first value wins and not the last: a provider
+/// sends a call's `function.name` and `id` once, on the first delta for that
+/// index, and its argument-only continuation deltas repeat both keys as
+/// present-but-empty strings (`"function":{"name":"","arguments":"…"}`).
+/// Present-but-empty is not absent, so last-write-wins would overwrite the real
+/// name and id with that placeholder.
+///
+/// This is a report, not a repair: a provider that never sends a name produces
+/// an empty [`ChatToolCall::name`]. Deciding what an unnamed call means is the
+/// caller's policy, so no name is invented here.
 pub(crate) fn accumulate_tool_calls_from_deltas(
     deltas: impl IntoIterator<Item = StreamToolCallDelta>,
 ) -> Vec<ChatToolCall> {
     let mut map: HashMap<u32, AccumulatingToolCall> = HashMap::new();
     for tc_delta in deltas {
         let entry = map.entry(tc_delta.index).or_default();
-        if let Some(id) = tc_delta.id {
-            entry.id = Some(id);
+        // Empty-or-whitespace-only is a continuation placeholder, i.e. absent —
+        // the two key lookups below share that one definition of "blank".
+        if let Some(id) = tc_delta.id.filter(|id| !id.trim().is_empty()) {
+            // `entry.id` never holds a blank, so "unset" is the whole rule.
+            entry.id.get_or_insert(id);
         }
         if let Some(func) = tc_delta.function {
-            if let Some(name) = func.name {
-                entry.name = Some(name);
+            if let Some(name) = func.name.filter(|name| !name.trim().is_empty()) {
+                // A kept name is stored verbatim — no trimming, so the caller
+                // sees exactly what the provider sent.
+                match entry.name.as_deref() {
+                    None => entry.name = Some(name),
+                    Some(first) if first != name => debug!(
+                        index = tc_delta.index,
+                        kept = first,
+                        later = %name,
+                        "tool call index reports a diverging name; keeping the first"
+                    ),
+                    Some(_) => {}
+                }
             }
             if let Some(args) = func.arguments {
                 entry.arguments.push_str(&args);
@@ -204,8 +229,10 @@ impl ChatCompletionsStreamAccumulator {
         assemble_turn(TurnParts {
             content: (!self.full_content.is_empty()).then_some(self.full_content),
             tool_calls,
-            // A chat call carries its own `name` delta, so no call reaches this
-            // point unnameable.
+            // The merge keeps the first real `name` a delta carries, but it does
+            // not invent one: a provider that never sends a non-blank name on any
+            // delta leaves the call's name empty, and repairing that is not this
+            // adapter's job.
             unnamed_calls: 0,
             reasoning: reasoning.display,
             reasoning_artifact: reasoning.artifact,
