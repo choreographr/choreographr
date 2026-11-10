@@ -268,6 +268,93 @@ pub(crate) fn error_type_label(e: ProviderError) -> &'static str {
     provider_error_to_inference(e).metric_label()
 }
 
+/// One recognizable family of provider tool-call rejections: the phrasings a
+/// provider uses for it, plus the short clause naming what actually went wrong.
+///
+/// The phrases are lowercase substrings of the provider's own detail text —
+/// providers word the same defect differently, so a family collects every
+/// wording we have seen rather than guessing at one canonical message.
+struct ToolCallRejectionClass {
+    /// Lowercase substrings that identify this family.
+    phrases: &'static [&'static str],
+    /// Operator-facing clause appended to the provider's own detail.
+    clause: &'static str,
+}
+
+/// The known tool-call rejection families, in match-priority order.
+///
+/// A rejected request names no field and no cause (a bare
+/// `invalid function name`, or even a bodyless `400`), so the funnel below is
+/// the one place that can say what the provider is objecting to. This is a
+/// deliberately small, closed list of *known* classes: an unrecognized body
+/// gets no clause at all, and nothing here feeds retries or adaptivity.
+const TOOL_CALL_REJECTION_CLASSES: &[ToolCallRejectionClass] = &[
+    ToolCallRejectionClass {
+        phrases: &["invalid function name", "invalid tool name"],
+        clause: "the request replayed a tool call whose name the provider rejects",
+    },
+    ToolCallRejectionClass {
+        phrases: &["tool_call_id", "tool call id", "insufficient tool messages"],
+        clause: "a tool result and its call are not paired in the request",
+    },
+    ToolCallRejectionClass {
+        phrases: &["number of function response parts"],
+        clause: "a turn's tool responses do not match its tool calls",
+    },
+    ToolCallRejectionClass {
+        phrases: &[
+            "must match the name of the functioncall",
+            "functionresponse name",
+        ],
+        clause: "a tool result is named after a different call than the one it answers",
+    },
+    ToolCallRejectionClass {
+        phrases: &["roles must alternate", "must be followed by tool messages"],
+        clause: "the message order around a tool call is invalid",
+    },
+];
+
+/// Classify a provider error detail as a known tool-call rejection.
+///
+/// Matching is a case-insensitive substring test (no regex) against a closed
+/// phrase table, first match wins, so a detail that fits no family yields
+/// `None` and the caller leaves it untouched.
+fn tool_call_rejection_hint(detail: &str) -> Option<&'static str> {
+    // Provider messages are short; one lowercase copy is cheaper than lowering
+    // every phrase on every request.
+    let lowered = detail.to_lowercase();
+    TOOL_CALL_REJECTION_CLASSES.iter().find_map(|class| {
+        class
+            .phrases
+            .iter()
+            .any(|phrase| lowered.contains(phrase))
+            .then_some(class.clause)
+    })
+}
+
+/// Append the tool-call-rejection clause to a provider detail, when one applies.
+///
+/// The provider's own wording stays as the **prefix** so operators can keep
+/// grepping for it; the clause only ever trail-appends, at most once, and a
+/// detail that already carries it (a re-entry through the funnel) comes back
+/// unchanged. A detail matching no known family is returned byte-identical.
+/// The log line carries the class tag and the status only — never the provider
+/// body, which is request-adjacent content.
+fn annotate_tool_call_rejection(status: u16, detail: String) -> String {
+    let Some(clause) = tool_call_rejection_hint(&detail) else {
+        return detail;
+    };
+    tracing::warn!(
+        class = "tool_call_rejected",
+        status,
+        "provider rejected a request over a tool call"
+    );
+    if detail.contains(clause) {
+        return detail;
+    }
+    format!("{detail} — {clause}")
+}
+
 /// Convert a `ProviderError` into the shared `InferenceError` type used
 /// across the `ProviderClient` trait boundary.
 pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
@@ -287,9 +374,10 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         ProviderError::ServerError { status, detail } => {
             InferenceError::ServerError { status, detail }
         }
-        ProviderError::ClientError { status, detail } => {
-            InferenceError::ClientError { status, detail }
-        }
+        ProviderError::ClientError { status, detail } => InferenceError::ClientError {
+            status,
+            detail: annotate_tool_call_rejection(status, detail),
+        },
         ProviderError::EmptyResponse => InferenceError::EmptyResponse,
         ProviderError::NotReady { detail } => InferenceError::NotReady { detail },
         ProviderError::ContentFiltered { detail } => InferenceError::ContentFiltered { detail },
@@ -659,6 +747,109 @@ mod tests {
             collect_events(result),
             vec![StreamEvent::Answer("text".into())]
         );
+    }
+
+    // ── Provider error mapping: tool-call rejections ───────────────────────
+
+    /// Every phrase in the table, embedded in a sentence, must classify to its
+    /// own family's clause — both as-is and upper-cased.
+    #[test]
+    fn every_rejection_phrase_classifies_to_its_clause() {
+        for class in TOOL_CALL_REJECTION_CLASSES {
+            for phrase in class.phrases {
+                let detail =
+                    format!("Upstream request failed: [invalid_request_error] {phrase} here");
+                assert_eq!(
+                    tool_call_rejection_hint(&detail),
+                    Some(class.clause),
+                    "phrase {phrase:?} must classify"
+                );
+                let shouted = detail.to_uppercase();
+                assert_eq!(
+                    tool_call_rejection_hint(&shouted),
+                    Some(class.clause),
+                    "phrase {phrase:?} must classify case-insensitively"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejection_clauses_are_distinct_and_ordered() {
+        // Overlapping wordings resolve to the first family, never to two
+        // clauses: a detail carrying two families' phrases gets exactly one.
+        let detail = "invalid function name; tool call id mismatch";
+        assert_eq!(
+            tool_call_rejection_hint(detail),
+            Some("the request replayed a tool call whose name the provider rejects")
+        );
+    }
+
+    #[test]
+    fn client_error_rejection_keeps_provider_wording_as_prefix() {
+        let original = "Upstream request failed: [invalid_request_error] invalid function name";
+        let mapped = provider_error_to_inference(ProviderError::ClientError {
+            status: 400,
+            detail: original.to_string(),
+        });
+        let InferenceError::ClientError { status, detail } = mapped else {
+            panic!("expected ClientError, got {mapped:?}");
+        };
+        assert_eq!(status, 400);
+        assert!(
+            detail.starts_with(original),
+            "provider wording must stay the prefix, got {detail:?}"
+        );
+        assert!(
+            detail.ends_with("the request replayed a tool call whose name the provider rejects"),
+            "the clause must trail-append, got {detail:?}"
+        );
+    }
+
+    #[test]
+    fn unrelated_client_error_is_byte_identical() {
+        let original = "model does not exist";
+        assert_eq!(tool_call_rejection_hint(original), None);
+        let mapped = provider_error_to_inference(ProviderError::ClientError {
+            status: 400,
+            detail: original.to_string(),
+        });
+        let InferenceError::ClientError { detail, .. } = mapped else {
+            panic!("expected ClientError, got {mapped:?}");
+        };
+        assert_eq!(detail, original);
+    }
+
+    #[test]
+    fn rejection_wordings_outside_the_client_error_arm_are_untouched() {
+        // Only a rejected request (the `ClientError` arm) is annotated; the same
+        // words in a 5xx detail must come through verbatim.
+        let original = "upstream died: invalid tool name";
+        let mapped = provider_error_to_inference(ProviderError::ServerError {
+            status: 500,
+            detail: original.to_string(),
+        });
+        let InferenceError::ServerError { status, detail } = mapped else {
+            panic!("expected ServerError, got {mapped:?}");
+        };
+        assert_eq!(status, 500);
+        assert_eq!(detail, original);
+    }
+
+    #[test]
+    fn already_annotated_detail_is_not_annotated_twice() {
+        let clause = "a tool result and its call are not paired in the request";
+        let once = provider_error_to_inference(ProviderError::ClientError {
+            status: 400,
+            detail: "invalid tool call id".to_string(),
+        });
+        let InferenceError::ClientError { detail: once, .. } = once else {
+            panic!("expected ClientError");
+        };
+        assert!(once.contains(clause));
+        // Re-entering the funnel with the annotated detail must be a no-op.
+        let twice = annotate_tool_call_rejection(400, once.clone());
+        assert_eq!(twice, once);
     }
 
     // ── Callback error propagation ────────────────────────────────────────

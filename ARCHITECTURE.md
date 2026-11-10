@@ -1135,6 +1135,26 @@ class is diagnosable without dumping the prose. The extra attempts are counted
 separately from the per-send budget, and a `no_retry` request
 (`max_attempts == 1`, e.g. the cache-warming ping) skips the policy entirely.
 
+#### Tool-call rejection annotations
+
+A provider that refuses a request over a tool call answers a bare `400` naming
+no field — `invalid function name`, `insufficient tool messages`, or an empty
+body — so the error reaches the operator with no cause and no action attached.
+Those are recognizable families, and the one funnel that turns a provider error
+into an `InferenceError` (`shared::provider_error_to_inference`, which every
+protocol client routes through) is the place that names them: a
+`ClientError` whose detail matches a phrase in
+`shared::TOOL_CALL_REJECTION_CLASSES` gets a short trailing clause saying what
+went wrong (the replayed call name is unusable, a call and its result are
+unpaired, a turn's responses do not match its calls, a result is named after a
+different call, or the order around a tool call is invalid), and the same
+classification is tagged on a log line (`class = "tool_call_rejected"`) without
+the provider body. The provider's own wording stays as the message **prefix**
+so existing greps keep working, at most one clause is appended (never twice),
+an unrecognized body passes through byte-identical, and every other error arm
+(`401`/`429`/`5xx`/empty/context-window) is untouched — so the change is
+invisible on the wire, and nothing here feeds retries or any downgrade.
+
 ### Runtime catalog refresh (S4)
 
 The compiled-in catalog is only the *fallback*: at runtime the daemon layers a
