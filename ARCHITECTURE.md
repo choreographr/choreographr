@@ -2778,7 +2778,13 @@ into a deterministic id **before the turn is recorded** — `seed_tool_results`
 keys placeholders by id and the streaming update matches by id, so two blank ids
 in one reply would otherwise collide on `""` — but names and arguments are
 recorded exactly as the provider sent them; repairing those is the wire layer's
-job.
+job. This recovery unit — the cause table, the note/instruction builders, and the
+per-cause consecutive-recovery bookkeeping — lives in its own module
+(`choreo-daemon`'s `requests/recovery.rs`), which the agent loop drives through a
+single `RecoveryBudget` state machine: `note_progress` resets every cause on a
+turn that produced runnable output, and `note_recovery` advances one cause and
+reports `Continue`/`Stop` at its budget, so the reset-on-progress rule is
+structural rather than a bare assignment a new branch could forget.
 
 **The request copy is repaired, never the transcript.** A stored turn keeps
 whatever bytes a reply carried, but a stored call is not always one a later
@@ -2804,10 +2810,17 @@ the prompt-cache prefix. A chained Responses route keeps its non-blank ids
 byte-identical (it sends only the post-assistant tail, and the
 `function_call_output`'s `call_id` must match the id the service minted) while
 still minting a blank one. The repair reports what it changed per request — the
-counts are its return value, never a side effect — which the builder logs once at
-`debug` (numbers only, never a name, an id or message content) and exports as the
-labelled counter `choreo_wire_repairs_total{kind}`, so a provider or model that
-emits unusable tool calls is visible without reading a log.
+counts are its return value, never a side effect. Only the send path
+(`build_chat_request_messages_recording`, called once per provider round-trip)
+logs the counts at `debug` (numbers only, never a name, an id or message
+content) and exports them as the labelled counter
+`choreo_wire_repairs_total{provider,model,kind}`; the diagnostic build
+(`session_inspect`) and the tests use the non-recording builder so they cannot
+inflate it. Because the whole transcript is re-repaired on every send, the
+counter measures repair *work per send*, not distinct bad replies — a single
+unusable recorded call accumulates one increment per later turn — but the
+provider/model labels still make a model that emits unusable tool calls visible
+without reading a log.
 
 **Logging:** every binary uses `tracing` with `tracing-subscriber`. Default level is `info`.
 CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and

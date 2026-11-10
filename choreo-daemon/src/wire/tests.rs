@@ -243,8 +243,9 @@ fn two_calls_one_result_gets_one_stub() {
 
 #[test]
 fn result_answering_nothing_in_its_turn_is_dropped() {
-    // Two calls, but the result ids name neither — positional pairing still
-    // consumes each call once, so the extra (third) result is an orphan.
+    // The first result matches call_1 by id; the second (same non-blank id, now
+    // no longer matching an unanswered call) is a genuine orphan. A non-blank id
+    // gets no positional fallback, so the extra result is dropped.
     let mut messages = vec![
         assistant(vec![call("call_1", "sh", "{}")]),
         tool_result("call_1"),
@@ -252,6 +253,37 @@ fn result_answering_nothing_in_its_turn_is_dropped() {
     ];
     repair_replayed_calls(&mut messages, true);
     assert_eq!(messages.len(), 2);
+}
+
+#[test]
+fn a_nonblank_orphan_does_not_steal_a_legitimate_result() {
+    // A result whose non-blank id matches no call must NOT be paired
+    // positionally: doing so would let it take call_1's only answer, so the real
+    // result for call_1 would be dropped as the orphan. The genuine orphan is
+    // dropped and the real answer is kept and still pairs by its own id.
+    let ghost = ChatRequestMessage {
+        role: "tool",
+        content: Some("ghost content".to_string()),
+        images: Vec::new(),
+        tool_call_id: Some("call_ghost".to_string()),
+        tool_calls: None,
+        reasoning_artifact: None,
+    };
+    let mut messages = vec![
+        assistant(vec![call("call_1", "sh", "{}")]),
+        ghost,
+        tool_result("call_1"),
+    ];
+    repair_replayed_calls(&mut messages, true);
+    assert_eq!(messages.len(), 2, "assistant + the real result only");
+    assert_eq!(messages[0].role, "assistant");
+    assert_eq!(messages[1].role, "tool");
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(
+        messages[1].content.as_deref(),
+        Some("ok"),
+        "the genuine answer must survive, not the orphan's content"
+    );
 }
 
 #[test]

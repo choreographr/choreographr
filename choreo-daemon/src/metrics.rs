@@ -113,8 +113,8 @@ mod backend {
             )?,
             wire_repairs_total: prometheus::register_int_counter_vec!(
                 "choreo_wire_repairs_total",
-                "Total number of repairs applied to the per-request message copy before it is sent, by repair kind",
-                &["kind"]
+                "Repairs applied to a per-request message copy before it is sent, by provider, model and repair kind (counts repair work per send, not distinct bad replies)",
+                &["provider", "model", "kind"]
             )?,
             prompt_cache_hit_ratio: prometheus::register_histogram_vec!(
                 "choreo_prompt_cache_hit_ratio",
@@ -300,15 +300,18 @@ mod backend {
         }
     }
 
-    /// Count `count` repairs of one `kind` applied to a request copy. The kinds
-    /// are a fixed set (`names`, `ids`, `arguments`, `stubbed`, `dropped`), so
-    /// the series stays cardinality-bounded. Only counts are recorded — never a
-    /// tool name, a call id or any message content. Silently a no-op before
-    /// [`init`].
-    pub fn record_wire_repair(kind: &str, count: u64) {
+    /// Count `count` repairs of one `kind` applied to a request copy built for
+    /// `provider`/`model`. The kinds are a fixed set (`names`, `ids`,
+    /// `arguments`, `stubbed`, `dropped`) and the provider/model pair is drawn
+    /// from the catalog, so the series stays cardinality-bounded. Only counts are
+    /// recorded — never a tool name, a call id or any message content. The
+    /// counter measures repair *work per send* (the same recorded call is
+    /// re-repaired on every later send), so it is not a count of distinct bad
+    /// replies. Silently a no-op before [`init`].
+    pub fn record_wire_repair(provider: &str, model: &str, kind: &str, count: u64) {
         if let Some(m) = METRICS.get() {
             m.wire_repairs_total
-                .with_label_values(&[kind])
+                .with_label_values(&[provider, model, kind])
                 .inc_by(count);
         }
     }
@@ -559,7 +562,7 @@ mod backend {
             record_eviction();
             record_cache_warm_attempt();
             record_cache_warm_skip("no_ttl");
-            record_wire_repair("names", 2);
+            record_wire_repair("zai", "test_model", "names", 2);
             record_prompt_cache_hit_ratio("zai", "test_model", 100, 40);
             // Gather and encode all metrics via the text encoder, verify
             // that the output contains expected HELP/TYPE lines.
@@ -654,7 +657,7 @@ mod backend {
     pub fn record_cache_warm_skip(_reason: &str) {}
 
     /// No-op: metrics support is compiled out, so there is nothing to record.
-    pub fn record_wire_repair(_kind: &str, _count: u64) {}
+    pub fn record_wire_repair(_provider: &str, _model: &str, _kind: &str, _count: u64) {}
 
     /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_prompt_cache_hit_ratio(

@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use crate::metrics;
 use crate::sessions::SessionState;
-use crate::wire::repair_replayed_calls;
+use crate::wire::{RepairCounts, repair_replayed_calls};
 
 /// Build the provider request messages for a session, applying the reasoning
 /// passback policy (phase 4b): the opaque artifact captured on a previous
@@ -49,6 +49,52 @@ pub fn build_chat_request_messages(
     model: &str,
     in_flight_from_turn: Option<u32>,
 ) -> Vec<ChatRequestMessage> {
+    assemble_request_messages(
+        session,
+        system_prompt,
+        provider_slug,
+        model,
+        in_flight_from_turn,
+    )
+    .0
+}
+
+/// Build the request copy AND record the wire-repair counts against
+/// `provider_slug`/`model` — the agent loop's per-send path. Recording lives
+/// only here, so a diagnostic build (`session_inspect`) never inflates the
+/// counter. See [`assemble_request_messages`].
+#[must_use]
+pub fn build_chat_request_messages_recording(
+    session: &SessionState,
+    system_prompt: Option<&str>,
+    provider_slug: &str,
+    model: &str,
+    in_flight_from_turn: Option<u32>,
+) -> Vec<ChatRequestMessage> {
+    let (messages, counts) = assemble_request_messages(
+        session,
+        system_prompt,
+        provider_slug,
+        model,
+        in_flight_from_turn,
+    );
+    record_wire_repairs(provider_slug, model, &counts);
+    messages
+}
+
+/// The shared assembly behind the two public builders: build the message list,
+/// apply the reasoning passback policy, and run the mechanical wire repair.
+/// Returns the repaired copy together with what the repair changed, so the
+/// caller decides whether to record it. Pure and deterministic — no metrics and
+/// no side effects — so the request bytes (and the prompt-cache prefix) never
+/// depend on which wrapper was called.
+fn assemble_request_messages(
+    session: &SessionState,
+    system_prompt: Option<&str>,
+    provider_slug: &str,
+    model: &str,
+    in_flight_from_turn: Option<u32>,
+) -> (Vec<ChatRequestMessage>, RepairCounts) {
     let mut messages = Vec::new();
 
     // Prepend system prompt and context if provided.
@@ -184,35 +230,39 @@ pub fn build_chat_request_messages(
     // one.
     let rewrite_ids = !chains_via_response_id(provider_slug, model);
     let counts = repair_replayed_calls(&mut messages, rewrite_ids);
-    // The repair reports what it changed (counts only — never a tool name, a
-    // call id or any message content) and the agent loop exports it as a
-    // labelled counter, so a provider or model that produces unusable tool
-    // calls is visible without reading a log. This builder also runs for the
-    // `session_inspect` tool and the cache-warming path; recording there is
-    // correct, because the repair really did run on that copy too — do not
-    // special-case those callers.
-    if !counts.is_empty() {
-        debug!(
-            names = counts.names,
-            ids = counts.ids,
-            arguments = counts.arguments,
-            stubbed = counts.stubbed,
-            dropped = counts.dropped,
-            "wire repair applied to the request copy",
-        );
-        for (kind, count) in [
-            ("names", counts.names),
-            ("ids", counts.ids),
-            ("arguments", counts.arguments),
-            ("stubbed", counts.stubbed),
-            ("dropped", counts.dropped),
-        ] {
-            if count > 0 {
-                metrics::record_wire_repair(kind, count);
-            }
+    (messages, counts)
+}
+
+/// Log and export what one wire-repair pass changed. Counts only — never a tool
+/// name, a call id or any message content. Recording is confined to the
+/// send-path wrapper so a diagnostic build cannot inflate the counter; the same
+/// recorded call is re-repaired on every later send, so the counter measures
+/// repair work, not distinct bad replies.
+fn record_wire_repairs(provider: &str, model: &str, counts: &RepairCounts) {
+    if counts.is_empty() {
+        return;
+    }
+    debug!(
+        provider,
+        model,
+        names = counts.names,
+        ids = counts.ids,
+        arguments = counts.arguments,
+        stubbed = counts.stubbed,
+        dropped = counts.dropped,
+        "wire repair applied to the request copy",
+    );
+    for (kind, count) in [
+        ("names", counts.names),
+        ("ids", counts.ids),
+        ("arguments", counts.arguments),
+        ("stubbed", counts.stubbed),
+        ("dropped", counts.dropped),
+    ] {
+        if count > 0 {
+            metrics::record_wire_repair(provider, model, kind, count);
         }
     }
-    messages
 }
 
 /// Build synthetic `user` messages that carry a turn's tool-result images

@@ -36,7 +36,6 @@ use std::collections::{HashMap, HashSet};
 
 use choreo_ai_protocols::openai::ChatRequestMessage;
 use serde_json::Value;
-use tracing::warn;
 
 use crate::tools::{MAX_FUNCTION_NAME_LEN, is_provider_safe_function_name, sha256_hex};
 
@@ -88,7 +87,7 @@ pub(crate) fn normalize_call<'a>(
 ) -> NormalizedCall<'a> {
     // Arguments first: a minted id derives from the *repaired* arguments, so a
     // blank-id call whose arguments were dropped to `{}` mints from `{}`.
-    let arguments_json = normalize_arguments(arguments_json, id);
+    let arguments_json = normalize_arguments(arguments_json);
     let name = normalize_name(name);
     let id = normalize_id(id, &name, &arguments_json, position, rewrite_id);
     NormalizedCall {
@@ -104,17 +103,15 @@ pub(crate) fn normalize_call<'a>(
 /// respace the bytes and churn the prompt-cache prefix. Anything else (a parse
 /// failure, `null`, an array, a scalar, a bare string) becomes `"{}"`, the
 /// universal "no arguments" object every provider accepts.
-fn normalize_arguments<'a>(arguments_json: &'a str, call_id: &str) -> Cow<'a, str> {
+fn normalize_arguments(arguments_json: &str) -> Cow<'_, str> {
     if let Ok(Value::Object(_)) = serde_json::from_str::<Value>(arguments_json) {
         Cow::Borrowed(arguments_json)
     } else {
-        // One warning per call, naming the id and the LENGTH only — the
-        // payload is never logged (AGENTS.md forbids logging tool arguments).
-        warn!(
-            call_id,
-            arguments_len = arguments_json.len(),
-            "replayed tool-call arguments are not a JSON object; replacing with `{{}}`",
-        );
+        // Not an object: a parse failure, `null`, an array, or a scalar. The
+        // replacement is counted by the caller (see [`RepairCounts`]) and
+        // exported as a metric; there is deliberately no per-call log line,
+        // because the same recorded call is re-repaired on every later send and
+        // would spam. AGENTS.md forbids logging tool arguments regardless.
         Cow::Borrowed("{}")
     }
 }
@@ -231,7 +228,10 @@ fn disambiguate(used: &mut HashSet<String>, id: String) -> String {
         // trimming the base, never the suffix (the suffix is what makes it
         // unique).
         let base_len = MAX_FUNCTION_NAME_LEN.saturating_sub(suffix.len());
-        let base: String = id.chars().take(base_len).collect();
+        // Truncate by BYTES on a char boundary so the suffixed id stays within
+        // the byte ceiling even for a non-ASCII id (a chained Responses route
+        // keeps such ids byte-identical, so they can reach here).
+        let base = truncate_to_bytes(&id, base_len);
         let candidate = format!("{base}{suffix}");
         if used.insert(candidate.clone()) {
             return candidate;
@@ -267,12 +267,23 @@ pub(crate) struct RepairCounts {
 impl RepairCounts {
     /// Whether the pass changed nothing at all (every counter is zero).
     pub(crate) fn is_empty(&self) -> bool {
-        self.names == 0
-            && self.ids == 0
-            && self.arguments == 0
-            && self.stubbed == 0
-            && self.dropped == 0
+        *self == Self::default()
     }
+}
+
+/// Truncate `s` to at most `max` bytes without splitting a UTF-8 char, so a
+/// byte-bounded id stays a valid `&str`.
+fn truncate_to_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    // `end` is a char boundary by construction, so `get` yields `Some`; the
+    // fallback keeps this panic-free even if that invariant were ever violated.
+    s.get(..end).unwrap_or(s)
 }
 
 /// One repaired call, tracked so the tool messages can be re-paired to it.
@@ -379,13 +390,19 @@ pub(crate) fn repair_replayed_calls(
                 continue;
             };
             let nonblank = !original.trim().is_empty();
-            // Prefer the call whose original id matches; fall back to the first
-            // unanswered call so a span of blank or ambiguous ids pairs
-            // positionally. Each call is consumed at most once.
+            // Prefer the call whose original id matches. Only a BLANK id falls
+            // back to the first unanswered call: a non-blank id that matches no
+            // call is a genuine orphan, and pairing it positionally would let it
+            // steal the slot from a later result that answers a real call (the
+            // real answer would then be dropped as the orphan).
             let chosen = message_slots
                 .iter()
                 .position(|slot| !slot.answered && nonblank && slot.original_id == original)
-                .or_else(|| message_slots.iter().position(|slot| !slot.answered));
+                .or_else(|| {
+                    (!nonblank)
+                        .then(|| message_slots.iter().position(|slot| !slot.answered))
+                        .flatten()
+                });
             if let Some(slot) = chosen.and_then(|pos| message_slots.get_mut(pos)) {
                 slot.answered = true;
                 msg.tool_call_id = Some(slot.final_id.clone());
@@ -407,33 +424,36 @@ pub(crate) fn repair_replayed_calls(
     }
 
     // ── Pass C ──
+    // Walk the (now owned) list once, MOVING each kept message into `out`
+    // instead of cloning it — the transcript can carry large image/content
+    // payloads, and this runs on every send.
     let original = std::mem::take(messages);
     let mut out: Vec<ChatRequestMessage> = Vec::with_capacity(original.len());
-    let mut i = 0usize;
-    while let Some(msg) = original.get(i) {
+    let mut iter = original.into_iter().enumerate().peekable();
+    while let Some((i, msg)) = iter.next() {
         if msg.role == "assistant" {
             let has_calls = msg
                 .tool_calls
                 .as_ref()
                 .is_some_and(|calls| !calls.is_empty());
             let assistant_index = i;
-            out.push(msg.clone());
-            i += 1;
+            out.push(msg);
             if !has_calls {
                 continue;
             }
             // Consume the assistant's contiguous `tool` block, keeping only the
             // messages that answer one of its calls. An orphan in the block is
             // dropped here.
-            while original.get(i).is_some_and(|next| next.role == "tool") {
-                let keep = paired.get(i).copied().unwrap_or(false);
-                if keep && let Some(answer) = original.get(i) {
-                    out.push(answer.clone());
+            while matches!(iter.peek(), Some((_, next)) if next.role == "tool") {
+                let Some((j, answer)) = iter.next() else {
+                    break;
+                };
+                if paired.get(j).copied().unwrap_or(false) {
+                    out.push(answer);
                 } else {
                     // An unpaired result inside the block answers no call.
                     counts.dropped = counts.dropped.saturating_add(1);
                 }
-                i += 1;
             }
             // Every declared call needs exactly one answer: stub the ones that
             // have none, in call order, so the turn is complete on the wire.
@@ -450,10 +470,8 @@ pub(crate) fn repair_replayed_calls(
             // call in the message it follows — an ornament a strict provider
             // rejects. Drop it.
             counts.dropped = counts.dropped.saturating_add(1);
-            i += 1;
         } else {
-            out.push(msg.clone());
-            i += 1;
+            out.push(msg);
         }
     }
     // An assistant message that lost everything (no text, no calls, no
