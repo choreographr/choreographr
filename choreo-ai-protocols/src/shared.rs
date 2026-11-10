@@ -269,7 +269,8 @@ pub(crate) fn error_type_label(e: ProviderError) -> &'static str {
 }
 
 /// One recognizable family of provider tool-call rejections: the phrasings a
-/// provider uses for it, plus the short clause naming what actually went wrong.
+/// provider uses for it, the short clause naming what actually went wrong, and
+/// the stable tag that identifies it on a log line.
 ///
 /// The phrases are lowercase substrings of the provider's own detail text —
 /// providers word the same defect differently, so a family collects every
@@ -279,6 +280,11 @@ struct ToolCallRejectionClass {
     phrases: &'static [&'static str],
     /// Operator-facing clause appended to the provider's own detail.
     clause: &'static str,
+    /// Stable short label naming this family on the log line, so an operator
+    /// can tell an unusable replayed name from an unpaired call/result without
+    /// the provider's body — request-adjacent content — reaching the log.
+    /// `&'static str` keeps it a bounded label set rather than free text.
+    tag: &'static str,
 }
 
 /// The known tool-call rejection families, in match-priority order.
@@ -292,14 +298,17 @@ const TOOL_CALL_REJECTION_CLASSES: &[ToolCallRejectionClass] = &[
     ToolCallRejectionClass {
         phrases: &["invalid function name", "invalid tool name"],
         clause: "the request replayed a tool call whose name the provider rejects",
+        tag: "name",
     },
     ToolCallRejectionClass {
         phrases: &["tool_call_id", "tool call id", "insufficient tool messages"],
         clause: "a tool result and its call are not paired in the request",
+        tag: "pairing",
     },
     ToolCallRejectionClass {
         phrases: &["number of function response parts"],
         clause: "a turn's tool responses do not match its tool calls",
+        tag: "count",
     },
     ToolCallRejectionClass {
         phrases: &[
@@ -307,10 +316,12 @@ const TOOL_CALL_REJECTION_CLASSES: &[ToolCallRejectionClass] = &[
             "functionresponse name",
         ],
         clause: "a tool result is named after a different call than the one it answers",
+        tag: "name_mismatch",
     },
     ToolCallRejectionClass {
         phrases: &["roles must alternate", "must be followed by tool messages"],
         clause: "the message order around a tool call is invalid",
+        tag: "order",
     },
 ];
 
@@ -318,18 +329,34 @@ const TOOL_CALL_REJECTION_CLASSES: &[ToolCallRejectionClass] = &[
 ///
 /// Matching is a case-insensitive substring test (no regex) against a closed
 /// phrase table, first match wins, so a detail that fits no family yields
-/// `None` and the caller leaves it untouched.
-fn tool_call_rejection_hint(detail: &str) -> Option<&'static str> {
+/// `None` and the caller leaves it untouched. The returned class carries both
+/// the clause to append and the tag to log, so a caller never has to classify
+/// the same detail twice.
+fn tool_call_rejection_class(detail: &str) -> Option<&'static ToolCallRejectionClass> {
     // Provider messages are short; one lowercase copy is cheaper than lowering
-    // every phrase on every request.
+    // every phrase on every request. Only a detail that reaches this classifier
+    // pays it, and the search below stays allocation-free.
     let lowered = detail.to_lowercase();
-    TOOL_CALL_REJECTION_CLASSES.iter().find_map(|class| {
-        class
-            .phrases
-            .iter()
-            .any(|phrase| lowered.contains(phrase))
-            .then_some(class.clause)
-    })
+    TOOL_CALL_REJECTION_CLASSES
+        .iter()
+        .find(|class| class.phrases.iter().any(|phrase| lowered.contains(phrase)))
+}
+
+/// The result of classifying a provider detail: the detail to hand on, plus the
+/// family that matched when *this* call added the clause.
+///
+/// Carrying both in one value is what lets
+/// [`provider_error_to_inference`] stay a pure mapping: the annotation returns
+/// the very class it matched, so the `ClientError` arm can log that family's
+/// tag without re-classifying the detail and without the mapping itself
+/// touching `tracing`.
+struct ToolCallRejectionAnnotation {
+    /// The detail to publish: the input, with the family's clause appended
+    /// when this call determined one applies.
+    detail: String,
+    /// The family whose clause this call appended; `None` when nothing was
+    /// added, which is the signal that there is no fresh rejection to log.
+    family: Option<&'static ToolCallRejectionClass>,
 }
 
 /// Append the tool-call-rejection clause to a provider detail, when one applies.
@@ -338,21 +365,31 @@ fn tool_call_rejection_hint(detail: &str) -> Option<&'static str> {
 /// grepping for it; the clause only ever trail-appends, at most once, and a
 /// detail that already carries it (a re-entry through the funnel) comes back
 /// unchanged. A detail matching no known family is returned byte-identical.
-/// The log line carries the class tag and the status only — never the provider
-/// body, which is request-adjacent content.
-fn annotate_tool_call_rejection(status: u16, detail: String) -> String {
-    let Some(clause) = tool_call_rejection_hint(&detail) else {
-        return detail;
+///
+/// This is a pure function on purpose: no logging, no state. The one production
+/// caller ([`provider_error_to_inference`]) owns the log line, so the mapping
+/// stays reusable and a rejected request is reported exactly once.
+fn annotate_tool_call_rejection(detail: String) -> ToolCallRejectionAnnotation {
+    let Some(class) = tool_call_rejection_class(&detail) else {
+        return ToolCallRejectionAnnotation {
+            detail,
+            family: None,
+        };
     };
-    tracing::warn!(
-        class = "tool_call_rejected",
-        status,
-        "provider rejected a request over a tool call"
-    );
-    if detail.contains(clause) {
-        return detail;
+    // A detail that already carries the clause was annotated on an earlier pass
+    // through the funnel and its rejection was logged then. Returning it
+    // unchanged and without a family keeps annotation idempotent *and* keeps one
+    // rejected request to one log line.
+    if detail.contains(class.clause) {
+        return ToolCallRejectionAnnotation {
+            detail,
+            family: None,
+        };
     }
-    format!("{detail} — {clause}")
+    ToolCallRejectionAnnotation {
+        detail: format!("{detail} — {}", class.clause),
+        family: Some(class),
+    }
 }
 
 /// Convert a `ProviderError` into the shared `InferenceError` type used
@@ -374,10 +411,23 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         ProviderError::ServerError { status, detail } => {
             InferenceError::ServerError { status, detail }
         }
-        ProviderError::ClientError { status, detail } => InferenceError::ClientError {
-            status,
-            detail: annotate_tool_call_rejection(status, detail),
-        },
+        ProviderError::ClientError { status, detail } => {
+            let annotation = annotate_tool_call_rejection(detail);
+            if let Some(class) = annotation.family {
+                // The single production log site for a tool-call rejection. A
+                // line carries the status and the family tag only — never the
+                // provider body, which is request-adjacent content.
+                tracing::warn!(
+                    status,
+                    family = class.tag,
+                    "provider rejected a request over a tool call"
+                );
+            }
+            InferenceError::ClientError {
+                status,
+                detail: annotation.detail,
+            }
+        }
         ProviderError::EmptyResponse => InferenceError::EmptyResponse,
         ProviderError::NotReady { detail } => InferenceError::NotReady { detail },
         ProviderError::ContentFiltered { detail } => InferenceError::ContentFiltered { detail },
@@ -752,7 +802,7 @@ mod tests {
     // ── Provider error mapping: tool-call rejections ───────────────────────
 
     /// Every phrase in the table, embedded in a sentence, must classify to its
-    /// own family's clause — both as-is and upper-cased.
+    /// own family — both as-is and upper-cased.
     #[test]
     fn every_rejection_phrase_classifies_to_its_clause() {
         for class in TOOL_CALL_REJECTION_CLASSES {
@@ -760,15 +810,31 @@ mod tests {
                 let detail =
                     format!("Upstream request failed: [invalid_request_error] {phrase} here");
                 assert_eq!(
-                    tool_call_rejection_hint(&detail),
-                    Some(class.clause),
-                    "phrase {phrase:?} must classify"
+                    tool_call_rejection_class(&detail).map(|c| (c.tag, c.clause)),
+                    Some((class.tag, class.clause)),
+                    "phrase {phrase:?} must classify to its own family"
                 );
                 let shouted = detail.to_uppercase();
                 assert_eq!(
-                    tool_call_rejection_hint(&shouted),
-                    Some(class.clause),
+                    tool_call_rejection_class(&shouted).map(|c| c.tag),
+                    Some(class.tag),
                     "phrase {phrase:?} must classify case-insensitively"
+                );
+            }
+        }
+    }
+
+    /// Every family's tag is a distinct, non-empty label: two families sharing a
+    /// tag would make the log line unable to say which defect was objected to.
+    #[test]
+    fn rejection_family_tags_are_distinct_and_non_empty() {
+        for (i, class) in TOOL_CALL_REJECTION_CLASSES.iter().enumerate() {
+            assert!(!class.tag.is_empty(), "family {} tag is empty", class.tag);
+            for other in &TOOL_CALL_REJECTION_CLASSES[i + 1..] {
+                assert_ne!(
+                    class.tag, other.tag,
+                    "families sharing tag {:?} are indistinguishable in the log",
+                    class.tag
                 );
             }
         }
@@ -780,8 +846,8 @@ mod tests {
         // clauses: a detail carrying two families' phrases gets exactly one.
         let detail = "invalid function name; tool call id mismatch";
         assert_eq!(
-            tool_call_rejection_hint(detail),
-            Some("the request replayed a tool call whose name the provider rejects")
+            tool_call_rejection_class(detail).map(|c| c.tag),
+            Some("name")
         );
     }
 
@@ -809,7 +875,7 @@ mod tests {
     #[test]
     fn unrelated_client_error_is_byte_identical() {
         let original = "model does not exist";
-        assert_eq!(tool_call_rejection_hint(original), None);
+        assert!(tool_call_rejection_class(original).is_none());
         let mapped = provider_error_to_inference(ProviderError::ClientError {
             status: 400,
             detail: original.to_string(),
@@ -847,9 +913,42 @@ mod tests {
             panic!("expected ClientError");
         };
         assert!(once.contains(clause));
-        // Re-entering the funnel with the annotated detail must be a no-op.
-        let twice = annotate_tool_call_rejection(400, once.clone());
-        assert_eq!(twice, once);
+        // Re-entering the funnel with the annotated detail must be a no-op —
+        // and must report no family, so a request that already logged its
+        // rejection is not logged again.
+        let twice = annotate_tool_call_rejection(once.clone());
+        assert_eq!(twice.detail, once);
+        assert!(twice.family.is_none());
+    }
+
+    /// The mapping is a pure conversion: it can run with no subscriber
+    /// installed (a stray `tracing` call inside it would be a side effect the
+    /// mapping is not allowed to have), it produces identical bytes on every
+    /// call, and feeding its own output back through it is a fixed point.
+    #[test]
+    fn provider_error_mapping_is_a_pure_fixed_point() {
+        let original = "Upstream request failed: [invalid_request_error] invalid function name";
+        let map = || {
+            let mapped = provider_error_to_inference(ProviderError::ClientError {
+                status: 400,
+                detail: original.to_string(),
+            });
+            let InferenceError::ClientError { detail, .. } = mapped else {
+                panic!("expected ClientError, got {mapped:?}");
+            };
+            detail
+        };
+        let once = map();
+        assert_eq!(map(), once, "the mapping must not accumulate state");
+
+        let remapped = provider_error_to_inference(ProviderError::ClientError {
+            status: 400,
+            detail: once.clone(),
+        });
+        let InferenceError::ClientError { detail: twice, .. } = remapped else {
+            panic!("expected ClientError");
+        };
+        assert_eq!(twice, once, "an already-annotated detail must pass through");
     }
 
     // ── Callback error propagation ────────────────────────────────────────

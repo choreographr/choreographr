@@ -1148,8 +1148,13 @@ protocol client routes through) is the place that names them: a
 went wrong (the replayed call name is unusable, a call and its result are
 unpaired, a turn's responses do not match its calls, a result is named after a
 different call, or the order around a tool call is invalid), and the same
-classification is tagged on a log line (`class = "tool_call_rejected"`) without
-the provider body. The provider's own wording stays as the message **prefix**
+class matched is tagged on one log line (`family = name | pairing | count |
+name_mismatch | order`) without the provider body. That log call lives in the
+funnel's `ClientError` arm rather than in the annotation helper, so the helper
+stays a pure conversion that appends a clause and reports the family it found
+(the arm logs only when a clause was actually added, which keeps a rejected
+request to one line even if its detail re-enters the funnel). The provider's
+own wording stays as the message **prefix**
 so existing greps keep working, at most one clause is appended (never twice),
 an unrecognized body passes through byte-identical, and every other error arm
 (`401`/`429`/`5xx`/empty/context-window) is untouched — so the change is
