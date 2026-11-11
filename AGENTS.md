@@ -28,6 +28,29 @@ remaining as the permanent mechanism.
 
 Always try to refactor when implementing new features. Look for opportunities to improve code structure, reduce duplication, and simplify existing code alongside any additions.
 
+### State machines
+
+Reach for an explicit state machine when a process has **distinct phases driven
+by external events over time**: a connection/protocol lifecycle, a retry or
+backoff budget, a multi-step fetch, a parser, a transport handshake. The pattern
+earns its keep when it buys two properties a reviewer can check:
+
+- **A pure core separated from the I/O.** The decision logic is a total function
+  of the current state and the incoming event; the driver that reads sockets,
+  sleeps, or spawns threads lives beside it and makes no decisions. Every
+  decision takes an injected `now` and does no I/O, so it is deterministic and
+  testable without timers or a network round trip — the shape
+  `choreo-daemon/src/cache_warm/policy.rs` and `catalog/refresh.rs` already
+  follow.
+- **Illegal states are unrepresentable.** Transitions are an `enum` matched
+  exhaustively; a phase the machine cannot reach is a variant that does not
+  exist, not an invariant re-checked at runtime.
+
+Do **not** wrap a straight-line sequence of `if`s in a two-variant enum and a
+`step()` method to look principled. If the "states" never branch on an incoming
+event, there is no state machine — only ceremony around the branches it
+replaced.
+
 ## Documentation
 
 When making changes, ensure [ARCHITECTURE.md](./ARCHITECTURE.md) and [README.md](./README.md) are kept up to date. If a change affects the architectural decisions, module structure, data flow, or any other documented aspect, update the files accordingly.
