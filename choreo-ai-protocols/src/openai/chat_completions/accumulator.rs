@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::io;
 
-use choreo_proto::TokenUsage;
+use choreo_proto::{FinishOutcome, TokenUsage};
 use tracing::debug;
 
 use super::reasoning_stream::ReasoningStreamState;
@@ -215,7 +215,12 @@ impl ChatCompletionsStreamAccumulator {
             return Err(err);
         }
         // `length` on a FINAL-TEXT turn is a truncation notice, not an error.
-        let truncated = matches!(self.finish_reason, Some(FinishReason::Length));
+        // The shared `FinishOutcome` also keeps *which* terminal reason arrived,
+        // which is what a discarded tool call reports.
+        let finish = self
+            .finish_reason
+            .as_ref()
+            .map_or(FinishOutcome::Absent, FinishReason::outcome);
 
         // The state machine's finish applies the persisted precedence: a captured
         // structured details payload outranks the scalar text as the artifact (it
@@ -243,7 +248,7 @@ impl ChatCompletionsStreamAccumulator {
             reasoning_artifact: reasoning.artifact,
             produced_reasoning: reasoning.produced,
             usage: self.last_usage,
-            truncated,
+            finish,
             response_id: None,
         })
     }

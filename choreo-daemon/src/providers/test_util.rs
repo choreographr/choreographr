@@ -6,6 +6,7 @@
 //! client that exercises real tool dispatch.
 
 use super::*;
+use choreo_proto::FinishOutcome;
 
 #[derive(Debug)]
 pub(crate) struct StubProviderClient;
@@ -138,13 +139,16 @@ impl TruncatingProviderClient {
                 discarded: vec![choreo_proto::DiscardedToolCall {
                     name: "write_file".to_string(),
                     arguments_json: "{\"path\":\"x\",".to_string(),
+                    error_line: Some(1),
+                    error_column: Some(12),
                 }],
+                finish: FinishOutcome::Length,
             });
         }
         Ok(ChatTurnResult::FinalText(
             choreo_ai_protocols::FinalTextResult {
                 content: "done".to_string(),
-                truncated: false,
+                finish: FinishOutcome::Stop,
                 discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
@@ -224,10 +228,13 @@ impl ProseTruncatingProviderClient {
         if n < self.truncations {
             return ChatTurnResult::FinalText(choreo_ai_protocols::FinalTextResult {
                 content: PROSE_WITH_TRUNCATED_CALL.to_string(),
-                truncated: false,
+                // The provider reported its output cap when it cut the call off.
+                finish: FinishOutcome::Length,
                 discarded_tool_calls: vec![choreo_proto::DiscardedToolCall {
                     name: "run_series".to_string(),
                     arguments_json: "{\"steps\":[{\"tool\":".to_string(),
+                    error_line: Some(1),
+                    error_column: Some(12),
                 }],
                 reasoning: None,
                 usage: None,
@@ -237,7 +244,7 @@ impl ProseTruncatingProviderClient {
         }
         ChatTurnResult::FinalText(choreo_ai_protocols::FinalTextResult {
             content: "done".to_string(),
-            truncated: false,
+            finish: FinishOutcome::Stop,
             discarded_tool_calls: Vec::new(),
             reasoning: None,
             usage: None,
@@ -334,7 +341,7 @@ impl ProviderClient for RecordingProviderClient {
         Ok(ChatTurnResult::FinalText(
             choreo_ai_protocols::FinalTextResult {
                 content: String::new(),
-                truncated: false,
+                finish: FinishOutcome::Stop,
                 discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
@@ -435,6 +442,8 @@ impl ProviderClient for ToolLoopProviderClient {
                         arguments_json: "{}".to_string(),
                         caller: None,
                     }],
+                    discarded_tool_calls: Vec::new(),
+                    finish: FinishOutcome::Stop,
                     reasoning: None,
                     usage: None,
                     response_id: None,
@@ -445,7 +454,7 @@ impl ProviderClient for ToolLoopProviderClient {
         Ok(ChatTurnResult::FinalText(
             choreo_ai_protocols::FinalTextResult {
                 content: "done".to_string(),
-                truncated: false,
+                finish: FinishOutcome::Stop,
                 discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
@@ -553,7 +562,7 @@ impl ProviderClient for ScriptedStreamProviderClient {
         Ok(ChatTurnResult::FinalText(
             choreo_ai_protocols::FinalTextResult {
                 content: "done".to_string(),
-                truncated: false,
+                finish: FinishOutcome::Stop,
                 discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
@@ -605,6 +614,11 @@ pub(crate) enum ScriptedTurn {
     },
     /// A normal final answer ("done").
     FinalAnswer,
+    /// A mixed reply: the listed calls **run**, and one extra call the provider
+    /// cut off mid-arguments is reported as discarded. This is the shape that
+    /// used to lose a call silently, because the runnable calls made the turn
+    /// look like ordinary work.
+    ToolCallsWithTruncated(Vec<&'static str>),
 }
 
 /// Provider client that plays a scripted sequence of replies, one per streaming
@@ -664,18 +678,19 @@ impl ProviderClient for ScriptedTurnProviderClient {
             cb();
         }
         let reply = self.next_reply();
-        let (names, reasoning, artifact_bytes) = match reply {
-            ScriptedTurn::ToolCalls(names) => (names, None, None),
+        let (names, reasoning, artifact_bytes, discarded) = match reply {
+            ScriptedTurn::ToolCalls(names) => (names, None, None, false),
             ScriptedTurn::ToolCallsWithReasoning {
                 names,
                 reasoning,
                 artifact_bytes,
-            } => (names, Some(reasoning), Some(artifact_bytes)),
+            } => (names, Some(reasoning), Some(artifact_bytes), false),
+            ScriptedTurn::ToolCallsWithTruncated(names) => (names, None, None, true),
             ScriptedTurn::FinalAnswer => {
                 return Ok(ChatTurnResult::FinalText(
                     choreo_ai_protocols::FinalTextResult {
                         content: "done".to_string(),
-                        truncated: false,
+                        finish: FinishOutcome::Stop,
                         discarded_tool_calls: Vec::new(),
                         reasoning: None,
                         usage: None,
@@ -704,6 +719,17 @@ impl ProviderClient for ScriptedTurnProviderClient {
             choreo_ai_protocols::ChatAssistantToolUse {
                 content: Some("working".to_string()),
                 tool_calls,
+                discarded_tool_calls: if discarded {
+                    vec![choreo_proto::DiscardedToolCall {
+                        name: "run_series".to_string(),
+                        arguments_json: "{\"steps\":[{\"tool\":".to_string(),
+                        error_line: Some(1),
+                        error_column: Some(21),
+                    }]
+                } else {
+                    Vec::new()
+                },
+                finish: FinishOutcome::Length,
                 reasoning: reasoning.map(str::to_string),
                 usage: None,
                 response_id: None,

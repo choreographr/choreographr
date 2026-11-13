@@ -17,7 +17,8 @@ use super::*;
 // constants, so they are not re-exported from `requests` — the budget tests
 // assert against the exact numbers the recovery constants carry.
 use super::recovery::{
-    MAX_TRUNCATION_RECOVERIES, MAX_UNNAMED_TOOL_CALL_RECOVERIES, TRUNCATION_RECOVERY_INSTRUCTION,
+    MAX_TRUNCATION_RECOVERIES, MAX_UNNAMED_TOOL_CALL_RECOVERIES,
+    TRUNCATION_MIXED_RECOVERY_INSTRUCTION, TRUNCATION_RECOVERY_INSTRUCTION,
 };
 use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;

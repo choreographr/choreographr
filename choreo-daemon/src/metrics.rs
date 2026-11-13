@@ -39,6 +39,7 @@ mod backend {
         cache_warm_attempts_total: IntCounter,
         cache_warm_skips_total: IntCounterVec,
         wire_repairs_total: IntCounterVec,
+        tool_calls_discarded_total: IntCounterVec,
         prompt_cache_hit_ratio: HistogramVec,
         request_duration_seconds: HistogramVec,
         tool_execution_duration_seconds: HistogramVec,
@@ -115,6 +116,11 @@ mod backend {
                 "choreo_wire_repairs_total",
                 "Repairs applied to a per-request message copy before it is sent, by provider, model and repair kind (counts repair work per send, not distinct bad replies)",
                 &["provider", "model", "kind"]
+            )?,
+            tool_calls_discarded_total: prometheus::register_int_counter_vec!(
+                "choreo_tool_calls_discarded_total",
+                "Tool calls dropped for a turn because their arguments were unusable, by provider, model, recovery cause and the provider's finish outcome (absent means the stream ended without saying why)",
+                &["provider", "model", "cause", "finish"]
             )?,
             prompt_cache_hit_ratio: prometheus::register_histogram_vec!(
                 "choreo_prompt_cache_hit_ratio",
@@ -313,6 +319,33 @@ mod backend {
             m.wire_repairs_total
                 .with_label_values(&[provider, model, kind])
                 .inc_by(count);
+        }
+    }
+
+    /// Count one turn's discarded tool calls, keyed by `provider`/`model`, the
+    /// recovery `cause` that handled them and the provider's `finish` outcome.
+    ///
+    /// This is the only telemetry that distinguishes a provider output cap
+    /// (`finish = length`, nothing the client can repair) from arguments the
+    /// model itself mangled or a stream that ended without saying why — the
+    /// question an operator actually asks when a run stops mid-task. Every
+    /// dimension is a small fixed set, so the series stays cardinality-bounded:
+    /// **no tool name** is recorded (a model or an MCP server authors it), only
+    /// counts. `args_bytes` is deliberately not a label for the same reason.
+    /// `count` is the number of discarded **calls**, not their payload size — the
+    /// per-call `args_len` belongs to the log line, where it is bounded and does
+    /// not create a time series. Silently a no-op before [`init`].
+    pub fn record_tool_call_discarded(
+        provider: &str,
+        model: &str,
+        cause: &str,
+        finish: choreo_proto::FinishOutcome,
+        count: usize,
+    ) {
+        if let Some(m) = METRICS.get() {
+            m.tool_calls_discarded_total
+                .with_label_values(&[provider, model, cause, finish.label()])
+                .inc_by(count as u64);
         }
     }
 
@@ -658,6 +691,16 @@ mod backend {
 
     /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_wire_repair(_provider: &str, _model: &str, _kind: &str, _count: u64) {}
+
+    /// No-op: metrics support is compiled out, so there is nothing to record.
+    pub fn record_tool_call_discarded(
+        _provider: &str,
+        _model: &str,
+        _cause: &str,
+        _finish: choreo_proto::FinishOutcome,
+        _count: usize,
+    ) {
+    }
 
     /// No-op: metrics support is compiled out, so there is nothing to record.
     pub fn record_prompt_cache_hit_ratio(

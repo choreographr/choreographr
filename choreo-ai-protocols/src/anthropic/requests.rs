@@ -321,6 +321,11 @@ where
     // Reconstructs the thinking / `redacted_thinking` blocks in wire order for
     // the opaque round-trip artifact (same shape as the non-streaming path).
     let mut thinking_blocks = ThinkingBlockAccumulator::new();
+    // The stream's terminal stop reason, reported on `message_delta`.
+    let mut stop_reason: Option<String> = None;
+    // The stream's terminal signal: a normal `message_stop` is a real stop, so
+    // the outcome starts at `Stop` and is downgraded only by an explicit reason.
+    let mut saw_message_stop = false;
 
     while let Some((event_type, data)) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         match event_type.as_str() {
@@ -443,12 +448,17 @@ where
                 }
             }
             "message_delta" => {
-                // Parse output_tokens from the message_delta event.
+                // Parse output_tokens and the terminal stop reason from the
+                // message_delta event.
                 let delta_msg: MessageDelta = serde_json::from_str(&data)
                     .map_err(|e| AnthropicError::Io(io::Error::other(e)))?;
                 output_tokens = delta_msg.usage.map(|u| u.output_tokens);
+                if let Some(reason) = delta_msg.delta.and_then(|d| d.stop_reason) {
+                    stop_reason = Some(reason);
+                }
             }
             "message_stop" => {
+                saw_message_stop = true;
                 break;
             }
             // content_block_stop, ping — skip
@@ -459,6 +469,15 @@ where
     // Build usage from the tokens collected during message_start and
     // message_delta events. `cached_tokens`/`cache_write_tokens` are the
     // prompt-cache read/write counts from message_start.
+    // The turn's outcome: an explicit stop reason when the provider sent one,
+    // otherwise a bare `message_stop` (a real stop) or nothing at all (a stream
+    // that ended without its terminal event, which is reported as absent and
+    // never guessed at).
+    let stream_finish = match stop_reason.as_deref() {
+        Some(reason) => super::finish_outcome(Some(reason)),
+        None if saw_message_stop => super::finish_outcome(Some("end_turn")),
+        None => super::finish_outcome(None),
+    };
     let usage: Option<TokenUsage> = match (input_tokens, output_tokens) {
         (Some(in_tok), Some(out_tok)) => {
             let usage = anthropic_token_usage(in_tok, out_tok, cached_tokens, cache_write_tokens);
@@ -496,7 +515,7 @@ where
     }
 
     // If we collected tool calls, return ToolUse.
-    let tool_calls: Vec<ChatToolCall> = pending_tool_calls
+    let mut tool_calls: Vec<ChatToolCall> = pending_tool_calls
         .into_iter()
         .map(|tc| ChatToolCall {
             id: tc.id,
@@ -506,6 +525,13 @@ where
         })
         .collect();
 
+    // A streamed `input_json_delta` IS a raw string, so a truncated call can
+    // reach this path half-written. It is validated here exactly as the OpenAI
+    // paths validate theirs — whole string or nothing — because an unparseable
+    // call would otherwise be dispatched, fail to deserialize, and send the
+    // model into an error loop over arguments it cannot fix.
+    let discarded = crate::openai::validate_tool_call_arguments(&mut tool_calls, stream_finish);
+
     if !tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content: if full_text.is_empty() {
@@ -514,6 +540,8 @@ where
                 Some(full_text)
             },
             tool_calls,
+            discarded_tool_calls: discarded,
+            finish: stream_finish,
             reasoning: if full_reasoning.is_empty() {
                 None
             } else {
@@ -525,14 +553,24 @@ where
         }));
     }
 
+    if !discarded.is_empty() && full_text.is_empty() {
+        // Every call was cut off and there is no prose to keep: report the loss
+        // the way the `OpenAI` paths do, so the daemon recovers the turn instead
+        // of showing an empty answer.
+        return Err(AnthropicError::TruncatedToolCall {
+            discarded,
+            finish: stream_finish,
+        });
+    }
+
     if full_text.is_empty() {
         return Err(AnthropicError::EmptyResponse);
     }
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: full_text,
-        truncated: false,
-        discarded_tool_calls: Vec::new(),
+        finish: stream_finish,
+        discarded_tool_calls: discarded,
         reasoning: if full_reasoning.is_empty() {
             None
         } else {
@@ -824,6 +862,18 @@ struct MessageStartMessage {
 struct MessageDelta {
     #[serde(default)]
     usage: Option<AnthropicStreamUsageDelta>,
+    /// The stream's terminal stop reason (`max_tokens`, `end_turn`, …).
+    #[serde(default)]
+    delta: Option<MessageDeltaBody>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageDeltaBody {
+    /// Why the reply ended. Read for the turn's [`FinishOutcome`], which is the
+    /// only thing that can tell a provider output cap from a normal stop when a
+    /// tool call's arguments arrived incomplete.
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

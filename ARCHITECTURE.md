@@ -2759,13 +2759,33 @@ produces a final answer, is cancelled, or hits an error. This is a daemon-wide
 cap; individual sessions no longer carry their own `max_turns`.
 
 **A turn that yields nothing runnable is recovered, not dispatched.** Two
-conditions make a turn unrunnable: a tool call the provider cut off at its
-output-token limit mid-arguments (unsafe to execute), and a reply whose tool
+conditions make a turn unrunnable: a tool call whose arguments were not one
+complete JSON value (a provider that cuts a reply off mid-arguments leaves a
+fragment), and a reply whose tool
 calls carry a **name no provider will accept** — an empty or whitespace-only
 name, but also a non-blank one a strict endpoint rejects (`multi_tool_use.parallel`,
 a long shell command a weak model emitted as a name), which would otherwise be
 dispatched under that name, answered "no such tool", and (with `max_turns = 0`,
-no loop limit at all) never bounded. **Truncation is a casualty even when the
+no loop limit at all) never bounded. **Arguments are validated whole or not at
+all: no structural repair, no schema-aware salvage.** Closing an open string
+fabricates a value — a half-written file body, a *shorter* shell command than
+the model wrote — and would execute it as if the model had meant it, so a
+malformed call is dropped for the turn and its bytes are kept only for
+diagnosis. That rule must survive progressive argument streaming: showing a
+partial payload while it arrives is fine, executing one never is, and a call
+that fails validation ends in an aborted state rather than a committed one.
+A JSON parser is deliberately **not** the safety boundary here — the client
+refuses anything that did not arrive complete, instead of trusting what a
+repair made parseable.
+
+The rejection also keeps the **position** the parser itself reported
+(`serde_json`'s line/column, surfaced on `DiscardedToolCall`): that is the only
+"where did it stop" a reader needs, and computing a deeper one would mean
+scanning the fragment for no decision it could change. Each rejection records
+the **finish outcome** — length / stop / filtered / other / absent — because
+did the provider hit its own output cap is exactly the question that separates
+a client-side unfixable truncation from arguments the model mangled, and a
+stream may end naming no reason at all. **Truncation is a casualty even when the
 turn also carries prose.** A reply whose calls were all cut off but that also
 said something is a `FinalText` — the answer is kept, not replaced by an error —
 and it **carries the discarded calls** so the daemon can tell the two apart: a
@@ -2788,7 +2808,13 @@ though the cause now covers any unacceptable name) and the request ends once one
 is spent; **both budgets reset whenever a turn produces runnable output**, so
 they bound a stuck model rather than a long productive request. A reply mixing
 valid calls with a bad one runs the valid calls and gets the same notice, taking
-no strike. The recovery deliberately answers with a user-role instruction and no
+no strike — and a reply that loses calls **both** ways (an unacceptable name and
+a truncated call) puts both instructions into that one user message rather than
+letting the second overwrite the first. The transcript note claims an
+output-token limit **only** when the provider reported one; any other finish
+outcome says the arguments were incomplete when the reply ended and names that
+outcome, instead of asserting a cause nobody observed. The recovery deliberately
+answers with a user-role instruction and no
 synthesized tool result (there is no call id to answer, and an unpaired tool
 result is invalid on several wire formats), drops the response-id chain
 (chaining the retry would replay an unanswered call, which providers reject),
@@ -3851,11 +3877,24 @@ pane that never reported is never released.
     reach that verdict through one shared assembler (`openai::turn::assemble_turn`), fed by
     adapter-specific parts, so the tool-call / truncated-call / empty-response decision tree
     exists once rather than once per path. That assembler also owns the one place truncated
-    calls are reported: a turn that keeps a runnable call drops the cut-off ones from its
+    calls are reported: a turn that keeps a runnable call reports the cut-off ones on its
     `ToolUse`, and a final answer whose calls were all truncated reports them in
     `FinalTextResult::discarded_tool_calls` — the field the daemon keys its recovery on (see
     **A turn that yields nothing runnable is recovered, not dispatched**). Dropping them
     silently would make an unfinished turn indistinguishable from a finished one.
+
+    **Every turn result reports how the provider said it ended.** `FinishOutcome`
+    (`Length` / `Stop` / `Filtered` / `Other` / `Absent`) is read from each adapter's own
+    wire vocabulary — chat's `finish_reason`, Responses' `incomplete` details,
+    `Anthropic`'s `stop_reason`, Gemini's `finishReason` — by one mapping function per
+    adapter that both its streaming and non-streaming paths call, so the two cannot
+    disagree. `Absent` is a first-class verdict, not a fallback: a stream that ends without
+    naming a reason is reported as exactly that, because both the transcript note and the
+    discard metric must distinguish "the provider hit its output cap" from "we do not
+    know". The `Anthropic` streaming path additionally validates its accumulated
+    `input_json_delta` arguments through the same whole-or-nothing rule as the OpenAI
+    adapters — it is the one non-OpenAI route whose arguments arrive as raw text, so a
+    truncated call there could otherwise reach dispatch unparsed.
 
     **A tool call is reported, not adjudicated.** Every adapter passes the provider's
     function name through verbatim, so a nameless or provider-invalid `tool_use` / `functionCall`

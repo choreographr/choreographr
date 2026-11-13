@@ -11,7 +11,7 @@ use super::super::turn::{
     responses_response_to_turn,
 };
 use super::super::wire::ResponsesResponse;
-use choreo_proto::{ReasoningArtifact, TokenUsage};
+use choreo_proto::{FinishOutcome, ReasoningArtifact, TokenUsage};
 use serde_json::json;
 
 #[test]
@@ -137,14 +137,18 @@ fn an_incomplete_response_reports_truncation_not_an_error() {
     match result {
         ChatTurnResult::FinalText(f) => {
             assert_eq!(f.content, "The answer is");
-            assert!(f.truncated, "a length-capped answer is truncated");
+            assert_eq!(
+                f.finish,
+                FinishOutcome::Length,
+                "a length-capped answer is truncated"
+            );
         }
         other => panic!("expected FinalText, got {other:?}"),
     }
 }
 
 #[test]
-fn an_incomplete_response_with_an_unclassified_reason_is_a_truncation() {
+fn an_incomplete_response_with_an_unclassified_reason_is_not_claimed_as_length() {
     // A reason this client does not model must not throw away output the
     // provider charged for; it is logged and the turn keeps its text.
     let json_str = r#"{
@@ -158,7 +162,10 @@ fn an_incomplete_response_with_an_unclassified_reason_is_a_truncation() {
     match responses_response_to_turn(payload).expect("turn") {
         ChatTurnResult::FinalText(f) => {
             assert_eq!(f.content, "partial");
-            assert!(f.truncated);
+            // An unrecognised `incomplete` reason proves the reply stopped early
+            // but not *why*: it is `Other`, never `Length`, so no consumer can
+            // describe it as an output-token limit the provider never reported.
+            assert_eq!(f.finish, FinishOutcome::Other);
         }
         other => panic!("expected FinalText, got {other:?}"),
     }
@@ -190,7 +197,7 @@ fn a_completed_response_is_not_truncated() {
         }"#;
     let payload: ResponsesResponse = serde_json::from_str(json_str).unwrap();
     match responses_response_to_turn(payload).expect("turn") {
-        ChatTurnResult::FinalText(f) => assert!(!f.truncated),
+        ChatTurnResult::FinalText(f) => assert_ne!(f.finish, FinishOutcome::Length),
         other => panic!("expected FinalText, got {other:?}"),
     }
 }

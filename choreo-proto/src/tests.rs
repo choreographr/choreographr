@@ -1179,8 +1179,11 @@ fn inference_error_metric_labels_are_stable() {
         InferenceError::TruncatedToolCall {
             discarded: vec![DiscardedToolCall {
                 name: "t".into(),
-                arguments_json: "{}".into()
-            }]
+                arguments_json: "{}".into(),
+                error_line: None,
+                error_column: None,
+            }],
+            finish: FinishOutcome::Length,
         }
         .metric_label(),
         "truncated_tool_call"
@@ -1201,18 +1204,39 @@ fn inference_error_metric_labels_are_stable() {
 
 #[test]
 fn discarded_tool_call_display_is_bounded() {
-    // Short payloads render in full (name + raw arguments).
+    // Short payloads render in full (name + total size + raw arguments).
     let small = DiscardedToolCall {
         name: "get_weather".into(),
         arguments_json: r#"{"city":"London"}"#.into(),
+        error_line: None,
+        error_column: None,
     };
-    assert_eq!(small.to_string(), r#"get_weather: {"city":"London"}"#);
+    assert_eq!(
+        small.to_string(),
+        r#"get_weather (17 chars): {"city":"London"}"#
+    );
+
+    // A parse position, when the parser reported one, names where the payload
+    // stopped — the only form of "position" that needs no partial-JSON scanner,
+    // because serde_json's own error already carries it.
+    let positioned = DiscardedToolCall {
+        name: "sh".into(),
+        arguments_json: r#"{"command":"rm -rf /tmp"#.into(),
+        error_line: Some(1),
+        error_column: Some(21),
+    };
+    assert_eq!(
+        positioned.to_string(),
+        r#"sh (23 chars at line 1 column 21): {"command":"rm -rf /tmp"#
+    );
 
     // A large cropped payload (the length-truncated write_file case) is
     // previewed with its total size, never dumped whole.
     let big = DiscardedToolCall {
         name: "write_file".into(),
         arguments_json: "x".repeat(500),
+        error_line: None,
+        error_column: None,
     };
     let rendered = big.to_string();
     assert!(
@@ -1230,8 +1254,13 @@ fn discarded_tool_call_display_is_bounded() {
     let control = DiscardedToolCall {
         name: "write_file".into(),
         arguments_json: "line1\nline2\ttab".into(),
+        error_line: None,
+        error_column: None,
     };
-    assert_eq!(control.to_string(), "write_file: line1 line2 tab");
+    assert_eq!(
+        control.to_string(),
+        "write_file (15 chars): line1 line2 tab"
+    );
 }
 
 #[test]
@@ -1272,7 +1301,11 @@ fn inference_error_metric_labels_are_distinct() {
         InferenceError::Unsupported { detail: "x".into() }.metric_label(),
         InferenceError::Cancelled.metric_label(),
         InferenceError::DeadlineExceeded.metric_label(),
-        InferenceError::TruncatedToolCall { discarded: vec![] }.metric_label(),
+        InferenceError::TruncatedToolCall {
+            discarded: vec![],
+            finish: FinishOutcome::Length,
+        }
+        .metric_label(),
         InferenceError::UnidentifiedToolCalls { count: 1 }.metric_label(),
         InferenceError::OAuthReloginRequired { detail: "x".into() }.metric_label(),
         InferenceError::Io(std::io::Error::other("oops")).metric_label(),

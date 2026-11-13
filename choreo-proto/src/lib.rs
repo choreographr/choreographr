@@ -21,12 +21,12 @@ pub use io::{
 pub use types::{
     AccountInfo, AssistantToolCallRecord, CHAT_REASONING_WIRE_KEYS, CatalogProvider,
     ChatReasoningField, ClientMessage, ClientMessageType, ContextConfig, DaemonMessage,
-    DaemonMessageType, DiscardedToolCall, DisplayedImageRecord, ImageKey, ImageMetadata,
-    ImageReference, InferenceError, KeystoreState, McpAuthState, McpOAuthConfig, McpServerStatus,
-    MessageKind, OAuthClientIdentity, OAuthGrantEncoding, OAuthProviderDescriptor, OutputStream,
-    ReasoningArtifact, ReasoningCapability, ReasoningProducer, RefreshStatus, SessionEvent,
-    SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolCallCaller, ToolResultRecord, Turn,
-    is_models_warming_error, models_warming_error,
+    DaemonMessageType, DiscardedToolCall, DisplayedImageRecord, FinishOutcome, ImageKey,
+    ImageMetadata, ImageReference, InferenceError, KeystoreState, McpAuthState, McpOAuthConfig,
+    McpServerStatus, MessageKind, OAuthClientIdentity, OAuthGrantEncoding, OAuthProviderDescriptor,
+    OutputStream, ReasoningArtifact, ReasoningCapability, ReasoningProducer, RefreshStatus,
+    SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolCallCaller,
+    ToolResultRecord, Turn, is_models_warming_error, models_warming_error,
 };
 
 #[cfg(test)]

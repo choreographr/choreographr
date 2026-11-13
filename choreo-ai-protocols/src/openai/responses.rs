@@ -34,7 +34,7 @@ mod wire;
 use body::{build_responses_request_body, build_simple_responses_body};
 pub(crate) use input::{SystemPrompt, messages_to_responses_input};
 pub(crate) use stream::responses_request_streaming_with_tools;
-use turn::incomplete_stop;
+use turn::finish_outcome;
 pub(crate) use turn::responses_response_to_turn;
 use wire::{ResponseOutputItem, ResponsesResponse};
 
@@ -75,10 +75,10 @@ pub(crate) fn responses_request(
         .map_err(|e| super::OpenAiError::Io(io::Error::other(e)))?;
 
     // A policy block is terminal even on the one-shot path. There is no turn
-    // result here to carry a truncation flag, so the reason only decides
-    // whether the reply is an error; the partial text below still has to reach
-    // a non-empty answer on its own.
-    incomplete_stop(&payload)?;
+    // result here to carry a finish outcome, so the reason only decides whether
+    // the reply is an error; the partial text below still has to reach a
+    // non-empty answer on its own.
+    finish_outcome(&payload)?;
 
     let mut content = String::new();
     for raw in payload.output {

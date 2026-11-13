@@ -7,6 +7,7 @@
 //! [`AssistantMessage::take_reasoning`] folds through the adapter's one shared
 //! state machine.
 
+use choreo_proto::FinishOutcome;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -222,6 +223,26 @@ pub(crate) enum FinishReason {
 }
 
 impl FinishReason {
+    /// Normalize to the shared [`FinishOutcome`].
+    ///
+    /// `Sensitive`/`NetworkError`/`ContextWindowExceeded` normally turn into a
+    /// terminal error before a turn is assembled; they still map here so the
+    /// conversion is total and a path that assembles anyway reports honestly
+    /// rather than claiming a normal stop.
+    #[must_use]
+    pub(crate) fn outcome(&self) -> FinishOutcome {
+        match self {
+            // `tool_calls` is a normal completion of a tool-loop turn.
+            FinishReason::Stop | FinishReason::ToolCalls => FinishOutcome::Stop,
+            FinishReason::Length => FinishOutcome::Length,
+            FinishReason::Sensitive => FinishOutcome::Filtered,
+            FinishReason::ContextWindowExceeded | FinishReason::NetworkError => {
+                FinishOutcome::Other
+            }
+            FinishReason::Other(_) => FinishOutcome::Other,
+        }
+    }
+
     /// Map a raw wire string to the lenient enum. Never fails.
     fn parse(raw: &str) -> Self {
         match raw {

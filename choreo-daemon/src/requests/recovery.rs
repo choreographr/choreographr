@@ -13,7 +13,7 @@
 use std::io;
 
 use choreo_ai_protocols::ChatToolCall;
-use choreo_proto::{ReasoningArtifact, ReasoningProducer};
+use choreo_proto::{FinishOutcome, ReasoningArtifact, ReasoningProducer};
 use itertools::Itertools;
 
 use crate::sessions::{AssistantResponse, RequestContext, SessionState};
@@ -51,6 +51,20 @@ pub(crate) const TRUNCATION_RECOVERY_INSTRUCTION: &str = "Your previous response
      but produce much smaller outputs: split large writes into several smaller \
      tool calls (write a file in sections and append, or use multiple smaller \
      files), and avoid emitting very large tool arguments in a single call.";
+
+/// Model-visible instruction for the **mixed** case: a reply that did its real
+/// work but lost one call to truncation.
+///
+/// Deliberately different from [`TRUNCATION_RECOVERY_INSTRUCTION`], which says
+/// the whole response was truncated — false here, since the other calls in the
+/// reply ran. The actionable half is identical: the call must be reissued, and
+/// its arguments must be smaller.
+pub(crate) const TRUNCATION_MIXED_RECOVERY_INSTRUCTION: &str = "One of the tool calls in \
+     your previous reply was cut off before its arguments finished, so it did not \
+     run — the other calls in that reply did run, and their results are above. \
+     Re-issue only the call that was lost, with smaller arguments: split a large \
+     write into several smaller calls rather than emitting very large tool \
+     arguments at once.";
 
 /// Model-visible instruction seeded as the next turn's user text after a reply
 /// whose tool calls named a tool the provider will not accept.
@@ -116,17 +130,20 @@ pub(crate) struct TurnRecovery {
     cause: RecoveryCause,
     /// Stable label used in the recovery log line. The value matches what
     /// `InferenceError::metric_label()` reports for the same condition, so an
-    /// operator can filter on one string across both reporting paths.
-    label: &'static str,
+    /// operator can filter on one string across both reporting paths — and it is
+    /// the cause dimension of the discard metric.
+    pub(crate) label: &'static str,
     /// How many consecutive recoveries of this cause the loop tolerates before
     /// ending the request.
     budget: u32,
     /// Model-facing instruction seeded as the next turn's user text.
     instruction: &'static str,
     /// Builds the bracketed transcript note from a cause-specific detail (the
-    /// discarded tool names, or the count of unnamed calls), so the recorded
-    /// note names what was lost instead of being a generic apology.
-    note: fn(&str) -> String,
+    /// discarded tool names, or the count of unnamed calls) and the provider's
+    /// finish outcome, so the recorded note names what was lost instead of being
+    /// a generic apology — and claims an output-token limit only when the
+    /// provider actually reported one.
+    note: fn(&str, FinishOutcome) -> String,
 }
 
 /// The truncation cause: a call the provider cut off at its output-token limit.
@@ -162,7 +179,12 @@ const MAX_ECHOED_NAME_CHARS: usize = 64;
 
 /// Transcript note for a truncated tool call. `names` is the comma-joined list
 /// of the discarded calls' tool names, empty when the provider cut off before
-/// any name arrived.
+/// any name arrived; `finish` is how the provider said the turn ended.
+///
+/// The wording follows the evidence: only [`FinishOutcome::Length`] licenses
+/// "cut off at the output-token limit". A stream that ended without naming a
+/// reason must not borrow that claim — it says only that the arguments were
+/// incomplete when the reply stopped, which is all we know.
 ///
 /// A hostile model cannot bloat this note: `names` is built at the truncation
 /// call site by filtering the discarded calls through
@@ -170,15 +192,22 @@ const MAX_ECHOED_NAME_CHARS: usize = 64;
 /// are already provider-safe — at most [`choreo_ai_protocols::tool_name::MAX_FUNCTION_NAME_LEN`]
 /// bytes (64) of `[A-Za-z0-9_-]` each. No control characters survive that
 /// filter, and the per-call count is bounded by the provider's own reply.
-fn truncation_note(names: &str) -> String {
+fn truncation_note(names: &str, finish: FinishOutcome) -> String {
     let subject = if names.is_empty() {
         "A tool call".to_string()
     } else {
         format!("The {names} tool call")
     };
+    if finish == FinishOutcome::Length {
+        return format!(
+            "[{subject} was cut off at the model's output-token limit before its \
+             arguments finished, so it did not run.]"
+        );
+    }
     format!(
-        "[{subject} was cut off at the model's output-token limit before its \
-         arguments finished, so it did not run.]"
+        "[{subject}'s arguments were incomplete when the provider's reply ended \
+         (finish: {}) before they finished, so it did not run.]",
+        finish.label()
     )
 }
 
@@ -186,7 +215,7 @@ fn truncation_note(names: &str) -> String {
 /// will not accept. `detail` is either the comma-joined offending names or, for
 /// a wholly blank reply, the count of such calls — phrased so the note reads
 /// the same for a single straggler and for a reply that named nothing usable.
-fn unnamed_tool_call_note(detail: &str) -> String {
+fn unnamed_tool_call_note(detail: &str, _finish: FinishOutcome) -> String {
     format!("[Tool calls the provider will not accept: {detail}. None were run.]")
 }
 
@@ -334,6 +363,10 @@ pub(crate) struct TurnRecoveryParams<'a> {
     pub cause: TurnRecovery,
     /// The cause-specific detail the note builder renders.
     pub detail: &'a str,
+    /// How the provider said the turn ended. It shapes the transcript note
+    /// (only a reported `length` may be described as an output-token limit) and
+    /// is carried into the discard metric by the caller.
+    pub finish: FinishOutcome,
     /// The consecutive-recovery budget this cause draws down.
     pub budget: &'a mut RecoveryBudget,
     /// Prose the model wrote alongside the discarded work, recorded ahead of
@@ -372,6 +405,7 @@ pub(crate) fn recover_unrunnable_turn(
         stream_id,
         cause,
         detail,
+        finish,
         budget,
         prose,
         reasoning,
@@ -388,6 +422,7 @@ pub(crate) fn recover_unrunnable_turn(
         stream_id,
         turn_id,
         cause = cause.label,
+        finish = finish.label(),
         // The length, never the text: `detail` echoes model-authored tool names,
         // which are assistant-response content and can carry control characters
         // that would corrupt an operator's log file. The transcript note built
@@ -407,7 +442,7 @@ pub(crate) fn recover_unrunnable_turn(
     } else {
         String::new()
     };
-    let note = format!("{}{stop_reason}", (cause.note)(detail));
+    let note = format!("{}{stop_reason}", (cause.note)(detail, finish));
     let text = match prose {
         Some(prose) if !prose.trim().is_empty() => format!("{prose}\n\n{note}"),
         _ => note,
@@ -452,6 +487,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_transcript_note_claims_a_token_limit_only_when_one_was_reported() {
+        // The wording is evidence-bound: a reported `length` is a provider cap,
+        // while a stream that ended without saying why must not borrow that
+        // claim — it is the difference between "the provider cut us off" and
+        // "we do not know what happened", and the transcript is where a reader
+        // decides whether to retry or to change models.
+        let limited = truncation_note("sh", FinishOutcome::Length);
+        assert!(limited.contains("output-token limit"), "{limited}");
+
+        for finish in [
+            FinishOutcome::Absent,
+            FinishOutcome::Stop,
+            FinishOutcome::Filtered,
+            FinishOutcome::Other,
+        ] {
+            let note = truncation_note("sh", finish);
+            assert!(
+                !note.contains("output-token limit"),
+                "{finish:?} must not claim a token limit: {note}"
+            );
+            assert!(note.contains("incomplete"), "{note}");
+            assert!(note.contains(finish.label()), "{note}");
+        }
+
+        // The unnamed note ignores the finish outcome entirely.
+        assert_eq!(
+            unnamed_tool_call_note("bad", FinishOutcome::Length),
+            unnamed_tool_call_note("bad", FinishOutcome::Absent)
+        );
+    }
+
+    #[test]
     fn discarded_names_join_the_provider_safe_ones_and_drop_the_rest() {
         // The note is model- and user-visible, so only names a provider would
         // accept are echoed: an unrunnable one is dropped instead of rendered,
@@ -460,14 +527,20 @@ mod tests {
             choreo_proto::DiscardedToolCall {
                 name: "run_series".to_string(),
                 arguments_json: "{".to_string(),
+                error_line: Some(1),
+                error_column: Some(12),
             },
             choreo_proto::DiscardedToolCall {
                 name: "rm -rf / #".to_string(),
                 arguments_json: "{".to_string(),
+                error_line: Some(1),
+                error_column: Some(12),
             },
             choreo_proto::DiscardedToolCall {
                 name: "edit_file".to_string(),
                 arguments_json: "{".to_string(),
+                error_line: Some(1),
+                error_column: Some(12),
             },
         ];
         assert_eq!(discarded_names(&discarded), "run_series, edit_file");
@@ -481,6 +554,8 @@ mod tests {
         let discarded = vec![choreo_proto::DiscardedToolCall {
             name: String::new(),
             arguments_json: "{".to_string(),
+            error_line: Some(1),
+            error_column: Some(12),
         }];
         assert_eq!(discarded_names(&discarded), "");
     }
@@ -569,6 +644,7 @@ mod tests {
         // here so a rename on either side is caught.
         let truncated = choreo_proto::InferenceError::TruncatedToolCall {
             discarded: Vec::new(),
+            finish: FinishOutcome::Length,
         };
         let unidentified = choreo_proto::InferenceError::UnidentifiedToolCalls { count: 1 };
         assert_eq!(TRUNCATION_RECOVERY.label, truncated.metric_label());

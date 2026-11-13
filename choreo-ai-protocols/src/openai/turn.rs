@@ -16,7 +16,9 @@
 //! instead of mistaking it for a finished answer.
 
 use super::validate_tool_call_arguments;
-use crate::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
+use crate::types::{
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, FinishOutcome,
+};
 use choreo_proto::{ReasoningArtifact, TokenUsage};
 
 /// The finalized parts of one turn, handed to [`assemble_turn`].
@@ -49,9 +51,11 @@ pub(super) struct TurnParts {
     pub(super) produced_reasoning: bool,
     /// Token usage reported for the turn, when the provider sent any.
     pub(super) usage: Option<TokenUsage>,
-    /// Whether the reply was cut off (chat's `finish_reason: length`, Responses'
-    /// `incomplete`) on a final-text turn.
-    pub(super) truncated: bool,
+    /// How the provider said the turn ended (see [`FinishOutcome`]). The
+    /// adapter's own reading of *its* wire format: chat's `finish_reason`,
+    /// Responses' `incomplete` details, `Anthropic`'s `stop_reason`, Gemini's
+    /// `finishReason`. [`FinishOutcome::Absent`] when the adapter saw no signal.
+    pub(super) finish: FinishOutcome,
     /// The provider's response id, when the wire format reports one (Responses
     /// chains the next turn onto it via `previous_response_id`).
     pub(super) response_id: Option<String>,
@@ -73,7 +77,7 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
         reasoning_artifact,
         produced_reasoning,
         usage,
-        truncated,
+        finish,
         response_id,
     } = parts;
     // The one normalization of a turn's content: the final answer is the
@@ -84,7 +88,7 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
     let final_text = content.as_deref().unwrap_or_default().trim().to_string();
     let content_is_empty = final_text.is_empty();
     // Truncated / malformed tool calls are dropped here, once, for every path.
-    let discarded = validate_tool_call_arguments(&mut tool_calls);
+    let discarded = validate_tool_call_arguments(&mut tool_calls, finish);
     if !tool_calls.is_empty() {
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             // The tool-use arm keeps the RAW content: a tool-call turn's text is
@@ -94,6 +98,10 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
             // which one the provider reported.
             content,
             tool_calls,
+            // A mixed reply reports its casualties: the calls above run, and the
+            // dropped ones reach the model on the next turn.
+            discarded_tool_calls: discarded,
+            finish,
             reasoning,
             usage,
             response_id,
@@ -116,11 +124,11 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
         // same recovery (keeping this prose), so a turn that would otherwise
         // read as a completed answer cannot silently end the request.
         if content_is_empty {
-            return Err(super::OpenAiError::TruncatedToolCall { discarded });
+            return Err(super::OpenAiError::TruncatedToolCall { discarded, finish });
         }
         return Ok(ChatTurnResult::FinalText(FinalTextResult {
             content: final_text,
-            truncated,
+            finish,
             discarded_tool_calls: discarded,
             reasoning,
             usage,
@@ -148,7 +156,7 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
     }
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: final_text,
-        truncated,
+        finish,
         // Nothing was dropped on this path: every call the reply carried was
         // either usable (handled above) or absent.
         discarded_tool_calls: Vec::new(),
@@ -174,7 +182,7 @@ mod tests {
             reasoning_artifact: None,
             produced_reasoning: false,
             usage: None,
-            truncated: false,
+            finish: FinishOutcome::Absent,
             response_id: None,
         }
     }
@@ -305,6 +313,8 @@ mod tests {
                     vec![choreo_proto::DiscardedToolCall {
                         name: "run_series".to_string(),
                         arguments_json: "{\"steps\":[{\"tool\":".to_string(),
+                        error_line: Some(1),
+                        error_column: Some(18),
                     }]
                 );
             }

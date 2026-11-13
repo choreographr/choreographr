@@ -655,6 +655,91 @@ fn agent_loop_runs_the_named_calls_of_a_mixed_reply() {
 }
 
 #[test]
+fn agent_loop_tells_the_model_about_a_dropped_call_in_a_mixed_reply() {
+    // A reply that mixes a runnable call with one the provider cut off still
+    // does its real work — and it must say so. Silence here is the worst
+    // outcome: the model asked for two things, one ran, and nothing tells it the
+    // other did not, so it can report work that never happened.
+    let mut registry = ToolRegistry::new();
+    registry.register(crate::tools::random::Random);
+    let mut h = agent_loop_harness(registry);
+    let provider = make_scripted_turn_provider(vec![
+        ScriptedTurn::ToolCallsWithTruncated(vec!["random"]),
+        ScriptedTurn::FinalAnswer,
+    ]);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut h.session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &h.ctx,
+        Some("hi"),
+    );
+    assert!(!result.unwrap(), "a mixed reply takes no strike");
+    assert_eq!(
+        h.session.turns.len(),
+        2,
+        "the run continues to the provider's final answer"
+    );
+
+    let t0 = h.session.turns.get(&0).expect("turn 0 exists");
+    assert_eq!(t0.tool_calls.len(), 1, "only the runnable call is recorded");
+    assert_eq!(t0.tool_calls[0].name, "random");
+    assert_eq!(t0.tool_results.len(), 1);
+    assert!(
+        !t0.tool_results[0].is_error,
+        "the runnable call of a mixed reply still runs"
+    );
+
+    let t1 = h.session.turns.get(&1).expect("turn 1 exists");
+    assert_eq!(
+        t1.user_text.as_deref(),
+        Some(TRUNCATION_MIXED_RECOVERY_INSTRUCTION),
+        "the dropped call is reported to the model on the next turn"
+    );
+}
+
+#[test]
+fn agent_loop_reports_a_mixed_reply_that_lost_calls_both_ways() {
+    // One reply, two casualties: an unnamed call and a truncated one. Both must
+    // reach the model in the single user message the loop has room for, or one
+    // of them is silently forgotten.
+    let mut registry = ToolRegistry::new();
+    registry.register(crate::tools::random::Random);
+    let mut h = agent_loop_harness(registry);
+    let provider = make_scripted_turn_provider(vec![
+        ScriptedTurn::ToolCallsWithTruncated(vec!["random", ""]),
+        ScriptedTurn::FinalAnswer,
+    ]);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut h.session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &h.ctx,
+        Some("hi"),
+    );
+    assert!(!result.unwrap(), "a mixed reply takes no strike");
+
+    let t1 = h.session.turns.get(&1).expect("turn 1 exists");
+    let guidance = t1.user_text.as_deref().unwrap_or_default();
+    assert!(
+        guidance.contains(TRUNCATION_MIXED_RECOVERY_INSTRUCTION),
+        "the truncated call is reported, got {guidance:?}"
+    );
+    assert!(
+        guidance.contains(UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION),
+        "the unnamed call is reported too, got {guidance:?}"
+    );
+}
+
+#[test]
 fn agent_loop_resets_the_recovery_budget_when_a_turn_produces_output() {
     // Two recoveries, then a turn that runs a real tool, then two more: the
     // request only completes if the productive turn reset the counter. Without

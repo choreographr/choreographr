@@ -1,5 +1,10 @@
 use choreo_proto::{ReasoningArtifact, TokenUsage};
 
+// Re-exported so an adapter names these through one module: the finish outcome
+// lives in `choreo_proto` because `InferenceError` carries it, and a discarded
+// call rides on both the turn results and that error.
+pub use choreo_proto::{DiscardedToolCall, FinishOutcome};
+
 /// Information about the caller that initiated a tool call.
 /// Stored alongside tool call records for auditing/filtering.
 ///
@@ -67,6 +72,15 @@ pub struct ChatAssistantToolUse {
     pub content: Option<String>,
     /// The tool calls the assistant requested this turn.
     pub tool_calls: Vec<ChatToolCall>,
+    /// Tool calls the provider sent with arguments that were not valid JSON, so
+    /// they were dropped from [`Self::tool_calls`]. Empty on a clean reply.
+    ///
+    /// Reported rather than forgotten: a reply that mixes runnable calls with a
+    /// cut-off one still did its real work, but the lost call must reach the
+    /// model on the next turn or it will report work that never happened.
+    pub discarded_tool_calls: Vec<DiscardedToolCall>,
+    /// How the provider said the turn ended (see [`FinishOutcome`]).
+    pub finish: FinishOutcome,
     /// Display text of the assistant's reasoning, when the provider produced
     /// it.
     pub reasoning: Option<String>,
@@ -86,14 +100,16 @@ pub struct ChatAssistantToolUse {
 pub struct FinalTextResult {
     /// The assistant's final answer text.
     pub content: String,
-    /// The provider reported `finish_reason: "length"` (or equivalent) on a
-    /// final-text turn: the answer was cut off by the output token limit, not
-    /// finished. Purely informational for consumers — the daemon appends the
-    /// user-visible truncation notice when it consumes the result; only the
-    /// chat-completions adapter sets this today (other providers leave it
-    /// `false`). `length` + tool calls is normal tool-loop flow, so a
-    /// `ToolUse` turn never carries it.
-    pub truncated: bool,
+    /// How the provider said the turn ended (see [`FinishOutcome`]).
+    ///
+    /// [`FinishOutcome::Length`] on a final-text turn means the answer was cut
+    /// off by the output token limit, not finished: the daemon appends a
+    /// user-visible truncation notice. `length` + tool calls is normal tool-loop
+    /// flow, so a [`ChatTurnResult::ToolUse`] turn carries the outcome but no
+    /// notice is ever shown for it. Adapters that cannot read a finish reason
+    /// report [`FinishOutcome::Absent`], which asserts nothing about why the
+    /// reply ended.
+    pub finish: FinishOutcome,
     /// Tool calls the provider returned with arguments that were not valid
     /// JSON (typically cut off mid-response), so they were discarded as unsafe
     /// to execute — empty on an ordinary final answer.
@@ -107,7 +123,7 @@ pub struct FinalTextResult {
     /// calls were lost, and the model is asked to retry in smaller steps.
     /// Without that signal the turn looks like a finished answer and ends the
     /// request mid-task.
-    pub discarded_tool_calls: Vec<choreo_proto::DiscardedToolCall>,
+    pub discarded_tool_calls: Vec<DiscardedToolCall>,
     /// Display text of the assistant's reasoning, when the provider produced
     /// it.
     pub reasoning: Option<String>,

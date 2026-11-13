@@ -104,6 +104,43 @@ fn messages_response_with_text_deserialises() {
 }
 
 #[test]
+fn a_max_tokens_stop_is_reported_as_a_length_finish() {
+    // `max_tokens` is the provider's own output cap. Reporting it as `Length`
+    // is what lets the daemon tell a provider limit (unfixable here) from a
+    // normal stop or a reason it never classified — the fact that used to be
+    // dropped entirely on this path.
+    let resp = MessagesResponse {
+        id: "msg_1".into(),
+        r#type: "message".into(),
+        role: "assistant".into(),
+        content: vec![ContentBlock::Text {
+            text: "half an ans".into(),
+        }],
+        stop_reason: Some("max_tokens".into()),
+        stop_sequence: None,
+        model: "claude-sonnet-4-20250514".into(),
+        usage: None,
+    };
+    match response_to_turn_result(resp).unwrap() {
+        ChatTurnResult::FinalText(ft) => assert_eq!(ft.finish, FinishOutcome::Length),
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
+#[test]
+fn finish_outcome_covers_every_stop_reason_shape() {
+    // One table for the mapping, so a new stop reason cannot silently become a
+    // "normal stop": unknown reasons are `Other` and a missing one is `Absent`,
+    // neither of which may be described as an output-token limit.
+    assert_eq!(finish_outcome(Some("end_turn")), FinishOutcome::Stop);
+    assert_eq!(finish_outcome(Some("tool_use")), FinishOutcome::Stop);
+    assert_eq!(finish_outcome(Some("max_tokens")), FinishOutcome::Length);
+    assert_eq!(finish_outcome(Some("refusal")), FinishOutcome::Filtered);
+    assert_eq!(finish_outcome(Some("something_new")), FinishOutcome::Other);
+    assert_eq!(finish_outcome(None), FinishOutcome::Absent);
+}
+
+#[test]
 fn response_to_turn_result_text_only() {
     let resp = MessagesResponse {
         id: "msg_1".into(),

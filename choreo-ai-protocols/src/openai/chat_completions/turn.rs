@@ -11,7 +11,7 @@ use tracing::debug;
 use super::super::turn::{TurnParts, assemble_turn};
 use super::wire::{ChatCompletionsResponse, FinishReason};
 use crate::types::{ChatToolCall, ChatTurnResult};
-use choreo_proto::TokenUsage;
+use choreo_proto::{FinishOutcome, TokenUsage};
 
 /// Convert a parsed non-streaming chat completions response into a turn
 /// result. The raw reasoning value is captured into the round-trip artifact
@@ -61,7 +61,13 @@ pub(crate) fn chat_completions_response_to_turn(
     }
     // `length` on a FINAL-TEXT turn means the answer was cut off; the tool-call
     // arm ignores it (a length-truncated tool call is normal tool-loop flow).
-    let truncated = matches!(choice.finish_reason, Some(FinishReason::Length));
+    // The shared `FinishOutcome` carries the same fact plus *which* terminal
+    // reason arrived, so a discarded tool call can report whether a provider
+    // output limit or something unidentified cut it off.
+    let finish = choice
+        .finish_reason
+        .as_ref()
+        .map_or(FinishOutcome::Absent, FinishReason::outcome);
 
     // Extract reasoning early (before the partial moves into tool_calls / content)
     let reasoning = choice.message.take_reasoning();
@@ -108,7 +114,7 @@ pub(crate) fn chat_completions_response_to_turn(
         reasoning_artifact: reasoning.artifact,
         produced_reasoning: reasoning.produced,
         usage: turn_usage,
-        truncated,
+        finish,
         response_id: None,
     })
 }

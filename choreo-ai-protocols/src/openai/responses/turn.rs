@@ -10,6 +10,8 @@ use std::io;
 
 use tracing::{debug, warn};
 
+use choreo_proto::FinishOutcome;
+
 use super::super::reasoning_details::MAX_REASONING_BYTES;
 use super::wire::{ResponseOutputItem, ResponsesResponse};
 use crate::openai::turn::{TurnParts, assemble_turn};
@@ -28,24 +30,30 @@ pub(super) fn responses_usage_to_token_usage(usage: &super::super::Usage) -> Tok
     usage.to_token_usage()
 }
 
-/// Classify a response that stopped early (`status: "incomplete"`).
+/// How the `Responses` reply ended, from its `status`/`incomplete_details`.
 ///
 /// `incomplete` is a terminal SUCCESS with possibly-partial output, so its
 /// reason decides what the caller does: a policy block is a terminal error
-/// that retrying can never clear, and every other reason
-/// (`max_output_tokens` included, and the absent-reason case) yields a partial
-/// answer reported as truncated — the same reading chat gives
-/// `finish_reason: length`. An unknown reason is logged so it stays
-/// diagnosable without failing a turn the provider charged for.
-pub(super) fn incomplete_stop(
+/// that retrying can never clear, `max_output_tokens` is
+/// [`FinishOutcome::Length`], and any reason this client does not classify is
+/// logged and reported as [`FinishOutcome::Other`] rather than asserted to be a
+/// token limit. A payload that names no reason at all reports it honestly
+/// instead of guessing.
+pub(super) fn finish_outcome(
     payload: &ResponsesResponse,
-) -> Result<bool, super::super::OpenAiError> {
+) -> Result<FinishOutcome, super::super::OpenAiError> {
     let reason = payload
         .incomplete_details
         .as_ref()
         .and_then(|details| details.reason.as_deref());
     if payload.status.as_deref() != Some("incomplete") && reason.is_none() {
-        return Ok(false);
+        // `completed` is a real stop; a payload that said nothing at all is
+        // reported as absent, never guessed at.
+        return Ok(match payload.status.as_deref() {
+            Some("completed") => FinishOutcome::Stop,
+            Some(_) => FinishOutcome::Other,
+            None => FinishOutcome::Absent,
+        });
     }
     match reason {
         Some("content_filter") => Err(super::super::OpenAiError::ContentFiltered {
@@ -53,10 +61,14 @@ pub(super) fn incomplete_stop(
                      (incomplete: content_filter)"
                 .into(),
         }),
-        Some("max_output_tokens") | None => Ok(true),
+        Some("max_output_tokens") => Ok(FinishOutcome::Length),
+        None => {
+            warn!("responses turn stopped incomplete without naming a reason");
+            Ok(FinishOutcome::Other)
+        }
         Some(other) => {
             warn!(reason = other, "responses turn stopped incomplete");
-            Ok(true)
+            Ok(FinishOutcome::Other)
         }
     }
 }
@@ -161,10 +173,10 @@ pub(crate) fn responses_response_to_turn(
 ) -> Result<ChatTurnResult, super::super::OpenAiError> {
     let response_id = payload.id.clone();
     // A declared stop wins over whatever (possibly empty) body arrived: a
-    // length-capped answer keeps its partial text as `truncated`, while a
+    // length-capped answer keeps its partial text as `Length`, while a
     // content-filter refusal is a distinct terminal error. Classified before
     // the usage field is moved out below.
-    let truncated = incomplete_stop(&payload)?;
+    let finish = finish_outcome(&payload)?;
     let turn_usage = payload.usage.as_ref().map(responses_usage_to_token_usage);
 
     // Parse output items: extract text, reasoning, tool calls, and the
@@ -295,7 +307,7 @@ pub(crate) fn responses_response_to_turn(
         reasoning_artifact,
         produced_reasoning,
         usage: turn_usage,
-        truncated,
+        finish,
         response_id,
     })
 }

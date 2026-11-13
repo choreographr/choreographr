@@ -31,7 +31,7 @@ use crate::openai::{ChatImagePart, ChatRequestMessage, ChatToolDefinition};
 use crate::overrides::ProviderOverrides;
 use crate::retry::RequestCompression;
 use crate::types::{
-    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, FinishOutcome, StreamEvent,
 };
 use crate::{ChatTurnRequest, ContextWindowConfig};
 use choreo_proto::{ReasoningArtifact, TokenUsage};
@@ -651,6 +651,27 @@ pub(super) fn function_call_id(name: &str, position: usize) -> String {
     format!("fc_{sanitized}_{position}")
 }
 
+/// How a Gemini reply ended, from its candidate `finishReason`.
+///
+/// `MAX_TOKENS` is the provider's output cap — the one outcome that explains a
+/// tool call cut off mid-arguments. A safety/recitation stop is a policy block,
+/// distinct from both, and an absent reason (a stream that simply ended) is
+/// reported honestly rather than assumed to be a normal stop.
+///
+/// Shared by the non-streaming and streaming paths so they cannot disagree
+/// about what a given reason means.
+pub(super) fn finish_outcome(finish_reason: Option<&str>) -> FinishOutcome {
+    match finish_reason {
+        Some("STOP") => FinishOutcome::Stop,
+        Some("MAX_TOKENS") => FinishOutcome::Length,
+        Some(
+            "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY",
+        ) => FinishOutcome::Filtered,
+        Some(_) => FinishOutcome::Other,
+        None => FinishOutcome::Absent,
+    }
+}
+
 /// Convert a non-streaming Gemini response into a `ChatTurnResult`.
 fn response_to_turn_result(
     response: GenerateContentResponse,
@@ -661,6 +682,8 @@ fn response_to_turn_result(
         .into_iter()
         .next()
         .ok_or(GoogleError::EmptyResponse)?;
+    // Read the finish reason before the candidate's content is moved out.
+    let finish = finish_outcome(candidate.finish_reason.as_deref());
 
     let content = candidate.content.ok_or(GoogleError::EmptyResponse)?;
 
@@ -721,6 +744,11 @@ fn response_to_turn_result(
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content,
             tool_calls,
+            // Gemini sends `functionCall.args` as a JSON object, so a truncated
+            // call fails the payload parse instead of arriving half-written:
+            // there is nothing to drop at this layer.
+            discarded_tool_calls: Vec::new(),
+            finish,
             reasoning,
             usage,
             response_id: None,
@@ -735,7 +763,7 @@ fn response_to_turn_result(
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
-        truncated: false,
+        finish,
         discarded_tool_calls: Vec::new(),
         reasoning,
         usage,

@@ -21,7 +21,7 @@ use crate::openai::{ChatImagePart, ChatRequestMessage, ChatToolDefinition};
 use crate::overrides::ProviderOverrides;
 use crate::retry::RequestCompression;
 use crate::types::{
-    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
+    ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, FinishOutcome, StreamEvent,
 };
 use crate::{ChatTurnRequest, ContextWindowConfig};
 use choreo_proto::{ReasoningArtifact, TokenUsage};
@@ -632,9 +632,30 @@ pub(super) fn anthropic_token_usage(
     }
 }
 
+/// How an `Anthropic` reply ended, from its `stop_reason`.
+///
+/// `max_tokens` is the one outcome that matters to a discarded tool call: it
+/// means the provider cut the reply off at its output limit. A `refusal` is a
+/// policy stop, distinct from both. An absent `stop_reason` (a stream that
+/// simply ended) is reported honestly rather than assumed to be a normal stop.
+///
+/// Shared by the non-streaming and streaming paths so the two cannot disagree
+/// about what a given reason means.
+pub(super) fn finish_outcome(stop_reason: Option<&str>) -> FinishOutcome {
+    match stop_reason {
+        Some("end_turn" | "stop_sequence" | "tool_use" | "pause_turn") => FinishOutcome::Stop,
+        Some("max_tokens") => FinishOutcome::Length,
+        Some("refusal") => FinishOutcome::Filtered,
+        Some(_) => FinishOutcome::Other,
+        None => FinishOutcome::Absent,
+    }
+}
+
 /// Convert the content blocks from a Messages API response into a
 /// [`ChatTurnResult`].
 fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult, AnthropicError> {
+    // Read the stop reason before the content is moved out of `response`.
+    let finish = finish_outcome(response.stop_reason.as_deref());
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_uses: Vec<ChatToolCall> = Vec::new();
     let mut reasoning_parts: Vec<String> = Vec::new();
@@ -723,6 +744,11 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
         return Ok(ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content,
             tool_calls: tool_uses,
+            // Anthropic sends a call's `input` as a JSON object, not a string,
+            // so a truncated call fails the whole payload parse instead of
+            // arriving here half-written: nothing can be dropped at this layer.
+            discarded_tool_calls: Vec::new(),
+            finish,
             reasoning,
             usage,
             response_id: None,
@@ -737,7 +763,7 @@ fn response_to_turn_result(response: MessagesResponse) -> Result<ChatTurnResult,
 
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
-        truncated: false,
+        finish,
         discarded_tool_calls: Vec::new(),
         reasoning,
         usage,

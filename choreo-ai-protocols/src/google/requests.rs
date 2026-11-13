@@ -273,6 +273,8 @@ where
     // Encrypted thought signatures in wire order, captured for the opaque
     // round-trip artifact (same shape as the non-streaming path).
     let mut signatures: Vec<String> = Vec::new();
+    // The terminal finish reason from the last chunk that named one.
+    let mut finish_reason: Option<String> = None;
 
     while let Some(data) = crate::stream::recv_sse_event(&sse, cancel_rx)? {
         let payload: GenerateContentResponse =
@@ -288,6 +290,11 @@ where
         let Some(candidate) = payload.candidates.into_iter().next() else {
             continue;
         };
+        // The last chunk that names a finish reason carries it (Gemini emits
+        // it on the terminal chunk, and intermediate chunks leave it empty).
+        if let Some(reason) = candidate.finish_reason {
+            finish_reason = Some(reason);
+        }
         let Some(content) = candidate.content else {
             continue;
         };
@@ -316,6 +323,9 @@ where
         return Err(GoogleError::EmptyResponse);
     }
 
+    // The stream's terminal outcome: Gemini names it on its final candidate.
+    let stream_finish = super::finish_outcome(finish_reason.as_deref());
+
     if !pending_tool_calls.is_empty() {
         return Ok(super::ChatTurnResult::ToolUse(
             super::ChatAssistantToolUse {
@@ -325,6 +335,11 @@ where
                     Some(full_text)
                 },
                 tool_calls: pending_tool_calls,
+                // Gemini streams `functionCall.args` as a JSON object, so a
+                // truncated call fails the chunk parse rather than arriving
+                // half-written: nothing is dropped at this layer.
+                discarded_tool_calls: Vec::new(),
+                finish: stream_finish,
                 reasoning: if full_reasoning.is_empty() {
                     None
                 } else {
@@ -343,7 +358,7 @@ where
 
     Ok(super::ChatTurnResult::FinalText(super::FinalTextResult {
         content: full_text,
-        truncated: false,
+        finish: stream_finish,
         discarded_tool_calls: Vec::new(),
         reasoning: if full_reasoning.is_empty() {
             None

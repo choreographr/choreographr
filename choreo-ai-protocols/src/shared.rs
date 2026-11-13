@@ -180,6 +180,10 @@ pub enum ProviderError {
         /// The tool calls discarded because their arguments were not valid
         /// JSON.
         discarded: Vec<choreo_proto::DiscardedToolCall>,
+        /// How the provider said the turn ended, so "the provider cut us off at
+        /// its output limit" stays distinguishable from "the arguments were
+        /// malformed for some other reason".
+        finish: choreo_proto::FinishOutcome,
     },
     /// The provider streamed one or more tool calls this client could not
     /// identify — the Responses adapter names a call from its `function_call`
@@ -436,8 +440,8 @@ pub(crate) fn provider_error_to_inference(e: ProviderError) -> InferenceError {
         }
         ProviderError::Cancelled => InferenceError::Cancelled,
         ProviderError::DeadlineExceeded => InferenceError::DeadlineExceeded,
-        ProviderError::TruncatedToolCall { discarded } => {
-            InferenceError::TruncatedToolCall { discarded }
+        ProviderError::TruncatedToolCall { discarded, finish } => {
+            InferenceError::TruncatedToolCall { discarded, finish }
         }
         ProviderError::UnidentifiedToolCalls { count } => {
             InferenceError::UnidentifiedToolCalls { count }
@@ -662,7 +666,7 @@ pub(crate) fn emit_non_streaming_events(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ChatAssistantToolUse, ChatToolCall, FinalTextResult};
+    use crate::types::{ChatAssistantToolUse, ChatToolCall, FinalTextResult, FinishOutcome};
 
     /// Collect emitted events from a call to [`emit_non_streaming_events`].
     fn collect_events(result: ChatTurnResult) -> Vec<StreamEvent> {
@@ -681,7 +685,7 @@ mod tests {
     fn final_text_with_content_emits_answer() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hello".into(),
-            truncated: false,
+            finish: FinishOutcome::Stop,
             discarded_tool_calls: Vec::new(),
             reasoning: None,
             usage: None,
@@ -698,7 +702,7 @@ mod tests {
     fn final_text_with_content_and_reasoning_emits_both() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hello".into(),
-            truncated: false,
+            finish: FinishOutcome::Stop,
             discarded_tool_calls: Vec::new(),
             reasoning: Some("thinking...".into()),
             usage: None,
@@ -718,7 +722,7 @@ mod tests {
     fn final_text_empty_content_emits_nothing() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: String::new(),
-            truncated: false,
+            finish: FinishOutcome::Stop,
             discarded_tool_calls: Vec::new(),
             reasoning: None,
             usage: None,
@@ -732,7 +736,7 @@ mod tests {
     fn final_text_empty_reasoning_is_skipped() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hi".into(),
-            truncated: false,
+            finish: FinishOutcome::Stop,
             discarded_tool_calls: Vec::new(),
             reasoning: Some(String::new()),
             usage: None,
@@ -751,6 +755,9 @@ mod tests {
         ChatTurnResult::ToolUse(ChatAssistantToolUse {
             content: content.map(String::from),
             tool_calls: vec![],
+            // These fixtures exercise stream-event emission, not the discard path.
+            discarded_tool_calls: Vec::new(),
+            finish: FinishOutcome::Stop,
             reasoning: reasoning.map(String::from),
             usage: None,
             response_id: None,
@@ -961,7 +968,7 @@ mod tests {
     fn callback_error_propagates_final_text() {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "boom".into(),
-            truncated: false,
+            finish: FinishOutcome::Stop,
             discarded_tool_calls: Vec::new(),
             reasoning: None,
             usage: None,
@@ -983,6 +990,9 @@ mod tests {
                 arguments_json: "{}".into(),
                 caller: None,
             }],
+            // These fixtures exercise stream-event emission, not the discard path.
+            discarded_tool_calls: Vec::new(),
+            finish: FinishOutcome::Stop,
             reasoning: None,
             usage: None,
             response_id: None,

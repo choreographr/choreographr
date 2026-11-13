@@ -15,7 +15,8 @@ use choreo_ai_protocols::openai::OpenAiError;
 use choreo_ai_protocols::openai::RequestFormat;
 use choreo_ai_protocols::test_utils::MockProvider;
 use choreo_ai_protocols::{
-    ChatTurnRequest, ChatTurnResult, OpenAiClient, RequestAuth, SocketRegistry, StreamEvent,
+    ChatTurnRequest, ChatTurnResult, FinishOutcome, OpenAiClient, RequestAuth, SocketRegistry,
+    StreamEvent,
 };
 
 use choreo_ai_protocols::openai::ServiceConfig;
@@ -224,7 +225,7 @@ fn reasoning_only_stream_is_a_turn_not_an_empty_response() {
         panic!("expected FinalText, got {result:?}");
     };
     assert_eq!(text.content, "");
-    assert!(!text.truncated);
+    assert_ne!(text.finish, FinishOutcome::Length);
     assert_eq!(text.response_id.as_deref(), Some("resp_1"));
     assert!(
         text.reasoning_artifact.is_some(),
@@ -298,7 +299,11 @@ fn a_length_capped_stream_is_truncated_not_failed() {
         panic!("expected FinalText, got {result:?}");
     };
     assert_eq!(text.content, "The answer is");
-    assert!(text.truncated, "the turn reports the truncation");
+    assert_eq!(
+        text.finish,
+        FinishOutcome::Length,
+        "the turn reports the truncation"
+    );
     assert_eq!(text.response_id.as_deref(), Some("resp_3"));
     assert_eq!(text.usage.expect("usage").total_tokens, 11);
 }

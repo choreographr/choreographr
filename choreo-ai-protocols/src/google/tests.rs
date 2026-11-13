@@ -228,6 +228,47 @@ fn build_message_payloads_tool_call() {
     assert_eq!(parts[1]["functionCall"]["args"]["location"], "NYC");
 }
 
+// ── finish outcome ─────────────────────────────────────────────────
+
+#[test]
+fn finish_outcome_reads_the_gemini_finish_reasons() {
+    // The one reason that explains a cut-off tool call is `MAX_TOKENS`; a
+    // safety stop is a policy block, an unknown reason is `Other`, and a chunk
+    // that named nothing is `Absent` — none of the three may be reported as an
+    // output-token limit.
+    assert_eq!(finish_outcome(Some("STOP")), FinishOutcome::Stop);
+    assert_eq!(finish_outcome(Some("MAX_TOKENS")), FinishOutcome::Length);
+    assert_eq!(finish_outcome(Some("SAFETY")), FinishOutcome::Filtered);
+    assert_eq!(finish_outcome(Some("RECITATION")), FinishOutcome::Filtered);
+    assert_eq!(finish_outcome(Some("SOMETHING_NEW")), FinishOutcome::Other);
+    assert_eq!(finish_outcome(None), FinishOutcome::Absent);
+}
+
+#[test]
+fn a_max_tokens_candidate_is_reported_as_a_length_finish() {
+    // The non-streaming path must carry the provider's own cap through to the
+    // turn result, not flatten it to "not truncated".
+    let resp = GenerateContentResponse {
+        candidates: vec![Candidate {
+            content: Some(ContentBlock {
+                parts: vec![ResponsePart::Text {
+                    text: "half an answ".to_string(),
+                    thought: None,
+                    thought_signature: None,
+                }],
+                role: Some("model".to_string()),
+            }),
+            finish_reason: Some("MAX_TOKENS".to_string()),
+            index: 0,
+        }],
+        usage_metadata: None,
+    };
+    match response_to_turn_result(resp).unwrap() {
+        ChatTurnResult::FinalText(ft) => assert_eq!(ft.finish, FinishOutcome::Length),
+        other => panic!("expected FinalText, got {other:?}"),
+    }
+}
+
 // ── response_to_turn_result tests ─────────────────────────────────────
 
 #[test]

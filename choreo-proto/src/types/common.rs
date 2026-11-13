@@ -222,6 +222,51 @@ impl TokenUsage {
     }
 }
 
+/// How the provider said the turn ended.
+///
+/// The provider's own stop signal, normalized across wire formats — not a
+/// judgment about whether the reply was usable. It exists because *did the
+/// provider hit an output limit?* is the one fact that separates arguments cut
+/// off by a provider cap (which the client can only report) from arguments the
+/// model itself malformed, and because a stream can end with no signal at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FinishOutcome {
+    /// A normal completion: chat's `stop`/`tool_calls`, `Anthropic`'s
+    /// `end_turn`/`tool_use`/`stop_sequence`, Gemini's `STOP`, Responses'
+    /// `completed`.
+    Stop,
+    /// The provider reported an output-token limit (chat's `length`,
+    /// `Anthropic`'s `max_tokens`, Gemini's `MAX_TOKENS`, Responses'
+    /// `max_output_tokens`): the reply was cut off mid-generation.
+    Length,
+    /// The provider ended the reply for a policy reason (a content filter, a
+    /// safety block, a refusal) — terminal, but not a length problem.
+    Filtered,
+    /// A terminal reason this client does not classify. Kept distinct from
+    /// [`Self::Absent`]: the provider did say something, it just is not one of
+    /// the shapes above.
+    Other,
+    /// No finish reason arrived at all: the stream simply ended. This is the
+    /// case that most needs reporting, because a call cut off here was cut off
+    /// by something that never identified itself.
+    Absent,
+}
+
+impl FinishOutcome {
+    /// Stable label for logs and metric dimensions. Bounded set, so it is safe
+    /// as a metric label (unlike a model-authored tool name).
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            FinishOutcome::Stop => "stop",
+            FinishOutcome::Length => "length",
+            FinishOutcome::Filtered => "filtered",
+            FinishOutcome::Other => "other",
+            FinishOutcome::Absent => "absent",
+        }
+    }
+}
+
 /// A tool call that was discarded because the provider sent truncated or
 /// otherwise invalid (non-JSON) arguments.
 ///
@@ -236,6 +281,16 @@ pub struct DiscardedToolCall {
     /// actually returned, retained so the failure stays diagnosable without
     /// the raw network log.
     pub arguments_json: String,
+    /// 1-based line the JSON parser stopped at, when the rejection came from a
+    /// parse error. This is the *position* of the truncation, and it is free:
+    /// `serde_json`'s own error carries it, so no partial-JSON scanner is
+    /// needed to say where the payload stopped. `None` when the failure was not
+    /// a syntax error (e.g. the arguments parsed but were not an object).
+    pub error_line: Option<usize>,
+    /// 1-based column within [`Self::error_line`], when known. For the
+    /// single-line JSON these providers emit, this reads as the character
+    /// offset the payload was cut at.
+    pub error_column: Option<usize>,
 }
 
 impl std::fmt::Display for DiscardedToolCall {
@@ -249,13 +304,25 @@ impl std::fmt::Display for DiscardedToolCall {
         const PREVIEW_CHARS: usize = 200;
         let args = &self.arguments_json;
         let total = args.chars().count();
+        // The parse position, when the parser reported one, is the only part of
+        // "where it stopped" that survives into this message — it says whether
+        // the payload died at the end of the object or somewhere in the middle.
+        let at = match (self.error_line, self.error_column) {
+            (Some(line), Some(column)) => format!(" at line {line} column {column}"),
+            _ => String::new(),
+        };
         if total <= PREVIEW_CHARS {
-            write!(f, "{}: {}", self.name, sanitize_control_chars(args))
+            write!(
+                f,
+                "{} ({total} chars{at}): {}",
+                self.name,
+                sanitize_control_chars(args)
+            )
         } else {
             let preview: String = args.chars().take(PREVIEW_CHARS).collect();
             write!(
                 f,
-                "{} ({total} chars): {}…",
+                "{} ({total} chars{at}): {}…",
                 self.name,
                 sanitize_control_chars(&preview)
             )
@@ -379,6 +446,11 @@ pub enum InferenceError {
         /// The calls that were dropped, each with the partial payload the
         /// provider sent (see [`DiscardedToolCall`]).
         discarded: Vec<DiscardedToolCall>,
+        /// How the provider said the turn ended, carried so the daemon can
+        /// record *why* the call was cut off instead of only that it was. A
+        /// `Length` here means a provider output cap the client cannot repair;
+        /// [`FinishOutcome::Absent`] means the stream ended without saying.
+        finish: FinishOutcome,
     },
     /// The provider streamed tool calls this client could not identify — the
     /// Responses adapter names a call from its `function_call` output item, and

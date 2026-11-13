@@ -37,9 +37,9 @@ pub(crate) use config_tools::*;
 // handful of tests, so spelling out its surface keeps an accidental rename from
 // silently re-exporting (or hiding) one of its items.
 pub(crate) use recovery::{
-    RecoveryBudget, RecoveryOutcome, TRUNCATION_RECOVERY, TurnRecoveryParams,
-    UNNAMED_TOOL_CALL_RECOVERY, UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION, discarded_names,
-    recover_unrunnable_turn, recovery_detail,
+    RecoveryBudget, RecoveryOutcome, TRUNCATION_MIXED_RECOVERY_INSTRUCTION, TRUNCATION_RECOVERY,
+    TurnRecoveryParams, UNNAMED_TOOL_CALL_RECOVERY, UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION,
+    discarded_names, recover_unrunnable_turn, recovery_detail,
 };
 pub(crate) use stream::*;
 pub(crate) use system_content::*;
@@ -482,7 +482,7 @@ pub(crate) fn run_agent_loop(
                 // calls only steer the branch).
                 let choreo_ai_protocols::FinalTextResult {
                     content,
-                    truncated,
+                    finish,
                     discarded_tool_calls,
                     reasoning,
                     usage,
@@ -513,6 +513,17 @@ pub(crate) fn run_agent_loop(
                         provider_slug: provider_slug.clone(),
                         model: model.to_string(),
                     };
+                    // The provider slug and model are named here because the
+                    // metric needs them and the recovery unit does not carry
+                    // them; only bounded labels are recorded, never a tool name
+                    // or any message content.
+                    crate::metrics::record_tool_call_discarded(
+                        &provider_slug,
+                        model,
+                        TRUNCATION_RECOVERY.label,
+                        finish,
+                        discarded_tool_calls.len(),
+                    );
                     let outcome = recover_unrunnable_turn(TurnRecoveryParams {
                         session,
                         ctx,
@@ -520,6 +531,7 @@ pub(crate) fn run_agent_loop(
                         stream_id,
                         cause: TRUNCATION_RECOVERY,
                         detail: &discarded_names(&discarded_tool_calls),
+                        finish,
                         budget: &mut recovery_budget,
                         // The model's own words are kept: the casualty is the
                         // tool call, not the answer.
@@ -548,13 +560,24 @@ pub(crate) fn run_agent_loop(
                 // mid-answer would otherwise be indistinguishable from a
                 // finished reply.
                 let mut assistant_text = content;
-                if truncated {
+                if finish == choreo_ai_protocols::FinishOutcome::Length {
                     warn!(
                         session_id = ctx.session_id,
                         turn = turn_iter,
                         "provider cut the final answer at the output length limit"
                     );
                     assistant_text.push_str("\n\n⚠ response truncated (length limit)");
+                } else if finish == choreo_ai_protocols::FinishOutcome::Other {
+                    // The provider said the reply ended early without a reason
+                    // this client can name. Mark it rather than letting a
+                    // half-answer read as complete — but do not claim a length
+                    // limit the provider never reported.
+                    warn!(
+                        session_id = ctx.session_id,
+                        turn = turn_iter,
+                        "provider ended the final answer early without a reason"
+                    );
+                    assistant_text.push_str("\n\n⚠ response ended early (provider stopped)");
                 }
                 // Write the reasoning artifact + producing model through to the
                 // turn (phase 4c): the builder re-emits it on the next request
@@ -603,6 +626,8 @@ pub(crate) fn run_agent_loop(
                 let choreo_ai_protocols::ChatAssistantToolUse {
                     content,
                     tool_calls,
+                    discarded_tool_calls,
+                    finish,
                     reasoning,
                     usage,
                     response_id,
@@ -648,6 +673,7 @@ pub(crate) fn run_agent_loop(
                         stream_id,
                         cause: UNNAMED_TOOL_CALL_RECOVERY,
                         detail: &recovery_detail(&unnamed_calls),
+                        finish,
                         budget: &mut recovery_budget,
                         prose: content,
                         reasoning,
@@ -669,11 +695,42 @@ pub(crate) fn run_agent_loop(
                 // takes no strike, and neither does a productive turn between
                 // two failure bursts.
                 recovery_budget.note_progress();
+                // A mixed reply can lose calls in two ways at once, and both are
+                // told to the model rather than silently swallowed just because
+                // the turn also did real work. The guidance is accumulated into
+                // one user-role message: `pending_user_text` is a single slot
+                // consumed by the next iteration.
+                let mut mixed_guidance: Vec<&str> = Vec::new();
                 if unnamed_call_count > 0 {
-                    // Mixed reply: the named calls run below, and the next
-                    // turn's user text tells the model one of its calls was
-                    // dropped so it can reissue it with a real name.
-                    pending_user_text = Some(UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION.to_string());
+                    // The named calls run below; the next turn's user text tells
+                    // the model one of its calls was dropped so it can reissue it
+                    // with a real name.
+                    mixed_guidance.push(UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION);
+                }
+                if !discarded_tool_calls.is_empty() {
+                    // A call the provider cut off mid-arguments was dropped while
+                    // its siblings ran. Same treatment, same no-strike rule: the
+                    // model is told, and the metric records why it happened.
+                    crate::metrics::record_tool_call_discarded(
+                        &provider_slug,
+                        model,
+                        TRUNCATION_RECOVERY.label,
+                        finish,
+                        discarded_tool_calls.len(),
+                    );
+                    warn!(
+                        session_id = ctx.session_id,
+                        stream_id,
+                        turn_id = current_turn_id,
+                        discarded = discarded_tool_calls.len(),
+                        kept = runnable_calls.len(),
+                        finish = finish.label(),
+                        "a mixed reply dropped a truncated tool call; the runnable ones still run",
+                    );
+                    mixed_guidance.push(TRUNCATION_MIXED_RECOVERY_INSTRUCTION);
+                }
+                if !mixed_guidance.is_empty() {
+                    pending_user_text = Some(mixed_guidance.join("\n\n"));
                 }
                 // Mint a deterministic id for any call whose provider id was
                 // blank, before the turn is recorded. A blank id already breaks
@@ -1370,11 +1427,18 @@ pub(crate) fn run_agent_loop(
                 // steps, bounded by the cause's budget; the loop then continues
                 // to the next iteration instead of ending the request, so the
                 // session survives without a restart.
-                choreo_proto::InferenceError::TruncatedToolCall { discarded } => {
+                choreo_proto::InferenceError::TruncatedToolCall { discarded, finish } => {
                     // The affected tool(s) are named for the visible record by
                     // `discarded_names`, which keeps only provider-safe names
                     // and drops the rest — see its docs. The cropped JSON never
                     // reaches the transcript note.
+                    crate::metrics::record_tool_call_discarded(
+                        &provider_slug,
+                        model,
+                        TRUNCATION_RECOVERY.label,
+                        finish,
+                        discarded.len(),
+                    );
                     let outcome = recover_unrunnable_turn(TurnRecoveryParams {
                         session,
                         ctx,
@@ -1382,6 +1446,7 @@ pub(crate) fn run_agent_loop(
                         stream_id,
                         cause: TRUNCATION_RECOVERY,
                         detail: &discarded_names(&discarded),
+                        finish,
                         budget: &mut recovery_budget,
                         // The model never completed this response, so there is
                         // no reasoning to replay and no producer to attribute.

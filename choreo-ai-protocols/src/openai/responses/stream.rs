@@ -11,7 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::shared::RequestAuth;
 use crate::types::{ChatTurnResult, StreamEvent};
-use choreo_proto::TokenUsage;
+use choreo_proto::{FinishOutcome, TokenUsage};
 
 use super::super::retry;
 use super::super::{ResponsesStreamEvent, SseReader, parse_responses_stream_event};
@@ -83,10 +83,10 @@ where
     let mut last_usage: Option<TokenUsage> = None;
     let mut response_id: Option<String> = None;
     // The response stopped early with output it did keep (`max_output_tokens`
-    // and any reason this client does not classify): the partial answer rides
-    // a `FinalText` with this flag rather than failing the turn, exactly as
-    // chat maps `finish_reason: length`.
-    let mut truncated = false;
+    // is `Length`; any reason this client does not classify is `Other`): the
+    // partial answer rides a `FinalText` carrying that outcome rather than
+    // failing the turn, exactly as chat maps `finish_reason: length`.
+    let mut finish = FinishOutcome::Absent;
     // Opaque reasoning items collected across the stream (deduped by id in
     // `merge_reasoning_item`) — serialized into the round-trip artifact at
     // the end.
@@ -140,6 +140,8 @@ where
             ) => acc_calls.absorb(&event)?,
             Some(ResponsesStreamEvent::ResponseCompleted { id, usage }) => {
                 response_id = id;
+                // A completed response is the provider's normal terminal signal.
+                finish = FinishOutcome::Stop;
                 if let Some(u) = usage {
                     debug!(
                         prompt_tokens = u.prompt_tokens,
@@ -178,7 +180,11 @@ where
                         {
                             warn!(reason, "responses stream ended incomplete");
                         }
-                        truncated = true;
+                        finish = if other == Some("max_output_tokens") {
+                            FinishOutcome::Length
+                        } else {
+                            FinishOutcome::Other
+                        };
                         break;
                     }
                 }
@@ -250,7 +256,7 @@ where
         reasoning_artifact,
         produced_reasoning,
         usage: last_usage,
-        truncated,
+        finish,
         response_id,
     })
 }

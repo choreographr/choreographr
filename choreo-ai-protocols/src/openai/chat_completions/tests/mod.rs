@@ -4,7 +4,7 @@ use super::*;
 // them directly, so it imports them directly too.
 use crate::openai::reasoning_details::MAX_REASONING_BYTES;
 use crate::types::{ChatAssistantToolUse, ChatToolCall};
-use choreo_proto::{ChatReasoningField, ReasoningArtifact, TokenUsage};
+use choreo_proto::{ChatReasoningField, FinishOutcome, ReasoningArtifact, TokenUsage};
 
 // The reasoning re-emission (wire projection) cases live in their own
 // subject module: they assert the wire shape of one projected message.
@@ -85,7 +85,7 @@ fn length_on_final_text_sets_truncation_flag() {
     let ChatTurnResult::FinalText(result) = turn else {
         panic!("expected FinalText");
     };
-    assert!(result.truncated, "length on final text must set truncated");
+    assert_eq!(result.finish, FinishOutcome::Length);
     assert_eq!(result.content, "partial answer");
 }
 
@@ -143,6 +143,8 @@ fn all_truncated_tool_calls_with_text_returns_text() {
         vec![choreo_proto::DiscardedToolCall {
             name: "write_file".into(),
             arguments_json: "{\"path\":".into(),
+            error_line: Some(1),
+            error_column: Some(8),
         }]
     );
 }
@@ -156,7 +158,7 @@ fn stop_keeps_behavior_unchanged() {
     let ChatTurnResult::FinalText(result) = turn else {
         panic!("expected FinalText");
     };
-    assert!(!result.truncated);
+    assert_ne!(result.finish, FinishOutcome::Length);
     assert_eq!(result.content, "done");
 }
 
@@ -234,7 +236,7 @@ fn streaming_length_sets_truncation_flag_on_final_text() {
     acc.apply(&chunk2, &mut |_| Ok(())).unwrap();
     let result = acc.into_turn_result().unwrap();
     match result {
-        ChatTurnResult::FinalText(f) => assert!(f.truncated),
+        ChatTurnResult::FinalText(f) => assert_eq!(f.finish, FinishOutcome::Length),
         other => panic!("expected FinalText, got {other:?}"),
     }
 }
@@ -282,7 +284,7 @@ fn streaming_stop_leaves_truncation_flag_false() {
     let result = acc.into_turn_result().unwrap();
     match result {
         ChatTurnResult::FinalText(f) => {
-            assert!(!f.truncated);
+            assert_ne!(f.finish, FinishOutcome::Length);
             assert_eq!(f.content, "all done");
         }
         other => panic!("expected FinalText, got {other:?}"),
@@ -327,11 +329,48 @@ fn streaming_all_truncated_tool_calls_with_text_returns_text() {
         vec![choreo_proto::DiscardedToolCall {
             name: "write_file".into(),
             arguments_json: "{\"path\":".into(),
+            error_line: Some(1),
+            error_column: Some(8),
         }]
     );
 }
 
 // -- validate_tool_call_arguments tests --------------------------------
+
+#[test]
+fn a_truncated_call_is_never_repaired_into_a_runnable_one() {
+    // The two shapes that a structural repair would happily "fix" by closing
+    // the open string. Both must be discarded whole: the repaired first one
+    // would write a half-finished file body, and the repaired second one would
+    // execute a *different* (shorter) shell command than the model wrote. This
+    // is the rule that must survive the arrival of progressively streamed
+    // arguments — display may show a partial payload, execution never sees it.
+    let mut calls = vec![
+        ChatToolCall {
+            id: "call_1".into(),
+            name: "write_file".into(),
+            arguments_json: r#"{"path":"src/main.rs","content":"fn main() {"#.into(),
+            caller: None,
+        },
+        ChatToolCall {
+            id: "call_2".into(),
+            name: "sh".into(),
+            arguments_json: r#"{"command":"rm -rf /tmp/buil"#.into(),
+            caller: None,
+        },
+    ];
+    let discarded = crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Length);
+    assert!(calls.is_empty(), "nothing truncated may be dispatched");
+    assert_eq!(discarded.len(), 2);
+    // The bytes are kept for diagnosis, and the parser's own position says where
+    // each payload stopped — no partial-JSON scanner required.
+    assert_eq!(discarded[0].error_line, Some(1));
+    assert!(discarded[0].error_column.is_some());
+    assert_eq!(
+        discarded[0].arguments_json,
+        r#"{"path":"src/main.rs","content":"fn main() {"#
+    );
+}
 
 #[test]
 fn validate_valid_arguments_kept() {
@@ -349,7 +388,7 @@ fn validate_valid_arguments_kept() {
             caller: None,
         },
     ];
-    let discarded = crate::openai::validate_tool_call_arguments(&mut calls);
+    let discarded = crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Length);
     assert_eq!(discarded, [] as [choreo_proto::DiscardedToolCall; 0]);
     assert_eq!(calls.len(), 2);
 }
@@ -370,12 +409,14 @@ fn validate_invalid_arguments_discarded() {
             caller: None,
         },
     ];
-    let discarded = crate::openai::validate_tool_call_arguments(&mut calls);
+    let discarded = crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Length);
     assert_eq!(
         discarded,
         vec![choreo_proto::DiscardedToolCall {
             name: "bad_tool".into(),
             arguments_json: "truncated garbage".into(),
+            error_line: Some(1),
+            error_column: Some(4),
         }]
     );
     assert_eq!(calls.len(), 1);
@@ -398,7 +439,7 @@ fn validate_all_invalid_returns_all_names() {
             caller: None,
         },
     ];
-    let discarded = crate::openai::validate_tool_call_arguments(&mut calls);
+    let discarded = crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Length);
     assert_eq!(discarded.len(), 2);
     assert_eq!(discarded[0].name, "tool_a");
     assert_eq!(discarded[0].arguments_json, "bad");
@@ -410,7 +451,7 @@ fn validate_all_invalid_returns_all_names() {
 #[test]
 fn validate_empty_list_returns_empty() {
     let mut calls: Vec<ChatToolCall> = vec![];
-    let discarded = crate::openai::validate_tool_call_arguments(&mut calls);
+    let discarded = crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Length);
     assert_eq!(discarded, [] as [choreo_proto::DiscardedToolCall; 0]);
     assert_eq!(calls, [] as [ChatToolCall; 0]);
 }
@@ -748,6 +789,8 @@ fn accumulate_deltas_to_tool_use_result() {
     let result = ChatTurnResult::ToolUse(ChatAssistantToolUse {
         content: Some("I'll search for that.".into()),
         tool_calls,
+        discarded_tool_calls: Vec::new(),
+        finish: FinishOutcome::Stop,
         reasoning: None,
         usage: None,
         response_id: None,
