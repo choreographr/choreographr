@@ -74,6 +74,17 @@ jobs:
             --profile minimal --no-self-update
           rustup run "${{ steps.floor.outputs.version }}" rustc --version
 
+      # `--all-targets` builds choreo-gui, whose Blitz text stack links the
+      # system fontconfig and whose wgpu/winit stack links libwayland-client at
+      # build time (neither is dlopen'd), and openssl-sys (via native-tls) is not
+      # vendored. Without these, yeslogic-fontconfig-sys's build.rs aborts on a
+      # pkg-config lookup before any of our code is checked. Same package set
+      # gui-tests.yml installs for the same crates.
+      - name: Install system packages
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq pkg-config libfontconfig1-dev libwayland-dev libssl-dev
+
       # zlob's build.rs compiles its Zig source, which runs during resolution
       # as well as the compile; the version is pinned for the reason given in
       # release.yml's header note.

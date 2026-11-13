@@ -23,7 +23,9 @@
 #   scripts/mcp-conformance.sh --scenario tools_call   # one scenario
 #   MCP_CONFORMANCE_SPEC_VERSION=2026-07-28 scripts/mcp-conformance.sh
 #
-# Requires Node.js (npx) and network access; CI provides both.
+# Requires Node.js >= 22 (npx) and network access; CI provides both. The
+# pinned suite calls `fs.globSync` at module load, so an older Node aborts before
+# the first scenario.
 set -euo pipefail
 
 CONFORMANCE_VERSION="${MCP_CONFORMANCE_VERSION:-0.2.0-alpha.12}"

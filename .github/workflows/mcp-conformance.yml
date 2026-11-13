@@ -48,9 +48,13 @@ jobs:
           # at invocation time.
           rustup toolchain install nightly --profile minimal --no-self-update
 
-      - uses: actions/setup-node@v4
+      # The pinned conformance suite imports `fs.globSync` at module load, which
+      # only exists in Node >= 22; on Node 20 the run dies before the first
+      # scenario with "does not provide an export named 'globSync'". setup-node@v7
+      # also runs on a current (non-deprecated) Node runtime.
+      - uses: actions/setup-node@v7
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Run the client conformance suite
         env:
