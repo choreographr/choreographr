@@ -58,10 +58,9 @@
 
 use std::io::{Cursor, Read};
 use std::path::Path;
-use std::sync::Arc;
 
-use image::{DynamicImage, GenericImageView, ImageFormat, RgbaImage};
-use resvg::{tiny_skia, usvg};
+use choreo_image::svg::tiny_skia;
+use image::{DynamicImage, GenericImageView, ImageFormat};
 use tracing::{debug, warn};
 
 /// Longest-edge cap after normalization (px). A 2000px longest edge comfortably
@@ -464,11 +463,7 @@ fn finalize(
 /// its top-left to the pixmap origin — so the crop keeps the vector detail the
 /// full-tree render would have downscaled away.
 fn rasterize_svg(bytes: &[u8], region: Option<CropRegion>) -> std::io::Result<DynamicImage> {
-    let mut options = usvg::Options::default();
-    // Load system fonts so `<text>` elements render (matching the TUI's SVG
-    // rasterizer). Failure to load is non-fatal — missing glyphs are skipped.
-    Arc::make_mut(&mut options.fontdb).load_system_fonts();
-    let tree = usvg::Tree::from_data(bytes, &options)
+    let tree = choreo_image::svg::parse(bytes)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 
     // Resolve the fractional region into the viewport's own coordinate space
@@ -518,12 +513,6 @@ fn rasterize_svg(bytes: &[u8], region: Option<CropRegion>) -> std::io::Result<Dy
     #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let out_h = (region_h * scale).ceil().max(1.0) as u32;
 
-    let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "svg dimensions are too large to rasterize",
-        )
-    })?;
     // Scale by `scale` and shift the region's top-left corner to the pixmap
     // origin: a viewport point (vx, vy) lands at ((vx - origin_x) * scale,
     // (vy - origin_y) * scale). Content outside the pixmap is clipped.
@@ -535,13 +524,11 @@ fn rasterize_svg(bytes: &[u8], region: Option<CropRegion>) -> std::io::Result<Dy
         -origin_x * scale,
         -origin_y * scale,
     );
-    resvg::render(&tree, transform, &mut pixmap.as_mut());
-    let rgba = RgbaImage::from_raw(out_w, out_h, pixmap.take()).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "failed to build raster image from svg",
-        )
-    })?;
+    // The shared renderer allocates the pixmap and hands back straight-alpha
+    // RGBA, so this path cannot rasterize with a different alpha convention than
+    // the TUI's. A target it refuses is a policy rejection of this geometry.
+    let rgba = choreo_image::svg::render(&tree, transform, out_w, out_h)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     Ok(DynamicImage::ImageRgba8(rgba))
 }
 

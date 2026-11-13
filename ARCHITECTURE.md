@@ -148,13 +148,14 @@ the workspace agrees on the same policy and budget and the shell tool and MCP
 stdio child strip the same variables.
 
 `choreo-image` is a leaf crate (only `image` + `heifer` + `heifer-isobmff` +
-`moxcms` + `thiserror` + `tracing`) consumed by
+`moxcms` + `resvg` + `thiserror` + `tracing`) consumed by
 `choreo-daemon` and `choreo-tui` — it owns the single decode path for raster
 formats (with EXIF orientation baked in) and the HEIC/HEIF decode (with `heifer`,
 which applies the container's own orientation transforms), so the model path and
 the UI path cannot drift apart. It is split by decoder, not by caller: `raster`
 owns the `image`-crate decode and probe, `heic` owns the `heifer` decode and its
-container-geometry probe, and the two modules own their colour conversion
+container-geometry probe, and `svg` owns the `usvg`/`resvg` parse-and-rasterize
+path, and the modules own their colour conversion
 separately because their decoders expose it differently. A raster's embedded ICC
 profile is converted with the pure-Rust `moxcms` engine — an RGB profile on an
 RGB buffer, at the buffer's own depth, skipped for a source that is already sRGB
@@ -180,6 +181,22 @@ crop/rotate). That HEIC replay is arithmetic duplicated from `heifer`, so it is
 pinned by a test that encodes containers through `heifer`'s own encoder and
 asserts the probe's prediction equals the decoded extent — a drift becomes a test
 failure instead of a silently wrong size.
+
+SVG is the one image format the crate treats as *code*: `svg::parse` runs `usvg`,
+which resolves `<use>`/`xlink:href` chains, CSS, gradients, patterns, clip paths,
+masks and filters before any pixel exists. That resolution walks references an
+author controls, so the parse policy lives in this one module rather than at each
+call site: a nesting depth cap (`MAX_SVG_DEPTH`, 256 against `usvg`'s 1024
+default) bound to input the workspace does not control, and one process-wide
+`usvg::Options` whose system font database is scanned once per process instead of
+once per image — a per-image scan would put a filesystem walk in the vision and
+display paths. `svg::render` then allocates the target pixmap and hands back
+**straight** (non-premultiplied) RGBA: `tiny-skia` stores premultiplied alpha, so
+the demultiply happens at this boundary, and a translucent fill reaches the model
+and the terminal at the colour the document specifies rather than darkened. Only
+*how much* of the tree to draw stays with the caller, because the daemon renders
+an optional crop region at native resolution while the TUI renders a whole frame
+scaled to fit its cell.
 
 ---
 
@@ -4359,7 +4376,7 @@ cargo run -p choreo-im -- telegram
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | choreo-tui | Terminal UI |
 | `dioxus` | choreo-gui | Desktop/Android UI (Native/Blitz renderer) |
-| `image` + `resvg` + `heifer` + `moxcms` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (resvg), HEIC/HEIF decode (`heifer`, pure Rust, with `unsafe_code` forbidden) bounded by the decoder's own pixel limit against the buffer it is about to allocate plus a declared-geometry pre-check, and sRGB colour management on both decode paths (`moxcms` for a raster's embedded ICC profile; `heifer`'s own decode for a HEIC's profile or `nclx` description) so a Display-P3/AdobeRGB photo is not rendered desaturated |
+| `image` + `resvg` + `heifer` + `moxcms` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (`usvg` parse + `resvg` render, behind one shared parse policy: a 256-deep nesting cap for untrusted markup and one process-wide font database, with straight-alpha RGBA out of the premultiplied rasterizer), HEIC/HEIF decode (`heifer`, pure Rust, with `unsafe_code` forbidden) bounded by the decoder's own pixel limit against the buffer it is about to allocate plus a declared-geometry pre-check, and sRGB colour management on both decode paths (`moxcms` for a raster's embedded ICC profile; `heifer`'s own decode for a HEIC's profile or `nclx` description) so a Display-P3/AdobeRGB photo is not rendered desaturated |
 | `syntect` | choreo-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |

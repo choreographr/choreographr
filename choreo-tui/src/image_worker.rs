@@ -9,12 +9,11 @@
 
 use choreo_proto::ImageMetadata;
 use crossbeam_channel as channel;
-use image::{DynamicImage, RgbaImage};
+use image::DynamicImage;
 use ratatui::layout::Size;
 use ratatui_image::{Resize, ResizeEncodeRender, picker::Picker, protocol::StatefulProtocol};
-use resvg::{tiny_skia, usvg};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
 use std::thread;
 
 /// Identifier pairing an [`ImageJob`] with the [`ImageResult`] it produces.
@@ -256,27 +255,6 @@ fn decode_image(
     }
 }
 
-/// Process-wide `usvg` options with the system font database loaded once.
-///
-/// `load_system_fonts` scans the OS font directories, which costs far more than
-/// parsing a single SVG. Loading it on every image would rescan the filesystem
-/// per render; `Options` holds its database behind an `Arc`, so one scan shared
-/// through this `LazyLock` (read-only during parsing) removes that per-image
-/// cost. The catalogue is fixed for the life of the process — a font installed
-/// while the client runs is picked up only on restart, which is the right
-/// trade for a TUI.
-static SVG_OPTIONS: LazyLock<usvg::Options<'static>> = LazyLock::new(|| {
-    let mut options = usvg::Options::default();
-    Arc::make_mut(&mut options.fontdb).load_system_fonts();
-    options
-});
-
-/// Parse SVG bytes into a `usvg::Tree` with system fonts loaded (once, see
-/// [`SVG_OPTIONS`]).
-fn parse_svg(data: &[u8]) -> Result<usvg::Tree, String> {
-    usvg::Tree::from_data(data, &SVG_OPTIONS).map_err(|e| format!("failed to parse svg: {e}"))
-}
-
 /// Rasterize an SVG at a target pixel resolution, preserving aspect ratio.
 /// The resulting image will fit within `target_px_w × target_px_h` pixels.
 fn rasterize_svg_at_size(
@@ -284,7 +262,11 @@ fn rasterize_svg_at_size(
     target_px_w: u32,
     target_px_h: u32,
 ) -> Result<DynamicImage, String> {
-    let tree = parse_svg(data)?;
+    // The parse policy (nesting depth cap, one process-wide font database) and
+    // the straight-alpha output convention are shared with the daemon's vision
+    // path, so an SVG the model sees and the same SVG the terminal shows are
+    // decoded by one implementation.
+    let tree = choreo_image::svg::parse(data).map_err(|e| format!("failed to parse svg: {e}"))?;
     let svg_size = tree.size();
 
     // Compute a uniform scale that fits the SVG within the target pixel
@@ -304,17 +286,13 @@ fn rasterize_svg_at_size(
     let out_w = out_w.max(1);
     let out_h = out_h.max(1);
 
-    let mut pixmap = tiny_skia::Pixmap::new(out_w, out_h)
-        .ok_or_else(|| "svg dimensions are too large to rasterize".to_string())?;
-
-    resvg::render(
+    let image = choreo_image::svg::render(
         &tree,
-        tiny_skia::Transform::from_scale(scale, scale),
-        &mut pixmap.as_mut(),
-    );
-
-    let image = RgbaImage::from_raw(out_w, out_h, pixmap.take())
-        .ok_or_else(|| "failed to build raster image from svg".to_string())?;
+        choreo_image::svg::tiny_skia::Transform::from_scale(scale, scale),
+        out_w,
+        out_h,
+    )
+    .map_err(|e| e.to_string())?;
 
     Ok(DynamicImage::ImageRgba8(image))
 }

@@ -30,7 +30,6 @@ serde.workspace = true
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
 signal-hook.workspace = true
-resvg.workspace = true
 syntect = "5.3"
 # Small-vector storage for the renderer's per-line copy-chrome metadata
 # (`LineChrome`): the overwhelmingly common case is empty, and a `SmallVec`

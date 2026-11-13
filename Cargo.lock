@@ -2933,7 +2933,6 @@ dependencies = [
  "prometheus",
  "rand 0.10.3",
  "redb",
- "resvg",
  "rmp-serde",
  "rustix 1.1.6",
  "schemars 1.2.3",
@@ -3021,6 +3020,7 @@ dependencies = [
  "heifer-isobmff",
  "image",
  "moxcms",
+ "resvg",
  "thiserror 2.0.21",
  "tracing",
 ]
@@ -3188,7 +3188,6 @@ dependencies = [
  "nix 0.31.3",
  "ratatui",
  "ratatui-image",
- "resvg",
  "serde",
  "signal-hook 0.4.6",
  "smallvec",

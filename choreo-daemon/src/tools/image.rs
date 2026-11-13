@@ -1,7 +1,6 @@
 use super::{PreparedImage, ToolExecError, context::ToolContext, truncate_tool_output};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use choreo_keystore::ServiceCredential;
-use resvg::usvg;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -310,8 +309,11 @@ fn inspect_image_dimensions(mime_type: &str, data: &[u8]) -> io::Result<(u32, u3
         | "image/x-farbfeld"
         | "image/avif" => choreo_image::probe_dimensions(data).map_err(io::Error::other),
         "image/svg+xml" => {
-            let options = usvg::Options::default();
-            let tree = usvg::Tree::from_data(data, &options).map_err(io::Error::other)?;
+            // Shared parse policy: the same depth cap and font database the
+            // rasterize paths use, so the probe cannot admit a document the
+            // renderer refuses, and the `<text>` metrics that feed the reported
+            // size agree with what a rasterization would produce.
+            let tree = choreo_image::svg::parse(data).map_err(io::Error::other)?;
             let size = tree.size().to_int_size();
             Ok((size.width(), size.height()))
         }

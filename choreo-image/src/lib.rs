@@ -14,6 +14,11 @@
 //!   header-only geometry probe ([`probe_heic_dimensions`]). `heifer` enforces
 //!   the same pixel budget itself, against the picture it is about to allocate,
 //!   and rejects picture-less or unsupported files rather than guessing.
+//! - [`svg`] — the `usvg`/`resvg` parse-and-rasterize path ([`svg::parse`],
+//!   [`svg::render`]), where the parse policy (a nesting depth cap bound to
+//!   untrusted input, one process-wide font database) and the straight-alpha
+//!   output convention live so neither can drift between the model path and the
+//!   UI path.
 //! - `colour` — the ICC→sRGB conversion for the raster path.
 //!
 //! # Colour management
@@ -52,6 +57,7 @@ use tracing::warn;
 mod colour;
 pub mod heic;
 pub mod raster;
+pub mod svg;
 
 pub use heic::{decode_heic, probe_heic_dimensions};
 pub use raster::{decode_raster_oriented, probe_dimensions};

@@ -21,6 +21,11 @@ heifer.workspace = true
 heifer-isobmff.workspace = true
 image.workspace = true
 moxcms.workspace = true
+# The SVG renderer (`usvg` parse + `resvg` rasterize, both re-exported from the
+# `svg` module). Owned here rather than at the call sites so the daemon's model
+# path and the TUI's display path share one parse policy instead of building
+# their own `usvg::Options` and drifting.
+resvg.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
