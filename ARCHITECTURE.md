@@ -4168,8 +4168,11 @@ select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`, set the
 result in `[workspace.package]` `rust-version`, and commit lockfile + bump
 together, so
 the crates.io metadata on the published crates is accurate (see RELEASE.md
-Phase 2). The CI MSRV job validates the claim at release time rather than
-constraining day-to-day development.
+Phase 2). Nothing enforces the claim automatically: dependency resolution
+explicitly ignores it, no CI job pins the floor's toolchain, and the only
+check is that manual preflight recompute — so it constrains neither day-to-day
+development nor dependency updates, and a stale number is possible between
+releases.
 
 **Building defaults to nightly.** `rust-toolchain.toml` pins the workspace to
 the `nightly` channel (rustup auto-installs it on first `cargo` run) so that

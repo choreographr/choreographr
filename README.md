@@ -384,7 +384,7 @@ brew install zig
 cargo build --release
 ```
 
-The **source uses no nightly-only features**, so the code also builds on any stable ≥ 1.100 (the MSRV floor, enforced by CI). Stable builds are a supported but explicit opt-out, because the nightly-only flags we wire in hard-block stable *Cargo* — use the `just` recipes, which temporarily strip those flags for one command and restore them:
+The **source uses no nightly-only features**, so the code also builds on any stable ≥ 1.100 (the MSRV floor — declared in the workspace manifest and re-synced during the release preflight, see [`RELEASE.md`](./RELEASE.md)). Stable builds are a supported but explicit opt-out, because the nightly-only flags we wire in hard-block stable *Cargo* — use the `just` recipes, which temporarily strip those flags for one command and restore them:
 
 ```bash
 just build-stable   # build on stable (release by default)
