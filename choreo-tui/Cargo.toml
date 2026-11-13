@@ -36,7 +36,7 @@ syntect = "5.3"
 # (`LineChrome`): the overwhelmingly common case is empty, and a `SmallVec`
 # keeps that allocation-free while still allowing multiple intervals on the
 # rare nested-chrome row.  Only choreo-tui uses it, so it stays crate-local.
-smallvec = "1.16.4"
+smallvec = "1.16.5"
 choreo-client-core.workspace = true
 choreo-keystore.workspace = true
 choreo-markdown.workspace = true
