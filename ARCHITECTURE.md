@@ -2881,10 +2881,13 @@ it declines, so a stray result can never take a call a genuine answer later in
 the block still claims by id. The repair is
 byte-deterministic and never re-serializes a valid object, so it does not churn
 the prompt-cache prefix. A chained Responses route keeps its non-blank ids
-byte-identical (it sends only the post-assistant tail, and the
-`function_call_output`'s `call_id` must match the id the service minted) while
-still minting a blank one. The repair reports what it changed per request — the
-counts are its return value, never a side effect. Only the send path
+byte-identical, duplicates included (it sends only the post-assistant tail, and
+the `function_call_output`'s `call_id` must match the id the service minted, so
+inventing a suffixed copy would answer nothing and cost the tool's real result)
+while still minting a blank one — the id guarantee is structural on that route,
+not a reliance on the service never minting a duplicate. The repair reports what
+it changed per request — the counts are its return value, never a side effect.
+Only the send path
 (`build_chat_request_messages_recording`, called once per provider round-trip)
 logs the counts at `debug` (numbers only, never a name, an id or message
 content) and exports them as the labelled counter

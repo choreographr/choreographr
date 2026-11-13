@@ -167,6 +167,52 @@ fn duplicate_ids_get_suffixes() {
     assert_eq!(ids_of(&messages[0]), vec!["dup", "dup_d2", "dup_d3"]);
 }
 
+#[test]
+fn rewrite_ids_true_suffixes_a_duplicate() {
+    // The rewriting route may invent an id, so the second occurrence of a
+    // duplicate is suffixed. This is the baseline the byte-identical route is
+    // contrasted against: same input, different verdict on the id alone.
+    let mut messages = vec![assistant(vec![
+        call("dup", "sh", "{}"),
+        call("dup", "sh", "{}"),
+    ])];
+    repair_replayed_calls(&mut messages, true);
+    assert_eq!(ids_of(&messages[0]), vec!["dup", "dup_d2"]);
+}
+
+#[test]
+fn rewrite_ids_false_keeps_a_duplicate_byte_identical_and_answers_both() {
+    // The chained Responses route: the id is minted by the service and echoed
+    // back in the `function_call_output`, so a suffixed copy would answer
+    // nothing and cost the tool's real result. A duplicate is a broken
+    // transcript, and the repair still emits both ids exactly as recorded.
+    let mut messages = vec![
+        assistant(vec![call("dup", "sh", "{}"), call("dup", "sh", "{}")]),
+        tool_result_with("dup", "first output"),
+        tool_result_with("dup", "second output"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, false);
+    assert_eq!(
+        ids_of(&messages[0]),
+        vec!["dup", "dup"],
+        "ids survive verbatim"
+    );
+    assert_eq!(
+        counts.ids, 0,
+        "nothing diverged, so no id repair is counted"
+    );
+    // Pairing resolves the duplicate positionally: the first result takes the
+    // first *unanswered* call and the second the remaining one, so neither
+    // result is dropped for a stub.
+    assert_eq!(counts.stubbed, 0, "both results answer a call");
+    assert_eq!(counts.dropped, 0, "neither result is an orphan");
+    assert_eq!(messages.len(), 3, "assistant + both results, no stub");
+    assert_eq!(messages[1].tool_call_id.as_deref(), Some("dup"));
+    assert_eq!(messages[1].content.as_deref(), Some("first output"));
+    assert_eq!(messages[2].tool_call_id.as_deref(), Some("dup"));
+    assert_eq!(messages[2].content.as_deref(), Some("second output"));
+}
+
 // ── argument normalization ──
 
 #[test]

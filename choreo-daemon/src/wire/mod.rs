@@ -27,11 +27,13 @@
 //!
 //! After [`repair_replayed_calls`], every assistant tool call carries a
 //! provider-safe name, a non-blank id unique within the request, and a JSON
-//! object for its arguments; every call is answered by exactly one `tool`
-//! message (a stub when the transcript holds no result), and a `tool` message
-//! that answers no call is dropped. A result whose recorded id no longer names
-//! its call still answers it when the choice is unambiguous, so a mangled or
-//! pre-mint id costs neither the tool's output nor a stub.
+//! object for its arguments — except on a chained Responses route, where the
+//! service's own id is kept byte-identically, duplicates included. Every call
+//! is answered by exactly one `tool` message (a stub when the transcript holds
+//! no result), and a `tool` message that answers no call is dropped. A result
+//! whose recorded id no longer names its call still answers it when the choice
+//! is unambiguous, so a mangled or pre-mint id costs neither the tool's output
+//! nor a stub.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -77,8 +79,11 @@ pub(crate) struct NormalizedCall<'a> {
 /// `rewrite_id` says whether a non-blank id may be normalized. A chained
 /// Responses route sets it to `false`: it sends only the post-assistant tail,
 /// and the `call_id` in a `function_call_output` must stay byte-identical to
-/// the id the service minted, or the output answers nothing. A blank id is
-/// still minted there — a provider never mints a blank one.
+/// the id the service minted, or the output answers nothing. The guarantee on
+/// that route is absolute — a non-blank id is emitted byte-identically,
+/// including under a (pathological) duplicate, which is why [`disambiguate`]
+/// takes the same flag and leaves such an id alone. A blank id is still minted
+/// there — a provider never mints a blank one.
 #[must_use]
 pub(crate) fn normalize_call<'a>(
     name: &'a str,
@@ -230,8 +235,25 @@ pub(crate) fn mint_call_id(name: &str, arguments_json: &str, position: usize) ->
 
 /// Make an id unique within the request, appending `_d2`, `_d3`, … to the
 /// second and later occurrence of an id already used earlier in the request.
-fn disambiguate(used: &mut HashSet<String>, id: String) -> String {
+///
+/// `rewrite_id` is the flag [`normalize_call`] takes, honoured here for the same
+/// reason: a chained Responses route's id is minted by the service and echoed
+/// back in the `function_call_output` that answers it, so the repair may not
+/// invent a different one — an output keyed to a suffixed id would answer
+/// nothing, which costs the tool's real result and substitutes a stub. A
+/// duplicate on that route means a broken transcript rather than a duplicate to
+/// paper over, and pairing still resolves it: [`slot_with_id`] and [`next_slot`]
+/// match the first *unanswered* call, so the second result still claims the
+/// second call.
+fn disambiguate(used: &mut HashSet<String>, id: String, rewrite_id: bool) -> String {
+    // The insert doubles as the duplicate test, and records the id either way so
+    // a third occurrence is not mistaken for a fresh one.
     if used.insert(id.clone()) {
+        return id;
+    }
+    // The id is the service's own and must survive byte-for-byte; the duplicate
+    // is left for pairing to resolve by position instead.
+    if !rewrite_id {
         return id;
     }
     let mut n = 2u32;
@@ -431,14 +453,20 @@ fn pair_results(
 
 /// Apply the wire repair to a fully-assembled request message list.
 ///
-/// `rewrite_ids` is passed straight to [`normalize_call`] (see its doc for why
-/// a chained Responses route passes `false`).
+/// `rewrite_ids` is threaded through to both [`normalize_call`] and
+/// [`disambiguate`] (see their docs for why a chained Responses route passes
+/// `false`). On that route the id guarantee is absolute rather than
+/// statistical: a non-blank id is emitted byte-identically — never sanitized
+/// and never suffixed, even under a pathological duplicate — because the id the
+/// service minted is the only one its `function_call_output` answers.
 ///
 /// Three passes, in order, because each depends on the previous one:
 ///
 /// * **A — normalize calls.** Every assistant call gets a provider-safe name,
 ///   a JSON-object argument string, and a non-blank id unique within the
-///   request (the duplicate suffix is applied here).
+///   request (the duplicate suffix is applied here). The one exception is the
+///   `rewrite_ids == false` route, whose non-blank ids are emitted as recorded
+///   even when one repeats an earlier one.
 /// * **B — pair results.** Each `role: "tool"` message is matched to the call
 ///   it answers and its `tool_call_id` is rewritten to that call's *final* id.
 ///   Every result is first given the chance to claim a call by its recorded id;
@@ -488,10 +516,11 @@ pub(crate) fn repair_replayed_calls(
                     normalized.arguments_json.into_owned(),
                 )
             };
-            let final_id = disambiguate(&mut used, id);
+            let final_id = disambiguate(&mut used, id, rewrite_ids);
             // Count the divergence from the recorded bytes before overwriting
             // them: a blank id counts as repaired (minted), and a duplicate id
-            // counts because the suffix changed it.
+            // counts when the suffix changed it — on the byte-identical route
+            // the duplicate is kept, so nothing diverged and nothing counts.
             if name != call.function.name {
                 counts.names = counts.names.saturating_add(1);
             }

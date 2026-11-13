@@ -237,8 +237,9 @@ pub(crate) fn assemble_request_messages(
     // `rewrite_ids` is off for a chained Responses route: it sends only the
     // post-assistant tail, and the `call_id` in a `function_call_output` must
     // stay byte-identical to the id the service minted, or the output answers
-    // nothing. A blank id is still minted there, since a service never mints
-    // one.
+    // nothing. That holds even under a duplicate id, so the repair never
+    // suffixes one on this route. A blank id is still minted there, since a
+    // service never mints one.
     let rewrite_ids = !chains_via_response_id(provider_slug, model);
     let counts = repair_replayed_calls(&mut messages, rewrite_ids);
     (messages, counts)
