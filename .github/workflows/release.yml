@@ -841,12 +841,15 @@ jobs:
           # Native toolchain inside the VM. `bash` is REQUIRED: release.sh,
           # build-stable.sh and the smoke scripts are bash (arrays, [[ ]]) and
           # FreeBSD base ships only sh/csh. `git` backs release.sh's dirty-tree
-          # guard; `ca_root_nss` lets curl trust the rustup TLS download; `xz`
-          # unpacks the Zig tarball below (zig itself is not from pkg — see the
-          # job comment).
+          # guard; `ca_root_nss` lets curl trust the rustup TLS download. Do NOT
+          # add `xz`: xz-utils is in FreeBSD's BASE system on every supported
+          # release (the `archivers/xz` port was deleted for exactly that
+          # reason), so `pkg install xz` finds no such package and aborts this
+          # script under `set -eu`. The base `xz` unpacks the Zig tarball below
+          # (zig itself is not from pkg — see the job comment).
           prepare: |
             set -eu
-            pkg install -y bash curl ca_root_nss git gmake xz
+            pkg install -y bash curl ca_root_nss git gmake
             # FreeBSD's packaged Zig lags (0.16.0), which cannot build zlob
             # 1.8.0 (it uses the `@backingInt` builtin added in Zig 0.17).
             # Fetch the pinned official release tarball and put it on PATH.
