@@ -95,11 +95,11 @@ pub fn parse_diff(text: &str) -> Vec<FileDiff> {
                 .to_string();
         } else if let Some(rest) = line.strip_prefix("--- ") {
             if state.old_path.is_empty() {
-                state.old_path = rest.strip_prefix("a/").unwrap_or(rest).to_string();
+                state.old_path = rest.trim_prefix("a/").to_string();
             }
         } else if let Some(rest) = line.strip_prefix("+++ ") {
             if state.new_path.is_empty() {
-                state.new_path = rest.strip_prefix("b/").unwrap_or(rest).to_string();
+                state.new_path = rest.trim_prefix("b/").to_string();
             }
         } else if line.starts_with("@@") {
             state.flush_hunk();

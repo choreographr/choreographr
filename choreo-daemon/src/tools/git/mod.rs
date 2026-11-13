@@ -193,7 +193,7 @@ pub(crate) fn pathspec_matches(pathspec: &[String], path: &str) -> bool {
         let spec = spec.trim();
         !spec.is_empty()
             && (path == spec
-                || path.starts_with(spec.strip_suffix('/').unwrap_or(spec))
+                || path.starts_with(spec.trim_suffix('/'))
                 || simple_glob_matches(spec, path))
     })
 }

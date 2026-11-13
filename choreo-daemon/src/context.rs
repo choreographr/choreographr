@@ -433,10 +433,10 @@ fn extract_yaml_frontmatter(content: &str) -> Option<String> {
     if !content.starts_with("---") {
         return None;
     }
-    let rest = content
-        .strip_prefix("---")?
-        .strip_prefix('\n')
-        .unwrap_or(content.strip_prefix("---")?);
+    // One optional newline after the `---` fence is consumed; `trim_prefix`
+    // returns the input unchanged on a miss, and the `starts_with` guard above
+    // already established the fence is present.
+    let rest = content.trim_prefix("---").trim_prefix('\n');
     let end = rest.find("\n---")?;
     // `end` comes from `find`, so it is a char boundary; fallback preserves behavior.
     Some(rest.get(..end).unwrap_or("").trim().to_string())
@@ -468,10 +468,10 @@ fn extract_skill_body(content: &str) -> Option<String> {
     if !content.starts_with("---") {
         return None;
     }
-    let rest = content
-        .strip_prefix("---")?
-        .strip_prefix('\n')
-        .unwrap_or(content.strip_prefix("---")?);
+    // One optional newline after the `---` fence is consumed; `trim_prefix`
+    // returns the input unchanged on a miss, and the `starts_with` guard above
+    // already established the fence is present.
+    let rest = content.trim_prefix("---").trim_prefix('\n');
     let end = rest.find("\n---")?;
     // `end` comes from `find`, so `end + 4` is a char boundary; fallback preserves behavior.
     let body = rest.get(end + 4..).unwrap_or("").trim().to_string();

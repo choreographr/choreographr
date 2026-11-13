@@ -447,16 +447,6 @@ mod tests {
     fn drop_kills_the_child_without_a_live_runtime() {
         use rustix::process::{Pid, WaitOptions};
 
-        // Ensure the child is killed even if an assertion panics before the
-        // transport's own drop — a leaked `sleep` would otherwise outlive the
-        // test.
-        struct KillOnDrop(Pid);
-        impl Drop for KillOnDrop {
-            fn drop(&mut self) {
-                let _ = rustix::process::kill_process(self.0, rustix::process::Signal::KILL);
-            }
-        }
-
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -477,7 +467,12 @@ mod tests {
         // u32→i32: pids live in the positive i32 range by kernel ABI.
         #[expect(clippy::cast_possible_wrap)]
         let child = Pid::from_raw(pid as i32).expect("a live child pid is nonzero");
-        let _reap = KillOnDrop(child);
+        // Ensure the child is killed even if an assertion panics before the
+        // transport's own drop — a leaked `sleep` would otherwise outlive the
+        // test.
+        let _reap = std::mem::DropGuard::new(child, |pid| {
+            let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+        });
 
         // The drop must signal the child's process group right here, with no
         // runtime to lean on.

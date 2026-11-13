@@ -211,7 +211,7 @@ pub(crate) fn sanitize_multiline(text: &str) -> String {
         // CRLF: fold the bare '\r' (the single-line sanitizers escape it,
         // but here it is just Windows line-ending residue, not hostile
         // content — and escaping it would leak `\r` into every CRLF body).
-        let line = line.strip_suffix('\r').unwrap_or(line);
+        let line = line.trim_suffix('\r');
         out.push_str(&sanitize_text(line, true));
     }
     out

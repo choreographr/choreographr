@@ -430,7 +430,7 @@ fn expand_env_with(value: &str, lookup: impl Fn(&str) -> Option<String>) -> Stri
             out.push_str(&expanded);
         }
         // `after_name` begins with the closing `}`.
-        rest = after_name.strip_prefix('}').unwrap_or("");
+        rest = after_name.trim_prefix('}');
     }
     out.push_str(rest);
     out

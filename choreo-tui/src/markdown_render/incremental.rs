@@ -466,7 +466,7 @@ fn last_blank_boundary(src: &str) -> Option<usize> {
     let mut offset = 0usize;
     for piece in src.split_inclusive('\n') {
         let complete = piece.ends_with('\n');
-        let content = piece.strip_suffix('\n').unwrap_or(piece);
+        let content = piece.trim_suffix('\n');
         if let Some((ch, min)) = fence {
             // Inside a fence: only a closing fence changes state, and no blank
             // line here is a boundary.

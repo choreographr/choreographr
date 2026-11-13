@@ -165,7 +165,7 @@ fn should_send_if_none_match(etag: Option<&str>) -> bool {
 /// (RFC 7232 requires a non-empty opaque-tag) — fails and is never sent on
 /// the wire.
 fn is_well_formed_etag(etag: &str) -> bool {
-    let body = etag.strip_prefix("W/").unwrap_or(etag);
+    let body = etag.trim_prefix("W/");
     // Two quotes plus at least one opaque-tag character between them.
     body.len() >= 3 && body.starts_with('"') && body.ends_with('"')
 }

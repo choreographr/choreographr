@@ -1226,16 +1226,6 @@ pub(crate) struct ExecuteToolParams<'a> {
 pub(crate) fn execute_tool_with_timeout(
     params: ExecuteToolParams<'_>,
 ) -> (ToolOutput, bool, Option<PreparedImage>) {
-    // Drop guard: when the main loop exits (for any reason), signal the
-    // forwarder to stop so it doesn't orphan waiting on output_rx.
-    // (Declared at the top of the block: items must precede statements.)
-    struct KillGuard(crossbeam_channel::Sender<()>);
-    impl Drop for KillGuard {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-
     let ExecuteToolParams {
         tool_call,
         x_credentials,
@@ -1304,7 +1294,11 @@ pub(crate) fn execute_tool_with_timeout(
         stream_id,
     });
 
-    let _kill_guard = KillGuard(kill_tx);
+    // Drop guard: when the main loop exits (for any reason), signal the
+    // forwarder to stop so it doesn't orphan waiting on output_rx.
+    let _kill_guard = std::mem::DropGuard::new(kill_tx, |tx| {
+        let _ = tx.send(());
+    });
 
     // Event-driven wait: `select_biased!` waits on the cancellation channel,
     // the tool's result channel, and an exact timer for the remaining budget

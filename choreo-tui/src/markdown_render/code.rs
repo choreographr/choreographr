@@ -79,7 +79,7 @@ fn render_code_box(
     // empty line that would render as a spurious blank interior row above the
     // bottom border.  A deliberately blank last line (two newlines) survives,
     // since only one suffix is stripped.
-    let code = code.strip_suffix('\n').unwrap_or(code);
+    let code = code.trim_suffix('\n');
     // The box must fit the block's available width.  Its frame costs four
     // columns — `│ ` on the left and ` │` on the right — so the interior code
     // area (and hence the box) is capped at `block_avail - 4`.

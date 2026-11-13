@@ -4155,10 +4155,13 @@ always picks the newest available versions even when their declared
 `rust-version` exceeds the workspace floor. Consequently the MSRV number may
 lag the resolved tree during development; that is fine. The floor is also
 raised deliberately when the workspace adopts a newly stabilized std API (for
-example `String::from_utf8_lossy_owned` or `Option::map_or_default`): the API becomes
+example `String::from_utf8_lossy_owned`, `Option::map_or_default`, or
+`str::trim_prefix` / `core::mem::DropGuard`): the API becomes
 the true build floor even when no dependency demands it, so the declared
 `rust-version` then reflects the workspace's own sources rather than the
-dependency tree alone. Before publishing,
+dependency tree alone. The dependency side can therefore trail the claim —
+the highest `rust-version` any dependency declares is what that half of the
+floor is, and an adopted std API is what usually sets the number. Before publishing,
 sync it: compute the resolved tree's floor with
 `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version |
 select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`, set the

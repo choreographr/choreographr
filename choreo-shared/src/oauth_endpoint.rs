@@ -86,17 +86,12 @@ pub fn is_loopback_endpoint(url: &str) -> bool {
 /// MCP connect path compares a stored credential's issuer against the one it
 /// re-discovers. A server that spells its issuer with or without a trailing
 /// slash must not be treated as two issuers — that only forces a needless
-/// re-login — so one trailing slash is ignored on each side. Both sides are
-/// compared verbatim otherwise (issuer identity is otherwise exact).
+/// re-login — so one trailing slash is ignored on each side (`trim_suffix`
+/// strips at most one, leaving `https://a` and `https://a//` distinct). Both
+/// sides are compared verbatim otherwise (issuer identity is otherwise exact).
 #[must_use]
 pub fn issuers_match(expected: &str, actual: &str) -> bool {
-    strip_one_trailing_slash(expected) == strip_one_trailing_slash(actual)
-}
-
-/// Strip at most one trailing slash, so a single trailing-slash difference
-/// between two otherwise-identical issuer URLs is tolerated.
-fn strip_one_trailing_slash(url: &str) -> &str {
-    url.strip_suffix('/').unwrap_or(url)
+    expected.trim_suffix('/') == actual.trim_suffix('/')
 }
 
 /// The loopback host of an `http://` URL (`127.0.0.1`, `localhost`, or `::1`),
