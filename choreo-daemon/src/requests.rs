@@ -802,27 +802,41 @@ pub(crate) fn run_agent_loop(
                     provider_slug: provider_slug.clone(),
                     model: model.to_string(),
                 };
-                session.set_assistant_response(
-                    current_turn_id,
-                    AssistantResponse {
-                        text: content.clone(),
-                        reasoning: reasoning.clone(),
-                        tool_calls: tool_call_records.clone(),
-                        token_usage,
-                        reasoning_artifact: reasoning_artifact.clone(),
-                        reasoning_producer: Some(producer.clone()),
-                    },
-                );
                 // Seed one placeholder tool result per call, in the model's
                 // call order, so the transcript renders every tool result in
                 // that order at all times — each placeholder is filled in
                 // place as its tool streams or finalizes.  The seeded
                 // placeholder already carries the invocation description so
                 // the live header matches the final record's exactly.
+                //
+                // Seeding runs before the assistant write because it only
+                // borrows `tool_call_records`, which that write consumes. The
+                // order is otherwise free: the two calls touch disjoint turn
+                // fields (`tool_results` versus the assistant text/reasoning/
+                // calls/artifact/producer). Every payload the record needs is
+                // MOVED into it rather than cloned — this point is only reached
+                // with runnable calls, and nothing after it reads the text, the
+                // reasoning or the opaque reasoning artifact (a provider
+                // round-trip blob that can run to kilobytes), so the record is
+                // their last consumer.
                 session.seed_tool_results(
                     current_turn_id,
                     &tool_call_records,
                     &invocation_descriptions,
+                );
+                session.set_assistant_response(
+                    current_turn_id,
+                    AssistantResponse {
+                        text: content,
+                        reasoning,
+                        tool_calls: tool_call_records,
+                        token_usage,
+                        reasoning_artifact,
+                        // The producer is one struct two call sites need (the
+                        // turn's provenance here, the response-id provenance
+                        // below), so it is the one value that is copied.
+                        reasoning_producer: Some(producer.clone()),
+                    },
                 );
                 broadcast_turn_appended(&ctx.cmd_tx, session, ctx.session_id, current_turn_id);
                 // Store response_id for chaining tool results back to this
