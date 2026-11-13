@@ -2765,15 +2765,23 @@ calls carry a **name no provider will accept** — an empty or whitespace-only
 name, but also a non-blank one a strict endpoint rejects (`multi_tool_use.parallel`,
 a long shell command a weak model emitted as a name), which would otherwise be
 dispatched under that name, answered "no such tool", and (with `max_turns = 0`,
-no loop limit at all) never bounded. The gate is the shared
-`choreo_ai_protocols::tool_name::is_provider_safe` rule, which the daemon
-re-exports under the name `is_provider_safe_function_name` (one owner, so the
-daemon cannot drift from it), deliberately wider than the adapters'
-blank-only merge rule: an adapter *reports* what the provider sent, and the
-daemon *governs* whether it may run. The calls are never recorded or dispatched,
-the turn keeps the model's prose plus a bracketed note naming what was
-discarded, and the model is told in the next **user** message what went wrong
-and how to retry. Each cause has its own small budget of consecutive recoveries
+no loop limit at all) never bounded. **Truncation is a casualty even when the
+turn also carries prose.** A reply whose calls were all cut off but that also
+said something is a `FinalText` — the answer is kept, not replaced by an error —
+and it **carries the discarded calls** so the daemon can tell the two apart: a
+`FinalText` with a non-empty `discarded_tool_calls` is recovered exactly like a
+text-less one (the same `truncated_tool_call` cause and budget) rather than
+being read as a finished answer. Without that signal a model that announces a
+step and then overflows its output limit ends the request mid-task, leaving the
+announcement as the last thing in the transcript. The gate for an unacceptable
+name is the shared `choreo_ai_protocols::tool_name::is_provider_safe` rule, which
+the daemon re-exports under the name `is_provider_safe_function_name` (one
+owner, so the daemon cannot drift from it), deliberately wider than the
+adapters' blank-only merge rule: an adapter *reports* what the provider sent,
+and the daemon *governs* whether it may run. The calls are never recorded or
+dispatched, the turn keeps the model's prose plus a bracketed note naming what
+was discarded, and the model is told in the next **user** message what went
+wrong and how to retry. Each cause has its own small budget of consecutive recoveries
 (`truncated_tool_call`, `unidentified_tool_calls` — the label keeps its name and
 its alignment with `InferenceError::UnidentifiedToolCalls::metric_label()` even
 though the cause now covers any unacceptable name) and the request ends once one
@@ -3842,7 +3850,12 @@ pane that never reported is never released.
     `EmptyResponse` error that discards a payload the provider billed for. Both wire formats
     reach that verdict through one shared assembler (`openai::turn::assemble_turn`), fed by
     adapter-specific parts, so the tool-call / truncated-call / empty-response decision tree
-    exists once rather than once per path.
+    exists once rather than once per path. That assembler also owns the one place truncated
+    calls are reported: a turn that keeps a runnable call drops the cut-off ones from its
+    `ToolUse`, and a final answer whose calls were all truncated reports them in
+    `FinalTextResult::discarded_tool_calls` — the field the daemon keys its recovery on (see
+    **A turn that yields nothing runnable is recovered, not dispatched**). Dropping them
+    silently would make an unfinished turn indistinguishable from a finished one.
 
     **A tool call is reported, not adjudicated.** Every adapter passes the provider's
     function name through verbatim, so a nameless or provider-invalid `tool_use` / `functionCall`

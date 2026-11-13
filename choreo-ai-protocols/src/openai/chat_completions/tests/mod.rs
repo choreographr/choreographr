@@ -136,6 +136,15 @@ fn all_truncated_tool_calls_with_text_returns_text() {
         panic!("expected FinalText");
     };
     assert_eq!(result.content, "here is the plan");
+    // The dropped call travels with the answer: the daemon recovers the turn
+    // instead of treating the prose as finished work.
+    assert_eq!(
+        result.discarded_tool_calls,
+        vec![choreo_proto::DiscardedToolCall {
+            name: "write_file".into(),
+            arguments_json: "{\"path\":".into(),
+        }]
+    );
 }
 
 #[test]
@@ -311,6 +320,15 @@ fn streaming_all_truncated_tool_calls_with_text_returns_text() {
         panic!("expected FinalText");
     };
     assert_eq!(f.content, "partial answer");
+    // The streamed shape reports the dropped call the same way the
+    // non-streaming one does, so both reach the daemon's recovery.
+    assert_eq!(
+        f.discarded_tool_calls,
+        vec![choreo_proto::DiscardedToolCall {
+            name: "write_file".into(),
+            arguments_json: "{\"path\":".into(),
+        }]
+    );
 }
 
 // -- validate_tool_call_arguments tests --------------------------------

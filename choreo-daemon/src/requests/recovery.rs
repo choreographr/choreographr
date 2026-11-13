@@ -230,6 +230,31 @@ fn echo_name(name: &str) -> String {
     }
 }
 
+/// Detail for the recovery note of a turn whose tool calls were cut off
+/// mid-arguments: the comma-joined names of the discarded calls, empty when the
+/// provider cut the reply off before any name arrived.
+///
+/// Both truncation sites use this — the text-less turn that fails outright and
+/// the text-carrying turn that is surfaced as a `FinalText` still carrying its
+/// discarded calls — so the two produce the same note for the same loss.
+///
+/// A discarded call can carry a name no provider accepts (a provider stub cut
+/// off before a valid function name arrived), so those are filtered out: the
+/// joined list never renders as a bare `", "`, and the empty check inside
+/// [`truncation_note`] stays meaningful. What survives
+/// [`crate::tools::tool_call_is_unrunnable`] is provider-safe by construction —
+/// at most [`choreo_ai_protocols::tool_name::MAX_FUNCTION_NAME_LEN`] bytes of
+/// `[A-Za-z0-9_-]` per name — so the note can never be bloated with, or carry
+/// control characters from, a hostile reply.
+pub(crate) fn discarded_names(discarded: &[choreo_proto::DiscardedToolCall]) -> String {
+    discarded
+        .iter()
+        .map(|d| d.name.as_str())
+        .filter(|name| !crate::tools::tool_call_is_unrunnable(name))
+        .format(", ")
+        .to_string()
+}
+
 /// What the agent loop does after a turn recovery ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RecoveryOutcome {
@@ -425,6 +450,40 @@ pub(crate) fn recover_unrunnable_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discarded_names_join_the_provider_safe_ones_and_drop_the_rest() {
+        // The note is model- and user-visible, so only names a provider would
+        // accept are echoed: an unrunnable one is dropped instead of rendered,
+        // which also keeps the empty-name case from leaving a bare ", ".
+        let discarded = vec![
+            choreo_proto::DiscardedToolCall {
+                name: "run_series".to_string(),
+                arguments_json: "{".to_string(),
+            },
+            choreo_proto::DiscardedToolCall {
+                name: "rm -rf / #".to_string(),
+                arguments_json: "{".to_string(),
+            },
+            choreo_proto::DiscardedToolCall {
+                name: "edit_file".to_string(),
+                arguments_json: "{".to_string(),
+            },
+        ];
+        assert_eq!(discarded_names(&discarded), "run_series, edit_file");
+    }
+
+    #[test]
+    fn discarded_names_is_empty_when_no_name_is_usable() {
+        // Every call was cut off before a valid function name arrived: the note
+        // then falls back to its "A tool call" phrasing rather than naming
+        // nothing.
+        let discarded = vec![choreo_proto::DiscardedToolCall {
+            name: String::new(),
+            arguments_json: "{".to_string(),
+        }];
+        assert_eq!(discarded_names(&discarded), "");
+    }
 
     #[test]
     fn note_recovery_stops_at_the_cause_budget() {

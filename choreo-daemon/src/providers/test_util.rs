@@ -145,6 +145,7 @@ impl TruncatingProviderClient {
             choreo_ai_protocols::FinalTextResult {
                 content: "done".to_string(),
                 truncated: false,
+                discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
                 response_id: None,
@@ -192,6 +193,95 @@ impl ProviderClient for TruncatingProviderClient {
 /// Build a provider that truncates its first `truncations` streaming turns.
 pub(crate) fn make_truncating_provider(truncations: usize) -> InferenceProvider {
     make_truncating_provider_with_slug(truncations, "test-truncating").0
+}
+
+/// The prose a [`ProseTruncatingProviderClient`] emits alongside its cut-off
+/// call: the shape that used to end a request silently, since a turn with text
+/// is a `FinalText` rather than a `TruncatedToolCall` error.
+pub(crate) const PROSE_WITH_TRUNCATED_CALL: &str = "Now the rewrites.";
+
+/// Provider whose first `truncations` turns are a **final answer carrying
+/// discarded calls** — the reply a model produces when it announces a step and
+/// then emits a tool call the provider cuts off mid-JSON. It is a `FinalText`
+/// (the prose survives) that still reports the dropped call, which is what the
+/// agent loop must treat as unfinished work rather than a finished answer.
+#[derive(Debug)]
+pub(crate) struct ProseTruncatingProviderClient {
+    truncations: usize,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+impl ProseTruncatingProviderClient {
+    fn new(truncations: usize) -> Self {
+        Self {
+            truncations,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    fn next_result(&self) -> ChatTurnResult {
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n < self.truncations {
+            return ChatTurnResult::FinalText(choreo_ai_protocols::FinalTextResult {
+                content: PROSE_WITH_TRUNCATED_CALL.to_string(),
+                truncated: false,
+                discarded_tool_calls: vec![choreo_proto::DiscardedToolCall {
+                    name: "run_series".to_string(),
+                    arguments_json: "{\"steps\":[{\"tool\":".to_string(),
+                }],
+                reasoning: None,
+                usage: None,
+                response_id: None,
+                reasoning_artifact: None,
+            });
+        }
+        ChatTurnResult::FinalText(choreo_ai_protocols::FinalTextResult {
+            content: "done".to_string(),
+            truncated: false,
+            discarded_tool_calls: Vec::new(),
+            reasoning: None,
+            usage: None,
+            response_id: None,
+            reasoning_artifact: None,
+        })
+    }
+}
+
+impl ProviderClient for ProseTruncatingProviderClient {
+    // &'static str is the trait's required lifetime, not an over-bound literal.
+    #[expect(clippy::unnecessary_literal_bound)]
+    fn provider_slug(&self) -> &str {
+        "test-prose-truncating"
+    }
+
+    fn chat_completion_turn(
+        &self,
+        _params: ChatTurnRequest<'_>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        Ok(self.next_result())
+    }
+
+    fn chat_completion_turn_streaming(
+        &self,
+        _params: ChatTurnRequest<'_>,
+        _on_event: &mut dyn FnMut(StreamEvent) -> io::Result<()>,
+    ) -> Result<ChatTurnResult, InferenceError> {
+        Ok(self.next_result())
+    }
+
+    fn list_models(&self) -> Result<Vec<String>, InferenceError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Build a provider whose first `truncations` turns are a final answer that
+/// carries a discarded tool call.
+pub(crate) fn make_prose_truncating_provider(truncations: usize) -> InferenceProvider {
+    InferenceProvider {
+        client: Arc::new(ProseTruncatingProviderClient::new(truncations)),
+        slug: "test-prose-truncating".to_string(),
+        image_client: None,
+    }
 }
 
 /// Like [`make_truncating_provider`], but with a caller-chosen catalog slug
@@ -245,6 +335,7 @@ impl ProviderClient for RecordingProviderClient {
             choreo_ai_protocols::FinalTextResult {
                 content: String::new(),
                 truncated: false,
+                discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
                 response_id: None,
@@ -355,6 +446,7 @@ impl ProviderClient for ToolLoopProviderClient {
             choreo_ai_protocols::FinalTextResult {
                 content: "done".to_string(),
                 truncated: false,
+                discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
                 response_id: None,
@@ -462,6 +554,7 @@ impl ProviderClient for ScriptedStreamProviderClient {
             choreo_ai_protocols::FinalTextResult {
                 content: "done".to_string(),
                 truncated: false,
+                discarded_tool_calls: Vec::new(),
                 reasoning: None,
                 usage: None,
                 response_id: None,
@@ -583,6 +676,7 @@ impl ProviderClient for ScriptedTurnProviderClient {
                     choreo_ai_protocols::FinalTextResult {
                         content: "done".to_string(),
                         truncated: false,
+                        discarded_tool_calls: Vec::new(),
                         reasoning: None,
                         usage: None,
                         response_id: None,

@@ -16,7 +16,6 @@ use choreo_proto::{
     AssistantToolCallRecord, DaemonMessageType, OutputStream, ReasoningProducer, SessionEvent,
     SessionStatus,
 };
-use itertools::Itertools;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -39,8 +38,8 @@ pub(crate) use config_tools::*;
 // silently re-exporting (or hiding) one of its items.
 pub(crate) use recovery::{
     RecoveryBudget, RecoveryOutcome, TRUNCATION_RECOVERY, TurnRecoveryParams,
-    UNNAMED_TOOL_CALL_RECOVERY, UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION, recover_unrunnable_turn,
-    recovery_detail,
+    UNNAMED_TOOL_CALL_RECOVERY, UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION, discarded_names,
+    recover_unrunnable_turn, recovery_detail,
 };
 pub(crate) use stream::*;
 pub(crate) use system_content::*;
@@ -477,7 +476,20 @@ pub(crate) fn run_agent_loop(
                     reasoning_len = final_text.reasoning.as_deref().map_or(0, str::len),
                     "model returned final text",
                 );
-                let token_usage = final_text.usage;
+                // Taken apart up front so every path below moves its own part
+                // (`usage` is recorded before the recovery branch, the prose and
+                // reasoning go to whichever record is written, and the dropped
+                // calls only steer the branch).
+                let choreo_ai_protocols::FinalTextResult {
+                    content,
+                    truncated,
+                    discarded_tool_calls,
+                    reasoning,
+                    usage,
+                    response_id,
+                    reasoning_artifact,
+                } = final_text;
+                let token_usage = usage;
                 accumulate_token_usage(
                     session,
                     token_usage.as_ref(),
@@ -487,6 +499,46 @@ pub(crate) fn run_agent_loop(
                     ctx,
                 );
                 broadcast_token_usage(ctx, session);
+                // A final answer can still be carrying a casualty. A reply whose
+                // tool calls were all cut off mid-arguments but that also said
+                // something is surfaced as text — the answer is kept, not thrown
+                // away — yet the calls it asked for never ran. Reading that as a
+                // finished answer ends the request mid-task with no notice, so
+                // such a turn is recovered exactly like a text-less truncated
+                // one: the prose is recorded with a note naming what was lost,
+                // the model is told how to retry smaller, and the loop continues
+                // under the same consecutive-recovery budget.
+                if !discarded_tool_calls.is_empty() {
+                    let producer = ReasoningProducer {
+                        provider_slug: provider_slug.clone(),
+                        model: model.to_string(),
+                    };
+                    let outcome = recover_unrunnable_turn(TurnRecoveryParams {
+                        session,
+                        ctx,
+                        turn_id: current_turn_id,
+                        stream_id,
+                        cause: TRUNCATION_RECOVERY,
+                        detail: &discarded_names(&discarded_tool_calls),
+                        budget: &mut recovery_budget,
+                        // The model's own words are kept: the casualty is the
+                        // tool call, not the answer.
+                        prose: Some(content),
+                        reasoning,
+                        reasoning_artifact,
+                        producer: Some(producer),
+                        prev_resp_id: &mut prev_resp_id,
+                        pending_user_text: &mut pending_user_text,
+                    })?;
+                    if outcome == RecoveryOutcome::Stop {
+                        return Ok(false);
+                    }
+                    // The loop bottom advances the turn counter; `continue`
+                    // would skip it, so advance it here instead (matching the
+                    // unnamed-call recovery).
+                    turn_iter += 1;
+                    continue;
+                }
                 // Cheap display hook for the finish-reason truncation flag:
                 // `length` on a final-text turn means the answer was cut off
                 // by the output limit. Append a visible notice so the user is
@@ -495,8 +547,8 @@ pub(crate) fn run_agent_loop(
                 // "sees" the truncation marker — acceptable, since resuming
                 // mid-answer would otherwise be indistinguishable from a
                 // finished reply.
-                let mut assistant_text = final_text.content;
-                if final_text.truncated {
+                let mut assistant_text = content;
+                if truncated {
                     warn!(
                         session_id = ctx.session_id,
                         turn = turn_iter,
@@ -518,9 +570,9 @@ pub(crate) fn run_agent_loop(
                     current_turn_id,
                     AssistantResponse {
                         text: Some(assistant_text),
-                        reasoning: final_text.reasoning,
+                        reasoning,
                         token_usage,
-                        reasoning_artifact: final_text.reasoning_artifact.clone(),
+                        reasoning_artifact,
                         reasoning_producer: Some(producer.clone()),
                         ..Default::default()
                     },
@@ -541,10 +593,7 @@ pub(crate) fn run_agent_loop(
                 // later provenance match to replay into a service that does
                 // not understand it.
                 if chains_via_response_id(&provider_slug, model) {
-                    session
-                        .config
-                        .last_response_id
-                        .clone_from(&final_text.response_id);
+                    session.config.last_response_id.clone_from(&response_id);
                     session.config.last_response_id_producer = Some(producer);
                 }
                 finalize_and_broadcast_turn(session, ctx, current_turn_id)?;
@@ -1322,31 +1371,17 @@ pub(crate) fn run_agent_loop(
                 // to the next iteration instead of ending the request, so the
                 // session survives without a restart.
                 choreo_proto::InferenceError::TruncatedToolCall { discarded } => {
-                    // Name the affected tool(s) for the visible record; the
-                    // exact per-call note is built from the names only — the
-                    // cropped JSON lives in the (now-bounded) Display and the
-                    // log, never in the transcript text. A discarded call can
-                    // carry a name no provider accepts (a provider stub cut off
-                    // before a valid function name arrived); drop those so the
-                    // joined list never renders as a bare ", " and the empty
-                    // check inside the note builder stays meaningful. What
-                    // survives `tool_call_is_unrunnable` is provider-safe by
-                    // construction — at most 64 bytes of `[A-Za-z0-9_-]` per
-                    // name — so this note can never be bloated or carry control
-                    // characters from a hostile reply.
-                    let names = discarded
-                        .iter()
-                        .map(|d| d.name.as_str())
-                        .filter(|name| !tool_call_is_unrunnable(name))
-                        .format(", ")
-                        .to_string();
+                    // The affected tool(s) are named for the visible record by
+                    // `discarded_names`, which keeps only provider-safe names
+                    // and drops the rest — see its docs. The cropped JSON never
+                    // reaches the transcript note.
                     let outcome = recover_unrunnable_turn(TurnRecoveryParams {
                         session,
                         ctx,
                         turn_id: current_turn_id,
                         stream_id,
                         cause: TRUNCATION_RECOVERY,
-                        detail: &names,
+                        detail: &discarded_names(&discarded),
                         budget: &mut recovery_budget,
                         // The model never completed this response, so there is
                         // no reasoning to replay and no producer to attribute.

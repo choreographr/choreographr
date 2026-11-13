@@ -94,6 +94,20 @@ pub struct FinalTextResult {
     /// `false`). `length` + tool calls is normal tool-loop flow, so a
     /// `ToolUse` turn never carries it.
     pub truncated: bool,
+    /// Tool calls the provider returned with arguments that were not valid
+    /// JSON (typically cut off mid-response), so they were discarded as unsafe
+    /// to execute — empty on an ordinary final answer.
+    ///
+    /// A final answer can carry a casualty: a reply whose calls were all
+    /// truncated but that also carried visible text is still an answer, so the
+    /// text is surfaced here instead of being replaced by an error. The dropped
+    /// calls are not silently forgotten, though: the daemon reads this list to
+    /// route the turn into the same truncated-tool-call recovery a text-less
+    /// one gets — the prose is kept in the transcript, the user is told which
+    /// calls were lost, and the model is asked to retry in smaller steps.
+    /// Without that signal the turn looks like a finished answer and ends the
+    /// request mid-task.
+    pub discarded_tool_calls: Vec<choreo_proto::DiscardedToolCall>,
     /// Display text of the assistant's reasoning, when the provider produced
     /// it.
     pub reasoning: Option<String>,

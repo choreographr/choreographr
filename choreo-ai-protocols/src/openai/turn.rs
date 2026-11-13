@@ -8,6 +8,12 @@
 //! format (finish reasons, `incomplete` details, output-item variants); this one
 //! owns the shared verdict — and, with it, the single place a turn's content is
 //! normalized — so the chat-completions and Responses paths cannot drift apart.
+//!
+//! Discarded (truncated) calls are reported on whichever result the verdict
+//! lands on, never silently dropped: a `ToolUse` turn keeps the runnable calls
+//! only, and a text-carrying turn whose calls were all truncated stays a
+//! `FinalText` **but carries the discarded calls** so the daemon can recover it
+//! instead of mistaking it for a finished answer.
 
 use super::validate_tool_call_arguments;
 use crate::types::{ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult};
@@ -54,7 +60,8 @@ pub(super) struct TurnParts {
 /// Assemble a turn result from its finalized parts.
 ///
 /// The order is the contract: a usable tool call always wins, a reply whose
-/// every tool call was truncated surfaces the answer when there is one and a
+/// every tool call was truncated surfaces the answer when there is one (flagged
+/// with the dropped calls, so the daemon can recover the unfinished work) and a
 /// dedicated `TruncatedToolCall` when there is not, and a final answer with no
 /// visible text is only empty when the provider produced no reasoning either.
 pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::OpenAiError> {
@@ -102,12 +109,19 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
         // fabricating an empty "final answer" that looks complete — the daemon
         // special-cases it to tell the model what happened and let it retry in
         // smaller steps.
+        //
+        // The text-carrying case still reports the dropped calls, because the
+        // turn is not finished work: the model asked for something that never
+        // ran. The daemon routes a non-empty `discarded_tool_calls` into that
+        // same recovery (keeping this prose), so a turn that would otherwise
+        // read as a completed answer cannot silently end the request.
         if content_is_empty {
             return Err(super::OpenAiError::TruncatedToolCall { discarded });
         }
         return Ok(ChatTurnResult::FinalText(FinalTextResult {
             content: final_text,
             truncated,
+            discarded_tool_calls: discarded,
             reasoning,
             usage,
             response_id,
@@ -135,6 +149,9 @@ pub(super) fn assemble_turn(parts: TurnParts) -> Result<ChatTurnResult, super::O
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: final_text,
         truncated,
+        // Nothing was dropped on this path: every call the reply carried was
+        // either usable (handled above) or absent.
+        discarded_tool_calls: Vec::new(),
         reasoning,
         usage,
         response_id,
@@ -258,6 +275,56 @@ mod tests {
         .expect("reasoning is still model output");
         match turn {
             ChatTurnResult::FinalText(result) => assert_eq!(result.content, ""),
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_text_carrying_truncation_reports_the_discarded_calls() {
+        // The model said something and then asked for a tool the provider cut
+        // off mid-arguments. The prose is still an answer (it is returned, not
+        // replaced by an error), but the turn must report the call it lost — a
+        // `FinalText` with an empty `discarded_tool_calls` reads as finished
+        // work and would end the request without the call ever running.
+        let turn = assemble_turn(TurnParts {
+            content: Some("Now the rewrites.".to_string()),
+            tool_calls: vec![ChatToolCall {
+                id: "call_1".to_string(),
+                name: "run_series".to_string(),
+                arguments_json: "{\"steps\":[{\"tool\":".to_string(),
+                caller: None,
+            }],
+            ..textless_parts(None)
+        })
+        .expect("the prose keeps the turn a final answer");
+        match turn {
+            ChatTurnResult::FinalText(result) => {
+                assert_eq!(result.content, "Now the rewrites.");
+                assert_eq!(
+                    result.discarded_tool_calls,
+                    vec![choreo_proto::DiscardedToolCall {
+                        name: "run_series".to_string(),
+                        arguments_json: "{\"steps\":[{\"tool\":".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected FinalText, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_final_answer_reports_no_discarded_calls() {
+        // Nothing was dropped, so the daemon must not mistake a finished answer
+        // for a recovery case.
+        let turn = assemble_turn(textless_parts(Some("all done".to_string())))
+            .expect("a plain answer is still an answer");
+        match turn {
+            ChatTurnResult::FinalText(result) => {
+                assert_eq!(
+                    result.discarded_tool_calls,
+                    [] as [choreo_proto::DiscardedToolCall; 0]
+                );
+            }
             other => panic!("expected FinalText, got {other:?}"),
         }
     }

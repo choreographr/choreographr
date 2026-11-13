@@ -736,6 +736,7 @@ fn response_to_turn_result(
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content,
         truncated: false,
+        discarded_tool_calls: Vec::new(),
         reasoning,
         usage,
         response_id: None,

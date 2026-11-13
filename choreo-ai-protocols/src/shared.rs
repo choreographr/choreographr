@@ -682,6 +682,7 @@ mod tests {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hello".into(),
             truncated: false,
+            discarded_tool_calls: Vec::new(),
             reasoning: None,
             usage: None,
             response_id: None,
@@ -698,6 +699,7 @@ mod tests {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hello".into(),
             truncated: false,
+            discarded_tool_calls: Vec::new(),
             reasoning: Some("thinking...".into()),
             usage: None,
             response_id: None,
@@ -717,6 +719,7 @@ mod tests {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: String::new(),
             truncated: false,
+            discarded_tool_calls: Vec::new(),
             reasoning: None,
             usage: None,
             response_id: None,
@@ -730,6 +733,7 @@ mod tests {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "hi".into(),
             truncated: false,
+            discarded_tool_calls: Vec::new(),
             reasoning: Some(String::new()),
             usage: None,
             response_id: None,
@@ -958,6 +962,7 @@ mod tests {
         let result = ChatTurnResult::FinalText(FinalTextResult {
             content: "boom".into(),
             truncated: false,
+            discarded_tool_calls: Vec::new(),
             reasoning: None,
             usage: None,
             response_id: None,

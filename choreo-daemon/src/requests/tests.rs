@@ -23,9 +23,10 @@ use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
 use crate::providers::test_util::{
-    ScriptedTurn, make_failing_provider, make_scripted_stream_provider,
-    make_scripted_turn_provider, make_scripted_turn_provider_with_slug, make_test_provider,
-    make_tool_loop_provider, make_tool_loop_provider_with_tool, make_truncating_provider,
+    PROSE_WITH_TRUNCATED_CALL, ScriptedTurn, make_failing_provider, make_prose_truncating_provider,
+    make_scripted_stream_provider, make_scripted_turn_provider,
+    make_scripted_turn_provider_with_slug, make_test_provider, make_tool_loop_provider,
+    make_tool_loop_provider_with_tool, make_truncating_provider,
     make_truncating_provider_with_slug,
 };
 use crate::reasoning::{

@@ -228,7 +228,7 @@ impl TokenUsage {
 /// The `arguments_json` field holds the partial/cropped payload the provider
 /// actually returned, making it easier to diagnose what went wrong without
 /// digging through raw network logs.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscardedToolCall {
     /// The tool name the provider invoked (e.g. `write_file`).
     pub name: String,

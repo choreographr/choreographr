@@ -328,6 +328,98 @@ fn agent_loop_recovers_from_truncated_tool_call() {
 }
 
 #[test]
+fn agent_loop_recovers_a_truncated_call_that_came_with_prose() {
+    // The provider cut a tool call off mid-JSON but the model had also written a
+    // line of prose. That turn is a `FinalText` (the answer is kept) that still
+    // reports the dropped call, and it must be recovered exactly like a
+    // text-less truncation: record the prose plus the note, seed the retry
+    // instruction, and keep going — reading it as a finished answer would end
+    // the request mid-task with only a step announcement in the transcript.
+    let mut h = agent_loop_harness(ToolRegistry::new());
+    let provider = make_prose_truncating_provider(1);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut h.session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &h.ctx,
+        Some("hi"),
+    );
+    assert!(
+        !result.unwrap(),
+        "a recovered request still completes normally"
+    );
+
+    assert_eq!(
+        h.session.turns.len(),
+        2,
+        "the prose turn is recorded and retried, not treated as the answer"
+    );
+    let t0 = h.session.turns.get(&0).expect("turn 0 exists");
+    let text = t0.assistant_text.as_deref().unwrap_or_default();
+    assert!(
+        text.contains(PROSE_WITH_TRUNCATED_CALL),
+        "the model's prose is kept, got {text:?}"
+    );
+    assert!(
+        text.contains("run_series") && text.contains("output-token"),
+        "the note names the dropped call, got {text:?}"
+    );
+    let t1 = h.session.turns.get(&1).expect("turn 1 exists");
+    assert_eq!(
+        t1.user_text.as_deref(),
+        Some(TRUNCATION_RECOVERY_INSTRUCTION),
+        "the recovery instruction is seeded as the retry's user turn"
+    );
+    assert_eq!(t1.assistant_text.as_deref(), Some("done"));
+}
+
+#[test]
+fn agent_loop_truncation_budget_bounds_a_prose_carrying_recovery() {
+    // The same prose-plus-dropped-call reply every turn: the budget must still
+    // bound it. Such a turn spends the truncation cause's budget like any other
+    // recovery, and the last recorded turn says why the request stopped here.
+    let mut h = agent_loop_harness(ToolRegistry::new());
+    let provider = make_prose_truncating_provider(MAX_TRUNCATION_RECOVERIES as usize + 5);
+    let (_cancel_tx, cancel_rx) = crossbeam_channel::unbounded::<()>();
+
+    let result = run_agent_loop(
+        &provider,
+        &mut h.session,
+        "test-model",
+        7,
+        &cancel_rx,
+        &h.ctx,
+        Some("hi"),
+    );
+    assert!(
+        !result.unwrap(),
+        "the request ends cleanly, not with an error"
+    );
+    assert_eq!(
+        h.session.turns.len(),
+        MAX_TRUNCATION_RECOVERIES as usize,
+        "the recovery loop stops at the budget"
+    );
+    let last = h
+        .session
+        .turns
+        .get(&(MAX_TRUNCATION_RECOVERIES - 1))
+        .expect("the last turn exists");
+    assert!(
+        last.assistant_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("The run stopped here"),
+        "the exhausted budget is explained in the transcript, got {:?}",
+        last.assistant_text
+    );
+}
+
+#[test]
 fn agent_loop_gives_up_after_truncation_recovery_budget() {
     // A provider that truncates every turn: the loop must retry only up to the
     // budget, then end the request cleanly (Ok(false)) instead of spinning

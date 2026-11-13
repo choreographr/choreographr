@@ -532,6 +532,7 @@ where
     Ok(ChatTurnResult::FinalText(FinalTextResult {
         content: full_text,
         truncated: false,
+        discarded_tool_calls: Vec::new(),
         reasoning: if full_reasoning.is_empty() {
             None
         } else {
