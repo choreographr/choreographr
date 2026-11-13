@@ -29,7 +29,6 @@ serde.workspace = true
 # with anything other than ratatui's own wrapper would risk a one-row clip.
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ratatui-image = { version = "11", default-features = false, features = ["crossterm"] }
-signal-hook.workspace = true
 syntect = "5.3"
 # Small-vector storage for the renderer's per-line copy-chrome metadata
 # (`LineChrome`): the overwhelmingly common case is empty, and a `SmallVec`
@@ -50,19 +49,24 @@ tracing.workspace = true
 lru.workspace = true
 chrono.workspace = true
 crossbeam-channel.workspace = true
-mio = { version = "1.2", features = ["os-ext"] }
 tui-prompts = "0.6"
 humfmt.workspace = true
 # Process-wide allocator for the binary only — enabled by the `mimalloc`
 # feature (see [features] below); library consumers never see it.
 mimalloc = { version = "0.1", optional = true }
 
-# `nix` is a Unix-only crate: it does not compile on Windows at all (no
-# POSIX signals/fds there), so it is gated behind cfg(unix) rather than being
-# a universal dependency. `mio` stays universal — it is cross-platform and
-# its `mio::unix` module is cfg-gated internally.
+# Every use of `nix`, `mio` and `signal-hook` in this crate is behind
+# `#[cfg(unix)]`: `nix` does not compile on Windows at all, `mio` is reached only
+# through `mio::unix` (`SourceFd`, the self-pipe, the `Poll` over them), and
+# `signal_hook`'s low-level pipe handler is Unix-only. Declaring them here rather
+# than as universal dependencies keeps the Windows build honest: on a non-unix
+# target the crate names none of them, and Cargo's `[lints.cargo]`
+# `unused_dependencies` deny (see the root manifest) fails the build for a
+# dependency that is resolved but never used.
 [target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
 nix = { workspace = true, features = ["signal", "fs"] }
+mio = { version = "1.2", features = ["os-ext"] }
 
 [features]
 # mimalloc — process-wide allocator for the `choreo-tui` BINARY, enabled ONLY
