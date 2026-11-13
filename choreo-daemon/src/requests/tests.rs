@@ -13,13 +13,19 @@
 // the AGENTS.md test allowances are spelled out here instead.
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 use super::*;
-// Test-only handles into the recovery unit: the loop itself never reads these
-// constants, so they are not re-exported from `requests` — the budget tests
-// assert against the exact numbers the recovery constants carry.
+// Test-only handles into the recovery unit: the loop itself reads these
+// constants through the recovery module, so they are not re-exported from
+// `requests` — the budget tests assert against the exact numbers the recovery
+// constants carry, and the agent-loop tests assert on the seeded guidance.
 use super::recovery::{
     MAX_TRUNCATION_RECOVERIES, MAX_UNNAMED_TOOL_CALL_RECOVERIES,
     TRUNCATION_MIXED_RECOVERY_INSTRUCTION, TRUNCATION_RECOVERY_INSTRUCTION,
+    UNNAMED_TOOL_CALL_RECOVERY_INSTRUCTION,
 };
+// The turn arms live in their own modules now, so the agent loop's imports no
+// longer carry the types the tests build (a reply, a producer, a tool call) or
+// the std handles they need. This parent is the shared origin for its children's
+// `use super::*`, so they are imported here once.
 use crate::context::LoadedSkill;
 use crate::daemon::DaemonCommand;
 use crate::providers::InferenceProvider;
@@ -34,8 +40,10 @@ use crate::reasoning::{
     build_chat_request_messages, chains_via_response_id, initial_prev_resp_id,
     warn_on_uncaptured_reasoning,
 };
+use crate::sessions::AssistantResponse;
 use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolError, ToolExecError, ToolOutput, ToolRegistry};
+use choreo_ai_protocols::ChatToolCall;
 use choreo_ai_protocols::StreamEvent;
 use choreo_ai_protocols::chat_reasoning_echo;
 use choreo_ai_protocols::openai::{
@@ -43,9 +51,14 @@ use choreo_ai_protocols::openai::{
     chat_wire_messages,
 };
 use choreo_keystore::ServiceCredential;
+use choreo_proto::{AssistantToolCallRecord, ReasoningProducer};
 use choreo_proto::{ChatReasoningField, ReasoningArtifact, ToolCallCaller};
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 /// Protected set for the mirror tests: just "core" (no platform tools
 /// registered in these unit tests).

@@ -20,7 +20,7 @@ use crate::providers::InferenceProvider;
 ///
 /// Owned (not borrowed) because the warmer runs on its own thread while the
 /// agent loop rebuilds the next iteration's payload — see the O(conversation)
-/// clone note at the arm site in `run_agent_loop`.
+/// clone note at the arm site in `crate::requests::tool_use_turn`.
 pub struct WarmRequest {
     /// The model slug of the just-sent request.
     pub model: String,

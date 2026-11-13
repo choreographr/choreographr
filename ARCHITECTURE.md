@@ -2499,7 +2499,7 @@ tools regardless of group state.
 
 ### Concurrent tool dispatch
 
-`run_agent_loop` partitions each response's tool calls into a **serial
+Each response's tool calls are partitioned into a **serial
 (session-config)** phase — `load_tools`, `unload_tools`, `set_working_dir`, and
 the other session-config mutators — and a **concurrent** phase holding every
 remaining tool (shell, filesystem, VM, HTTP, Git, `spawn_subsession`, …) whose
@@ -2514,10 +2514,23 @@ recording) lives in `requests/tool_execution.rs`, and the system-prompt /
 tool-result side-effect helpers live in `requests/system_content.rs`. The
 forward-only streaming phase and its chunk/status broadcasters live in
 `requests/stream.rs`, and the prompt-size estimate the context-window display
-uses in `requests/tokens.rs`. Every one of them is re-exported from
-`requests.rs` (a `pub(crate) use <mod>::*;` glob, or an explicit named list where
-the surface is small), so `requests.rs` itself holds
-`run_agent_loop` and its direct helpers. Each concurrent tool runs on a dedicated
+uses in `requests/tokens.rs`. The agent loop's two largest result arms have
+their own modules as well: `requests/final_text.rs` owns the final-answer arm
+(the finish-reason truncation marker, the answer record, and the routing of a
+reply that still lost tool calls to truncation into the shared recovery unit),
+and `requests/tool_use_turn.rs` owns the tool-use arm — the ingest gate that
+drops provider-unacceptable call names, the mixed-reply guidance, the call-id
+minting, the turn recording with its seeded placeholders, the cache-warmer
+arming, and the three dispatch phases above. The tool-use helper also owns the
+turn counter for its arm, advancing it on every exit that lets the loop
+continue, so `run_agent_loop`'s loop-tail increment serves only the
+truncated-tool-call error recovery. Every extracted unit except those two
+turn-arm helpers is re-exported from `requests.rs` (a `pub(crate) use <mod>::*;`
+glob, or an explicit named list where the surface is small); the helpers are
+called only from `run_agent_loop` and stay private. `requests.rs` itself holds
+`run_agent_loop` — its setup, the provider call (including the OAuth 401
+refresh-and-retry), the thin dispatch to those helpers, and the small error
+arms. Each concurrent tool runs on a dedicated
 execution thread, a forwarding thread, and a wait-loop thread — see the
 `requests/tool_execution.rs` module docs for the thread topology and the
 per-tool timeout budgets.
