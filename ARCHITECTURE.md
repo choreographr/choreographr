@@ -3894,7 +3894,10 @@ pane that never reported is never released.
     know". The `Anthropic` streaming path additionally validates its accumulated
     `input_json_delta` arguments through the same whole-or-nothing rule as the OpenAI
     adapters — it is the one non-OpenAI route whose arguments arrive as raw text, so a
-    truncated call there could otherwise reach dispatch unparsed.
+    truncated call there could otherwise reach dispatch unparsed. That argument *text*
+    comes from the deltas alone: the block-start `input` object is only a fallback,
+    because the wire sends it as an empty object, so concatenating the two would produce
+    bytes that are not JSON.
 
     **A tool call is reported, not adjudicated.** Every adapter passes the provider's
     function name through verbatim, so a nameless or provider-invalid `tool_use` / `functionCall`

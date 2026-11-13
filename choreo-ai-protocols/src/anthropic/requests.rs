@@ -352,19 +352,24 @@ where
                             ))));
                         }
                         while pending_tool_calls.len() <= idx {
-                            pending_tool_calls.push(StreamToolCall {
-                                id: String::new(),
-                                name: String::new(),
-                                arguments: String::new(),
-                            });
+                            pending_tool_calls.push(StreamToolCall::default());
                         }
                         let input_str = input.to_string();
+                        // The wire sends the block-start `input` as an empty
+                        // object and the arguments document as
+                        // `input_json_delta` fragments, so the deltas ARE the
+                        // argument text. `arguments` therefore stays empty here
+                        // and only `start_input` holds the serialized start
+                        // object: seeding the argument buffer with it would
+                        // concatenate the two (`{}{"city": …}`) into bytes that
+                        // are not JSON, and every streamed call would be
+                        // discarded as truncated.
                         // The vec was grown to cover `idx` above, so the lookup
                         // always succeeds; the None arm is unreachable.
                         if let Some(call) = pending_tool_calls.get_mut(idx) {
                             call.id.clone_from(&id);
                             call.name.clone_from(&name);
-                            call.arguments.clone_from(&input_str);
+                            call.start_input.clone_from(&input_str);
                         }
                         trace!(
                             index = start.index,
@@ -515,12 +520,22 @@ where
     }
 
     // If we collected tool calls, return ToolUse.
+    //
+    // The accumulated `input_json_delta` text is the call's arguments. The
+    // `content_block_start` input object is only a fallback: a provider that
+    // sends the complete input there and no deltas still yields its real
+    // arguments, and a genuinely no-argument call yields `{}` rather than an
+    // empty string.
     let mut tool_calls: Vec<ChatToolCall> = pending_tool_calls
         .into_iter()
         .map(|tc| ChatToolCall {
             id: tc.id,
             name: tc.name,
-            arguments_json: tc.arguments,
+            arguments_json: if tc.arguments.is_empty() {
+                tc.start_input
+            } else {
+                tc.arguments
+            },
             caller: None,
         })
         .collect();
@@ -589,7 +604,13 @@ where
 struct StreamToolCall {
     id: String,
     name: String,
+    /// The argument document, assembled from the block's `input_json_delta`
+    /// fragments — the only place the wire puts the argument text.
     arguments: String,
+    /// The serialized `content_block_start` `input` object, held as a fallback
+    /// only: the wire sends it as an empty object alongside the delta text, so
+    /// it is used just when no delta arrived at all.
+    start_input: String,
 }
 
 /// SSE event for `content_block_start`.
