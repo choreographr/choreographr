@@ -142,12 +142,20 @@ default-members = [".", "choreo-tui"]
 # tree's high-water mark, and any newly stabilized std API the workspace has
 # chosen to adopt (an adopted API is the true build floor even when no
 # dependency demands it). Today the binding source is the adopted-API side —
-# `str`/`[T]`/`Path::trim_prefix`/`trim_suffix` and `core::mem::DropGuard`
-# (1.100), beneath them `String::from_utf8_lossy_owned` and
-# `Option::map_or_default` (1.96–1.99). The highest *dependency* demand is
-# ckb-vm 0.24.15 (choreo-daemon's RISC-V VM) at 1.95.0, so there is deliberate
-# headroom: adopting a std API, not a dependency, is what moves this number.
-# Recompute after any dependency change (RELEASE.md Phase 2).
+# `str::trim_prefix` / `str::trim_suffix` and `core::mem::DropGuard` (1.100),
+# beneath them `String::from_utf8_lossy_owned` and `Option::map_or_default`
+# (1.96–1.99). The highest *dependency* demand is ckb-vm 0.24.15
+# (choreo-daemon's RISC-V VM) at 1.95.0, so there is deliberate headroom:
+# adopting a std API, not a dependency, is what moves this number. The 1.100
+# release also stabilized the `[T]` and `Path` `trim_*` methods; only the `str`
+# forms are adopted here, so they set no part of the floor.
+#
+# `just msrv` verifies that this declared floor actually builds (it compiles
+# the workspace on exactly this toolchain, and the CI `msrv` job runs the same
+# check), so the number is a checked claim rather than a note. It is still not
+# a constraint on dependency resolution — the resolver's
+# `incompatible-rust-versions` is `allow` in `.cargo/config.toml` — so recompute
+# it after any dependency change (RELEASE.md Phase 2).
 #
 # version/license/repository/homepage/readme/description are required by
 # crates.io for published crates; the publish-set members inherit them, while

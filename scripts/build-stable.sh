@@ -9,10 +9,16 @@
 # escape hatch — it lets you verify/build/test on stable from the same tree.
 #
 # It backs up the two files that carry the nightly-only bits (the root manifest
-# and the cargo config), strips exactly those keys, runs `cargo +stable "$@"`,
-# and restores both files on exit (success or failure). Stable compatibility
-# itself never depended on this config: the sources use no nightly features, so
-# this is purely about un-blocking stable *Cargo* from the manifest/config.
+# and the cargo config), strips exactly those keys, runs the cargo command on a
+# stable-family toolchain, and restores both files on exit (success or failure).
+# Stable compatibility itself never depended on this config: the sources use no
+# nightly features, so this is purely about un-blocking stable *Cargo* from the
+# manifest/config.
+#
+# The toolchain defaults to the current stable channel; `CARGO_TOOLCHAIN`
+# overrides it, so the same strip/restore path can pin an exact version. The
+# `msrv` recipe uses that to run the declared MSRV floor (root `Cargo.toml`'s
+# `rust-version`) rather than whatever stable happens to be installed.
 #
 # (Publishing has the same problem from the other side — a published manifest
 # that still carries per-profile `rustflags` breaks stable `cargo install` — so
@@ -98,4 +104,4 @@ trap 'exit 143' TERM HUP
 # (it is the file's final section; removing its two lines is sufficient).
 "${SED_I[@]}" '/^\[unstable\]$/d; /^profile-rustflags = true$/d' "$CONFIG"
 
-cargo +stable "$@"
+cargo +"${CARGO_TOOLCHAIN:-stable}" "$@"

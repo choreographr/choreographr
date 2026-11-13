@@ -1,0 +1,87 @@
+name: MSRV
+
+# Verifies that the MSRV the manifests declare — `[workspace.package]`
+# `rust-version` in the root `Cargo.toml`, inherited by every member — is
+# actually buildable, by compiling the whole workspace on exactly that toolchain.
+#
+# The claim is otherwise unenforced: `.cargo/config.toml` sets
+# `resolver.incompatible-rust-versions = "allow"`, so dependency resolution
+# happily picks a crate whose own `rust-version` exceeds the floor, and
+# day-to-day development runs on nightly while dist builds run on current
+# stable. Both ways the number can go stale — an adopted std API newer than the
+# floor, or a dependency that outgrew it — show up here and nowhere else.
+#
+# This job is a VERIFICATION of the declared floor, not a second copy of the
+# resolution logic: the floor is read from the manifest, and the compile is the
+# same `scripts/build-stable.sh check --workspace --all-targets` the local
+# `just msrv` recipe runs (with CARGO_TOOLCHAIN pinned to the floor, so the
+# hardened nightly-config strip/restore path is reused unchanged).
+#
+# Scoped to the inputs that can change the answer, so a docs-only change does
+# not pay for a cold-toolchain build.
+
+on:
+  push:
+    branches: [master]
+    # One anchor, aliased by both triggers, so the "inputs that change the
+    # answer" list has a single edit point instead of two copies that drift.
+    paths: &msrv_paths
+      - '**/*.rs'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - '.cargo/config.toml'
+      - 'rust-toolchain.toml'
+      - 'justfile'
+      - 'scripts/build-stable.sh'
+      - '.github/workflows/msrv.yml'
+  pull_request:
+    paths: *msrv_paths
+  workflow_dispatch:
+
+# A newer push to the same branch supersedes an in-flight run.
+concurrency:
+  group: msrv-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  msrv:
+    name: Declared MSRV floor builds
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # Read the floor from the manifest rather than duplicating the literal in
+      # this file, so the job and the claim can never disagree. The pattern is
+      # anchored to `^`, matching only the `[workspace.package]` line and never
+      # the root package's `rust-version.workspace = true`.
+      - name: Read the declared MSRV floor
+        id: floor
+        run: |
+          version="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)"
+          if [ -z "$version" ]; then
+            echo "error: no rust-version found in [workspace.package]" >&2
+            exit 1
+          fi
+          echo "declared MSRV floor: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # rustup installs the requested toolchain on demand; naming it explicitly
+      # makes the run independent of whatever channel the runner image ships.
+      - name: Install the floor toolchain
+        run: |
+          rustup toolchain install "${{ steps.floor.outputs.version }}" \
+            --profile minimal --no-self-update
+          rustup run "${{ steps.floor.outputs.version }}" rustc --version
+
+      # zlob's build.rs compiles its Zig source, which runs during resolution
+      # as well as the compile; the version is pinned for the reason given in
+      # release.yml's header note.
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+
+      - name: Check the declared floor
+        env:
+          CARGO_TOOLCHAIN: ${{ steps.floor.outputs.version }}
+        run: ./scripts/build-stable.sh check --workspace --all-targets

@@ -384,12 +384,13 @@ brew install zig
 cargo build --release
 ```
 
-The **source uses no nightly-only features**, so the code also builds on any stable ≥ 1.100 (the MSRV floor — declared in the workspace manifest and re-synced during the release preflight, see [`RELEASE.md`](./RELEASE.md)). Stable builds are a supported but explicit opt-out, because the nightly-only flags we wire in hard-block stable *Cargo* — use the `just` recipes, which temporarily strip those flags for one command and restore them:
+The **source uses no nightly-only features**, so the code also builds on any stable ≥ 1.100 (the MSRV floor — declared as `rust-version` in the workspace manifest, re-synced during the release preflight, and verified by `just msrv`, see [`RELEASE.md`](./RELEASE.md)). Stable builds are a supported but explicit opt-out, because the nightly-only flags we wire in hard-block stable *Cargo* — use the `just` recipes, which temporarily strip those flags for one command and restore them:
 
 ```bash
 just build-stable   # build on stable (release by default)
 just check-stable   # type-check on stable
 just test-stable    # unit tests on stable
+just msrv           # check the workspace on the declared MSRV floor itself
 ```
 
 Start the daemon:
@@ -1616,6 +1617,7 @@ just test-integration     # integration tests (the #[ignore] suite) via nextest
 just test-libtest         # unit tests via libtest (no nextest required)
 just test-crate choreo-proto   # a single crate via nextest
 just test-gui             # the GUI crate alone (excluded from `test-all`/`test-fast`)
+just msrv                 # check the workspace on the declared MSRV floor (root Cargo.toml's `rust-version`)
 just coverage             # line coverage of the test-all suite (cargo-llvm-cov ≥ 0.9.1; extra args pass through, e.g. --html --open)
 just coverage-lcov        # the same as an lcov file + per-crate summary table (what the coverage CI job runs)
 

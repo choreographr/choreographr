@@ -298,7 +298,11 @@ tree:
    `cargo metadata --format-version 1 | jq -r '[.packages[].rust_version | select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`
    and set the result in `[workspace.package]` `rust-version` (root
    `Cargo.toml`), committing the bump together with `Cargo.lock`, so the
-   crates.io metadata published below is truthful.
+   crates.io metadata published below is truthful. Then run `just msrv` to
+   confirm the declared floor actually builds — it compiles the workspace on
+   exactly that toolchain, so an adopted std API newer than the claim (or a
+   dependency that outgrew it) fails here rather than on a consumer's machine.
+   The same check runs in CI (`.github/workflows/msrv.yml`).
 
 #### New-crate rate limit
 

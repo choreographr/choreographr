@@ -55,6 +55,15 @@ cross_rustflags := "-Cdebuginfo=0"
 # reference; ARCHITECTURE.md owns the cross-cutting system view).
 doc_crates := "-p choreo-shared -p choreo-image -p choreo-sockreg -p choreo-power-events -p choreo-sanitize -p choreo-markdown -p choreo-keystore -p choreo-transport -p choreo-tui -p choreo-gui -p choreo-blockchain -p choreo-mcp -p choreo-im -p choreo-content -p choreo-client-core -p choreo-acp -p choreo-proto -p choreo-ai-protocols -p choreo-daemon"
 
+# The declared MSRV floor, read from the single source of truth — the root
+# manifest's `[workspace.package]` `rust-version` — rather than hard-coded
+# here: the number moves when the workspace adopts a newly stabilized std API
+# or the dependency tree's floor rises, and a copy in this file would silently
+# drift from the claim the `msrv` recipe exists to verify. The pattern is
+# anchored to `^` so it matches only the `[workspace.package]` line, never a
+# member's `rust-version.workspace = true`.
+msrv := `sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml`
+
 # ── entry points ──────────────────────────────────────────────────────────────
 
 # Show all recipes (default — run with bare `just`)
@@ -153,7 +162,8 @@ build-debug: _require-zig
 # explicit opt-out: these recipes run through scripts/build-stable.sh, which
 # temporarily strips the nightly-only config/manifest keys for one command and
 # restores them afterwards. Stable compatibility itself is guaranteed by the
-# code (no nightly features) and the CI MSRV job, independent of this config.
+# code (no nightly features) and checked independently of this config by the
+# `msrv` recipe below and the matching `.github/workflows/msrv.yml` job.
 
 # Stable build (the `profile` — release by default — plus any extra args)
 build-stable: _require-zig
@@ -166,6 +176,14 @@ check-stable: _require-zig
 # Stable unit tests (libtest, serialized — no nextest needed)
 test-stable: _require-zig
     ./scripts/build-stable.sh test --workspace {{ CARGO_FLAGS }}
+
+# Verify the declared MSRV floor actually builds (Cargo.toml's rust-version).
+# Same hardened strip/restore path as `check-stable`, pinned to the declared
+# toolchain via CARGO_TOOLCHAIN. Catches both ways the claim can go stale: an
+# adopted std API newer than the floor, or a dependency whose own
+# `rust-version` exceeded it.
+msrv: _require-zig
+    CARGO_TOOLCHAIN={{ msrv }} ./scripts/build-stable.sh check --workspace --all-targets {{ CARGO_FLAGS }}
 
 # Publish the 14 crates to crates.io (RELEASE.md Phase 2) with the nightly-only
 # per-profile rustflags stripped, so published manifests stay buildable by

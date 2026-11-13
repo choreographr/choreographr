@@ -4208,7 +4208,9 @@ always picks the newest available versions even when their declared
 lag the resolved tree during development; that is fine. The floor is also
 raised deliberately when the workspace adopts a newly stabilized std API (for
 example `String::from_utf8_lossy_owned`, `Option::map_or_default`, or
-`str::trim_prefix` / `core::mem::DropGuard`): the API becomes
+`str::trim_prefix` / `core::mem::DropGuard`; the same release also stabilized
+`[T]` and `Path` `trim_*`, which the tree does not call — only the `str`
+methods and `core::mem::DropGuard` are actually adopted): the API becomes
 the true build floor even when no dependency demands it, so the declared
 `rust-version` then reflects the workspace's own sources rather than the
 dependency tree alone. The dependency side can therefore trail the claim —
@@ -4220,11 +4222,19 @@ select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`, set the
 result in `[workspace.package]` `rust-version`, and commit lockfile + bump
 together, so
 the crates.io metadata on the published crates is accurate (see RELEASE.md
-Phase 2). Nothing enforces the claim automatically: dependency resolution
-explicitly ignores it, no CI job pins the floor's toolchain, and the only
-check is that manual preflight recompute — so it constrains neither day-to-day
-development nor dependency updates, and a stale number is possible between
-releases.
+Phase 2). The floor is verified rather than trusted: `just msrv` runs the
+hardened stable strip/restore path (`scripts/build-stable.sh check --workspace
+--all-targets`) on the declared toolchain — it passes the manifest's
+`rust-version` to the script as `CARGO_TOOLCHAIN` — and the CI `msrv` job
+(`.github/workflows/msrv.yml`) runs the same check on a clean runner, reading
+the floor from the manifest rather than repeating the literal. It remains
+**not** a constraint on dependency resolution:
+`resolver.incompatible-rust-versions = "allow"` still admits a crate whose own
+`rust-version` exceeds the floor, so the mismatch fails `just msrv` and the CI
+job loudly instead of forcing resolution, and the manual preflight recompute
+above stays the way the number is moved. Between releases, a dependency that
+outgrows the floor or an adopted std API newer than it therefore surfaces as a
+red `msrv` check rather than a stale claim.
 
 **Building defaults to nightly.** `rust-toolchain.toml` pins the workspace to
 the `nightly` channel (rustup auto-installs it on first `cargo` run) so that
