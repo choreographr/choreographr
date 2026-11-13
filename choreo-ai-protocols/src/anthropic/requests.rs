@@ -7,6 +7,7 @@ use tracing::{debug, trace};
 use crate::ChatTurnRequest;
 use crate::retry;
 use crate::shared::MAX_TOOL_CALLS;
+use crate::tool_name;
 use crate::types::{
     ChatAssistantToolUse, ChatToolCall, ChatTurnResult, FinalTextResult, StreamEvent,
 };
@@ -371,9 +372,15 @@ where
                             call.name.clone_from(&name);
                             call.start_input.clone_from(&input_str);
                         }
+                        // The name is model output, so it is reported as
+                        // bounded facts (its length, and whether a provider
+                        // would accept it) rather than verbatim: a weak model
+                        // can put a whole shell command, or control characters,
+                        // in a call's `name`.
                         trace!(
                             index = start.index,
-                            tool_name = %name,
+                            name_len = name.len(),
+                            name_is_provider_safe = tool_name::is_provider_safe(&name),
                             input_len = input_str.len(),
                             "anthropic: tool call content block start",
                         );

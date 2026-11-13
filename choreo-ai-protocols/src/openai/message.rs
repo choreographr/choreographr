@@ -327,9 +327,14 @@ pub(crate) fn validate_tool_call_arguments(
             Arguments::Invalid { line, column } => {
                 // The parser's position is the truncation position, so keeping
                 // it costs nothing and answers "where did it stop?" without a
-                // scanner of our own.
+                // scanner of our own. The name is model output, so it is
+                // reported as bounded facts (its length, and whether a provider
+                // would accept it) rather than verbatim: a weak model can put a
+                // whole shell command, or control characters, in a call's
+                // `name`.
                 warn!(
-                    name = %tc.name,
+                    name_len = tc.name.len(),
+                    name_is_provider_safe = tool_name::is_provider_safe(&tc.name),
                     args_len = tc.arguments_json.len(),
                     error_line = line,
                     error_column = column,

@@ -6,6 +6,7 @@ use tracing::{debug, trace};
 use crate::ChatTurnRequest;
 use crate::retry;
 use crate::shared::MAX_TOOL_CALLS;
+use crate::tool_name;
 use crate::types::{ChatTurnResult, StreamEvent};
 
 use super::{
@@ -423,8 +424,13 @@ pub(super) fn handle_stream_part(
             // mints the same ids.
             let id = super::function_call_id(&name, pending_tool_calls.len());
             let args_json = args.to_string();
+            // The name is model output, so it is reported as bounded facts (its
+            // length, and whether a provider would accept it) rather than
+            // verbatim: a weak model can put a whole shell command, or control
+            // characters, in a call's `name`.
             trace!(
-                tool_name = %name,
+                name_len = name.len(),
+                name_is_provider_safe = tool_name::is_provider_safe(&name),
                 args_len = args_json.len(),
                 "google: function call",
             );
