@@ -1,3 +1,13 @@
+// GENERATED FILE — do not hand-edit. This is `subxt codegen` output built from
+// the Coordination Platform chain's runtime metadata: a `pub mod api` of
+// pallet/storage/call/event bindings whose integers and identifiers are the
+// chain's own (pallet and call indices, SCALE type and field names), not choices
+// this workspace made. That is why the blanket allows below are deliberate
+// rather than debt: which lints fire varies by feature and consumer, so no
+// `#[expect]` could be fulfilled across every build, and the generated spelling
+// cannot be renamed to please a lint. The file is regenerated wholesale on a
+// subxt upgrade, so the reason lives at the include site in `lib.rs` as well.
+#[allow(clippy::allow_attributes)]
 #[allow(
     dead_code,
     missing_docs,
