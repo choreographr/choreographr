@@ -456,6 +456,65 @@ fn validate_empty_list_returns_empty() {
     assert_eq!(calls, [] as [ChatToolCall; 0]);
 }
 
+#[test]
+fn an_empty_argument_list_is_kept_as_an_empty_object() {
+    // An OpenAI-compatible endpoint sends `"arguments": ""` for a tool that
+    // takes none. That is a legal no-argument call, not a casualty: keeping it
+    // is what stops a complete reply being reported as a truncation and spending
+    // the daemon's recovery budget.
+    let mut calls = vec![no_argument_call("call_1", "get_time", "")];
+    let discarded = crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Stop);
+    assert_eq!(discarded, [] as [choreo_proto::DiscardedToolCall; 0]);
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].arguments_json, "{}");
+}
+
+#[test]
+fn a_whitespace_or_null_argument_list_is_kept_as_an_empty_object() {
+    // The other spellings of the same fact: a blank fragment, and the JSON
+    // literal `null` that some endpoints emit in place of an empty string.
+    for raw in ["  ", "null"] {
+        let mut calls = vec![no_argument_call("call_1", "get_time", raw)];
+        let discarded =
+            crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Stop);
+        assert_eq!(
+            discarded,
+            [] as [choreo_proto::DiscardedToolCall; 0],
+            "{raw:?}",
+        );
+        assert_eq!(calls[0].arguments_json, "{}", "{raw:?}");
+    }
+}
+
+#[test]
+fn a_non_object_argument_list_is_discarded_without_a_position() {
+    // A well-formed value of the wrong type was not cut off, so there is no
+    // "where did it stop" to report — but it still cannot be sent.
+    let mut calls = vec![no_argument_call("call_1", "get_time", "[1, 2]")];
+    let discarded = crate::openai::validate_tool_call_arguments(&mut calls, FinishOutcome::Stop);
+    assert_eq!(
+        discarded,
+        vec![choreo_proto::DiscardedToolCall {
+            name: "get_time".into(),
+            arguments_json: "[1, 2]".into(),
+            error_line: None,
+            error_column: None,
+        }]
+    );
+    assert_eq!(calls, [] as [ChatToolCall; 0]);
+}
+
+/// A call whose arguments are `raw` verbatim — the shape a no-argument tool
+/// arrives in, before the gate normalizes it.
+fn no_argument_call(id: &str, name: &str, raw: &str) -> ChatToolCall {
+    ChatToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments_json: raw.into(),
+        caller: None,
+    }
+}
+
 // -- tool call accumulation tests ------------------------------------
 
 #[test]

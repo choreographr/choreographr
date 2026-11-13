@@ -11,8 +11,9 @@
 //! the client that happens to define it first.
 //!
 //! [`validate_tool_call_arguments`] lives here too: it is a message-level
-//! check (are the accumulated tool calls parseable?) that both the chat and the
-//! Responses adapters apply to their own turn results.
+//! check (do the accumulated tool calls carry a JSON object as their
+//! arguments?) that both the chat and the Responses adapters apply to their own
+//! turn results.
 
 use choreo_proto::{FinishOutcome, ReasoningArtifact};
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use tracing::warn;
 
 use super::AllowedCaller;
 use crate::CallerInfo;
+use crate::tool_name::{self, Arguments};
 
 /// A tool definition advertised to an OpenAI-compatible provider.
 #[derive(Debug, Clone, Serialize)]
@@ -263,23 +265,38 @@ impl ChatToolDefinition {
     }
 }
 
-/// Filter tool calls whose `arguments_json` is not valid JSON (e.g. truncated
-/// mid-stream by the provider).  Returns the discarded calls so the caller can
-/// surface the cropped JSON in error messages.
+/// Filter tool calls whose `arguments_json` is not a JSON object (e.g.
+/// truncated mid-stream by the provider). Returns the discarded calls so the
+/// caller can surface the cropped JSON in error messages.
 ///
-/// **Whole or nothing.** The accumulated arguments must parse as one complete
-/// JSON value; anything else is dropped for the turn. There is deliberately no
-/// structural repair and no schema-aware salvage, and this must stay true when
-/// arguments are streamed to a client progressively: a repair closes the open
-/// string and fabricates a value — a half-written file body, a truncated shell
-/// command — and executes it as if the model had meant it. The bytes are kept
-/// only so the failure can be diagnosed; they are never turned back into a
-/// call.
+/// **Three outcomes, one rule.** Which outcome a call gets is decided by the
+/// shared [`tool_name::classify_arguments`] — the same classifier the daemon's
+/// replay repair applies to a recorded call, so a call this gate accepts is not
+/// something a later request rewrites (see that function for the rule itself):
+///
+/// * a JSON **object** is kept byte-identical. The request bytes double as the
+///   prompt-cache prefix, so re-serializing would churn it for nothing;
+/// * **no argument list** — an empty or whitespace-only string, or the JSON
+///   literal `null` — is a legal no-argument call and is kept, normalized to
+///   `{}`. Discarding it would report a complete reply as a truncation and
+///   spend the daemon's truncated-call recovery budget on arguments the model
+///   never had;
+/// * **anything else** is a casualty and is dropped for the turn.
+///
+/// **Whole or nothing.** For a call that does carry an argument list, the
+/// accumulated arguments must parse as one complete JSON value; anything else is
+/// dropped for the turn. There is deliberately no structural repair and no
+/// schema-aware salvage, and this must stay true when arguments are streamed to
+/// a client progressively: a repair closes the open string and fabricates a
+/// value — a half-written file body, a truncated shell command — and executes it
+/// as if the model had meant it. The bytes are kept only so the failure can be
+/// diagnosed; they are never turned back into a call.
 ///
 /// The rejection keeps the parser's own position (`serde_json`'s line/column),
 /// which is the only form of "where it stopped" that needs no partial-JSON
-/// scanner, and it logs the finish outcome so an operator can tell a provider
-/// output cap from arguments the model itself mangled.
+/// scanner (`None` for a well-formed value that is simply not an object), and it
+/// logs the finish outcome so an operator can tell a provider output cap from
+/// arguments the model itself mangled.
 ///
 /// Providers (especially cheaper models via OpenAI-compatible APIs) sometimes
 /// return incomplete `function.arguments` strings, which would otherwise cause
@@ -291,38 +308,43 @@ pub(crate) fn validate_tool_call_arguments(
     finish: FinishOutcome,
 ) -> Vec<choreo_proto::DiscardedToolCall> {
     let all = std::mem::take(tool_calls);
-    let (valid, discarded): (Vec<_>, Vec<_>) = all
-        .into_iter()
-        .partition(|tc| serde_json::from_str::<serde_json::Value>(&tc.arguments_json).is_ok());
-    let mut positions = Vec::with_capacity(discarded.len());
-    for tc in &discarded {
-        // The parse error is captured, not discarded with the call: its
-        // line/column is the truncation position, so keeping it costs nothing
-        // and answers "where did it stop?" without a scanner of our own.
-        let position = serde_json::from_str::<serde_json::Value>(&tc.arguments_json)
-            .err()
-            .map_or((None, None), |err| (Some(err.line()), Some(err.column())));
-        warn!(
-            name = %tc.name,
-            args_len = tc.arguments_json.len(),
-            error_line = position.0,
-            error_column = position.1,
-            finish = finish.label(),
-            "discarding tool call with invalid (truncated) arguments JSON",
-        );
-        positions.push(position);
+    let mut kept = Vec::with_capacity(all.len());
+    let mut discarded = Vec::new();
+    for mut tc in all {
+        // One parse, and the borrow of the call's own bytes (`Arguments::Object`)
+        // ends here, so the call is free to be rewritten or moved below.
+        let verdict = tool_name::classify_arguments(&tc.arguments_json);
+        match verdict {
+            // An object travels untouched — the bytes are the cache prefix.
+            Arguments::Object(_) => kept.push(tc),
+            // A tool that takes no arguments still has a call to run: give it
+            // the universal empty object and keep it, so a complete reply is
+            // never mistaken for a truncation.
+            Arguments::Absent => {
+                tc.arguments_json = "{}".to_string();
+                kept.push(tc);
+            }
+            Arguments::Invalid { line, column } => {
+                // The parser's position is the truncation position, so keeping
+                // it costs nothing and answers "where did it stop?" without a
+                // scanner of our own.
+                warn!(
+                    name = %tc.name,
+                    args_len = tc.arguments_json.len(),
+                    error_line = line,
+                    error_column = column,
+                    finish = finish.label(),
+                    "discarding tool call with invalid (truncated) arguments JSON",
+                );
+                discarded.push(choreo_proto::DiscardedToolCall {
+                    name: tc.name,
+                    arguments_json: tc.arguments_json,
+                    error_line: line,
+                    error_column: column,
+                });
+            }
+        }
     }
-    *tool_calls = valid;
+    *tool_calls = kept;
     discarded
-        .into_iter()
-        .zip(positions)
-        .map(
-            |(tc, (error_line, error_column))| choreo_proto::DiscardedToolCall {
-                name: tc.name,
-                arguments_json: tc.arguments_json,
-                error_line,
-                error_column,
-            },
-        )
-        .collect()
 }

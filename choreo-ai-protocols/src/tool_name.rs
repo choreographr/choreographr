@@ -1,7 +1,17 @@
-//! The two rules that decide whether a tool-call name is usable.
+//! The rules that decide whether a tool call may be put on the wire.
 //!
-//! They are deliberately different predicates and deliberately live together,
-//! because they are easy to confuse and costly to let drift apart:
+//! A provider answers one unacceptable call by rejecting the **whole** request
+//! (HTTP 400), so every judgement about a call — what its `arguments_json`
+//! bytes are, and whether its `function.name` is a name a provider accepts — is
+//! made here, by this one owner. Two owners of one such rule drift apart, and
+//! the drift costs a turn in either direction: a call the ingest gate accepts
+//! and the replay repair rewrites is dispatched as something other than what
+//! the model sent, and a call the gate refuses that a later layer would have
+//! accepted is a casualty of a rejection nobody actually made.
+//!
+//! The two **name** rules are deliberately different predicates and deliberately
+//! live together, because they are easy to confuse and costly to let drift
+//! apart:
 //!
 //! - [`is_blank`] is the **stream-delta merge** rule. A provider sends a call's
 //!   `function.name` and `id` once, on the first delta for that index, and its
@@ -20,6 +30,13 @@
 //! accepts names a provider will refuse — the asymmetry is real, and a caller
 //! must pick the predicate that matches its job rather than the stricter-looking
 //! one.
+//!
+//! The **arguments** rule is the single classifier [`classify_arguments`]: its
+//! three outcomes are consumed by the adapters' ingest gate and by the daemon's
+//! replay repair, so what was accepted at ingest and what a later request
+//! replays cannot disagree.
+
+use serde_json::Value;
 
 /// The provider's function-name byte cap (`OpenAI`'s ceiling).
 ///
@@ -64,6 +81,74 @@ pub fn is_provider_safe(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+/// What a tool call's recorded `arguments_json` bytes are, for both the ingest
+/// gate and the replay repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arguments<'a> {
+    /// The bytes already parse as a JSON object and may be sent verbatim.
+    Object(&'a str),
+    /// No arguments were given: empty, whitespace-only, or the JSON literal
+    /// `null`. A provider sends this shape for a tool that takes none.
+    Absent,
+    /// Not a JSON object. `line`/`column` are the parser's own 1-based position
+    /// when the failure was a syntax error (typically a cut-off reply), and
+    /// `None` for a well-formed value that simply is not an object.
+    Invalid {
+        /// Parser's 1-based line of the syntax error, when there was one.
+        line: Option<usize>,
+        /// Parser's 1-based column of the syntax error, when there was one.
+        column: Option<usize>,
+    },
+}
+
+/// Classify a tool call's `arguments_json` bytes in one parse.
+///
+/// A provider puts one rule on this field — the arguments must be a JSON
+/// **object** — so the field is judged once, here, and every layer that has to
+/// decide what to do with it reads the same verdict:
+///
+/// * [`Arguments::Object`] hands back the **original** bytes, never a
+///   re-serialization. The request bytes double as the provider's prompt-cache
+///   prefix, so reordering or respacing an object would churn a cached prompt
+///   for no gain.
+/// * [`Arguments::Absent`] is a legal **no-argument call**, not a casualty: an
+///   empty or whitespace-only string is what several OpenAI-compatible
+///   endpoints send for a tool that declares no parameters, and the JSON
+///   literal `null` is the other spelling of the same fact. Both normalize to
+///   `{}` at ingest, so the call runs and the turn is never mistaken for a
+///   truncation that would spend the daemon's recovery budget on a complete
+///   reply.
+/// * [`Arguments::Invalid`] is a **casualty**: bytes that are not an object,
+///   whether a cut-off fragment (a syntax error, whose position is reported) or
+///   a well-formed value of the wrong type (an array, a string, a number, a
+///   bool). Keeping the two apart is what lets a caller discard the casualty
+///   while letting the legal no-argument call through.
+#[must_use]
+pub fn classify_arguments(raw: &str) -> Arguments<'_> {
+    // An empty or blank string never reaches the parser: `serde_json` would call
+    // it a syntax error, and it is not one — no argument list was written.
+    if raw.trim().is_empty() {
+        return Arguments::Absent;
+    }
+    // One parse answers both questions (is it an object, and if not, where did
+    // the parser stop), so no caller has to parse a second time to read the
+    // position off the error.
+    match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(_)) => Arguments::Object(raw),
+        Ok(Value::Null) => Arguments::Absent,
+        // A well-formed value of the wrong type carries no position: nothing
+        // was cut off, the model simply sent a shape a provider will not take.
+        Ok(_) => Arguments::Invalid {
+            line: None,
+            column: None,
+        },
+        Err(err) => Arguments::Invalid {
+            line: Some(err.line()),
+            column: Some(err.column()),
+        },
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +236,113 @@ mod tests {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
             assert_eq!(is_provider_safe(&name), expected, "{name:?}");
+        }
+    }
+
+    /// The corpus the arguments classifier is asserted over: the two shapes a
+    /// no-argument tool arrives as, ordinary objects (plain, nested and
+    /// whitespace-padded), the cut-off fragments a provider leaves behind, and
+    /// the well-formed non-objects a provider will not take.
+    fn arguments_corpus() -> Vec<&'static str> {
+        vec![
+            "{}",
+            r#"{"a": 1,"b":[2, 3]}"#,
+            "  {\n  \"city\": \"London\"\n}  ",
+            r#"{"outer":{"inner":[1,{"x":null}]}}"#,
+            "",
+            "   ",
+            "\t\n",
+            "null",
+            " null ",
+            r#"{"path":"#,
+            r#"{"command":"rm -rf /tmp/buil"#,
+            "[1]",
+            "\"hello\"",
+            "42",
+            "true",
+        ]
+    }
+
+    #[test]
+    fn classify_arguments_hands_back_the_original_object_bytes() {
+        // A kept object is never re-serialized: the same bytes have to come
+        // back, because the request bytes double as the prompt-cache prefix.
+        for raw in [
+            r#"{"a": 1,"b":[2, 3]}"#,
+            "  {\n  \"city\": \"London\"\n}  ",
+            r#"{"outer":{"inner":[1,{"x":null}]}}"#,
+        ] {
+            let Arguments::Object(bytes) = classify_arguments(raw) else {
+                panic!("{raw:?} is a JSON object");
+            };
+            assert_eq!(bytes, raw);
+            assert!(
+                std::ptr::eq(bytes, raw),
+                "{raw:?} must be borrowed, not rebuilt",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_arguments_calls_a_missing_argument_list_absent() {
+        // A legal no-argument call: empty, blank, and the JSON `null` a
+        // provider sends for the same thing.
+        for raw in ["", "   ", "\t\n", "null", " null "] {
+            assert_eq!(classify_arguments(raw), Arguments::Absent, "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn classify_arguments_marks_a_cut_off_fragment_with_the_parser_position() {
+        let Arguments::Invalid { line, column } =
+            classify_arguments(r#"{"command":"rm -rf /tmp/buil"#)
+        else {
+            panic!("a fragment is not an object");
+        };
+        assert_eq!(line, Some(1));
+        assert!(column.is_some(), "the parser reports where it stopped");
+    }
+
+    #[test]
+    fn classify_arguments_marks_a_well_formed_non_object_invalid_without_a_position() {
+        // Nothing was cut off, so there is no "where did it stop" to report.
+        for raw in ["[1]", "\"hello\"", "42", "true"] {
+            assert_eq!(
+                classify_arguments(raw),
+                Arguments::Invalid {
+                    line: None,
+                    column: None,
+                },
+                "{raw:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn arguments_corpus_agrees_with_the_literal_definition() {
+        // Pin the classifier to its literal definition over the corpus, so a
+        // future "tidy-up" (letting a `null` fall through to `Invalid`, or
+        // reading an empty string as a parse error) fails here rather than
+        // silently shifting the boundary both the ingest gate and the replay
+        // repair sit on.
+        for raw in arguments_corpus() {
+            let expected = if raw.trim().is_empty() {
+                Arguments::Absent
+            } else {
+                match serde_json::from_str::<Value>(raw) {
+                    Ok(Value::Object(_)) => Arguments::Object(raw),
+                    Ok(Value::Null) => Arguments::Absent,
+                    Ok(_) => Arguments::Invalid {
+                        line: None,
+                        column: None,
+                    },
+                    Err(err) => Arguments::Invalid {
+                        line: Some(err.line()),
+                        column: Some(err.column()),
+                    },
+                }
+            };
+            assert_eq!(classify_arguments(raw), expected, "{raw:?}");
         }
     }
 }

@@ -200,6 +200,29 @@ fn empty_arguments_become_empty_object() {
     assert_eq!(out.arguments_json, "{}");
 }
 
+#[test]
+fn an_absent_argument_list_is_repaired_and_counted() {
+    // The same rule the adapters apply at ingest, so the two layers agree: an
+    // empty argument list is a legal no-argument call normalized to `{}` (never
+    // discarded, never reported as a truncation), and the rewrite is counted
+    // like any other repair so a replayed call is visible in the metric.
+    let mut messages = vec![
+        assistant(vec![call("call_1", "sh", "")]),
+        tool_result("call_1"),
+    ];
+    let counts = repair_replayed_calls(&mut messages, true);
+    assert_eq!(counts.arguments, 1);
+    assert_eq!(counts.names, 0);
+    assert_eq!(counts.ids, 0);
+    assert_eq!(
+        messages[0]
+            .tool_calls
+            .as_ref()
+            .map(|calls| calls[0].function.arguments.as_str()),
+        Some("{}"),
+    );
+}
+
 // ── pairing, stubbing, dropping ──
 
 #[test]

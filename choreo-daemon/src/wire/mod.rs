@@ -38,7 +38,6 @@ use std::collections::{HashMap, HashSet};
 
 use choreo_ai_protocols::openai::ChatRequestMessage;
 use choreo_ai_protocols::tool_name;
-use serde_json::Value;
 
 use crate::tools::{MAX_FUNCTION_NAME_LEN, sha256_hex};
 
@@ -102,20 +101,24 @@ pub(crate) fn normalize_call<'a>(
 
 /// Coerce `arguments_json` into a JSON object string.
 ///
-/// A valid object is returned byte-identical — re-serializing would reorder or
-/// respace the bytes and churn the prompt-cache prefix. Anything else (a parse
-/// failure, `null`, an array, a scalar, a bare string) becomes `"{}"`, the
-/// universal "no arguments" object every provider accepts.
+/// The recorded bytes are judged by the same rule the adapters applied at
+/// ingest ([`tool_name::classify_arguments`]), so the two layers cannot drift: a
+/// call accepted by the gate is replayed as it was recorded, and a call the gate
+/// would have normalized or refused is repaired the same way here. A valid
+/// object is returned byte-identical — re-serializing would reorder or respace
+/// the bytes and churn the prompt-cache prefix. An absent argument list (empty,
+/// whitespace-only or `null`) and a non-object (a parse failure, an array, a
+/// scalar, a bare string) both become `"{}"`, the universal "no arguments"
+/// object every provider accepts.
 fn normalize_arguments(arguments_json: &str) -> Cow<'_, str> {
-    if let Ok(Value::Object(_)) = serde_json::from_str::<Value>(arguments_json) {
-        Cow::Borrowed(arguments_json)
-    } else {
-        // Not an object: a parse failure, `null`, an array, or a scalar. The
-        // replacement is counted by the caller (see [`RepairCounts`]) and
-        // exported as a metric; there is deliberately no per-call log line,
-        // because the same recorded call is re-repaired on every later send and
-        // would spam. AGENTS.md forbids logging tool arguments regardless.
-        Cow::Borrowed("{}")
+    match tool_name::classify_arguments(arguments_json) {
+        tool_name::Arguments::Object(raw) => Cow::Borrowed(raw),
+        // Everything else is replaced and counted by the caller (see
+        // [`RepairCounts`]) and exported as a metric; there is deliberately no
+        // per-call log line, because the same recorded call is re-repaired on
+        // every later send and would spam. AGENTS.md forbids logging tool
+        // arguments regardless.
+        tool_name::Arguments::Absent | tool_name::Arguments::Invalid { .. } => Cow::Borrowed("{}"),
     }
 }
 
@@ -266,7 +269,8 @@ pub(crate) struct RepairCounts {
     /// id, normalized, or suffixed to break a duplicate).
     pub ids: u64,
     /// Calls whose emitted argument string differs from the recorded one (the
-    /// `{}` replacement — a valid object is never re-serialized).
+    /// `{}` replacement, for an absent or non-object argument list — a valid
+    /// object is never re-serialized).
     pub arguments: u64,
     /// Synthetic results inserted for calls the transcript holds no answer for.
     pub stubbed: u64,

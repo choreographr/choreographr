@@ -2771,7 +2771,17 @@ all: no structural repair, no schema-aware salvage.** Closing an open string
 fabricates a value — a half-written file body, a *shorter* shell command than
 the model wrote — and would execute it as if the model had meant it, so a
 malformed call is dropped for the turn and its bytes are kept only for
-diagnosis. That rule must survive progressive argument streaming: showing a
+diagnosis. An **absent** argument list is not a malformed one: an empty or
+whitespace-only string, or the JSON literal `null`, is what several
+OpenAI-compatible endpoints send for a tool that declares no parameters, so it
+is a legal no-argument call normalized to `{}` at ingest and run as such — never
+discarded and never reported as a truncation, which is what keeps a no-argument
+call from spending the truncated-call recovery budget on a complete reply. The
+same owner judges those bytes on both sides of the transcript:
+`choreo_ai_protocols::tool_name::classify_arguments` is the rule the adapters
+apply at ingest and the rule the daemon's replay repair applies to a recorded
+call, so a call accepted at ingest cannot be replayed as anything other than
+what ran. That rule must survive progressive argument streaming: showing a
 partial payload while it arrives is fine, executing one never is, and a call
 that fails validation ends in an aborted state rather than a committed one.
 A JSON parser is deliberately **not** the safety boundary here — the client
@@ -2850,22 +2860,23 @@ owns replay *policy*, `wire` owns mechanical repair) therefore passes its
 fully-assembled message list through `wire::repair_replayed_calls` as the last
 step, working only on that throwaway copy. Names are coerced to a provider-safe
 form by the shared `choreo_ai_protocols::tool_name` rules — the single owner of
-both the blank stream-merge rule and the provider-safe validity rule, of which
-blank is a strict subset — an unsalvageable name becomes the `invalid_tool_call`
+the blank stream-merge rule, the provider-safe validity rule (of which blank is
+a strict subset) and the arguments classifier the adapters also apply at ingest
+— an unsalvageable name becomes the `invalid_tool_call`
 sentinel, a legal name that labels a *past* call whose result the transcript
 already holds, so nothing is dispatched under it. A call id is judged by that
 same validity rule — a call id draws on the same `[A-Za-z0-9_-]` alphabet and the
 same byte cap as a function name because it is an opaque token the provider must
 accept and echo back, not a name looked up in the catalog. A blank id becomes a
 deterministic `call_<12 hex>` minted from the call's name, arguments and
-position, and non-object arguments become `{}`. Calls and results are then
-paired so every recorded call is answered by exactly one `tool` message — an
-unanswered call gets a stub result, a result that answers no call is dropped,
-and an assistant message left with nothing is dropped too. Pairing tries the
-recorded id first, for every result in the block, before any fallback runs; then
-a blank id answers the first open call, and an unmatched non-blank id answers
-the only open call when exactly one is left (a mangling proxy or a pre-mint
-transcript costs the tool's output otherwise). With two or more candidates open
+position, and an absent or non-object argument list becomes `{}`. Calls and
+results are then paired so every recorded call is answered by exactly one
+`tool` message — an unanswered call gets a stub result, a result that answers no
+call is dropped, and an assistant message left with nothing is dropped too.
+Pairing tries the recorded id first, for every result in the block, before any
+fallback runs; then a blank id answers the first open call, and an unmatched
+non-blank id answers the only open call when exactly one is left (a mangling
+proxy or a pre-mint transcript costs the tool's output otherwise). With two or more candidates open
 it declines, so a stray result can never take a call a genuine answer later in
 the block still claims by id. The repair is
 byte-deterministic and never re-serializes a valid object, so it does not churn
