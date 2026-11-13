@@ -850,6 +850,22 @@ jobs:
           prepare: |
             set -eu
             pkg install -y bash curl ca_root_nss git gmake
+            # zlob's build.rs runs bindgen against its own header, so the build
+            # needs a shared libclang, and FreeBSD base ships clang but no
+            # libclang.so. The llvm package name is VERSIONED (llvm19, llvm32, ...)
+            # and the versionless `devel/llvm` meta-port is deprecated with an
+            # aggressive expiry, so resolve the newest versioned llvm from the
+            # catalog rather than pinning a number that will disappear. Version
+            # numbers are two digits wide, so a plain sort orders them correctly.
+            llvm_pkg="$(pkg search -q llvm \
+              | awk '$1 ~ /^llvm[0-9]+-[0-9]/ { print $1 }' \
+              | sed 's/-[0-9].*//' | sort -u | tail -n1)"
+            if [ -z "$llvm_pkg" ]; then
+              echo "error: no versioned llvm package in the FreeBSD catalog" >&2
+              exit 1
+            fi
+            echo "installing $llvm_pkg for its shared libclang"
+            pkg install -y "$llvm_pkg"
             # FreeBSD's packaged Zig lags (0.16.0), which cannot build zlob
             # 1.8.0 (it uses the `@backingInt` builtin added in Zig 0.17).
             # Fetch the pinned official release tarball and put it on PATH.
@@ -866,6 +882,21 @@ jobs:
               | sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
             . "$HOME/.cargo/env"
             rustup toolchain install stable --profile minimal
+            # zlob's build.rs runs bindgen against its own header (include/zlob.h),
+            # so the build needs a shared libclang. FreeBSD base ships clang but
+            # no libclang.so, so it comes from the llvm package installed in
+            # `prepare`. Do not assume a versioned path: the default llvm port
+            # moves, so discover the library instead. (The `lang/zig` package used
+            # to pull devel/llvm in as a runtime dependency; the pinned Zig
+            # tarball does not, which is why this is explicit.)
+            libclang_so="$(find /usr/local -maxdepth 5 -name 'libclang.so' | head -n1)"
+            if [ -z "$libclang_so" ]; then
+              echo "error: no libclang.so under /usr/local — zlob's bindgen build script needs it" >&2
+              exit 1
+            fi
+            LIBCLANG_PATH="$(dirname "$libclang_so")"
+            export LIBCLANG_PATH
+            echo "LIBCLANG_PATH=$LIBCLANG_PATH"
             # release.sh detects FreeBSD-amd64 and takes the native freebsd
             # branch (no musl, no mimalloc), then writes the FreeBSD tarball.
             ./scripts/release.sh --allow-dirty
