@@ -280,15 +280,10 @@ pub(crate) fn render_markdown_block(
 // ── Line-building helpers ─────────────────────────────────────────────────
 
 pub(crate) fn indented_line(indent: usize, text: String) -> Line<'static> {
-    let mut spans = Vec::new();
-    if indent > 0 {
-        // A separate span so the margin is always its own unit, matching
-        // `indented_line_as_spans` — the two helpers must agree on where the
-        // content columns start.
-        spans.push(Span::styled(" ".repeat(indent), Style::default()));
-    }
-    spans.push(Span::styled(text, Style::default()));
-    Line::from(spans)
+    // Delegate the indent to `indented_line_as_spans` so the two helpers can
+    // never disagree on where the content columns start — the margin is always
+    // its own leading span, never folded into the content span.
+    indented_line_as_spans(indent, vec![Span::styled(text, Style::default())])
 }
 
 pub(crate) fn indented_line_as_spans(

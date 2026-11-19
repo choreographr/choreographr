@@ -10,7 +10,7 @@
 
 use super::{
     Line, LineChrome, LineJoin, MarkdownAlignment, MarkdownInline, Modifier, Span, Style,
-    TableRowId, display_width, indented_line, indented_line_as_spans, inlines_to_lines,
+    TableRowId, indented_line, indented_line_as_spans, inlines_to_lines,
 };
 use std::cell::Cell;
 
@@ -477,11 +477,12 @@ pub(crate) fn render_cell(
 /// The display width a cell needs on one line — the widest of its hard-broken
 /// segments.
 ///
-/// Rendering *is* the measurement: `width` is the widest the column could ever
-/// be (the table's own content budget, which [`shrink_column_widths`] never
-/// exceeds), so a cell that still wraps here is one no column could hold on a
-/// single line anyway. Each rendered line is trimmed because the renderer can
-/// introduce padding of its own — display math is centred within `width` — and
+/// Rendering *is* the measurement: `width` is the widest a table line could ever
+/// be (the whole available width, before [`shrink_column_widths`] trims the
+/// columns down to the content budget), so a cell that still wraps here is one
+/// no column could hold on a single line anyway. Each rendered line's width is
+/// taken with its leading and trailing whitespace trimmed, because the renderer
+/// can add padding of its own — display math is centred within `width` — and
 /// that padding is not content.
 ///
 /// Measuring through the renderer is the point: there is no second text
@@ -491,12 +492,43 @@ pub(crate) fn render_cell(
 pub(crate) fn cell_measure_width(inlines: &[MarkdownInline], width: usize) -> usize {
     render_cell(inlines, width, Modifier::empty())
         .iter()
-        .map(|(spans, _join)| {
-            let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
-            display_width(text.trim())
-        })
+        .map(|(spans, _join)| trimmed_line_width(spans))
         .max()
         .unwrap_or(0)
+}
+
+/// Display width of a rendered line's text with its leading and trailing
+/// whitespace trimmed, computed straight from the spans with no intermediate
+/// `String`.
+///
+/// Whitespace is matched with [`char::is_whitespace`] — the same rule
+/// [`str::trim`] uses — and per-char widths are summed exactly as
+/// [`unicode_width::UnicodeWidthStr::width`] does, so the result equals
+/// `display_width(text.trim())` over the concatenated span text.
+pub(crate) fn trimmed_line_width(spans: &[Span<'static>]) -> usize {
+    let char_width = |ch: char| unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+    let total: usize = spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .map(char_width)
+        .sum();
+    let leading: usize = spans
+        .iter()
+        .flat_map(|span| span.content.chars())
+        .take_while(|ch| ch.is_whitespace())
+        .map(char_width)
+        .sum();
+    let trailing: usize = spans
+        .iter()
+        .rev()
+        .flat_map(|span| span.content.chars().rev())
+        .take_while(|ch| ch.is_whitespace())
+        .map(char_width)
+        .sum();
+    // Subtracting both runs from the total is correct when there is any content;
+    // an all-whitespace line makes `leading` and `trailing` each equal the total,
+    // so the saturating steps clamp the double subtraction to zero.
+    total.saturating_sub(leading).saturating_sub(trailing)
 }
 
 /// Pad `spans` to exactly `width` display columns according to `alignment`.

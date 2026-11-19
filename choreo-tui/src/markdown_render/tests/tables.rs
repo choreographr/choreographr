@@ -155,6 +155,84 @@ fn cell_with_display_math_and_a_link_stays_inside_the_frame() {
 }
 
 #[test]
+fn cell_measure_width_trims_renderer_padding() {
+    // Display math is centred by the renderer, which pads it with leading
+    // spaces. That padding is not content, so the measured width is the
+    // equation's own width — the allocation-free trim path and the emitted text
+    // must agree on where the content ends.
+    let inlines = vec![MarkdownInline::DisplayMath("x^2".to_string())];
+    let measured = cell_measure_width(&inlines, 40);
+    let emitted: String = render_cell(&inlines, 40, Modifier::empty())
+        .iter()
+        .map(|(spans, _join)| {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        measured,
+        display_width(emitted.trim()),
+        "measured width ignores the centred-math padding: {emitted:?}"
+    );
+    assert!(
+        measured < 40,
+        "the measurement is the equation, not the full width: {measured}"
+    );
+}
+
+#[test]
+fn trimmed_line_width_matches_trimmed_display_width() {
+    // The measurement trims renderer padding off each drawn line without
+    // building an intermediate `String`. Prove the allocation-free path agrees
+    // with `display_width(text.trim())` across leading/trailing spaces, an
+    // all-whitespace line, a wide glyph, and a combining mark — so it cannot
+    // drift from the semantics it replaces.
+    let cases: [&[&str]; 4] = [
+        &["  x²  "],
+        &["   ", ""],
+        &["", "héllo", " "],
+        &["Ａ\u{0301} "],
+    ];
+    for parts in cases {
+        let spans: Vec<Span<'static>> = parts
+            .iter()
+            .map(|part| Span::styled((*part).to_string(), Style::default()))
+            .collect();
+        let text = parts.concat();
+        assert_eq!(
+            trimmed_line_width(&spans),
+            display_width(text.trim()),
+            "trimmed width of {text:?}"
+        );
+    }
+}
+
+#[test]
+fn a_link_wider_than_its_column_hard_splits_inside_the_cell() {
+    // A destination longer than its column is hard-split mid-word inside the
+    // cell, exactly as an over-wide token is split in prose: the frame stays
+    // square, and the split is recorded as a per-cell `Join` so the copy
+    // rejoins the URL without inventing a space.
+    let md = "| Link |\n|---|\n| [site](https://example.com/a/very/long/path/that/does/not/fit) |";
+    let (lines, _joins, chrome) = markdown_lines_joined(md, 30);
+    let widths: Vec<usize> = lines.iter().map(Line::width).collect();
+    assert!(
+        widths.windows(2).all(|pair| pair[0] == pair[1]),
+        "every table line shares one width: {widths:?} in {:?}",
+        lines.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+    assert!(
+        chrome
+            .iter()
+            .any(|c| c.cell_joins().contains(&LineJoin::Join)),
+        "the split URL records a per-cell mid-word join: {chrome:#?}"
+    );
+}
+
+#[test]
 fn table_body_row_without_markup_is_not_bold() {
     // The complement of the header rule: a plain body cell is plain, so the
     // frame's only emphasis is the header row's own.
