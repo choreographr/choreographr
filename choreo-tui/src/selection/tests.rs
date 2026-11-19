@@ -1022,6 +1022,33 @@ fn table_selection_excludes_borders() {
 }
 
 #[test]
+fn table_inline_markup_copies_as_plain_cell_text() {
+    // A cell is rendered through the inline renderer, so its text is split into
+    // several styled spans. The copy must be blind to that: markup inside a cell
+    // copies exactly like the same text without markup, and the cell bands the
+    // selection slices on do not shift by a column.
+    let plain = "| Key | Value |\n|---|---|\n| alpha | beta gamma |";
+    let marked = "| **Key** | *Value* |\n|---|---|\n| **alpha** | `beta` gamma |";
+    let (start, end) = ("alpha", "gamma");
+    let copy = |md: &str| {
+        let mut app = app_with_turns(&[(0, md)], 40);
+        let (from, _) = locate(&app, start);
+        let (_, to) = locate(&app, end);
+        drag_and_finish(&mut app, from, to)
+    };
+    let plain_copy = copy(plain).expect("plain table selection should extract");
+    let marked_copy = copy(marked).expect("marked table selection should extract");
+    assert_eq!(
+        marked_copy, plain_copy,
+        "markup inside a cell copies as its text: {marked_copy:?}"
+    );
+    assert!(
+        !marked_copy.contains(['*', '`']),
+        "no markup copied: {marked_copy:?}"
+    );
+}
+
+#[test]
 fn table_wrapped_cell_rejoins_to_original_text() {
     // Dragging down a wrapped cell's column copies the cell's *original* text:
     // the display's wrap rows are rejoined with the space the reflow consumed,

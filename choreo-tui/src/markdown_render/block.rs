@@ -280,22 +280,14 @@ pub(crate) fn render_markdown_block(
 // ── Line-building helpers ─────────────────────────────────────────────────
 
 pub(crate) fn indented_line(indent: usize, text: String) -> Line<'static> {
-    indented_styled_line(indent, text, Modifier::empty())
-}
-
-/// Like [`indented_line`], but applies `modifier` (e.g. `Modifier::BOLD` for a
-/// table's header row) to the text span only — the indent stays unstyled so the
-/// emphasis never bleeds into the leading margin.
-pub(crate) fn indented_styled_line(
-    indent: usize,
-    text: String,
-    modifier: Modifier,
-) -> Line<'static> {
     let mut spans = Vec::new();
     if indent > 0 {
+        // A separate span so the margin is always its own unit, matching
+        // `indented_line_as_spans` — the two helpers must agree on where the
+        // content columns start.
         spans.push(Span::styled(" ".repeat(indent), Style::default()));
     }
-    spans.push(Span::styled(text, Style::default().add_modifier(modifier)));
+    spans.push(Span::styled(text, Style::default()));
     Line::from(spans)
 }
 

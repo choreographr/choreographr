@@ -1,10 +1,16 @@
 //! Data-table rendering: the nushell-style rounded frame, column sizing,
 //! cell wrapping, and alignment.
+//!
+//! Cell content is rendered by [`inlines_to_lines`] — the same inline renderer
+//! prose uses — so a cell keeps every inline style (bold, italic, code colour,
+//! link emphasis) and wraps with the same [`LineJoin`] semantics the copy model
+//! relies on. A table row's emphasis is therefore a property of its *cells*: the
+//! header row's `BOLD` is handed to the inline renderer for each cell and never
+//! applied to the assembled line, so the frame's borders and padding stay plain.
 
 use super::{
     Line, LineChrome, LineJoin, MarkdownAlignment, MarkdownInline, Modifier, Span, Style,
-    TableRowId, display_width, indented_line, indented_styled_line, render_math_pretty,
-    split_word_to_width,
+    TableRowId, display_width, indented_line, indented_line_as_spans, inlines_to_lines,
 };
 use std::cell::Cell;
 
@@ -106,30 +112,32 @@ pub(crate) fn render_table_lines(
             vec![LineChrome::default()],
         );
     }
-    let mut table_rows = Vec::with_capacity(rows.len() + 1);
-    table_rows.push(normalize_table_row(header, column_count));
-    table_rows.extend(
-        rows.iter()
-            .map(|row| normalize_table_row(row, column_count)),
-    );
-    let mut widths = vec![3usize; column_count];
-    for row in &table_rows {
-        for (index, cell) in row.iter().enumerate() {
-            for line in cell.lines() {
-                // `widths` has one entry per normalized column, and `row` was
-                // normalized to exactly that column count, so `index` is in
-                // bounds.
-                if let Some(w) = widths.get_mut(index) {
-                    *w = (*w).max(display_width(line));
-                }
-            }
-        }
-    }
+    let table_rows: Vec<Vec<&[MarkdownInline]>> =
+        std::iter::once(normalize_table_row(header, column_count))
+            .chain(
+                rows.iter()
+                    .map(|row| normalize_table_row(row, column_count)),
+            )
+            .collect();
+    // `border_width`/`available`/`content_budget` are derived from the column
+    // count alone, so they are settled before the cells are measured: `available`
+    // is the widest a column could ever be, which is the width a cell is measured
+    // at (see `cell_measure_width`).
     let border_width = column_count * 3 + 1;
     let available = width
         .saturating_sub(indent)
         .max(border_width + column_count);
     let content_budget = available.saturating_sub(border_width).max(column_count);
+    let mut widths = vec![3usize; column_count];
+    for row in &table_rows {
+        for (index, cell) in row.iter().enumerate() {
+            // `widths` has one entry per normalized column, and `row` was
+            // normalized to exactly that column count, so `index` is in bounds.
+            if let Some(w) = widths.get_mut(index) {
+                *w = (*w).max(cell_measure_width(cell, available));
+            }
+        }
+    }
     shrink_column_widths(&mut widths, content_budget);
     let header_alignment = normalized_alignments(alignments, column_count);
     let mut lines = Vec::new();
@@ -155,8 +163,10 @@ pub(crate) fn render_table_lines(
         ),
         rule_id,
     );
-    // The header row is the table's first row and the only one drawn bold —
-    // the same emphasis nushell gives its column headers.
+    // The header row is the table's first row and the only one whose *cells* are
+    // drawn bold — the same emphasis nushell gives its column headers. The
+    // emphasis is handed to the inline renderer per cell, so the frame's borders
+    // and padding stay plain.
     if let Some(header_row) = table_rows.first() {
         let (header_lines, header_joins, header_chrome) = render_table_row_wrapped(
             header_row,
@@ -259,12 +269,19 @@ pub(crate) fn normalized_alignments(
         .collect()
 }
 
-pub(crate) fn normalize_table_row(row: &[Vec<MarkdownInline>], column_count: usize) -> Vec<String> {
+/// Normalize a source row to exactly `column_count` cells.
+///
+/// A short row's missing cells become empty slices, which the inline renderer
+/// renders as one empty display line — the same blank the old plain-text padding
+/// produced. The cells are borrowed rather than flattened to text: they are
+/// rendered once the column widths are known, so their inline styles survive to
+/// the point of emission.
+pub(crate) fn normalize_table_row(
+    row: &[Vec<MarkdownInline>],
+    column_count: usize,
+) -> Vec<&[MarkdownInline]> {
     (0..column_count)
-        .map(|index| {
-            row.get(index)
-                .map_or_default(|cell| inline_plain_text(cell))
-        })
+        .map(|index| row.get(index).map_or(&[][..], Vec::as_slice))
         .collect()
 }
 
@@ -312,8 +329,8 @@ pub(crate) fn table_border_line(
 /// The rule between the header row and the body.
 ///
 /// A uniform `├───┼───┤` for every column: column alignment is expressed by
-/// the cells' padding (`pad_aligned`), not by the `:───` / `:───:` / `───:`
-/// marks the GFM delimiter row uses. Those source-level marks used to be
+/// the cells' padding (`pad_aligned_spans`), not by the `:───` / `:───:` /
+/// `───:` marks the GFM delimiter row uses. Those source-level marks used to be
 /// echoed into the rendered rule, which reads as stray punctuation next to a
 /// nushell-style frame; the rule is now plain.
 pub(crate) fn table_separator_line(widths: &[usize], indent: usize) -> Line<'static> {
@@ -333,19 +350,24 @@ pub(crate) fn table_separator_line(widths: &[usize], indent: usize) -> Line<'sta
 }
 
 pub(crate) fn render_table_row_wrapped(
-    row: &[String],
+    row: &[&[MarkdownInline]],
     widths: &[usize],
     alignments: &[MarkdownAlignment],
     indent: usize,
-    modifier: Modifier,
+    emphasis: Modifier,
     row_id: TableRowId,
 ) -> (Vec<Line<'static>>, Vec<LineJoin>, Vec<LineChrome>) {
-    let wrapped_cells: Vec<Vec<(String, LineJoin)>> = row
+    let rendered_cells: Vec<Vec<CellLine>> = row
         .iter()
         .zip(widths.iter())
-        .map(|(cell, width)| wrap_cell_text(cell, *width))
+        .map(|(cell, width)| render_cell(cell, *width, emphasis))
         .collect();
-    let row_height = wrapped_cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    let row_height = rendered_cells
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .max(1);
     // Every display line of a table row is a fresh line in the copy: the
     // reading-order fill reconstructs each cell from the per-cell copy-joins
     // recorded on the row's chrome (below), not from a row-level join, so the
@@ -354,20 +376,25 @@ pub(crate) fn render_table_row_wrapped(
     let mut lines = Vec::with_capacity(row_height);
     let mut chrome = Vec::with_capacity(row_height);
     for line_index in 0..row_height {
-        let mut text = String::new();
+        // The row is assembled from spans that each keep their own style: the
+        // frame glyphs and the cell padding are `Style::default()`, while a
+        // cell's spans carry whatever the inline renderer gave them (plus the
+        // row's emphasis). The frame must never inherit the emphasis — a bold
+        // header should read as bold text in a plain box, not a bold box.
+        let mut spans: Vec<Span<'static>> = Vec::new();
         // Track the row's display columns so each `│` border column is recorded
         // as chrome: the selection keeps the cell text and drops the borders.
         let mut col = 0usize;
         let mut row_chrome = LineChrome::default();
         row_chrome.set_table(row_id);
-        text.push('│');
+        spans.push(Span::styled("│", Style::default()));
         row_chrome.push(indent + col, indent + col + 1);
         col += 1;
         for column_index in 0..widths.len() {
-            // `wrapped_cells`/`alignments` carry one entry per column of
+            // `rendered_cells`/`alignments` carry one entry per column of
             // `widths` (rows are normalized to the column count), so these
             // lookups are in bounds; `.get()` keeps them total.
-            let cell_line = wrapped_cells
+            let cell_line = rendered_cells
                 .get(column_index)
                 .and_then(|cell| cell.get(line_index));
             let Some(cell_width) = widths.get(column_index) else {
@@ -380,96 +407,111 @@ pub(crate) fn render_table_row_wrapped(
             // selection's reading-order fill can rejoin a wrapped cell to its
             // original text without guessing.
             row_chrome.push_cell_join(cell_line.map_or(LineJoin::Break, |(_, join)| *join));
-            let cell_text = cell_line.map_or("", |(text, _join)| text.as_str());
+            let cell_spans: &[Span<'static>] = cell_line.map_or(&[], |(spans, _join)| spans);
+            // The cell was rendered at exactly the column width, so each of its
+            // lines must fit it; an over-wide one would desync the frame from
+            // its border columns. The only way to exceed it is a grapheme
+            // cluster wider than the column, which the cluster reflow cannot
+            // split any further.
+            debug_assert!(
+                cell_spans.iter().map(Span::width).sum::<usize>() <= *cell_width,
+                "table cell line wider than its column"
+            );
             // One padding space, the aligned cell text, then one padding space
             // and the cell's trailing border.
-            text.push(' ');
+            spans.push(Span::styled(" ", Style::default()));
             col += 1;
-            let padded = pad_aligned(
-                cell_text,
+            let aligned = pad_aligned_spans(
+                cell_spans,
                 *cell_width,
                 alignments
                     .get(column_index)
                     .copied()
                     .unwrap_or(MarkdownAlignment::None),
             );
-            col += display_width(&padded);
-            text.push_str(&padded);
-            text.push(' ');
+            for span in aligned {
+                col += span.width();
+                spans.push(span);
+            }
+            spans.push(Span::styled(" ", Style::default()));
             col += 1;
-            text.push('│');
+            spans.push(Span::styled("│", Style::default()));
             row_chrome.push(indent + col, indent + col + 1);
             col += 1;
         }
-        lines.push(indented_styled_line(indent, text, modifier));
+        lines.push(indented_line_as_spans(indent, spans));
         chrome.push(row_chrome);
     }
     (lines, joins, chrome)
 }
 
-/// Wrap one cell's text to `width`, returning each display line paired with
-/// the [`LineJoin`] describing how it glues to the line before it (so the copy
-/// can rejoin a wrapped cell to its original text): `Break` for the first line
-/// of a source segment, `Space` for a word-boundary wrap, `Join` for a hard
-/// mid-word split.
-pub(crate) fn wrap_cell_text(text: &str, width: usize) -> Vec<(String, LineJoin)> {
-    let width = width.max(1);
-    let mut lines: Vec<(String, LineJoin)> = Vec::new();
-    for raw_line in text.split('\n') {
-        let mut current = String::new();
-        let mut current_width = 0;
-        // The join of the line currently being built; a fresh source segment
-        // is a break, a word-wrap seam becomes a space, a hard split joins.
-        let mut current_join = LineJoin::Break;
-        for word in raw_line.split_whitespace() {
-            let word_width = display_width(word);
-            let separator_width = usize::from(!current.is_empty());
-            if current_width + separator_width + word_width <= width {
-                if separator_width == 1 {
-                    current.push(' ');
-                    current_width += 1;
-                }
-                current.push_str(word);
-                current_width += word_width;
-            } else {
-                // Flush the current line (the wrap is a word boundary → the
-                // copy re-inserts the separating space) before placing `word`.
-                if !current.is_empty() {
-                    lines.push((std::mem::take(&mut current), current_join));
-                    current_join = LineJoin::Space;
-                    current_width = 0;
-                }
-                if word_width <= width {
-                    current.push_str(word);
-                    current_width = word_width;
-                } else {
-                    // The word alone exceeds the width: hard-split it, its
-                    // chunks joined directly (no space exists in the source).
-                    for (chunk_index, chunk) in
-                        split_word_to_width(word, width).into_iter().enumerate()
-                    {
-                        if chunk_index > 0 {
-                            lines.push((std::mem::take(&mut current), current_join));
-                            current_join = LineJoin::Join;
-                        }
-                        current_width += display_width(&chunk);
-                        current.push_str(&chunk);
-                    }
-                }
-            }
-        }
-        lines.push((current, current_join));
-    }
-    if lines.is_empty() {
-        lines.push((String::new(), LineJoin::Break));
-    }
+/// One rendered cell display line: its styled spans and how it glues to the
+/// cell's previous line (the copy's per-cell join).
+type CellLine = (Vec<Span<'static>>, LineJoin);
+
+/// Render one cell's inlines at `width` through the shared inline renderer.
+///
+/// `emphasis` is the row's baseline modifier — `Modifier::BOLD` for a header
+/// row, empty for a body row. Handing it to the inline renderer stacks it onto
+/// every *cell* span (so a header cell's nested `*italic*` still becomes
+/// bold+italic) instead of onto the assembled row line, which is what keeps the
+/// frame's borders and padding plain.
+///
+/// The renderer's [`LineChrome`] output is discarded: inline content records no
+/// chrome, and [`render_table_row_wrapped`] builds the table's own (border bands
+/// plus per-cell copy joins). Merging the two would double-count the bands the
+/// selection slices cells on.
+pub(crate) fn render_cell(
+    inlines: &[MarkdownInline],
+    width: usize,
+    emphasis: Modifier,
+) -> Vec<CellLine> {
+    let (lines, joins, _chrome) = inlines_to_lines(inlines, 0, Vec::new(), width, emphasis);
     lines
+        .into_iter()
+        .zip(joins)
+        .map(|(line, join)| (line.spans, join))
+        .collect()
 }
 
-pub(crate) fn pad_aligned(text: &str, width: usize, alignment: MarkdownAlignment) -> String {
-    let text_width = display_width(text);
+/// The display width a cell needs on one line — the widest of its hard-broken
+/// segments.
+///
+/// Rendering *is* the measurement: `width` is the widest the column could ever
+/// be (the table's own content budget, which [`shrink_column_widths`] never
+/// exceeds), so a cell that still wraps here is one no column could hold on a
+/// single line anyway. Each rendered line is trimmed because the renderer can
+/// introduce padding of its own — display math is centred within `width` — and
+/// that padding is not content.
+///
+/// Measuring through the renderer is the point: there is no second text
+/// projection that could drift from what is actually emitted. Style does not
+/// change [`Span::width`], so measuring with [`Modifier::empty`] and emitting
+/// with the row's emphasis wrap identically.
+pub(crate) fn cell_measure_width(inlines: &[MarkdownInline], width: usize) -> usize {
+    render_cell(inlines, width, Modifier::empty())
+        .iter()
+        .map(|(spans, _join)| {
+            let text: String = spans.iter().map(|span| span.content.as_ref()).collect();
+            display_width(text.trim())
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Pad `spans` to exactly `width` display columns according to `alignment`.
+///
+/// The padding is emitted as plain [`Style::default()`] space spans, so a row's
+/// emphasis never reaches the frame: a padded header cell reads as bold text in
+/// a plain box.
+pub(crate) fn pad_aligned_spans(
+    spans: &[Span<'static>],
+    width: usize,
+    alignment: MarkdownAlignment,
+) -> Vec<Span<'static>> {
+    let text_width: usize = spans.iter().map(Span::width).sum();
     if text_width >= width {
-        return text.to_string();
+        return spans.to_vec();
     }
     let remaining = width - text_width;
     let (left, right) = match alignment {
@@ -477,51 +519,13 @@ pub(crate) fn pad_aligned(text: &str, width: usize, alignment: MarkdownAlignment
         MarkdownAlignment::Center => (remaining / 2, remaining.div_ceil(2)),
         MarkdownAlignment::Left | MarkdownAlignment::None => (0, remaining),
     };
-    format!("{}{}{}", " ".repeat(left), text, " ".repeat(right))
-}
-
-pub(crate) fn inline_plain_text(inlines: &[MarkdownInline]) -> String {
-    let mut text = String::new();
-    append_inline_plain_text(inlines, &mut text);
-    text
-}
-
-pub(crate) fn append_inline_plain_text(inlines: &[MarkdownInline], text: &mut String) {
-    for inline in inlines {
-        match inline {
-            MarkdownInline::Text(value) | MarkdownInline::Code(value) => text.push_str(value),
-            MarkdownInline::InlineMath(value) | MarkdownInline::DisplayMath(value) => {
-                // Table cells are rendered as plain text; pretty-print math so
-                // it reads like the surrounding cell content instead of raw
-                // LaTeX source.
-                text.push_str(&render_math_pretty(value));
-            }
-            MarkdownInline::Strikethrough(content)
-            | MarkdownInline::Emphasis(content)
-            | MarkdownInline::Strong(content) => append_inline_plain_text(content, text),
-            MarkdownInline::Link {
-                content,
-                destination,
-            } => {
-                append_inline_plain_text(content, text);
-                if !destination.is_empty() {
-                    text.push_str(" (");
-                    text.push_str(destination);
-                    text.push(')');
-                }
-            }
-            MarkdownInline::Image { alt, destination } => {
-                text.push_str("[image: ");
-                append_inline_plain_text(alt, text);
-                if destination.is_empty() {
-                    text.push(']');
-                } else {
-                    text.push_str("] (");
-                    text.push_str(destination);
-                    text.push(')');
-                }
-            }
-            MarkdownInline::LineBreak => text.push('\n'),
-        }
+    let mut padded = Vec::with_capacity(spans.len() + 2);
+    if left > 0 {
+        padded.push(Span::styled(" ".repeat(left), Style::default()));
     }
+    padded.extend(spans.iter().cloned());
+    if right > 0 {
+        padded.push(Span::styled(" ".repeat(right), Style::default()));
+    }
+    padded
 }

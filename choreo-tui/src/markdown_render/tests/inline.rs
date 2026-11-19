@@ -274,18 +274,40 @@ fn markdown_link_wrapping_does_not_overflow() {
         "long link text should wrap onto multiple lines, got {}",
         result.len()
     );
-    // The first 3 lines are the bold content — each must be ≤ width.
-    // The last line(s) contain the separator + URL, which may exceed width.
-    for line in result.iter().take(3) {
+    for line in &result {
         assert!(
             line.width() <= 10,
-            "wrapped link content line width {} exceeds 10",
-            line.width()
+            "every wrapped link line fits the width, {} exceeds 10: {:?}",
+            line.width(),
+            line.to_string()
         );
     }
     // The URL should appear somewhere.
     let whole: String = result.iter().map(ToString::to_string).collect();
     assert!(whole.contains("http://example.com"), "URL should appear");
+}
+
+#[test]
+fn markdown_url_longer_than_the_row_hard_splits() {
+    // A destination that cannot fit a row at all is hard-split at the row
+    // boundary, like an over-wide word, instead of overrunning the content
+    // width. Rejoining the chunks without the wrap must reproduce the URL
+    // exactly: splitting loses no characters and adds none.
+    let md = "see [site](https://example.com/a/very/long/path/that/does/not/fit)";
+    let result = markdown_lines(md, 24);
+    for line in &result {
+        assert!(
+            line.width() <= 24,
+            "line width {} exceeds 24: {:?}",
+            line.width(),
+            line.to_string()
+        );
+    }
+    let rejoined: String = result.iter().map(ToString::to_string).collect();
+    assert!(
+        rejoined.contains("https://example.com/a/very/long/path/that/does/not/fit"),
+        "the split URL rejoins to its original text: {rejoined:?}"
+    );
 }
 
 // ── heading modifiers ────────────────────────────────────────────────

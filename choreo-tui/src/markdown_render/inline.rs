@@ -444,9 +444,23 @@ pub(crate) fn render_link_inline(
 
     // URL underlined (stacked on parent but not bold).
     ctx.modifier = prev | Modifier::UNDERLINED;
-    ctx.push_span(destination.to_string(), ctx.base_style());
+    if *ctx.current_width + url_width > ctx.width && *ctx.current_width >= ctx.indent {
+        // The URL alone does not fit what is left of the row. Hard-split it at
+        // the row boundary exactly as an over-wide word is split: a destination
+        // longer than the row is common (`https://…`), and pushing it whole
+        // would overrun the content width — and, in a table cell, desync the
+        // frame from its border columns. The separator stays on this row when
+        // there is any room for it, so a split URL never leaves a dangling
+        // ` - ` alone on a line.
+        if *ctx.current_width >= ctx.width {
+            ctx.flush_line_with_next(LineJoin::Space);
+        }
+        ctx.render_word_split(destination, ctx.base_style());
+    } else {
+        ctx.push_span(destination.to_string(), ctx.base_style());
+        *ctx.current_width += url_width;
+    }
     ctx.modifier = prev;
-    *ctx.current_width += url_width;
 
     *ctx.needs_separator = true;
 }
