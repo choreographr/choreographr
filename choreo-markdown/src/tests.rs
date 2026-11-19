@@ -768,3 +768,103 @@ fn math_pretty_is_total_on_adversarial_input() {
         assert!(!out.is_empty(), "unexpected collapse: {out:?}");
     }
 }
+
+// ── raw HTML ───────────────────────────────────────────────────────────────
+//
+// Raw HTML is not interpreted: the text a reader would see survives, the markup
+// is dropped. `<br>` is the exception — a GFM table cell can only break a line
+// with it — and `<script>`/`<style>` lose their body as well as their tags.
+
+#[test]
+fn inline_hard_break_tag_becomes_a_line_break() {
+    for source in ["a<br>b", "a<br/>b", "a<br />b", "a<BR>b"] {
+        let document = MarkdownDocument::parse(source);
+        let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+            panic!("expected a paragraph for {source:?}");
+        };
+        assert_eq!(
+            content,
+            &vec![
+                MarkdownInline::Text("a".to_string()),
+                MarkdownInline::LineBreak,
+                MarkdownInline::Text("b".to_string()),
+            ],
+            "for {source:?}"
+        );
+    }
+}
+
+#[test]
+fn table_cell_hard_break_tag_breaks_inside_the_cell() {
+    // The shape a model writes to get two lines into one GFM cell.
+    let source = "| Switching | 8-port PoE 60 W<br>16-port non-PoE |\n|:--|:--|";
+    let document = MarkdownDocument::parse(source);
+    let MarkdownBlock::Table { header, .. } = &document.blocks[0] else {
+        panic!("expected a table");
+    };
+    assert_eq!(inline_text(&header[1]), "8-port PoE 60 W\n16-port non-PoE");
+
+    // A cell is one source line, so the break serializes back as `<br>`: a
+    // literal newline would split the row instead of breaking inside the cell.
+    let markdown = document.to_markdown();
+    assert!(
+        markdown.contains("8-port PoE 60 W<br>16-port non-PoE"),
+        "cell break did not round-trip: {markdown:?}"
+    );
+    let MarkdownBlock::Table { header, .. } = &MarkdownDocument::parse(&markdown).blocks[0] else {
+        panic!("the round-tripped table lost its structure: {markdown:?}");
+    };
+    assert_eq!(header.len(), 2, "row split on its break: {markdown:?}");
+    assert_eq!(inline_text(&header[1]), "8-port PoE 60 W\n16-port non-PoE");
+}
+
+#[test]
+fn inline_html_tags_are_dropped_and_their_text_survives() {
+    let document = MarkdownDocument::parse("a<b>bold</b>c");
+    assert_eq!(item_plain_text(&document.blocks), "aboldc");
+}
+
+#[test]
+fn html_block_keeps_the_text_it_wrapped() {
+    for source in ["<div>block</div>", "<div>\nblock\n</div>"] {
+        let document = MarkdownDocument::parse(source);
+        assert_eq!(item_plain_text(&document.blocks), "block", "for {source:?}");
+    }
+}
+
+#[test]
+fn script_and_style_bodies_are_dropped() {
+    // Inline: the body is its own run of text events.
+    let inline = MarkdownDocument::parse("a <script>alert(1)</script> b");
+    assert_eq!(item_plain_text(&inline.blocks), "a  b");
+
+    // Block: pulldown hands the whole element over as one raw string.
+    let block = MarkdownDocument::parse("<script>\nalert(1)\n</script>");
+    assert_eq!(item_plain_text(&block.blocks), "");
+
+    let style = MarkdownDocument::parse("<style>\np { color: red }\n</style>\n\nkept");
+    assert_eq!(item_plain_text(&style.blocks), "kept");
+}
+
+#[test]
+fn an_unterminated_script_only_loses_its_own_block() {
+    // The suppression is bounded to the block that opened it, so a missing close
+    // tag can never hide the rest of the message.
+    let document = MarkdownDocument::parse("before <script>gone\n\nkept paragraph");
+    assert_eq!(item_plain_text(&document.blocks), "before kept paragraph");
+}
+
+#[test]
+fn html_comments_and_declarations_are_dropped() {
+    let comment = MarkdownDocument::parse("a<!-- hidden -->b");
+    assert_eq!(item_plain_text(&comment.blocks), "ab");
+
+    let declaration = MarkdownDocument::parse("x<!DOCTYPE html>y");
+    assert_eq!(item_plain_text(&declaration.blocks), "xy");
+}
+
+#[test]
+fn html_blocks_stay_inside_their_container() {
+    let document = MarkdownDocument::parse("> <div>quoted</div>\n\nafter");
+    assert_eq!(item_plain_text(&document.blocks), "quotedafter");
+}

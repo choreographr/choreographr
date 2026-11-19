@@ -143,13 +143,23 @@ fn write_table_row_markdown(row: &[Vec<MarkdownInline>], markdown: &mut String) 
     markdown.push('|');
     for cell in row {
         markdown.push(' ');
-        write_markdown_inlines(cell, markdown);
+        write_inlines(cell, markdown, true);
         markdown.push(' ');
         markdown.push('|');
     }
 }
 
 fn write_markdown_inlines(inlines: &[MarkdownInline], markdown: &mut String) {
+    write_inlines(inlines, markdown, false);
+}
+
+/// Write `inlines` as markdown.
+///
+/// `in_table_cell` swaps a hard break's `\n` for `<br>`: a GFM table row is one
+/// line, so a literal newline would split the row instead of breaking inside the
+/// cell — and `<br>` is exactly what the parser reads back as a [`LineBreak`],
+/// so a cell round-trips.
+fn write_inlines(inlines: &[MarkdownInline], markdown: &mut String, in_table_cell: bool) {
     for inline in inlines {
         match inline {
             MarkdownInline::Text(text) => markdown.push_str(text),
@@ -170,17 +180,17 @@ fn write_markdown_inlines(inlines: &[MarkdownInline], markdown: &mut String) {
             }
             MarkdownInline::Strikethrough(content) => {
                 markdown.push_str("~~");
-                write_markdown_inlines(content, markdown);
+                write_inlines(content, markdown, in_table_cell);
                 markdown.push_str("~~");
             }
             MarkdownInline::Emphasis(content) => {
                 markdown.push('*');
-                write_markdown_inlines(content, markdown);
+                write_inlines(content, markdown, in_table_cell);
                 markdown.push('*');
             }
             MarkdownInline::Strong(content) => {
                 markdown.push_str("**");
-                write_markdown_inlines(content, markdown);
+                write_inlines(content, markdown, in_table_cell);
                 markdown.push_str("**");
             }
             MarkdownInline::Link {
@@ -188,19 +198,25 @@ fn write_markdown_inlines(inlines: &[MarkdownInline], markdown: &mut String) {
                 destination,
             } => {
                 markdown.push('[');
-                write_markdown_inlines(content, markdown);
+                write_inlines(content, markdown, in_table_cell);
                 markdown.push_str("](");
                 markdown.push_str(destination);
                 markdown.push(')');
             }
             MarkdownInline::Image { alt, destination } => {
                 markdown.push_str("![");
-                write_markdown_inlines(alt, markdown);
+                write_inlines(alt, markdown, in_table_cell);
                 markdown.push_str("](");
                 markdown.push_str(destination);
                 markdown.push(')');
             }
-            MarkdownInline::LineBreak => markdown.push('\n'),
+            MarkdownInline::LineBreak => {
+                if in_table_cell {
+                    markdown.push_str("<br>");
+                } else {
+                    markdown.push('\n');
+                }
+            }
         }
     }
 }

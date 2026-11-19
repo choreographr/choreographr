@@ -2,6 +2,7 @@ mod ansi;
 mod blockquote;
 mod code_box;
 mod copy_metadata;
+mod html;
 mod incremental;
 mod inline;
 mod lists;
