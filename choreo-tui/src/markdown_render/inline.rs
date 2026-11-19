@@ -1,6 +1,8 @@
 //! Inline markdown rendering: text, emphasis, links, code, and math into
 //! styled spans, with wrapping.
 
+use std::borrow::Cow;
+
 use super::{
     Color, Line, LineChrome, LineJoin, MarkdownInline, Modifier, Span, Style, display_width,
     render_math_pretty, split_word_to_width, wrap_plain_line,
@@ -86,9 +88,14 @@ pub(crate) struct RenderCtx<'a> {
     /// [`RenderCtx::flush_line_with_next`] and recorded when the line is
     /// finally pushed.
     current_join: LineJoin,
-    /// Whether the next word needs a space separator before it (set to
-    /// `true` after every word/code chunk, reset to `false` on line break
-    /// or flush).
+    /// Whether the *source* had whitespace immediately before whatever comes
+    /// next, i.e. whether the next inline node is preceded by a space.  Every
+    /// node leaves this describing its own right edge: a text node latches the
+    /// whitespace it ended with, while a code span, link, image marker, display
+    /// equation, or hard break sets it to `false` because none of them carries
+    /// trailing whitespace of its own.  A following text node ORs it with its
+    /// own leading whitespace — the only other place a gap can come from — and
+    /// [`RenderCtx::begin_inline`] is the one place that consumes it.
     needs_separator: &'a mut bool,
     /// Left-margin width for blockquote / list nesting.
     indent: usize,
@@ -105,8 +112,43 @@ impl RenderCtx<'_> {
         Style::default().add_modifier(self.modifier)
     }
 
-    fn push_span(&mut self, content: String, style: Style) {
+    fn push_span(&mut self, content: impl Into<Cow<'static, str>>, style: Style) {
         self.current.push(Span::styled(content, style));
+    }
+
+    /// Whether the current line already ends in whitespace, so a gap before the
+    /// next node would duplicate it.  A line with nothing beyond its indent
+    /// counts as ending in whitespace: that is what stops a node at the start of
+    /// a row from being pushed a space it cannot use.
+    fn ends_with_space(&self) -> bool {
+        if *self.current_width <= self.indent {
+            return true;
+        }
+        self.current
+            .last()
+            .is_some_and(|span| span.content.ends_with(char::is_whitespace))
+    }
+
+    /// Begin an inline node whose rendered form is `item_width` columns wide:
+    /// wrap to a fresh row when it would overflow the current one, otherwise
+    /// emit the single-space gap the source asked for in `gap`.
+    ///
+    /// The gap is emitted only when the line does not already sit on one, so a
+    /// marker that ends in its own space (the `[image: ` prefix) or a row that
+    /// was just flushed never gets a second one.  The caller owns what follows —
+    /// a mid-word split check, or the node's own spans — and is responsible for
+    /// setting [`Self::needs_separator`] to describe the node's right edge.
+    fn begin_inline(&mut self, item_width: usize, gap: bool) {
+        if *self.current_width + usize::from(gap) + item_width > self.width
+            && *self.current_width > self.indent
+        {
+            self.flush_line_with_next(LineJoin::Space);
+            return;
+        }
+        if gap && !self.ends_with_space() {
+            self.push_span(" ", self.base_style());
+            *self.current_width += 1;
+        }
     }
 
     /// Push the current line into the output and start a fresh line at indent.
@@ -187,25 +229,17 @@ pub(crate) fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut Rend
             MarkdownInline::Image { alt, destination } => {
                 let prefix_text = "[image: ";
                 let prefix_width = display_width(prefix_text);
-                let projected =
-                    *ctx.current_width + usize::from(*ctx.needs_separator) + prefix_width;
-                if projected > ctx.width && *ctx.current_width > ctx.indent {
-                    // Mid-inline wrap: the image continues the sentence.
-                    ctx.flush_line_with_next(LineJoin::Space);
-                } else if *ctx.needs_separator
-                    && !ctx.current.is_empty()
-                    && *ctx.current_width > ctx.indent
-                {
-                    // The source had a gap before the image, so the rendered
-                    // marker keeps it — an image sits on a word boundary like any
-                    // other inline.
-                    ctx.push_span(" ".to_string(), ctx.base_style());
-                    *ctx.current_width += 1;
-                }
-                ctx.push_span(prefix_text.to_string(), Style::default());
+                // The source's gap before the image sits on a word boundary like
+                // any other inline, so `begin_inline` emits it (or wraps first
+                // when it will not fit).
+                ctx.begin_inline(prefix_width, *ctx.needs_separator);
+                ctx.push_span(prefix_text, Style::default());
                 *ctx.current_width += prefix_width;
-                // The prefix ends with its own space, so the alt text starts
-                // immediately: leaving the pending gap set would double it.
+                // The prefix ends with its own space, so the alt starts straight
+                // after it: latching the gap would charge the first alt word a
+                // second column it does not get, and — the reason `begin_inline`
+                // also checks `ends_with_space` — an alt whose own text begins
+                // with whitespace must not double the prefix's space either.
                 *ctx.needs_separator = false;
 
                 render_inlines_to_lines(alt, ctx);
@@ -246,69 +280,67 @@ pub(crate) fn render_inlines_to_lines(inlines: &[MarkdownInline], ctx: &mut Rend
 /// `a` + `**b**` + `c` as `abc`, and `( **hi** )` as `( hi )`. Punctuation is
 /// not consulted: whether a bracket needs a space is a question about the
 /// source's whitespace, and no character-class heuristic can answer it.
+///
+/// The whitespace tests use [`char::is_whitespace`] — the same class
+/// [`str::split_whitespace`] collapses *within* a node — so a non-breaking or
+/// ideographic space on a node boundary keeps the pair apart instead of being
+/// silently dropped.
 pub(crate) fn render_text_inline(text: &str, ctx: &mut RenderCtx) {
-    let gap_before = *ctx.needs_separator || text.starts_with([' ', '\t']);
-    let trimmed = text.trim_start();
-    let words: Vec<&str> = trimmed.split_whitespace().collect();
-    if words.is_empty() {
+    // The gap before this node comes from one of two spellings of the same
+    // source whitespace: the previous node's trailing whitespace (latched in
+    // `needs_separator`) or this node's own leading whitespace.
+    let gap_before = *ctx.needs_separator || text.starts_with(char::is_whitespace);
+
+    // `split_whitespace` both trims and iterates lazily: a text node needs no
+    // buffer of its own, and the empty check is a peek rather than a collect.
+    let mut words = text.split_whitespace().peekable();
+    if words.peek().is_none() {
         // Whitespace-only source: it *is* the gap before the next node, the
         // separator between two adjacent styled spans for instance.
         *ctx.needs_separator = true;
         return;
     }
 
-    for (i, word) in words.iter().enumerate() {
+    for (i, word) in words.enumerate() {
         let word_width = display_width(word);
         // Within one text node every word after the first is separated by the
         // whitespace `split_whitespace` just collapsed; the first word is
         // separated only if the source had a gap before this node at all.
-        let separator = if i == 0 { gap_before } else { true };
-        let projected = *ctx.current_width + usize::from(separator) + word_width;
+        let separator = i > 0 || gap_before;
 
-        if projected > ctx.width && *ctx.current_width > ctx.indent {
-            // Word-wrap: the next row continues the sentence.
-            ctx.flush_line_with_next(LineJoin::Space);
-        }
+        ctx.begin_inline(word_width, separator);
 
         if *ctx.current_width + word_width > ctx.width && *ctx.current_width >= ctx.indent {
+            // Wider than a whole row: split it mid-word across rows.
             ctx.render_word_split(word, ctx.base_style());
             continue;
         }
 
-        if separator && !ctx.current.is_empty() && *ctx.current_width > ctx.indent {
-            ctx.push_span(" ".to_string(), ctx.base_style());
-            *ctx.current_width += 1;
-        }
         ctx.push_span(word.to_string(), ctx.base_style());
         *ctx.current_width += word_width;
     }
 
     // The gap *after* this node is the whitespace the source had here, nothing
     // more: a text ending in a word leaves the next node glued to it.
-    *ctx.needs_separator = text.ends_with([' ', '\t']);
+    *ctx.needs_separator = text.ends_with(char::is_whitespace);
 }
 
 pub(crate) fn render_code_inline(text: &str, ctx: &mut RenderCtx, color: Color) {
     let word_width = display_width(text);
 
-    // Flush if projected width exceeds the available line width
-    // (but only when the line already has content — don't flush a blank line).
-    let projected = *ctx.current_width + usize::from(*ctx.needs_separator) + word_width;
-    if projected > ctx.width && *ctx.current_width > ctx.indent {
-        ctx.flush_line_with_next(LineJoin::Space);
-    } else if *ctx.needs_separator && !ctx.current.is_empty() && *ctx.current_width > ctx.indent {
-        ctx.push_span(" ".to_string(), ctx.base_style());
-        *ctx.current_width += 1;
-    }
+    // A gap, or a wrap when the span will not fit beside what is already here
+    // (never flush a blank line — `begin_inline` leaves an empty row alone).
+    ctx.begin_inline(word_width, *ctx.needs_separator);
 
     if *ctx.current_width + word_width > ctx.width && *ctx.current_width >= ctx.indent {
+        // Wider than a whole row: split it mid-word across rows, exactly as a
+        // word is split.
         ctx.render_word_split(text, ctx.base_style().fg(color));
-        *ctx.needs_separator = false;
-        return;
+    } else {
+        ctx.push_span(text.to_string(), ctx.base_style().fg(color));
+        *ctx.current_width += word_width;
     }
 
-    ctx.push_span(text.to_string(), ctx.base_style().fg(color));
-    *ctx.current_width += word_width;
     // A code span has no whitespace of its own on either side: any gap before
     // the next node lives in that node's leading whitespace, never here.
     *ctx.needs_separator = false;
@@ -383,10 +415,10 @@ pub(crate) fn render_display_math(text: &str, ctx: &mut RenderCtx) {
 /// no heap allocation — e.g. ***bold italic*** becomes
 /// `BOLD | ITALIC` for the inner text.
 ///
-/// The pending gap is deliberately left as the content left it: `*a *` ends
-/// with whitespace and so keeps the next node at one space's distance, while
-/// `*a*` glues to it. The container adds no spacing of its own, which is why
-/// `**bold**.` renders `bold.` and `a**b**` renders `ab`.
+/// The pending gap is deliberately left as the content left it: a container adds
+/// no spacing of its own, which is why `**bold**.` renders `bold.` and `a**b**c`
+/// renders `abc`. The one space in `**a** **b**` comes from the whitespace-only
+/// text node between the two containers, not from either of them.
 pub(crate) fn render_style_inline(
     content: &[MarkdownInline],
     ctx: &mut RenderCtx,
