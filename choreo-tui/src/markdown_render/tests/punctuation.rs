@@ -1,90 +1,85 @@
 use super::super::*;
 
-// ── starts_with_closing_punct ────────────────────────────────────────
+// ── source adjacency between inline nodes ────────────────────────────
+//
+// Whether a space separates two inline nodes is decided by the whitespace the
+// *source* had between them, never by what the neighbouring characters look
+// like. A gap lives either in the following text node's leading whitespace or
+// in the preceding node's trailing whitespace, and only those make a space.
+// (Punctuation therefore needs no special case: `(**hi**)` and `( **hi** )` are
+// both answered by the source's own spacing.)
 
 #[test]
-fn starts_with_closing_punct_period() {
-    assert!(starts_with_closing_punct("."));
-    assert!(starts_with_closing_punct("..."));
-    assert!(starts_with_closing_punct(".not"));
+fn styled_text_glued_to_words_stays_glued() {
+    // `a**b**c` has no whitespace anywhere, so nothing gets a space.
+    let result = markdown_lines("a**b**c", 80);
+    let whole: String = result.iter().map(ToString::to_string).collect();
+    assert!(
+        whole.contains("abc"),
+        "expected 'abc' with no inserted spaces, got: {whole:?}"
+    );
 }
 
 #[test]
-fn starts_with_closing_punct_comma() {
-    assert!(starts_with_closing_punct(","));
-    assert!(starts_with_closing_punct(", "));
+fn code_span_glued_to_a_plus_sign_stays_glued() {
+    // The case that reads wrong in a table: `(+`num-traits`)` must not become
+    // `(+ num-traits`.
+    let result = markdown_lines("rmp (+`num-traits`, already present)", 80);
+    let whole: String = result.iter().map(ToString::to_string).collect();
+    assert!(
+        whole.contains("(+num-traits,"),
+        "expected '(+num-traits,' without an inserted space, got: {whole:?}"
+    );
+    assert!(
+        !whole.contains("(+ num-traits"),
+        "must not insert a space after '+': {whole:?}"
+    );
 }
 
 #[test]
-fn starts_with_closing_punct_exclamation() {
-    assert!(starts_with_closing_punct("!"));
-    assert!(starts_with_closing_punct("!important"));
+fn code_span_glued_after_a_word_stays_glued() {
+    let result = markdown_lines("foo`bar`", 80);
+    let whole: String = result.iter().map(ToString::to_string).collect();
+    assert!(
+        whole.contains("foobar"),
+        "expected 'foobar', got: {whole:?}"
+    );
 }
 
 #[test]
-fn starts_with_closing_punct_question() {
-    assert!(starts_with_closing_punct("?"));
-    assert!(starts_with_closing_punct("? "));
+fn adjacent_styled_spans_separated_by_source_whitespace_keep_one_space() {
+    // `**a** **b**` puts a whitespace-only text node between two styled
+    // containers: that node *is* the gap, and it must survive as one space.
+    let result = markdown_lines("**a** **b**", 80);
+    let whole: String = result.iter().map(ToString::to_string).collect();
+    assert!(whole.contains("a b"), "expected 'a b', got: {whole:?}");
+    assert!(!whole.contains("ab"), "must not drop the gap: {whole:?}");
 }
 
 #[test]
-fn starts_with_closing_punct_colon_semicolon() {
-    assert!(starts_with_closing_punct(":"));
-    assert!(starts_with_closing_punct(";"));
+fn image_after_a_word_keeps_the_source_space() {
+    // The rendered `[image: …]` marker sits on a word boundary like any other
+    // inline, so the source's space before the image is preserved.
+    let result = markdown_lines("see ![alt](u.png) here", 80);
+    let whole: String = result.iter().map(ToString::to_string).collect();
+    assert!(
+        whole.contains("see [image: alt] (u.png) here"),
+        "expected the image marker spaced on both sides, got: {whole:?}"
+    );
+    assert!(
+        !whole.contains("see[image:"),
+        "must not glue the marker to the preceding word: {whole:?}"
+    );
 }
 
 #[test]
-fn starts_with_closing_punct_brackets() {
-    assert!(starts_with_closing_punct(")"));
-    assert!(starts_with_closing_punct("]"));
-    assert!(starts_with_closing_punct("}"));
-}
-
-#[test]
-fn starts_with_closing_punct_unicode_quotes() {
-    assert!(starts_with_closing_punct("\u{2019}")); // right single quote
-    assert!(starts_with_closing_punct("\u{201d}")); // right double quote
-}
-
-#[test]
-fn starts_with_closing_punct_non_closing_chars() {
-    assert!(!starts_with_closing_punct("hello"));
-    assert!(!starts_with_closing_punct(""));
-    assert!(!starts_with_closing_punct("("));
-    assert!(!starts_with_closing_punct("["));
-    assert!(!starts_with_closing_punct("{"));
-    assert!(!starts_with_closing_punct("\u{2018}")); // left single quote
-    assert!(!starts_with_closing_punct("\u{201c}")); // left double quote
-}
-
-// ── ends_with_opening_punct ──────────────────────────────────────────
-
-#[test]
-fn ends_with_opening_punct_brackets() {
-    assert!(ends_with_opening_punct("("));
-    assert!(ends_with_opening_punct("(("));
-    assert!(ends_with_opening_punct("word ("));
-    assert!(ends_with_opening_punct("["));
-    assert!(ends_with_opening_punct("{"));
-}
-
-#[test]
-fn ends_with_opening_punct_unicode_quotes() {
-    assert!(ends_with_opening_punct("\u{2018}")); // left single quote
-    assert!(ends_with_opening_punct("\u{201c}")); // left double quote
-    assert!(ends_with_opening_punct("said \u{201c}"));
-}
-
-#[test]
-fn ends_with_opening_punct_non_opening_chars() {
-    assert!(!ends_with_opening_punct(""));
-    assert!(!ends_with_opening_punct("hello"));
-    assert!(!ends_with_opening_punct(")"));
-    // A trailing space means the source had a gap; the next inline must
-    // stay separated, so this must NOT count as ending with a bracket.
-    assert!(!ends_with_opening_punct("( "));
-    assert!(!ends_with_opening_punct("\u{201d}")); // right double quote
-    assert!(!ends_with_opening_punct("\u{2019}")); // right single quote
+fn link_destination_and_following_text_follow_the_source_spacing() {
+    let spaced = markdown_lines("see [a](u) b", 80);
+    let spaced: String = spaced.iter().map(ToString::to_string).collect();
+    assert!(
+        spaced.contains("a - u b"),
+        "expected 'a - u b', got: {spaced:?}"
+    );
 }
 
 // ── punctuation attachment (closing punct after styled text) ──────────
