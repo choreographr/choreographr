@@ -6,6 +6,8 @@
 //!   [`MarkdownBlock`], [`MarkdownInline`], [`MarkdownAlignment`]) and the
 //!   crate's public re-exports;
 //! * `parse` — the pulldown-cmark event → AST parser;
+//! * `raw_html` — the pure string helpers that reduce a raw HTML run to the
+//!   inline nodes a terminal can show;
 //! * `serialize` — the AST → markdown re-serializer;
 //! * `html` — markdown → sanitized HTML rendering;
 //! * `math` — math/prose classification (`math::detect`) and the LaTeX →
@@ -21,6 +23,7 @@ use thiserror::Error;
 mod html;
 mod math;
 mod parse;
+mod raw_html;
 mod serialize;
 
 #[cfg(test)]

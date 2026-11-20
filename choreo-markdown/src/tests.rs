@@ -833,6 +833,44 @@ fn html_block_keeps_the_text_it_wrapped() {
 }
 
 #[test]
+fn block_br_tag_breaks_the_line() {
+    // `<br>` has a textual meaning inside a block HTML element too, not just an
+    // inline one: `<div>a<br>b</div>` used to glue its text into "ab".
+    let document = MarkdownDocument::parse("<div>a<br>b</div>");
+    assert_eq!(
+        document.blocks,
+        vec![MarkdownBlock::Paragraph(vec![
+            MarkdownInline::Text("a".to_string()),
+            MarkdownInline::LineBreak,
+            MarkdownInline::Text("b".to_string()),
+        ])]
+    );
+}
+
+#[test]
+fn html_block_collapses_literal_newlines_to_spaces() {
+    // A literal newline inside block HTML is whitespace, not a break (HTML itself
+    // collapses it), so only an explicit `<br>` forces a line break.
+    let document = MarkdownDocument::parse("<div>\nline1\nline2\n</div>");
+    let MarkdownBlock::Paragraph(content) = &document.blocks[0] else {
+        panic!("expected a paragraph");
+    };
+    assert!(
+        !content
+            .iter()
+            .any(|i| matches!(i, MarkdownInline::LineBreak))
+    );
+}
+
+#[test]
+fn br_inside_a_script_body_is_dropped_with_it() {
+    // A `<br>` in a discarded `<script>`/`<style>` body is code, not prose: it
+    // must not leak a break out of the body it belongs to.
+    let document = MarkdownDocument::parse("a<script>x<br>y</script>b");
+    assert_eq!(item_plain_text(&document.blocks), "ab");
+}
+
+#[test]
 fn script_and_style_bodies_are_dropped() {
     // Inline: the body is its own run of text events.
     let inline = MarkdownDocument::parse("a <script>alert(1)</script> b");
@@ -847,11 +885,22 @@ fn script_and_style_bodies_are_dropped() {
 }
 
 #[test]
-fn an_unterminated_script_only_loses_its_own_block() {
-    // The suppression is bounded to the block that opened it, so a missing close
-    // tag can never hide the rest of the message.
+fn an_unterminated_inline_script_only_loses_its_own_paragraph() {
+    // An inline `<script>` is bounded by the paragraph that opened it, so a
+    // missing close tag drops the rest of that paragraph and nothing after it.
     let document = MarkdownDocument::parse("before <script>gone\n\nkept paragraph");
     assert_eq!(item_plain_text(&document.blocks), "before kept paragraph");
+}
+
+#[test]
+fn an_unterminated_block_script_drops_to_end_of_input() {
+    // A line-start `<script>` is an HTML block, and pulldown runs it to
+    // `</script>` or the end of input — the same extent HTML itself consumes. An
+    // unterminated one therefore takes the rest of the document with it; this is
+    // the one case the "keep the text" rule cannot recover prose, so it is
+    // pinned here rather than left as a surprise.
+    let document = MarkdownDocument::parse("<script>\nalert(1)\n\nkept paragraph");
+    assert_eq!(item_plain_text(&document.blocks), "");
 }
 
 #[test]

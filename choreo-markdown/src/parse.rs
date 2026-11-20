@@ -5,6 +5,7 @@ use std::ops::Range;
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use crate::math::normalize_math_event;
+use crate::raw_html::{is_hard_break_tag, scripting_tag, strip_html_block};
 use crate::{ListItem, MarkdownAlignment, MarkdownBlock, MarkdownDocument, MarkdownInline};
 
 #[derive(Debug)]
@@ -66,21 +67,24 @@ impl MarkdownDocument {
         let mut block_stack = Vec::<BlockContext>::new();
         let mut inline_stack = Vec::<InlineContext>::new();
         // Set while an inline `<script>`/`<style>` element is open, so the body
-        // that follows is dropped along with the tags that opened it. `Event::Html`
-        // streams an HTML block one line per event, so this state also carries
-        // across an element that spans several of them.
+        // that follows is dropped along with the tags that opened it. The state
+        // is cleared at every `End` event, which bounds the suppression to the
+        // block that opened it: an inline script whose close tag is missing only
+        // drops the rest of its own paragraph, never the enclosing document. (A
+        // *block-level* `<script>` is different — pulldown's HTML block runs to
+        // `</script>` or the end of input, so an unterminated one drops to the
+        // end of input, the same extent HTML itself would consume.)
         let mut in_script_body = false;
-        // The text an HTML block has contributed so far. pulldown-cmark delivers a
-        // block as `Start(HtmlBlock)` + one `Html` event per line + `End(HtmlBlock)`,
-        // so the kept text is gathered here and emitted as a single paragraph when
-        // the block closes.
-        let mut html_block: Option<String> = None;
+        // What an HTML block has contributed so far, as inline nodes. pulldown
+        // delivers a block as `Start(HtmlBlock)` + one `Html` event per line +
+        // `End(HtmlBlock)`, so the kept text is gathered here and emitted as a
+        // single paragraph when the block closes.
+        let mut html_block: Option<Vec<MarkdownInline>> = None;
 
         for (event, range) in parser {
-            // An unterminated `<script>` must not swallow the rest of the document:
-            // the suppression is bounded to the block that opened it, so an
-            // unbalanced tag can only ever show text it should have hidden, never
-            // hide the text that follows it.
+            // An unterminated `<script>` must not swallow more than its own
+            // block: clearing the flag at every `End` bounds an inline script to
+            // the paragraph that opened it.
             if matches!(&event, Event::End(_)) {
                 in_script_body = false;
             }
@@ -133,7 +137,7 @@ impl MarkdownDocument {
                     }
                     Tag::TableRow => block_stack.push(BlockContext::TableRow(Vec::new())),
                     Tag::TableCell => block_stack.push(BlockContext::TableCell(Vec::new())),
-                    Tag::HtmlBlock => html_block = Some(String::new()),
+                    Tag::HtmlBlock => html_block = Some(Vec::new()),
                     Tag::Emphasis => inline_stack.push(InlineContext::Emphasis(Vec::new())),
                     Tag::Strong => inline_stack.push(InlineContext::Strong(Vec::new())),
                     Tag::Strikethrough => {
@@ -268,22 +272,21 @@ impl MarkdownDocument {
                         }
                     }
                     TagEnd::HtmlBlock => {
-                        // Emit the block's kept text as one paragraph, wherever the
-                        // block sits (root, a quote, a list item).
+                        // Emit the block's kept content as one paragraph, wherever
+                        // the block sits (root, a quote, a list item).
                         if let Some(buffer) = html_block.take() {
-                            let kept = buffer.trim();
-                            if !kept.is_empty()
-                                && !push_text(&mut block_stack, &mut inline_stack, kept)
+                            let run = trim_inline_run(buffer);
+                            if !run.is_empty()
+                                && !push_inline_run(&mut block_stack, &mut inline_stack, &run)
                             {
-                                // No paragraph is open around a block, so the text
-                                // its tags wrapped keeps one of its own rather than
-                                // vanishing with them.
+                                // No paragraph-bearing context is open around the
+                                // block, so the text its tags wrapped keeps a
+                                // paragraph of its own rather than vanishing with
+                                // them.
                                 push_block(
                                     &mut blocks,
                                     &mut block_stack,
-                                    MarkdownBlock::Paragraph(vec![MarkdownInline::Text(
-                                        kept.to_string(),
-                                    )]),
+                                    MarkdownBlock::Paragraph(run),
                                 );
                             }
                         }
@@ -351,7 +354,14 @@ impl MarkdownDocument {
                     }
                 }
                 Event::InlineHtml(text) => {
-                    if is_hard_break_tag(&text) {
+                    if in_script_body {
+                        // Inside a dropped `<script>`/`<style>` body only the
+                        // matching close tag ends the suppression; a `<br>` or any
+                        // other tag there is code, not prose, and stays dropped.
+                        if let Some(true) = scripting_tag(&text) {
+                            in_script_body = false;
+                        }
+                    } else if is_hard_break_tag(&text) {
                         // `<br>` is the one raw tag with a textual meaning — a GFM
                         // table cell can only break a line this way — so it becomes
                         // the same `LineBreak` a source hard break produces.
@@ -368,16 +378,16 @@ impl MarkdownDocument {
                 }
                 Event::Html(text) => {
                     // One line of a raw HTML block: its tags are stripped and the
-                    // text they wrapped is gathered for the block's paragraph.
-                    let kept = strip_html_block(&text, &mut in_script_body);
-                    match html_block.as_mut() {
-                        Some(buffer) => buffer.push_str(&kept),
+                    // content they wrapped is gathered for the block's paragraph.
+                    let run = strip_html_block(&text, &mut in_script_body);
+                    if let Some(buffer) = html_block.as_mut() {
+                        extend_inlines(buffer, &run);
+                    } else {
                         // `Event::Html` belongs to an HTML block, so this is
-                        // unreachable in practice; keeping the text is the safe
-                        // direction if a future parser sends one outside.
-                        None => {
-                            push_text(&mut block_stack, &mut inline_stack, kept.trim());
-                        }
+                        // unreachable in practice; routing it as inline content is
+                        // the safe direction if a future parser sends one outside.
+                        let run = trim_inline_run(run);
+                        push_inline_run(&mut block_stack, &mut inline_stack, &run);
                     }
                 }
                 Event::Code(text) => push_inline(
@@ -452,96 +462,6 @@ fn heading_level(level: HeadingLevel) -> u8 {
     }
 }
 
-// ── raw HTML ──────────────────────────────────────────────────────────────
-//
-// Raw HTML is never interpreted: a terminal renders text, so the parser keeps
-// the text a reader would see and discards the markup. `<br>` is the exception —
-// a GFM table cell can only break a line that way, so the tag becomes the same
-// `LineBreak` a source hard break does. `<script>`/`<style>` lose their body as
-// well, because what they hold is code rather than prose.
-
-/// The element name of a raw tag (`<br>`, `</div>`, `<img src="x">`) and whether
-/// it closes.
-///
-/// Returns `None` when the slice is not an element tag: a comment, a
-/// `<!DOCTYPE>`, a processing instruction, or a stray `<`. Callers drop those as
-/// markup, exactly like an element they do not recognise.
-fn html_tag(text: &str) -> Option<(bool, &str)> {
-    let body = text.strip_prefix('<')?;
-    let (closing, body) = match body.strip_prefix('/') {
-        Some(rest) => (true, rest),
-        None => (false, body),
-    };
-    let name_len = body
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .unwrap_or(body.len());
-    let name = body.get(..name_len)?;
-    // A name starts with a letter, which is what separates a tag from `<!` and
-    // `<?` without special-casing either.
-    name.starts_with(|c: char| c.is_ascii_alphabetic())
-        .then_some((closing, name))
-}
-
-/// Whether `text` is a `<br>`, `<br/>`, or `<br />` tag — the only raw tag whose
-/// meaning is a hard line break.
-fn is_hard_break_tag(text: &str) -> bool {
-    matches!(html_tag(text), Some((false, name)) if name.eq_ignore_ascii_case("br"))
-}
-
-/// Whether `text` opens (`Some(false)`) or closes (`Some(true)`) a
-/// `<script>`/`<style>` element, whose body is dropped along with the tags.
-fn scripting_tag(text: &str) -> Option<bool> {
-    let (closing, name) = html_tag(text)?;
-    let scripting = name.eq_ignore_ascii_case("script") || name.eq_ignore_ascii_case("style");
-    scripting.then_some(closing)
-}
-
-/// Reduce one `Event::Html` run to the text a terminal can show.
-///
-/// `dropping_script_body` carries the "inside a `<script>`/`<style>` body" state
-/// in and out, because pulldown-cmark streams an HTML block one line per event
-/// and an element can span several of them (`Html("<script>\n")`, then its body,
-/// then `Html("</script>")`). A `<script>`/`<style>` element therefore goes
-/// whole — opening tag, body, closing tag — and one that never closes keeps
-/// dropping until the block ends, which is what HTML itself would do. Every other
-/// tag is removed and the text around it kept. Character references are left as
-/// written (`&amp;` stays `&amp;`): decoding them would be HTML parsing, which
-/// this renderer deliberately avoids.
-fn strip_html_block(text: &str, dropping_script_body: &mut bool) -> String {
-    let mut kept = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(open) = rest.find('<') {
-        if !*dropping_script_body {
-            kept.push_str(rest.get(..open).unwrap_or_default());
-        }
-        let tail = rest.get(open..).unwrap_or_default();
-        // A comment runs to its own terminator, which `>`-scanning would miss.
-        if let Some(body) = tail.strip_prefix("<!--") {
-            rest = body.split_once("-->").map_or("", |(_, after)| after);
-            continue;
-        }
-        // A `<` with no closing `>` is literal text, not markup.
-        let Some(close) = tail.find('>') else {
-            if !*dropping_script_body {
-                kept.push('<');
-            }
-            rest = tail.get(1..).unwrap_or_default();
-            continue;
-        };
-        let tag = tail.get(..=close).unwrap_or_default();
-        rest = tail.get(close + 1..).unwrap_or_default();
-        match scripting_tag(tag) {
-            Some(false) => *dropping_script_body = true,
-            Some(true) => *dropping_script_body = false,
-            None => {}
-        }
-    }
-    if !*dropping_script_body {
-        kept.push_str(rest);
-    }
-    kept
-}
-
 fn push_block(root: &mut Vec<MarkdownBlock>, stack: &mut [BlockContext], block: MarkdownBlock) {
     match stack.last_mut() {
         Some(BlockContext::Quote(blocks) | BlockContext::Item { blocks, .. }) => blocks.push(block),
@@ -579,17 +499,9 @@ fn item_marker_number(input: &str, range: &Range<usize>) -> Option<usize> {
 
 /// Route a text slice into the active context, merging with a neighbouring
 /// `Text` node where possible.
-///
-/// Returns whether an active context took the text. A quote, list, or table
-/// shell has nowhere to put bare inline text, and that `false` is what tells the
-/// caller an HTML block's kept text needs a paragraph of its own.
-fn push_text(
-    block_stack: &mut [BlockContext],
-    inline_stack: &mut [InlineContext],
-    text: &str,
-) -> bool {
+fn push_text(block_stack: &mut [BlockContext], inline_stack: &mut [InlineContext], text: &str) {
     if text.is_empty() {
-        return false;
+        return;
     }
 
     // Route the text into the active context, trying to merge into an
@@ -606,11 +518,11 @@ fn push_text(
                 push_text_content(content, text);
             }
         }
-        return true;
+        return;
     }
 
     let Some(context) = block_stack.last_mut() else {
-        return false;
+        return;
     };
     match context {
         BlockContext::Paragraph(content)
@@ -628,9 +540,106 @@ fn push_text(
         BlockContext::Quote(_)
         | BlockContext::List { .. }
         | BlockContext::Table { .. }
-        | BlockContext::TableRow(_) => return false,
+        | BlockContext::TableRow(_) => {}
     }
+}
+
+/// Route a run of inline nodes (an HTML block's kept content) into the active
+/// context, merging with a neighbouring `Text` node where possible.
+///
+/// Returns whether a context took the run. Only a paragraph-bearing block (or an
+/// open inline span) can; a quote, list, table, or code block has nowhere to put
+/// it, and that `false` is what tells the caller an HTML block's kept content
+/// needs a paragraph of its own.
+fn push_inline_run(
+    block_stack: &mut [BlockContext],
+    inline_stack: &mut [InlineContext],
+    run: &[MarkdownInline],
+) -> bool {
+    if run.is_empty() {
+        return false;
+    }
+    if let Some(context) = inline_stack.last_mut() {
+        match context {
+            InlineContext::Emphasis(content)
+            | InlineContext::Strong(content)
+            | InlineContext::Strikethrough(content)
+            | InlineContext::Link { content, .. }
+            | InlineContext::Image { alt: content, .. } => extend_inlines(content, run),
+        }
+        return true;
+    }
+    let Some(context) = block_stack.last_mut() else {
+        return false;
+    };
+    let content = match context {
+        BlockContext::Paragraph(content)
+        | BlockContext::Heading { content, .. }
+        | BlockContext::TableCell(content) => content,
+        BlockContext::Item { blocks, .. } => {
+            if !matches!(blocks.last(), Some(MarkdownBlock::Paragraph(_))) {
+                blocks.push(MarkdownBlock::Paragraph(Vec::new()));
+            }
+            match blocks.last_mut() {
+                Some(MarkdownBlock::Paragraph(content)) => content,
+                _ => return false,
+            }
+        }
+        // An HTML block cannot sit inside a code block, quote shell, list shell,
+        // table shell, or table row; if it somehow does there is nowhere to put
+        // it, so the caller falls back to a paragraph of its own.
+        BlockContext::CodeBlock { .. }
+        | BlockContext::Quote(_)
+        | BlockContext::List { .. }
+        | BlockContext::Table { .. }
+        | BlockContext::TableRow(_) => return false,
+    };
+    extend_inlines(content, run);
     true
+}
+
+/// Append `run` to `content`, merging adjacent `Text` nodes.
+fn extend_inlines(content: &mut Vec<MarkdownInline>, run: &[MarkdownInline]) {
+    for inline in run {
+        push_inline_content(content, inline.clone());
+    }
+}
+
+/// Trim an HTML block's kept content: drop leading and trailing whitespace and
+/// stray breaks so a block that opened or closed with a tag does not start or end
+/// with a blank line.
+fn trim_inline_run(mut run: Vec<MarkdownInline>) -> Vec<MarkdownInline> {
+    // A node the block can shed at either end: a stray break, or text that is
+    // only whitespace.
+    fn boundary(node: &MarkdownInline) -> bool {
+        match node {
+            MarkdownInline::LineBreak => true,
+            MarkdownInline::Text(text) => text.trim().is_empty(),
+            _ => false,
+        }
+    }
+
+    let mut start = 0;
+    while run.get(start).is_some_and(boundary) {
+        start += 1;
+    }
+    let mut end = run.len();
+    while end > start && run.get(end - 1).is_some_and(boundary) {
+        end -= 1;
+    }
+    // Trim the whitespace that survives on the boundary text nodes, then drop what
+    // fell outside the kept range.
+    if let Some(MarkdownInline::Text(text)) = run.get_mut(start) {
+        *text = text.trim_start().to_string();
+    }
+    if end > start
+        && let Some(MarkdownInline::Text(text)) = run.get_mut(end - 1)
+    {
+        *text = text.trim_end().to_string();
+    }
+    run.drain(end..);
+    run.drain(..start);
+    run
 }
 
 /// Push a text slice into a content vector, merging with the last element

@@ -57,6 +57,13 @@ fn an_html_block_keeps_the_text_it_wrapped() {
 }
 
 #[test]
+fn a_br_inside_an_html_block_breaks_the_line() {
+    // `<br>` means the same inside a block element as inline: without this the
+    // tags were dropped and the surrounding words glued into "ab".
+    assert_eq!(rows("<div>a<br>b</div>", 40), ["a", "b"]);
+}
+
+#[test]
 fn a_script_body_is_dropped_whole() {
     assert_eq!(rows("a <script>alert(1)</script> b", 40), ["a b"]);
     // Nothing survives the block but the renderer's blank line for an empty
