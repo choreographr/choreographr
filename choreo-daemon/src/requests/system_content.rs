@@ -151,8 +151,10 @@ pub(crate) fn persist_loaded_skill(
     }
 }
 
-/// Check whether a tool call touches a new subdirectory with an AGENTS.md /
-/// CLAUDE.md file and, if so, collect the hint text and newly discovered paths.
+/// Check whether a tool call touches a subdirectory holding a not-yet-surfaced
+/// `AGENTS.md` / `CLAUDE.md` and, if so, queue its hint text for the next turn's
+/// system prompt (`build_system_content`'s `pending_hints` block) and record the
+/// newly discovered paths so each hint is delivered exactly once.
 pub(crate) fn check_subdirectory_hints(
     working_dir: Option<&Path>,
     tool_name: &str,

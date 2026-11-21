@@ -11,7 +11,10 @@
 //!
 //! All I/O is synchronous `redb` transactions on the calling thread; `redb`'s
 //! `Database` is safe for concurrent readers, so one shared handle is threaded
-//! to every connection thread for on-demand image reads.
+//! to every connection thread for on-demand image reads. Every write commits at
+//! `redb`'s default `Durability::Immediate` — the daemon never lowers it — so a
+//! committed row has been fsynced and a crash loses only what was never
+//! committed.
 //!
 //! The store holds plaintext transcripts and tool output, so its filesystem
 //! permissions are part of the access control: [`open_db_at`] keeps the data

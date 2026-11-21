@@ -1,3 +1,18 @@
+//! The `load_skill` tool: resolve a skill by the `name` in its `SKILL.md`
+//! frontmatter and return its body, so the model can pull a skill's full
+//! instructions once a task matches the description listed in the prompt.
+//!
+//! Resolution prefers the session's `discovered_skills` snapshot — the same list
+//! the prompt's "Available skills" listing was built from — and falls back to a
+//! fresh ambient walk only when no snapshot is available (a dir-less or direct
+//! call), so the body returned here cannot diverge from the body the agent loop
+//! later re-injects. The returned body has its YAML frontmatter stripped.
+//!
+//! The agent loop persists a successful load into the session's loaded-skill
+//! list (`requests` does it in `persist_loaded_skill`), which re-injects the body
+//! under `<skill name="...">` on every later turn so the instructions stay
+//! visible after this tool result scrolls out of the context window.
+
 use crate::context;
 use crate::tools::context::ToolContext;
 use crate::tools::{Tool, ToolExecError};

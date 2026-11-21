@@ -2226,113 +2226,97 @@ on the last owner. The kernel-handle rationale is in `choreo-daemon`'s
 
 ## Session architecture
 
-Sessions are persisted to a `redb` (v4) embedded key-value store at
+Sessions are persisted to a `redb` embedded key-value store at
 `~/.local/share/choreographr/state.redb`, and each active session's in-memory state
 is a `SessionState` owned by its control thread with the persisted fields extracted
-into `SessionConfig`. The store holds plaintext conversation history and tool
-output, so it is kept owner-only: the data directory is created `0700` (foreign
-owned directories are refused) and the database file — like every
-pre-migration `state.redb.bak-v*` snapshot — is forced to `0600` on each open, so
-even a file left at the old umask default is tightened. The table schema — every
-table's key and value codec, the
-zstd turn-value compression, the turn-attachment byte split, the deletion
-tombstone, and the runtime catalog-refresh state — and the
-`SessionState`/`SessionConfig` split, with every field's rationale, are documented
-in-source (see `choreo-daemon`'s `db` and `sessions` modules, `cargo doc -p
-choreo-daemon` / `just doc`), held complete by the `#![warn(missing_docs)]` +
-`doc-check` gate.
+into `SessionConfig`. The table schema (every key and value codec), the
+`SessionState`/`SessionConfig` split with every field's rationale, and the store's
+owner-only filesystem permissions are documented in-source (see `choreo-daemon`'s
+`db` and `sessions` modules, `cargo doc -p choreo-daemon` / `just doc`); the
+permissions themselves are summarized under **On-disk state database** in the
+Security model.
 
 ### Turn durability
 
 Each `Turn` is written to disk when the **agent-loop iteration that produced it**
-completes, not when the request does. The loop builds its turns on the request
-worker's private `SessionState` clone, which the session thread only merges at
-`RequestFinished`; that merge remains the authoritative final write, but it is no
-longer the only one. The iteration boundary is the first moment a turn is
-complete (assistant message plus one recorded result per call), and it precedes
-the next provider round-trip, so a checkpoint there bounds the crash window to
-the single turn in flight. This matters because one request is not one turn: a
-tool loop may iterate without limit (unbounded when `max_turns` is 0) for tens of
-minutes, and deferring the write to the end made the whole request the unit of
-durability.
+completes, not when the request does — one request is not one turn: a tool loop may
+iterate without limit (unbounded when `max_turns` is 0) for tens of minutes, so the
+request is far too coarse a durability unit. The iteration boundary is the first
+moment a turn is complete (assistant message plus one recorded result per call), and
+it precedes the next provider round-trip, so a checkpoint there bounds the crash
+window to the single turn in flight. The worker builds its turns on a private
+`SessionState` clone, and the session thread's merge at `RequestFinished` stays the
+authoritative final write; the checkpoint itself, that merge's `persisted_turns`
+re-write skip, and the swallow-and-retry handling of a failed checkpoint are
+documented in-source (`choreo-daemon`'s `requests/tool_execution.rs`,
+`sessions/state.rs`, and `sessions/handlers/inference.rs`).
 
-Three properties hold around that boundary:
+Three invariants hold around that boundary:
 
 - **A turn is written whole or not at all.** One `write_turn` transaction covers
-the zstd-compressed blob and every attachment slot, so a reader can never see a
-turn with some of its images. Image bytes are additionally written per emit
-(see the image flow) because a client fetches them by key the moment the
-turn's `TurnAppended` arrives.
+  the zstd-compressed blob and every attachment slot, so a reader can never see a
+  turn with some of its images. Image bytes are additionally written per emit
+  (see the image flow) because a client fetches them by key the moment the
+  turn's `TurnAppended` arrives.
 - **A committed turn is durable.** `redb` write transactions default to
-`Durability::Immediate` and the daemon never lowers it, so a committed turn has
-been fsynced — a crash loses only what was never committed.
+  `Durability::Immediate` and the daemon never lowers it, so a committed turn has
+  been fsynced — a crash loses only what was never committed.
 - **Every request ending persists.** Completion, inference failure, and
-cancellation all finalize the turn and route the worker's snapshot through
-`RequestFinished`, so a graceful shutdown (which cancels in-flight requests)
-loses nothing; only process death, which cannot cancel, skips the paths that
-would have written.
-
-A checkpoint failure is logged and swallowed rather than failing the request:
-the turn stays in memory, the loop continues, and the `RequestFinished` merge
-retries the same idempotent write. Because a checkpointed turn is never mutated
-after its boundary, the worker reports the ids it wrote in the snapshot's
-`persisted_turns` set, and the merge inserts those turns into memory without
-re-writing the identical row — so a turn is written once, not twice. A turn the
-worker did *not* checkpoint (for example the turn open when a provider-side
-cancel returned) is absent from that set and is still written by the merge.
+  cancellation all finalize the turn and route the worker's snapshot through
+  `RequestFinished`, so a graceful shutdown (which cancels in-flight requests)
+  loses nothing; only process death, which cannot cancel, skips the paths that
+  would have written.
 
 **Crash-recovery skew.** Durability covers the turn rows, not every field of the
-worker's `SessionState`. Config the worker accumulates over a request — mainly
-`last_response_id` (the provider's continuation-chain head) and
-`accumulated_usage` (the billing total) — still merges only at `RequestFinished`,
-so after a mid-request crash the on-disk turns can be newer than those fields.
-Config changes a tool makes through the session's own commands (model, title,
-working directory, tool groups) are persisted when the command is applied, so
-only the worker-owned continuation/billing fields lag. On restart the session is
-rebuilt from the turn rows (with `next_turn_id` derived from the maximum turn id,
-not the record's advisory `turn_count`), and the stale `last_response_id` is
-restored only if its producing provider+model still matches; a `ResponseId`
-provider then continues from that older head with the checkpointed turns re-sent
-as new input. This is the accepted cost of turn-level durability — the
-conversation itself is never lost.
+worker's `SessionState`. The fields the worker owns — `last_response_id` (the
+provider's continuation-chain head) and `accumulated_usage` (the billing total) —
+change on that private clone and merge only at `RequestFinished`, so after a
+mid-request crash the on-disk turns can be newer than they are; config a tool
+changes through the session's own commands (model, title, working directory, tool
+groups) is persisted when the command is applied, so only the worker-owned fields
+lag. On restart the session is rebuilt from the turn rows: `next_turn_id` comes from
+the maximum turn id (never the record's advisory `turn_count`), the billing total
+and the context-size readout are re-derived from the per-turn usage those rows carry,
+and the stale `last_response_id` is restored only when its producing provider+model
+still matches — a `ResponseId` provider then continues from that older head with the
+checkpointed turns re-sent as new input. This is the accepted cost of turn-level
+durability: the conversation itself is never lost.
 
 ### Schema versioning & migrations
 
 The `meta` table holds the persisted schema version, and the daemon runs the
-migration chain right after opening the database on every startup. The versioning
-policy (an additive change needs no migration; a breaking change gets a numbered
-migration and a version bump), the migration contract (a contiguous chain,
-idempotent, transactional, and fixture-tested), the pre-migration backup, and the
-downgrade / redb `UpgradeRequired` refusals are documented in-source (see
-`choreo-daemon`'s `db` module, `cargo doc -p choreo-daemon` / `just doc`), held
-complete by the `#![warn(missing_docs)]` + `doc-check` gate.
+migration chain immediately after opening the database on every startup. The policy:
+an **additive** change (a `#[serde(default)]` field, a lazily created table) needs no
+migration, while a **breaking** change (codec swap, key-type change, table
+split/merge, semantic change) gets a numbered migration and a `SCHEMA_VERSION` bump.
+The contract every entry must satisfy — a chain contiguous over
+`1..SCHEMA_VERSION`, one write transaction per step, idempotent under re-run, old
+record shapes decoded through frozen local copies — plus the pre-migration
+`bak-v{from}` backup and the downgrade / redb `UpgradeRequired` refusals are
+documented in-source (see `choreo-daemon`'s `db` module, `cargo doc -p choreo-daemon`
+/ `just doc`).
 
 ### Undo/Redo
 
-Sessions support undo/redo via an `undone` boolean flag on each `Turn`. The `Turn`
-struct — its `turn_id`/`undone`/`user_text` fields, the assistant-response bundle,
-and the opaque `reasoning_artifact`/`reasoning_producer` round-trip payload — is
-documented in-source in `choreo-proto` (alongside its `ReasoningArtifact` and
-`ReasoningProducer` companions; `cargo doc -p choreo-proto` / `just doc`), held
-complete by the `#![warn(missing_docs)]` + `doc-check` gate. Two cross-cutting
-facts about that payload: the daemon strips it from every client-bound
-`DaemonMessage` (only its own request builder reads it), and the builder's
-same-model provenance check drops the artifact after a mid-session model switch.
+`/undo` and `/redo` mutate turn history through the `undone` flag on each `Turn`
+(the struct itself is documented in-source in `choreo-proto`; the daemon strips the
+opaque reasoning payload from every client-bound `DaemonMessage`, and the builder's
+same-model provenance check drops it after a mid-session model switch — see
+**Reasoning round-trip**). Two contracts govern the pair:
 
-A single `/undo` hides the most recent user turn together with every still-live
-turn after it (a tool-loop iteration creates several turns per user turn), and
-records only the turns it actually flipped as one **redo batch** on a stack.
-`/redo` pops the newest batch and restores exactly it, so undo and redo are
-LIFO-symmetric — one redo re-applies one undo, never collapsing several pending
-undos at once. A new user turn clears the stack (redo is void once the
-conversation has moved on), and undo also clears the persisted
-`last_response_id` so a chained request cannot leak the hidden turns back into
-the model. Both commands are gated to an **idle** session: an in-flight request
-worker holds the turn history on a private clone and merges it back at
-`RequestFinished`, so a history mutation underneath it would race that merge
-(and could resurrect the cleared chain). The daemon refuses a busy session with
-`Failed { error: "session is not idle" }`; the TUI applies the same idle check
-client-side to skip the doomed round-trip.
+- **Redo is LIFO-symmetric with undo.** A single `/undo` hides the most recent user
+  turn together with every still-live turn after it (a tool-loop iteration creates
+  several turns per user turn) and records only the turns it actually flipped as
+  one **redo batch**; `/redo` pops the newest batch and restores exactly it, so one
+  redo re-applies one undo and never collapses several pending undos at once. A new
+  user turn clears the stack, and undo also clears the persisted `last_response_id`
+  so a chained request cannot leak the hidden turns back into the model.
+- **Both commands require an idle session.** An in-flight request worker holds the
+  turn history on a private clone and merges it back at `RequestFinished`, so a
+  history mutation underneath it would race that merge (and could resurrect the
+  cleared chain). The daemon refuses a busy session with
+  `Failed { error: "session is not idle" }`; the TUI applies the same idle check
+  client-side to skip the doomed round-trip.
 
 ---
 
@@ -2626,16 +2610,6 @@ The full metric set — names, types, labels, and the exported help text — is 
 in-source in the daemon's `metrics` module, where every `record_*` function names the metric
 it updates (`cargo doc -p choreo-daemon --features metrics` / `just doc`), held complete by
 the `#![warn(missing_docs)]` + `doc-check` gate.
-
-### Implementation
-
-The metrics module keeps the real implementation in a feature-gated `backend`
-module (a no-op stub backend when disabled, re-exported behind the same public
-API), holding one static `Metrics` (a `std::sync::OnceLock`) of atomic Prometheus
-counters/gauges/histograms. A dedicated thread serves `/metrics` via `tiny_http`;
-because a blocking accept cannot be interrupted by a channel, that serve loop is
-the one place that consults the exception-#1 shutdown flag, on a bounded (1 s)
-`recv_timeout`.
 
 ---
 
@@ -3637,92 +3611,35 @@ pane that never reported is never released.
     daemon's id-keyed bookkeeping. The position is deterministic for a given reply, so a replayed
     turn mints the ids it recorded under.
 
-
-
-
 ---
 
 ## Context file discovery
 
 The daemon discovers project-specific context files (`AGENTS.md`, `CLAUDE.md`)
-and Agent Skills at session start and re-checks them before every model call
-(every turn of the tool-call loop), feeding what it finds into the system
-prompt. The discovery walk, the skill scopes and precedence, the fingerprint
-cache, and the `load_skill` body plumbing are documented in-source (see
-`choreo-daemon`'s `context` and `requests` modules, `cargo doc -p choreo-daemon`
-/ `just doc`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
+and Agent Skills at session start and re-checks them before every model call (every
+turn of the tool-call loop), feeding what it finds into the system prompt. Three
+properties are contractual and the discovery mechanism behind them is documented
+in-source (`choreo-daemon`'s `context` and `requests` modules, `cargo doc -p
+choreo-daemon` / `just doc`):
+
+- **The prompt is always full.** `build_system_content()` runs once per loop
+  iteration and always assembles a complete system prompt, so a session with no
+  working directory still gets the base prompt (identity, tool groups, skill
+  metadata, loaded skill bodies, session title); only the project context files
+  and pending subdirectory hints are working-dir-gated.
+- **Precedence runs most-local-wins.** Global files load first in a fixed order,
+  then the project tree from the outermost ancestor down to the working directory;
+  skills are scanned project-first (a project-local skill shadows a same-named
+  global one, a more-local one shadows a same-named ancestor), so the nearest
+  instructions and definitions always win.
+- **Skills are disclosed progressively.** Only a skill's `name` + `description`
+  ride the prompt; its body is injected when the model calls `load_skill`, and
+  re-injected on every later turn so it survives the tool result scrolling out of
+  the context window.
+
 The `[context]` config table (`context_file_names`, `context_file_max_bytes`,
 `disable_claude_code_prompt`) is documented in the README and the `ContextConfig`
 rustdoc (`choreo-proto`).
-
-### System prompt construction
-
-`build_system_content()` runs once per loop iteration and **always** returns a
-full system prompt, so a session with no working directory still receives the
-base prompt (identity, tool groups, skill metadata, loaded skill bodies, session
-title); the context files, pending subdirectory hints, and their fingerprint
-cache are the only working-dir-gated parts. Documented in-source
-(`choreo-daemon`'s `requests/system_content.rs`).
-
-### Discovery algorithm
-
-Global files load first in a fixed order — the config-dir `AGENTS.md`, then
-`~/.claude/CLAUDE.md` (unless `disable_claude_code_prompt` is set), then
-`~/.agents/AGENTS.md`. The project tree is then walked from the session working
-directory up to the git repository root (or the filesystem root when there is no
-`.git`), taking at most one file per directory (the first `context_file_names`
-match that exists) and rendering the outermost ancestor first and the working
-directory last, so the nearest instructions win. Documented in-source
-(`choreo-daemon`'s `context.rs`).
-
-### Subdirectory hints
-
-When a filesystem tool (`read_file`, `list_files`, `grep`, `find`, …) touches a
-path below the working directory, the daemon walks up from that path toward the
-working directory and appends any newly found `AGENTS.md`/`CLAUDE.md` to the
-**tool result** rather than the system prompt, so nested instructions surface
-without disturbing prompt-cache stability. Documented in-source
-(`choreo-daemon`'s `context.rs::subdirectory_hints`).
-
-### Skills (Agent Skills standard)
-
-Skills follow the Agent Skills standard: a `<name>/SKILL.md` under
-`~/.agents/skills` (global — always scanned) or `.agents/skills` (project —
-scanned only when the session has a working directory), each carrying YAML
-frontmatter with `name` and `description`. The project scope is scanned first
-and results dedup by frontmatter `name`, so a project-local skill shadows a
-same-named global one (and a more-local skill shadows one higher up the tree);
-within a scope the lexicographically-first path wins deterministically rather
-than depending on the unspecified `read_dir` order. **Progressive disclosure:**
-only the name + description metadata rides the stable prompt (`messages[0]`); the
-full body is injected when the model calls `load_skill`. Documented in-source
-(`choreo-daemon`'s `context.rs`).
-
-### Fingerprint-based refresh
-
-Before each turn the daemon fingerprints the known context-file paths and their
-mtimes (not their contents); an unchanged fingerprint reuses the assembled text
-cached on `SessionState::context_cache`, while a change (a file added, removed,
-or modified) rebuilds it. Documented in-source
-(`choreo-daemon`'s `context.rs::compute_fingerprint`).
-
-### User system prompt override
-
-The stable base prompt (`messages[0]`) is `~/.config/choreographr/system.md`
-when present, otherwise the built-in default (`choreo-daemon/system.md`,
-embedded at compile time via `include_str!`). Documented in-source
-(`choreo-daemon`'s `context.rs`).
-
-### Tool: `load_skill`
-
-`load_skill(name)` (core group) resolves the name against the session's
-`discovered_skills` snapshot — the same list the prompt listing was built from,
-falling back to a fresh ambient walk only when no snapshot is available — strips
-the YAML frontmatter, and returns `Loaded skill: <name>` plus the body. The agent
-loop then persists the body into `SessionState::loaded_skill_bodies`, re-injected
-under `<skill name="...">` on every later turn so its instructions stay visible
-after the tool result scrolls out of the context window. Documented in-source
-(`choreo-daemon`'s `tools/admin/load_skill.rs` and `requests/system_content.rs`).
 
 ## Testing
 

@@ -5,8 +5,11 @@
 //! the project tree from the git root down to the working directory), bundles
 //! them with a content fingerprint so a re-read can be skipped when nothing
 //! changed, and discovers Agent Skills with project-local precedence over the
-//! global scope. The request builder renders the assembled context and the
-//! base system prompt into the messages it sends.
+//! global scope. Skills ride the prompt as metadata only (`name` +
+//! `description`); a skill's body is read only when the model actually loads it
+//! (see [`load_skill_body_from`]), so the listed context stays small. The
+//! request builder renders the assembled context and the base system prompt
+//! into the messages it sends.
 
 use crate::tools::ToolGroup;
 use choreo_proto::ContextConfig;
@@ -501,15 +504,17 @@ pub fn recheck_context(
 /// target path's ancestor directories, up to but excluding the session working
 /// directory.
 ///
-/// Called when a file-touching tool runs: the returned text is appended to the
-/// tool result so a nested instruction file is surfaced even though only the
-/// top-level context was assembled at request start. `known_paths` lists files
-/// already surfaced, so each hint is delivered once; the returned paths are the
-/// newly-added ones for the caller to fold into that list. Paths are kept raw
-/// (not canonicalized) so they round-trip consistently through that tracking,
-/// while the containment check itself compares in canonical space so a `/var`
-/// symlink cannot wrongly end the walk. Returns `None` when no new hints are
-/// found.
+/// Called when a file-touching tool runs, so a nested instruction file is
+/// surfaced even though only the top-level context was assembled at request
+/// start. The returned text does NOT join the tool result: the caller queues it
+/// in `pending_hints`, and the next loop iteration's `build_system_content`
+/// renders it under `## New context from project subdirectories`. `known_paths`
+/// lists files already surfaced, so each hint is delivered once; the returned
+/// paths are the newly-added ones for the caller to fold into that list. Paths
+/// are kept raw (not canonicalized) so they round-trip consistently through that
+/// tracking, while the containment check itself compares in canonical space so
+/// a `/var` symlink cannot wrongly end the walk. Returns `None` when no new
+/// hints are found.
 #[must_use]
 pub fn subdirectory_hints(
     tool_name: &str,
