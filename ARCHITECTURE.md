@@ -154,74 +154,45 @@ the per-format detail (`cargo doc -p choreo-sanitize` / `-p choreo-image`,
 
 ## Release & packaging
 
-Releases are cut **locally** with the orchestrator below, or on GitHub
-Actions by pushing a `vX.Y.Z` tag —
+Releases are cut **locally** with the orchestrator, or on GitHub Actions by
+pushing a `vX.Y.Z` tag —
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) is the CI
-counterpart of `scripts/release.sh` (the Linux and macOS jobs literally run
-that script, so build flags, `--locked`, feature selection, service-file
-staging, and tarball naming stay in one place; the Windows and Termux jobs
-pass the same build line inline). A `workflow_dispatch` run builds everything
-but creates no release — that is the pipeline-test path so the first real tag
-is never the first test of the pipeline. The orchestrator,
-[`scripts/release.sh`](../scripts/release.sh), is a dry-run by default: it
-reads the version from the root `Cargo.toml` (the single source of truth that
-the Homebrew formula, AUR PKGBUILD, and installer mirror), runs
-`cargo build --profile dist -p choreographr -p choreo-tui` with
-package-scoped feature syntax (the daemon and the TUI are SEPARATE packages
-since the binary-split refactor; the musl build additionally enables both
-packages' `mimalloc` features) — the two shipped binaries only
-(choreo-gui's Dioxus Native (Blitz) renderer stack is excluded from
-the release build) under the workspace's dedicated `[profile.dist]` profile
-(root `Cargo.toml`),
-packs the release tarball, writes
-`SHA256SUMS`, builds the `.deb`/`.rpm` when the tools are present, and prints
-the exact upload + checklist commands. Only `--upload` runs
-`gh release create`; `--allow-dirty` skips the clean-tree guard. The
-`just` front door wraps all of it: `just release`, `just release-upload`,
-`just release-allow-dirty`, `just release-tap`, `just smoke-test`,
-`just package-deb`, `just package-rpm`, and `just install` (see the
-README).
+counterpart of [`scripts/release.sh`](../scripts/release.sh): the Linux, macOS,
+and FreeBSD jobs run that script verbatim and the Termux job runs its android
+sibling, so build flags, `--locked`, feature selection, service-file staging,
+and tarball naming stay in one place. A `workflow_dispatch` run builds
+everything but creates no release — the pipeline-test path, so the first real
+tag is never the first test of the pipeline. The version is read from
+`[workspace.package] version` in the root `Cargo.toml`, the single source of
+truth the Homebrew formula, AUR PKGBUILD, and installer mirror, and every
+shipped build selects the workspace's dedicated `[profile.dist]` profile (root
+`Cargo.toml`) rather than the local `[profile.release]`.
+
+The phase-by-phase runbook is [RELEASE.md](./RELEASE.md). `scripts/release.sh`
+is a dry run by default and only uploads under `--upload`; `just release` /
+`release-upload` / `release-tap` / `smoke-test` / `package-deb` / `package-rpm`
+/ `install` are the front door.
 
 ### Shipped artifacts
 
 Exactly **two binaries** ship in every artifact (tarball, `.deb`, `.rpm`,
-Homebrew, AUR):
+Windows `.zip`, Homebrew, AUR):
 
 - `choreographr` — the daemon
 - `choreo-tui` — terminal UI client
 
-The `choreo-im` and `choreo-acp` bridges are NOT built for release —
-release.sh / the CI workflow build only the two shipped binaries; the
-bridges are source-build extras (`cargo build -p choreo-im` /
-`cargo build -p choreo-acp`). Each bridge/TUI binary lives in its own
-workspace crate (choreo-im, choreo-acp, choreo-tui), which owns its
-`src/main.rs` wrapper and its own `mimalloc` feature.
+Nothing else is shipped. The `choreo-im` and `choreo-acp` bridges are
+source-build extras (`cargo build -p choreo-im` / `-p choreo-acp`), not release
+targets. `choreo-mcp` is **library-only**: its sole `[[bin]]` is the integration
+suite's `mcp-fixture-server`, which release builds never produce. `choreo-gui`
+is built separately (desktop via `cargo run -p choreo-gui`, Android via
+`dx build --platform android`, iOS via `scripts/build-ios.sh` + the `ios/`
+Xcode scaffold) and is not shipped either.
 
-`choreo-mcp` is a **library-only crate** (the MCP client the daemon's
-feature-gated `mcp` module uses to reach tool servers over stdio subprocesses or
-the Streamable HTTP transport) — it is never shipped as a
-binary. Its only `[[bin]]` target is a test fixture
-(`mcp-fixture-server`, a scripted stdio server the integration suite spawns),
-which release builds never produce. `choreo-gui` is built separately (desktop via `cargo run -p choreo-gui`,
-Android via `dx build --platform android`, iOS via `scripts/build-ios.sh` +
-the `ios/` Xcode scaffold) and is not shipped either.
-
-The CI release additionally publishes a **Windows `x86_64-pc-windows-msvc` `.zip`**
-(the same two `.exe` binaries) as a GitHub-release asset — it is built only by
-the release workflow's `windows-msvc` job, which `release.sh`/`install.sh` do not
-produce (they handle the POSIX tarballs). The four targets below are what
-`release.sh` and `install.sh` build and install; the Windows zip rides alongside
-them on the releases page for users to extract onto their `PATH`.
-
-The `release.sh`/`install.sh` shipped target set is exactly five; `release.sh` and `install.sh`
-hardcode this set and refuse any other platform ("ships Linux x86_64 + arm64,
-macOS arm64, macOS x86_64, and FreeBSD x86_64"), and `release.sh` builds each
-native host's own arch — the x86_64 tarball on a Linux-x86_64 host, the aarch64
-tarball on a Linux-aarch64 host, the native `x86_64-unknown-freebsd` tarball on
-a FreeBSD-amd64 host — and BOTH darwin tarballs on a Darwin-arm64 host (the
-x86_64 one
-cross-compiled — Apple's arm64-hosted toolchain targets x86_64-apple-darwin
-natively, sharing the single Xcode SDK):
+The POSIX target set is exactly five; `release.sh` and `install.sh` hardcode it
+and refuse any other platform, and each native host builds its own arch's
+tarball (a Darwin-arm64 host builds both darwin tarballs, the x86_64 one
+cross-compiled against the single Xcode SDK):
 
 | Target | Platform | Asset |
 |---|---|---|
@@ -231,141 +202,72 @@ natively, sharing the single Xcode SDK):
 | `x86_64-apple-darwin` | macOS Intel (cross-built on the arm64 host) | `choreographr-<version>-x86_64-apple-darwin.tar.gz` |
 | `x86_64-unknown-freebsd` | FreeBSD x86_64 (native) | `choreographr-<version>-x86_64-unknown-freebsd.tar.gz` |
 
-The Linux tarballs are **fully static musl builds** — `release.sh`
-cross-builds each to `<arch>-unknown-linux-musl` with `--features mimalloc`, so
-each artifact
-runs on any Linux kernel of its arch regardless of the host's glibc version
-(this also
-replaces the old "build inside an old-glibc container" compatibility dance).
-The `.deb`/`.rpm` remain native glibc host-target builds without the
-`mimalloc` feature — see `scripts/release.sh`; `build-deb.sh`/`build-rpm.sh`
-tag them from the host arch (Debian's `amd64`/`arm64` in the control field,
-the tarball spelling `x86_64`/`aarch64` in the filename). The tarball holds the two
-binaries at the **top level** (no `bin/` prefix)
-plus the platform service files (systemd unit, launchd agent, and the FreeBSD
-`rc.d` script), exec bits preserved — `install.sh` and the Homebrew
-formula reference them directly. The FreeBSD tarball is a **native** build
-against the FreeBSD base system (base clang/ld), not musl — see `release.sh`.
+The CI release adds a sixth artifact, a **Windows `x86_64-pc-windows-msvc`
+`.zip`** of the same two `.exe` binaries, built only by the workflow's
+`windows-msvc` job and attached to the release beside the tarballs, the
+`.deb`/`.rpm`, and the Termux `.deb`.
 
-**All shipped binaries are stripped.** The workspace `[profile.dist]` profile
-(root `Cargo.toml` — the shipped-artifact profile every release-pipeline build
-selects with `--profile dist`; every shipped-relevant key is pinned
-explicitly there so `[profile.release]` tuning for local builds can't leak
-into artifacts) sets `strip = "symbols"`, so every
-artifact — tarball, `.deb`,
-`.rpm`, Homebrew, AUR — ships binaries without a symbol table (~22% smaller;
-~10% smaller tarball). Shipped binaries get **fat LTO + `codegen-units = 1`**
-— set in `[profile.dist]` only, so the default local `cargo build --release`
-keeps its fast, LTO-free links (thin LTO was removed from `[profile.release]`
-in e6b5a47 because it made every default release link slow and memory-hungry;
-the dist profile is the shipped-only tuning home, and the fat-LTO link cost
-lands only in the release pipeline). Panic messages keep their `file:line`
-locations (compiled-in string constants via `#[track_caller]`); only
-`RUST_BACKTRACE=1` symbolization is lost, and the daemon emits no backtraces.
-`panic = "abort"` is deliberately NOT set: the daemon isolates
-request-worker panics with `catch_unwind` (sessions/worker.rs), which abort would
-defeat. The RPM spec keeps `__os_install_post %{nil}` so rpm's brp scripts
-never re-process the already-stripped binaries.
+Build details — the fully static musl tarballs with `mimalloc`, the native
+glibc `.deb`/`.rpm`, the FreeBSD base-system build, archive layout, and
+host-arch detection — are documented at their build sites in
+[`scripts/`](../scripts) and in [`packaging/README.md`](../packaging/README.md).
 
-Shipped binaries build at an explicit **CPU floor per target**, set via
-`RUSTFLAGS="-C target-cpu=…"` in the release scripts/workflow — never
-`target-cpu=native`, and never profile rustflags (those ignore `--target`, are
-nightly-only, and are stripped by `scripts/build-stable.sh` before every
-stable release build; env rustflags additionally override any developer's
-`~/.cargo/config.toml`, so local and CI artifacts are comparable):
+Shipped binaries build at an explicit **CPU floor per target**, passed as
+`RUSTFLAGS="-C target-cpu=…"` by the release scripts — never
+`target-cpu=native`, and never profile rustflags (those ignore `--target` and
+would poison a cross build, they are nightly-only, and `scripts/build-stable.sh`
+strips them before every stable release build; env rustflags additionally
+override a developer's `~/.cargo/config.toml`, so local and CI artifacts are
+comparable). Each target's chosen level — x86-64-v2 on x86_64 Linux and
+Windows, the target default on aarch64, x86-64-v3 on Intel macOS, and baseline
+for the `.deb`/`.rpm` — and the fleet reasoning behind it are documented where
+the flag is set, in [`scripts/release.sh`](../scripts/release.sh) and the
+release workflow. C dependencies (mimalloc, compiled by `cc`/zig) are NOT
+affected by `RUSTFLAGS` — only rustc codegen is — and mimalloc does its own
+runtime CPU-feature detection.
 
-- **x86_64 musl tarball + Windows zip: x86-64-v2** (SSE3/SSSE3/SSE4.1/SSE4.2/POPCNT/
-  CMPXCHG16B — Intel Nehalem 2008+, AMD Bulldozer 2011+). The level enterprise
-  distros have moved to (RHEL 10 baseline = v3, SLES 16 = v2) while the
-  community distros (Debian/Arch/Fedora, Ubuntu mainline) stay v1 — v2 is the
-  pragmatic floor between "runs on anything since 2003" and modern
-  vectorization. Future per-CPU-level artifacts (e.g. a v3 tarball) reuse the
-  same `RUSTFLAGS` mechanism with a different value.
-- **arm64 musl tarball: the generic aarch64 baseline (no flag)** — SIMD (NEON)
-  is mandatory in AArch64, so there is no x86-style v1/v2/v3 tier split to aim
-  at; the target default is the fleet-safe choice.
-- **macOS arm64 tarball: the target default** — `aarch64-apple-darwin` already
-  defaults to `apple-a14` (Apple-Silicon-tuned), and the fleet is homogeneous
-  by definition; no flag needed.
-- **macOS x86_64 tarball: x86-64-v3** (AVX2/FMA). Unlike the aarch64 target,
-  `x86_64-apple-darwin` defaults to generic baseline x86-64 (2003 SSE2),
-  which undershoots the actual fleet: the last Intel-capable macOS (26 Tahoe)
-  supports only the 2019–2020 Intel Macs (Coffee/Ice/Comet Lake, mac Pro
-  2019), every one AVX2-class — so v3 DESCRIBES the fleet rather than betting
-  on it. The fleet can only shrink (macOS 27 is Apple-Silicon-only), so v3
-  can never become too aggressive, and Rosetta 2 emulates AVX2/FMA, so the
-  binary also stays valid if run translated on Apple Silicon.
-- **Android/Termux: generic `armv8-a`** — the device fleet spans a decade of
-  cores with nothing newer in common; `build-android.sh` enforces
-  `RUSTFLAGS="-C target-cpu=generic"`.
-- **.deb/.rpm: baseline (v1)** — the glibc-distro range they serve is split
-  (Debian/Arch = v1, RHEL 10 = v3), so baseline is the only level covering
-  all of them (2003 SSE2 on x86-64; the generic aarch64 baseline on arm64).
-
-C dependencies (mimalloc, compiled by `cc`/zig) are NOT affected by
-`RUSTFLAGS` — only rustc codegen is — but those libraries do their own runtime
-feature detection.
-
-The desktop-notify tool (`notify_send`, backed by notify-rust) was removed
-from the daemon, so the shipped binaries link no C libraries on the glibc
-targets — and the only C component on the musl tarball is the mimalloc
-allocator, enabled via `--features mimalloc` (the only shipped artifact with a
-non-system allocator).
-
-**CI linker policy: default linkers everywhere.** No mold/wild/lld-fast-linker
-additions in the release pipeline. Fat-LTO links spend their time in LLVM, not
-the linker's data structures, so a faster linker barely moves link time; macOS
-links Mach-O via `ld64` and Windows links PE via `link.exe` regardless, and CI
-link time is a rounding error next to the 20–30 minute fat-LTO builds. A
-developer's local `wild` (via `~/.cargo/config.toml`) is deliberately
-overridden by the release scripts' env `RUSTFLAGS`.
-
-**Known-benign linker warning on the musl zigbuild link**: `warning: linker
-stderr: ignoring deprecated linker optimization setting '1'`
-(`#[warn(linker_messages)]`, once per binary). Root cause verified against the
-rustc source and reproduced locally: rustc itself emits `-Wl,-O1` for every
-optimized (opt-level ≥ 2) GNU-flavor link (`GccLinker::optimize()` in
-`rustc_codegen_ssa/src/back/linker.rs`) — a GNU-ld output-optimization hint
-that zig's bundled lld recognizes as deprecated and ignores. It never appears
-on `cargo -v`'s rustc command line because rustc constructs linker args
-internally at link time (same reason the relro args don't show there), which
-is why the source of the flag took a spy-linker investigation to pin down.
-Binaries are correct; treat it as CI noise, not something to suppress with
-`-A linker_messages` (that would hide real linker warnings too).
+**CI linker policy: default linkers everywhere.** No mold/wild/lld additions in
+the release pipeline: fat-LTO links spend their time in LLVM, not in the
+linker's data structures, so a faster linker barely moves link time, and CI link
+time is a rounding error next to the fat-LTO builds. A developer's local `wild`
+(via `~/.cargo/config.toml`) is deliberately overridden by the release scripts'
+env `RUSTFLAGS`. That link's one expected warning is documented at the build
+site.
 
 ### `packaging/` assets
 
-| Asset | Purpose |
-|---|---|
-| `choreographr.service` | systemd **user** unit (`ExecStart=%h/.local/bin/choreographr`, `Restart=on-failure`, `WantedBy=default.target`) — shipped in the tarball, `.deb`, and `.rpm`; installed to `~/.config/systemd/user/` by `install.sh` |
-| `com.choreographr.daemon.plist` | launchd agent for **non-Homebrew** macOS installs (`RunAtLoad`/`KeepAlive` true, logs to `/tmp/choreographr.log`, hardcoded `/opt/homebrew/bin/choreographr`) — shipped in the tarball; Homebrew installs use the formula's `service do` block instead |
-| `homebrew/choreographr.rb` | Homebrew formula for the `choreographr/choreographr` tap — prebuilt-tarball variant (no build toolchain); its `service do` block backs `brew services` |
-| `aur/PKGBUILD` + `aur/.SRCINFO` | Arch `choreographr-bin` (prebuilt; empty `depends=` — static binaries) |
-| `rpm/choreographr.spec` | RPM spec for the fat package — compiles nothing: `build-rpm.sh` stages the prebuilt binaries into the build root and disables `__os_install_post` so they are not stripped/rewritten |
+`packaging/` holds the shipped service files — `choreographr.service` (systemd
+**user** unit), `com.choreographr.daemon.plist` (launchd agent for
+non-Homebrew macOS installs), `choreographr.rc` (FreeBSD `rc.d` script) — plus
+the package recipes: `homebrew/choreographr.rb`, `aur/PKGBUILD` + `.SRCINFO`,
+and `rpm/choreographr.spec`.
+[`packaging/README.md`](../packaging/README.md) owns the per-asset inventory
+(what each file is, and where it is published).
 
-**Policy: installed, never auto-enabled.** The daemon is a *user* service
-that needs accounts and API keys before it is useful, so no package script,
-installer, or release tool ever enables it: no `%post`/`%preun` in the RPM
-spec, no `postinst` in the `.deb`, no `systemctl enable` in `install.sh`, and
-the launchd agent is loaded only on explicit user action. The user opts in
-with `systemctl --user enable --now choreographr` (Linux) or
-`launchctl load ~/Library/LaunchAgents/com.choreographr.daemon.plist`
-(macOS).
+**Policy: installed, never auto-enabled.** The daemon is a *user* service that
+needs accounts and API keys before it is useful, so no package script,
+installer, or release tool enables it — opting in is always the user's action
+(`systemctl --user enable --now choreographr`, `launchctl load …`). The
+`packaging/README.md` policy section carries the per-channel consequences.
 
 ### `scripts/` tooling
 
+Each script's header comment is its authoritative description; this table is the
+index.
+
 | Script | Role |
 |---|---|
-| `install.sh` | curl\|sh installer — downloads the pinned-version tarball, verifies its SHA-256 against the `SHA256SUMS` fetched over the same TLS channel (no trust-on-first-use, no eval), extracts only the shipped binaries via an explicit member list, installs the platform service file, and never auto-enables. `--uninstall` removes everything; `CHOREOGRAPHR_BASE_URL` overrides the download base for testing/mirrors only. |
-| `build-deb.sh` / `build-rpm.sh` | Build the single fat `.deb` / `.rpm` containing the shipped binaries plus the systemd user unit, from existing `target/dist/` artifacts. Both detect the host arch (`uname -m`): x86_64/aarch64 only, failing loudly otherwise. The `.deb` control field uses Debian's tag (`amd64`/`arm64`) while the filename uses the tarball tag (`x86_64`/`aarch64`); the `.rpm` gets its `Version` and `BuildArch` from the `pkg_version`/`pkg_arch` macros passed to the spec (the version read from the workspace manifest, so a shipped package can never carry a stale version). The `.deb` forces xz archive members (`-Zxz`) — dpkg ≥ 1.22 defaults to zstd, which older-dpkg distros the package targets (e.g. Ubuntu 22.04) cannot read |
-| `build-deb-termux.sh` | Build the **Termux-native** `.deb` from the already-cross-built `target/android/arm64-v8a/` binaries (NO rebuild) — package `choreographr`, `Architecture: aarch64` (Termux's tag, not Debian's `arm64`), files at `./data/data/com.termux/files/usr/bin/<name>` — Termux's dpkg installs against `/` with no chroot, so the package must carry the real on-device path of the fixed `$PREFIX` (as upstream Termux packages do; the earlier `./bin/` convention made dpkg try to write `/bin` at the read-only device root), no maintainer scripts / conffiles (Termux dpkg runs as the app uid, no root). Built with `dpkg-deb --build --root-owner-group -Zxz` — xz is forced because dpkg ≥ 1.22 on the ubuntu runners defaults to zstd and Termux's dpkg has no zstd support (it only finds `control.tar{xz,lzma,}` members; the on-device failure this caused is what the in-script member assertion guards against); validates control fields, archive members, contents, and exec bits in-script — structural only, since there is no Termux on the build host. Output: `dist/choreographr-termux_<ver>_aarch64.deb` (the `-termux-` infix disambiguates it from the desktop `.deb` on the release page). Wired into the release workflow's android job only — deliberately NOT into `release.sh` |
-| `smoke-test.sh` | Dispatches on the artifact suffix: a release tarball is extracted, the shipped binaries' presence/exec bits/`--version`/`--help` are checked; a `.deb` (the Termux package) is validated structurally via `dpkg-deb` — control fields, no `Depends:`/maintainer scripts, the shipped binaries at Termux's `$PREFIX` path (`./data/data/com.termux/files/usr/bin/`) with 0755 modes — the structural ceiling since no Termux exists on the host |
-| `release.sh` | The release orchestrator — local builds (its CI counterpart is `.github/workflows/release.yml`, which runs it on the Linux/macOS runners); dry-run by default, `--upload` runs `gh release create`, `--allow-dirty` skips the clean-tree guard (CI passes it: a checkout IS the pushed commit, so the uncommitted-edits threat model cannot apply) |
-| `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only per-profile `rustflags` and the `[unstable]` config opt-in for the duration of `cargo release publish` (masking the two edited files from cargo-release's clean-tree gate via `git update-index --skip-worktree`, and passing an `--exclude` for every `publish = false` member derived from the manifests — cargo-release 1.1.5 won't drop them on its own via `publish = false`), so published manifests stay buildable by stable `cargo install`, then restores both files and clears the masks |
-| `update-homebrew-tap.sh` | Bumps the `choreographr/homebrew-choreographr` tap formula to the workspace version — recomputes both macOS tarball `sha256` digests from `dist/` (no re-download), rewrites `Formula/choreographr.rb` with exact-count rewrite validation, prints the diff; `--push` commits + pushes to the tap. Keeps the tap bump on the release machine (the CI release workflow ships the tarballs but does not touch the tap) |
-| `check-supply-chain.sh` | The dependency supply-chain gate — runs `cargo deny check advisories bans sources` against `deny.toml` (falling back to `cargo-audit` + a literal lockfile scan when cargo-deny is absent), after scanning the local `~/.cargo/registry` cache for the `.crate` files deleted during the 2026-08-20 `arrayref` attack (RUSTSEC-2026-0260). Wired into the release workflow (`.github/workflows/release.yml`, before publishing) and runnable locally via `just check-supply-chain`; see the **Dependency supply chain** subsection under **Security model** |
-| `build-android.sh` | Cross-builds the shipped suite binaries for Android/Termux via cargo-ndk (`arm64-v8a` by default, `--emulator` adds `x86_64`; `--check` is a prerequisite-checking dry run) under `--profile dist` (the shipped-artifact profile — matches the desktop release pipeline), stages them in `target/android/<abi>/` (cargo's target/ tree — `dist/` is reserved for final publishable artifacts), and prints the `adb push` guidance for Termux `$PREFIX/bin`. Its output is the input for the Termux packaging step (`scripts/build-deb-termux.sh`, CI android job): packaging never rebuilds. Links both shipped binaries with a linker-script fragment that re-aligns the TLS output sections to 64 bytes — bionic's loader rejects arm64 executables whose `PT_TLS` has `p_align < 64` (rust/LLVM emit 8, and the emutls-for-Android rust PR was never merged), which aborted every Rust binary with thread-locals at startup on Android 10+; a post-build `readelf` gate fails the build rather than shipping a binary that dies on-device. Strips the per-profile `rustflags` from the manifest for the duration (persistent backups under `target/` + EXIT-trap restore, plus a next-run self-heal that recovers a tree left stripped by a hard-killed predecessor — the trap-reliant restore alone was not kill-safe; see `build-stable.sh`) — profile rustflags apply regardless of `--target`, so `-C target-cpu=native` would emit host-CPU code that traps on Android devices. Deliberately excludes `choreo-gui`, whose Android build is `dx build --platform android` (cdylib APK payload, `just gui-android`) |
-| `build-ios.sh` | Compiles `choreo-gui` (the ONLY crate that ships to iOS) for `aarch64-apple-ios` (+ the `-sim` slice when run on a Mac) and stages the link inputs the `ios/` Xcode scaffold consumes. Runs on ANY host: with Xcode it is a full build; without one (the Linux check laptop) it installs shims under `target/ios-shims/` — a `RUSTC` wrapper stripping `-C target-cpu=native` (profile rustflags are not suppressible via `RUSTFLAGS` env, the same trap `build-android.sh` documents) and cc wrappers translating clang/rust-style target triples to `zig cc` form (Apple-iOS compiles AND the pdf-inspector-style build-script dylib links are rewritten to zig's macOS target, because zig ships darwin libc headers and stub dylibs only for macOS — compile-validation fidelity, not on-device code; the shim is also put on `PATH` so build scripts that spawn a bare `cc` hit it instead of the HOST compiler), with a fake `SDKROOT` so cc-rs never needs `xcrun` (the cc/cxx shim generator is SHARED with `check-ios.sh` in `scripts/lib/ios-cc-shims.sh` — one generator, so the two scripts cannot drift again; the generated shim files are stamped with the current generator's name so a stale shim shows where it came from). The final Apple dylib/app link happens on the Mac; the script builds the staticlib via `cargo rustc --crate-type staticlib` — a self-contained `.a` (std + every C dependency folded in by rustc's internal archiver, so NO per-dependency staging list exists to rot as deps change; the staged artifact now embeds the whole choreo-daemon tree for the iOS embedded daemon, minus the `pdf` feature which is iOS-opted-out because pdf-inspector's Apple dylib link is exactly what the shim cannot do). The `ios/` directory (main.m UIApplication bootstrap + xcodegen `project.yml` + Info.plist) is the Xcode-side counterpart; see the phase 0b caveat comments there about the winit/blitz-shell iOS event-loop wiring, the one piece no non-Mac host can verify |
+| `install.sh` | curl\|sh installer — pinned version, per-file SHA-256 fetched over the same TLS channel, explicit tarball member list (no eval, no trust-on-first-use), installs the service file, never auto-enables; `--uninstall` removes everything |
+| `release.sh` | The release orchestrator (dry-run default; `--upload`, `--allow-dirty`); its CI counterpart is `.github/workflows/release.yml` |
+| `build-deb.sh` / `build-rpm.sh` | The fat `.deb` / `.rpm` from existing `target/dist/` artifacts; host arch detected (`x86_64`/`aarch64` only, failing loudly otherwise), package naming per `packaging/README.md` |
+| `build-deb-termux.sh` | The Termux-native `.deb`, packaged from the already-cross-built `target/android/arm64-v8a/` binaries — no rebuild, CI android job only |
+| `smoke-test.sh` | Artifact smoke test — tarball: the shipped binaries present, executable, and answering `--version`/`--help`; Termux `.deb`: structural `dpkg-deb` validation |
+| `daemon-smoke.sh` | Boots the shipped daemon hermetically (scratch socket + config dir) and proves the listener comes up |
+| `publish-stable.sh` | The crates.io publish wrapper (RELEASE.md Phase 2) — strips the nightly-only profile rustflags and the `[unstable]` opt-in, masks the two edited files from cargo-release's clean-tree check, and excludes every `publish = false` member |
+| `update-homebrew-tap.sh` | Bumps the tap formula to the workspace version, recomputing both macOS digests from `dist/`; `--push` commits and pushes to the tap |
+| `check-supply-chain.sh` | The dependency supply-chain gate — the local registry-cache scan for the 2026-08-20 `arrayref` attack plus `cargo deny check advisories bans sources` with a `cargo-audit` fallback |
+| `build-android.sh` | cargo-ndk cross-build for Termux under `--profile dist`, including the bionic `PT_TLS` 64-byte alignment gate that fails the build rather than shipping a binary that dies on-device |
+| `build-ios.sh` / `check-ios.sh` / `lib/ios-cc-shims.sh` | `choreo-gui` iOS staticlib staging for the `ios/` Xcode scaffold, and the zig-`cc`/SDK shims that let a host without Xcode validate it |
 
 ### Distribution channels (0.1)
 
@@ -377,19 +279,18 @@ with `systemctl --user enable --now choreographr` (Linux) or
 
 ### crates.io metadata
 
-The workspace inherits crates.io-required fields from `[workspace.package]`
-in the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`,
-`readme`, `description`), and members opt into publishing by *not* setting
+The workspace inherits crates.io-required fields from `[workspace.package]` in
+the root `Cargo.toml` (`version`, `license`, `repository`, `homepage`, `readme`,
+`description`), and members opt into publishing by *not* setting
 `publish = false`. The **publish set** is therefore nineteen of the twenty
-workspace packages (the root package plus all nineteen members except
-`choreo-gui`) — everything except `choreo-gui`, the one private member (a leaf
-client nothing depends on).
-`choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events`, and
-`choreo-content` are published too (all added since 0.1.0): the members that
-depend on them must resolve them from crates.io after a release, and
-cargo-release's publish verification rejects unpublished workspace deps (cargo
-will not even package a crate whose dependency is unpublished — optional deps
-included):
+workspace packages (the root package plus eighteen of the nineteen members) —
+everything except `choreo-gui`, the one private member (a leaf client nothing
+depends on, whose Dioxus Native renderer tree is not part of the shipped suite,
+so it is neither published nor in the prebuilt artifacts). The leaf crates —
+`choreo-sanitize`, `choreo-image`, `choreo-sockreg`, `choreo-power-events` — and
+`choreo-content` are in the set because a published member depends on each of
+them, and cargo will not package a crate whose dependency is unpublished
+(optional deps included):
 
 `choreographr` (root), `choreo-daemon`, `choreo-blockchain`, `choreo-tui`,
 `choreo-im`, `choreo-acp`, `choreo-proto`, `choreo-shared`, `choreo-keystore`,
@@ -397,50 +298,20 @@ included):
 `choreo-sanitize`, `choreo-markdown`, `choreo-image`, `choreo-sockreg`,
 `choreo-power-events`, `choreo-content`
 
-`choreo-gui` sets `publish = false`: it drags in the Dioxus Native (Blitz/wgpu)
-renderer tree and is not part of the shipped suite, so
-it is neither published to crates.io (`cargo install choreo-gui` does not
-exist) nor included in the prebuilt release artifacts (tarball/.deb/.rpm/
-Homebrew/AUR), which carry the daemon and TUI only. `choreo-gui` is kept
-out of the publish selection explicitly — `scripts/publish-stable.sh` derives
-an `--exclude` for every `publish = false` member from the manifests, because
-cargo-release 1.1.5 does not honor
-`publish = false` in `--workspace` selection (verified: its plan lists the
-private crate, and a real publish would then fail on cargo's own
-refusal). The
-root `choreographr` package transitively depends on the other 18 publish-set
-members, so releasing the suite publishes 19 crates in dependency order.
-
-Releases are driven by **cargo-release** (`[workspace.metadata.release]` in
-the root `Cargo.toml`): it bumps versions, tags, and publishes the 19 crates
-to crates.io topologically. With `dependent-version = "fix"`, published
-manifest requirements (e.g. `choreo-tui = "0.1"`) stay in lockstep across
-minor/major bumps. The crates.io publish runs through `scripts/publish-stable.sh`
-(which strips the nightly-only per-profile rustflags so the shipped manifests
-stay buildable by stable `cargo install` — profile rustflags in a published
-manifest hard-break stable cargo) and it runs before `scripts/release.sh`
+Releases are driven by **cargo-release** (`[workspace.metadata.release]` in the
+root `Cargo.toml`): it bumps versions, tags, and publishes the 19 crates
+topologically, and `dependent-version = "fix"` keeps published manifest
+requirements in lockstep across minor/major bumps. The crates.io publish runs
+through `scripts/publish-stable.sh` (which keeps the published manifests
+buildable by stable `cargo install`) and happens before `scripts/release.sh`
 builds the prebuilt artifacts.
 
-The root package declares `[package.metadata.binstall]`, so
-`cargo binstall choreographr` resolves the GitHub release asset naming
-(`choreographr-<version>-<target>.<ext>`) from the package itself instead of
-requiring a manual `--pkg-url`; `bin-dir = "{ bin }{ binary-ext }"` maps the
-tarball's archive-root binaries (an empty `bin-dir` is rejected by binstall),
-and an `x86_64-unknown-linux-gnu` override maps glibc hosts to the static
-musl tarball, plus an `aarch64-unknown-linux-gnu` override mapping arm64 glibc
-hosts to the arm64 musl tarball (each arch's static musl tarball is the only
-Linux asset shipped for that arch). The `choreo-tui` crate carries
-an IDENTICAL `[package.metadata.binstall]` block: the release tarball is one
-archive containing both binaries, and binstall installs only the binaries a
-package declares — so `cargo binstall choreo-tui` resolves the SAME asset
-URL (the version template renders the crate's version, which stays in
-lockstep with the release version via the workspace version inheritance) and
-extracts just `choreo-tui`. Fetching the same asset from two packages costs
-a duplicate download but keeps every package self-describing — the
-alternative (per-package asset split) would change the release artifact set
-for zero benefit. The daemon crate is `choreo-daemon` (library
-`choreo_daemon`, no `[[bin]]` target) — the `choreographr` binary it backs
-is declared by the root package's `src/bin/choreographr.rs`.
+Both shipped packages declare `[package.metadata.binstall]` — identical blocks,
+so `cargo binstall choreographr` and `cargo binstall choreo-tui` resolve the
+same release asset from the package itself, with no `--pkg-url`; binstall
+installs only the binaries a package declares, so each extracts just its own.
+The block's template mechanics and the glibc→musl host overrides are documented
+in the manifests.
 
 ---
 
@@ -3184,89 +3055,42 @@ cargo test -- --ignored   # libtest integration tests
 
 The manifests declare a `rust-version` (MSRV) in every crate, inherited from
 `[workspace.package]` in the root `Cargo.toml`. It is a **release-time claim,
-not a build constraint**: development runs on nightly and dist/publish builds
-run on the current stable, and `.cargo/config.toml` sets
-`resolver.incompatible-rust-versions = "allow"` so dependency resolution
-always picks the newest available versions even when their declared
-`rust-version` exceeds the workspace floor. Consequently the MSRV number may
-lag the resolved tree during development; that is fine. The floor is also
-raised deliberately when the workspace adopts a newly stabilized std API (for
-example `String::from_utf8_lossy_owned`, `Option::map_or_default`, or
-`str::trim_prefix` / `core::mem::DropGuard`; the same release also stabilized
-`[T]` and `Path` `trim_*`, which the tree does not call — only the `str`
-methods and `core::mem::DropGuard` are actually adopted): the API becomes
-the true build floor even when no dependency demands it, so the declared
-`rust-version` then reflects the workspace's own sources rather than the
-dependency tree alone. The dependency side can therefore trail the claim —
-the highest `rust-version` any dependency declares is what that half of the
-floor is, and an adopted std API is what usually sets the number. Before publishing,
-sync it: compute the resolved tree's floor with
-`cargo metadata --format-version 1 | jq -r '[.packages[].rust_version |
-select(. != null)] | sort_by(split(".") | map(tonumber)) | last'`, set the
-result in `[workspace.package]` `rust-version`, and commit lockfile + bump
-together, so
-the crates.io metadata on the published crates is accurate (see RELEASE.md
-Phase 2). The floor is verified rather than trusted: `just msrv` runs the
-hardened stable strip/restore path (`scripts/build-stable.sh check --workspace
---all-targets`) on the declared toolchain — it passes the manifest's
-`rust-version` to the script as `CARGO_TOOLCHAIN` — and the CI `msrv` job
-(`.github/workflows/msrv.yml`) runs the same check on a clean runner, reading
-the floor from the manifest rather than repeating the literal. It remains
-**not** a constraint on dependency resolution:
-`resolver.incompatible-rust-versions = "allow"` still admits a crate whose own
-`rust-version` exceeds the floor, so the mismatch fails `just msrv` and the CI
-job loudly instead of forcing resolution, and the manual preflight recompute
-above stays the way the number is moved. Between releases, a dependency that
-outgrows the floor or an adopted std API newer than it therefore surfaces as a
-red `msrv` check rather than a stale claim.
+not a build constraint**: development runs on nightly and dist/publish builds on
+the current stable, and `.cargo/config.toml` sets
+`resolver.incompatible-rust-versions = "allow"`, so resolution always takes the
+newest available dependency versions even when their own `rust-version` exceeds
+the floor. The floor is the higher of the resolved tree's high-water mark and
+any newly stabilized std API the workspace adopts — an adopted API is the true
+build floor even when no dependency demands it — so the number may lag while
+development resolves ahead of it. It is verified rather than trusted: `just msrv`
+compiles the workspace on exactly the declared toolchain and the CI `msrv` job
+runs the same check, so a dependency that outgrows the floor (or an adopted API
+newer than it) surfaces as a red check instead of a stale claim. Sync it before
+publishing, per RELEASE.md Phase 2. The per-API detail, and the exact
+recompute command, live in the `[workspace.package]` comment and that phase.
 
 **Building defaults to nightly.** `rust-toolchain.toml` pins the workspace to
-the `nightly` channel (rustup auto-installs it on first `cargo` run) so that
-EVERY adhoc `cargo` command — including per-crate builds like `cargo build -p
-choreo-x` / `cargo check -p x` / `cargo nextest run -p x` — automatically
-applies the fast per-profile `-Z` compiler flags. Nightly enables the
-per-profile `rustflags` in the root `Cargo.toml` via the unstable
-`profile-rustflags` feature (opted in under `[unstable]` in `.cargo/config.toml`):
-`-Zshare-generics=yes` in `[profile.dev]` only, `-Zunstable-options
---jobs-frontend=0` (parallel rustc frontend — `0` = one thread per logical
-core via `available_parallelism`, the replacement for the deprecated
-`-Zthreads`) in both dev and release, and `-C target-cpu=native`
-(build for the local machine's CPU — AVX2/BMI2 on x86-64, the M-chip on
-Apple Silicon) in both. An LLM/agent issuing raw `cargo` commands gets the
-fast, native-tuned build with no extra ceremony. Profile rustflags replace
-`[build]` rustflags but concatenate with `[target.'cfg(...)']` rustflags, so
-per-machine linker flags (e.g. the wild linker in `~/.cargo/config.toml`)
-still apply. `-C target-cpu=native` is a repo-wide local-build default that
-NEVER reaches a shipped artifact: both `scripts/build-stable.sh` (dist
-binaries) and `scripts/publish-stable.sh` (crates.io) strip the per-profile
-rustflags keys, so dist builds get their CPU floor from the per-target
-`RUSTFLAGS="-C target-cpu=…"` set in the release scripts (see the
-"Release & packaging" section), published-source builds stay baseline, and
-the RISC-V guest compiles (`tools/vm.rs`) are direct
-`rustc +stable` calls that never see cargo rustflags at all.
+the `nightly` channel (rustup installs it on the first `cargo` run), so every
+adhoc `cargo` command — including per-crate `cargo build -p choreo-x` /
+`cargo check -p x` / `cargo nextest run -p x` — automatically gets the fast
+per-profile `-Z` compiler flags that the nightly-only `profile-rustflags`
+feature enables (opted in under `[unstable]` in `.cargo/config.toml`, and
+configured — with the reason for each flag — in the root `Cargo.toml`'s profile
+comments).
 
 **Stable builds are a supported opt-out.** The sources use no nightly-only
-features, so the code builds on current stable (the MSRV claim in the root
-`Cargo.toml` documents the tested floor; see above). The nightly-only
-`profile-rustflags` wiring, however, hard-blocks stable *Cargo* (the keys it
-enables require that unstable feature), so a stable build is run through
-`scripts/build-stable.sh` (`just build-stable` / `check-stable` /
-`test-stable`): it temporarily strips the nightly-only `rustflags` keys and the
-`[unstable]` block, runs `cargo +stable ...`, and restores them on exit.
-Kill-safety: the strip/restore is hardened against a hard-killed run (CI-style
-timeout, SIGKILL — the EXIT trap cannot fire for those): backups are kept
-persistently under `target/`, and the next run self-heals by restoring a
-predecessor's surviving backups before taking its own (the failure this
-closes — a killed run's mktemp backups lost, so the next run backed up and
-"restored" the stripped files — was observed for real). `build-android.sh`
-shares the mechanism.
-
-The publish step has the identical constraint from the consumer side: per-
-profile rustflags that ship inside a published `.crate` hard-break stable
-`cargo install` (stable cargo errors on the `profile-rustflags` feature), so
-crates.io publishing runs through the sibling `scripts/publish-stable.sh`
-(`just publish-stable`), which strips the same keys before `cargo release
-publish` and restores them on exit — see RELEASE.md Phase 2.
+features, so the code builds on current stable (the root `Cargo.toml`'s
+`rust-version` documents the tested floor), but the nightly-only
+`profile-rustflags` wiring hard-blocks stable *Cargo*, so a stable build runs
+through `scripts/build-stable.sh` (`just build-stable` / `check-stable` /
+`test-stable`): it strips the nightly-only keys and the `[unstable]` block for
+the duration, runs `cargo +stable`, and restores them on exit — kill-safely,
+with backups persisted under `target/` and a self-heal on the next run.
+`scripts/build-android.sh` shares that mechanism, and the publish step meets the
+same constraint from the consumer side: crates.io publishing runs through
+`scripts/publish-stable.sh` (`just publish-stable`), which strips the same keys
+before `cargo release publish`, because a published manifest carrying them
+hard-breaks stable `cargo install`. See RELEASE.md Phase 2.
 
 The `choreo-daemon` crate depends on `zlob` (a Zig-implemented glob and
 gitignore-aware directory walker used by `grep`, `find`, `delete_files`, and
@@ -3294,7 +3118,6 @@ cargo run -p choreo-gui
 cargo run -p choreo-im -- telegram
 ```
 
-
 ---
 
 ## External dependencies (key crates)
@@ -3304,16 +3127,16 @@ cargo run -p choreo-im -- telegram
 | `tokio` | choreo-blockchain, choreo-content, choreo-mcp | Async runtime — the sidecar the blockchain, Coordination Platform, and MCP clients run on (linked via the daemon's `blockchain`, `content`, and `mcp` features respectively) |
 | `alloy` | choreo-blockchain | EVM blockchain tools (behind the `blockchain` feature) |
 | `subxt` | choreo-blockchain | Substrate/Polkadot blockchain tools (behind the `blockchain` feature) |
-| `rmcp` + `process-wrap` + `reqwest` | choreo-mcp | Official Model Context Protocol Rust SDK, its child-process wrappers, and the HTTP client — the MCP client protocol engine (behind the `mcp` feature; `process-wrap` places the stdio server child in its own process group, and `reqwest` (rustls) drives the Streamable HTTP transport and its deprecated-transport probe; the stdio read side uses a crate-local capped transport over `rmcp`'s `AsyncRwTransport`) |
+| `rmcp` + `process-wrap` + `reqwest` | choreo-mcp | The official Model Context Protocol Rust SDK, its child-process wrappers, and the HTTP client for the Streamable HTTP transport (behind the `mcp` feature); `choreo-mcp/Cargo.toml` records why each is needed |
 | `serde` + `rmp-serde` | proto, daemon | Wire protocol framing and DB value encoding (MessagePack, named mode) |
-| `structured-zstd` | daemon, choreo-ai-protocols | Pure-Rust zstd: the daemon's `session_turns` DB values (a standard zstd frame around the MessagePack blob, level 6 — the tuned level maps onto C zstd numbering; see `db/codec.rs` `COMPRESSION_LEVEL`) and opted-in LLM request bodies (level 3; see `choreo-ai-protocols/src/retry/compression.rs`). Apache-2.0; no libzstd C build. |
-| `flate2` | choreo-ai-protocols | Pure-Rust gzip for opted-in LLM request bodies (the `rust_backend`/miniz_oxide backend `ureq` already enables; see `choreo-ai-protocols/src/retry/compression.rs`). |
+| `structured-zstd` | daemon, choreo-ai-protocols | Pure-Rust zstd (no libzstd C build) — the daemon's `session_turns` DB values and opted-in LLM request bodies; level choices and rationale live in `db/codec.rs` and `retry/compression.rs` |
+| `flate2` | choreo-ai-protocols | Pure-Rust gzip for opted-in LLM request bodies (the miniz_oxide backend `ureq` already enables) |
 | `snow` | daemon, client-core, transport | Noise IK handshake and transport encryption |
 | `ureq` | daemon | HTTP client |
 | `pulldown-cmark` + `ammonia` | client-core | Markdown parsing, HTML sanitization |
 | `ratatui` + `crossterm` | choreo-tui | Terminal UI |
 | `dioxus` | choreo-gui | Desktop/Android UI (Native/Blitz renderer) |
-| `image` + `resvg` + `heifer` + `moxcms` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization (`usvg` parse + `resvg` render, behind one shared parse policy: a 256-deep nesting cap for untrusted markup and one process-wide font database, with straight-alpha RGBA out of the premultiplied rasterizer), HEIC/HEIF decode (`heifer`, pure Rust, with `unsafe_code` forbidden) bounded by the decoder's own pixel limit against the buffer it is about to allocate plus a declared-geometry pre-check, and sRGB colour management on both decode paths (`moxcms` for a raster's embedded ICC profile; `heifer`'s own decode for a HEIC's profile or `nclx` description) so a Display-P3/AdobeRGB photo is not rendered desaturated |
+| `image` + `resvg` + `heifer` + `moxcms` (via the `choreo-image` leaf crate) | daemon, choreo-tui | Image decoding (all `image`-crate raster formats incl. feature-gated AVIF), SVG rasterization, HEIC/HEIF decode, and sRGB colour management — one decode path shared by the model and UI paths; the per-format detail, the decompression-bomb budget, and the colour policy are the crate's rustdoc |
 | `syntect` | choreo-tui | Syntax highlighting for code blocks (uses Sublime Text grammar files) |
 | `aes-gcm` + `argon2` | keystore | Encryption, key derivation |
 | `x25519-dalek` + `hkdf` + `sha2` | keystore | X25519 ECDH key agreement, HKDF key derivation |
@@ -3321,7 +3144,11 @@ cargo run -p choreo-im -- telegram
 | `postcard` | daemon, client-core | Compact binary serialization for Rust-only internal channels (VM↔host tool communication, encrypted credential pipeline) |
 | `thiserror` | proto, keystore, client-core, daemon | Structured library error types |
 | `anyhow` | daemon, tui, dioxus, im, keystore | Application error context & propagation |
-
+| `gix` | daemon | Git operations |
+| `teloxide` | choreo-im | Telegram Bot API client |
+| `prometheus` | daemon | OpenMetrics instrumentation, process metrics (optional — behind the `metrics` feature, off by default) |
+| `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint (optional — behind the `metrics` feature, off by default) |
+| `tracing` | daemon | Structured logging |
 
 ---
 
@@ -3329,55 +3156,39 @@ cargo run -p choreo-im -- telegram
 
 ### Library crates — `thiserror`
 
-Each library crate defines a structured error enum:
-
-| Crate | Error type | Key variants |
-|---|---|---|
-| `choreo-proto` | `ProtoError` | `Codec`, `FrameTooLarge`, `TrailingBytes`, `UnsupportedVersion`, `Io` |
-| `choreo-keystore` | `KeystoreError` | `Io`, `TooShort`, `DecryptionFailed`, `InvalidKeyLength`, `EncryptionFailed`, `ConfigDirNotFound` |
-| `choreo-client-core` | `ClientError` | `Proto`, `Io`, `Utf8`, `ImageTooLarge`, `ImageExceedsSize`, `DuplicateImage`, `UnknownImage`, `ImageSizeMismatch` |
-
-Every library error type implements `From<ErrorType> for io::Error` for backward compatibility
-with code that still uses `io::Result`. Binary crates convert library errors to `anyhow::Error`
-automatically via the blanket `From<E: Error> for anyhow::Error` impl.
+Each library crate defines one structured error enum with `thiserror`
+(`ProtoError`, `KeystoreError`, `ClientError`, …), documented at its
+declaration: the variant set, the `Display` wording, and each `#[from]`
+conversion are the type's own rustdoc, so that is the reference. The conversion
+that crosses a crate boundary is `impl From<ErrorType> for io::Error` on the
+error types whose callers sit on io-shaped plumbing (`ProtoError`,
+`ClientError`), which folds non-I/O variants into
+`io::ErrorKind::InvalidData`.
 
 ### Binary crates — `anyhow`
 
-All binary `main()` functions return `anyhow::Result<()>`. Key boundaries (socket bind,
-keystore load, config parse) use `.context()` to attach meaningful messages. Internal
-functions use domain error types (`io::Result`, `ProtoError`, etc.) and `?` auto-converts to
-`anyhow::Error`.
-
-The `send_or_warn` fire-and-forget broadcast helper uses `anyhow::Error` formatting for
-warning logs when a subscriber is disconnected.
+All binary `main()` functions return `anyhow::Result<()>`. Key boundaries (socket
+bind, keystore load, config parse) use `.context()` to attach meaningful messages;
+internal functions keep domain error types (`io::Result`, `ProtoError`, …) and `?`
+auto-converts through the blanket `From<E: Error> for anyhow::Error` impl.
 
 ### Tool errors
 
-Each tool defines its own error type via the `type Error` associated type on the `Tool` trait.
-Simple tools use `ToolExecError` (a string-wrapper newtype). Tools whose errors are consumed by
-VM guests (e.g. `DbError`, `HttpError`) define a `thiserror` enum that is `Serialize` +
-`Deserialize`, enabling the guest to pattern-match on specific variants.
+Each tool defines its own error type via the `Tool` trait's `type Error`.
+Simple tools use `ToolExecError` (a string-wrapper newtype); tools whose errors
+a VM guest consumes (`DbError`, `HttpError`) define a `Serialize` +
+`Deserialize` `thiserror` enum so the guest can pattern-match specific variants.
 
-The `ToolError` enum (thiserror) covers *infrastructure* failures that happen around tool execution:
-argument deserialisation, I/O, postcard encoding. It is never returned by a tool's `execute()`
-directly — only by the `ToolDyn` conversion layer.
+`ToolError` covers *infrastructure* failures around tool execution — argument
+deserialisation, I/O, postcard encoding — and is never returned by a tool's
+`execute()` directly, only by the `ToolDyn` conversion layer. `execute_json`
+and `execute_streaming_json` return `Result<ToolOutput, ToolError>` so a caller
+can tell an infrastructure failure (JSON deserialisation) from a tool failure,
+folding the latter into `ToolOutput { is_error: true }` for the LLM while keeping
+the structured error for programmatic consumers.
 
-The `ToolDyn::execute_json()` and `execute_streaming_json()` methods return
-`Result<ToolOutput, ToolError>` so callers can distinguish infrastructure errors
-(JSON deserialisation) from tool execution errors. The caller converts `Err(e)` into a
-`ToolOutput { is_error: true }` for the LLM path, preserving the structured error
-for programmatic consumers.
-
-The postcard binary path encodes all outcomes as a nested
-`Result<Result<R, E>, ToolError>`: `Ok(Ok(ret))` for success, `Ok(Err(e))` for a
-structured tool error, and `Err(e)` for an infrastructure failure. The `encode_outer()`
-helper in `choreo-daemon/src/tools/mod.rs` handles this serialization.
-
-`ToolOutput` replaces the old `ToolExecutionOutput` and `ToolResult` types. The `ToolOutputFormat`
-enum lets callers choose between `Text` (human-readable via `return_string`) and `Json`
-(JSON-encoded via `serde_json::to_string`) output formats.
-| `gix` | daemon | Git operations |
-| `teloxide` | choreo-im | Telegram Bot API client |
-| `prometheus` | daemon | OpenMetrics instrumentation, process metrics (optional — behind the `metrics` feature, off by default) |
-| `tiny_http` | daemon | Metrics HTTP server for `/metrics` endpoint (optional — behind the `metrics` feature, off by default) |
-| `tracing` | daemon | Structured logging |
+The postcard binary path encodes all three outcomes in one nested
+`Result<Result<R, E>, ToolError>` (`encode_outer()` in
+`choreo-daemon/src/tools/mod.rs`), so a VM guest gets the whole picture from a
+single byte buffer. The type docs in `choreo-daemon/src/tools/` own the field-by-field
+detail of `ToolOutput` and `ToolOutputFormat`.

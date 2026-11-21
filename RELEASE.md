@@ -9,12 +9,12 @@ A release ships three things:
    dependency order) — enables
    `cargo install choreographr choreo-tui` / `cargo binstall`.
 2. **GitHub release `vX.Y.Z`** on `choreographr/choreographr` with prebuilt
-   artifacts (Linux x86_64 + arm64 musl tarballs, macOS/Android tarballs,
-   desktop `.deb` + `.rpm` in both Linux arches,
-   Termux-native `.deb`, combined `SHA256SUMS`) — enables Homebrew,
-   AUR, `cargo binstall`, and the `choreographr.com` installer. (The Windows
-   `.zip` is built and smoke-tested on every tag but is not attached to the
-   release yet — see [CI builds](#ci-builds-github-actions).)
+   artifacts (Linux x86_64 + arm64 musl tarballs, macOS arm64 + x86_64
+   tarballs, the FreeBSD x86_64 tarball, the Windows x86_64 `.zip`, desktop
+   `.deb` + `.rpm` in both Linux arches, Termux-native `.deb`, combined
+   `SHA256SUMS`) — enables Homebrew, AUR, `cargo binstall`, and the
+   `choreographr.com` installer. The shipped target set is exactly those six
+   platforms — see [CI builds](#ci-builds-github-actions).
 3. **Channel updates** — Homebrew tap, choreographr.com (AUR deferred: no account).
 
 One release conductor drives all three. The binary artifacts for all shipped
@@ -39,11 +39,12 @@ nothing — the channel updates are conductor tasks in every case).
 ## CI builds (GitHub Actions)
 
 `.github/workflows/release.yml` builds the release binaries on GitHub-hosted
-runners. It reuses `scripts/release.sh` (Linux + macOS jobs run it verbatim)
+runners. It reuses `scripts/release.sh` (Linux, macOS, and FreeBSD jobs run it
+verbatim)
 and `scripts/build-android.sh`, so build flags, `--locked`, feature selection,
 artifact naming, and smoke tests stay in the scripts — the workflow only adds
-per-runner toolchain setup and artifact plumbing. `choreo-gui` (a stub) is
-built nowhere.
+per-runner toolchain setup and artifact plumbing. `choreo-gui` is not part of
+the release set (the `ios-build` job only compile-checks it).
 
 **Triggers** (deliberately narrow — full multi-platform builds are expensive):
 
@@ -64,25 +65,29 @@ built nowhere.
 | `linux-x86_64` | ubuntu-latest | static `x86_64-unknown-linux-musl` tarball + `.deb` + `.rpm` (via `scripts/release.sh`; `rpmbuild` is apt-installed in the job, since it is not preinstalled) |
 | `linux-arm64` | ubuntu-24.04-arm | static `aarch64-unknown-linux-musl` tarball + arm64 `.deb` + `.rpm` (via `scripts/release.sh` on a NATIVE arm64 runner, so its smoke tests execute the arm64 binaries on real arm64 hardware) |
 | `macos-arm64` | macos-latest | native `aarch64-apple-darwin` tarball **plus** the cross-built `x86_64-apple-darwin` tarball (both via one `scripts/release.sh` pass; the Intel slice is smoke-tested under Rosetta and verified by construction downstream — no free x64 macOS runner exists) |
+| `freebsd-x86_64` | FreeBSD VM (vmactions) | native `x86_64-unknown-freebsd` tarball (via `scripts/release.sh`; there is no hosted FreeBSD runner, so the build runs in a VM and both smoke suites execute natively there) |
 | `windows-msvc` | windows-latest | `x86_64-pc-windows-msvc` zip of the shipped `.exe` files — built, smoke-tested, and published with the release (the `release` job downloads it and folds it into the combined `SHA256SUMS`) |
 | `android-termux` | ubuntu-latest + NDK | `aarch64-linux-android` Termux tarball (via `scripts/build-android.sh --features metrics,blockchain`) + the Termux-native `.deb` (via `scripts/build-deb-termux.sh`, structural smoke-test on the runner; the packaged binaries are then extracted with Termux's own dpkg-deb under qemu-user and executed against an unpacked Termux aarch64 rootfs — see the workflow's qemu step) |
 | `ios-build` | macos-latest | **none** — `choreo-gui` (the only crate that ships to iOS) compile check for both iOS targets, the real Xcode app link via the `ios/` scaffold, and a non-blocking simulator boot smoke (`continue-on-error` until the plumbing has proven stable). Deliberately not part of the release; a failing link is diagnosed from the log |
 
 Every build job smoke-tests its own artifact beyond the clap surface: the
-four desktop jobs run `scripts/daemon-smoke.sh` (boots the shipped daemon
+desktop jobs (both Linux arches, macOS, FreeBSD) run `scripts/daemon-smoke.sh`
+(boots the shipped daemon
 hermetically — scratch socket + config dir — and proves the listener comes
 up); the arm64 Linux job runs both smoke suites NATIVELY on real arm64
 hardware; the macOS job additionally runs the x86_64 tarball's smoke suites under
 Rosetta (an approximation, not native execution — no free x64 macOS runner
-exists; see the release.yml comments); and the android job **executes** its
+exists; see the release.yml comments); the FreeBSD job runs both suites inside
+the VM; and the android job **executes** its
 binaries under qemu-user
 against the official Termux aarch64 rootfs (skopeo fetches the image layers;
 no docker), closing the "never executed before release" gap.
 
 The `release` job runs on every tag push **and** on `workflow_dispatch` (only
 the final `gh release create` step is push-gated, so a dispatch runs every other
-check). It downloads the five shipping platforms' build artifacts
-(`linux-x86_64`, `linux-arm64`, `macos-arm64`, `windows-msvc`, `android-termux`),
+check). It downloads the six shipping platforms' build artifacts
+(`linux-x86_64`, `linux-arm64`, `macos-arm64`, `freebsd-x86_64`, `windows-msvc`,
+`android-termux`),
 generates one combined `SHA256SUMS`
 over everything, installs `cargo-deny` + `git-cliff`, runs the supply-chain
 guard, then on a tag guards that the pushed tag matches the manifest version,
@@ -102,11 +107,11 @@ Every job builds the same shipped binaries (`choreographr choreo-tui` — the
 `choreo-im`/`choreo-acp` bridges live in their own packages and are not built
 for release) with the package-scoped
 `--features choreographr/metrics,choreographr/blockchain` on the **stable**
-toolchain, smoke-tests its artifact, and uploads it; the `release` job only
-runs for tag pushes. The Termux artifacts ship **in addition to** the
-Homebrew/AUR channels — those package the same tarballs CI produces. (The
-Windows `.zip` is built and uploaded to the workflow run, but as noted above
-it is not yet attached to the release.)
+toolchain, smoke-tests its artifact, and uploads it. The Termux artifacts ship
+**in addition to** the Homebrew/AUR channels — those package the same tarballs
+CI produces. The Windows `.zip` and the FreeBSD tarball are attached to the
+release alongside the rest, and every artifact folds into the single combined
+`SHA256SUMS`.
 
 How this slots into the SOP: push the `vX.Y.Z` tag (Phase 3) **after** the
 crates.io publish (Phase 2) — the tag push both publishes binaries and is the
@@ -460,22 +465,19 @@ details in [CI builds](#ci-builds-github-actions)).
 
 Conductor duties while the workflow runs:
 
-1. **Watch the run** (`gh run watch` on the `release` workflow) — the four
-   jobs the release waits on (`linux-x86_64`, `linux-arm64`, `macos-arm64`,
-   `android-termux`)
-   must go green. The `windows-msvc` job runs and smoke-tests its artifact but
-   does NOT gate the release (it is not in the release job's `needs`), and the
-   `ios-build` job may report its (non-blocking) smoke result; investigate a
-   failure in either log, but neither holds the release.
+1. **Watch the run** (`gh run watch` on the `release` workflow) — every
+   shipping job (`linux-x86_64`, `linux-arm64`, `macos-arm64`,
+   `freebsd-x86_64`, `windows-msvc`, `android-termux`) must go green; all of
+   them are in the release job's `needs`. The `ios-build` job may report its
+   (non-blocking) smoke result; investigate a failure in its log, but it does
+   not hold the release.
 2. **Verify the release page** once the `release` job completes:
    - the tag on the release matches `vX.Y.Z` and the manifest version
      (the job guards this too — a guard failure means a Phase 1/2 mistake);
-   - all assets are present: five tarballs (Linux musl x86_64 + arm64,
-     macOS arm64, macOS x86_64, Android Termux),
-     the desktop `.deb` and `.rpm` for both Linux arches, the Termux-native
-     `.deb`, and the
-     combined `SHA256SUMS` (the Windows `.zip` is built but intentionally not
-     attached — see [CI builds](#ci-builds-github-actions));
+   - all assets are present: six tarballs (Linux musl x86_64 + arm64,
+     macOS arm64, macOS x86_64, FreeBSD x86_64, Android Termux), the Windows
+     x86_64 `.zip`, the desktop `.deb` and `.rpm` for both Linux arches, the
+     Termux-native `.deb`, and the combined `SHA256SUMS`;
    - each asset downloads.
 
 **Gate:** workflow green, release page lists all assets + `SHA256SUMS`,
@@ -508,9 +510,9 @@ the result (exact-count rewrite checks, no stale version/placeholder, `ruby -c`
 syntax check when ruby is present) and prints the diff. `--push` writes the
 resolved formula back to `packaging/homebrew/choreographr.rb` (keeping the two
 in lockstep — **commit that file with the rest of the release**) and commits +
-pushes to the tap repo's default branch. The x86_64 branch is left untouched
-when no `choreographr-<V>-x86_64-apple-darwin.tar.gz` is in `dist/` (Intel
-macOS is not shipped yet — the branch stays a placeholder).
+pushes to the tap repo's default branch. Both macOS branches carry real
+artifacts: `release.sh` ships the native arm64 tarball and the cross-built
+x86_64 one, and the updater aborts if either is missing from `dist/`.
 
 Then verify the channel — no Mac required: the `homebrew-verify` workflow
 installs from the tap on a macOS arm64 runner and asserts `--version`:
@@ -655,7 +657,8 @@ desktop machines run `scripts/release.sh`, which:
   `cargo build --release` output the packaging steps could otherwise pick up
   by mistake (see root `Cargo.toml`),
 - builds every artifact at an explicit **CPU floor per target** via
-  `RUSTFLAGS="-C target-cpu=…"` (see ARCHITECTURE.md "Release & packaging"):
+  `RUSTFLAGS="-C target-cpu=…"` (each target's chosen level, and why, is
+  documented at the build site in `scripts/release.sh`):
   x86-64-v2 for the musl tarball, the target default (`apple-a14`) for the
   macOS arm64 tarball, x86-64-v3 (AVX2/FMA) for the macOS x86_64 tarball —
   the last Intel-capable macOS fleet is exactly the 2019–2020 Intel Macs,
@@ -683,10 +686,10 @@ release.sh on a Darwin-arm64 host native-builds the aarch64 tarball AND
 cross-builds the x86_64 one in the same pass).
 Artifacts are staged and uploaded from the Linux box — the arm64 Linux and
 macOS tarballs are
-copied there before upload. Windows and Android/Termux artifacts have no
-manual path; if CI is unavailable for them, skip those assets for the
-release or wait for CI (a re-pushed tag after `gh release delete` re-triggers
-it).
+copied there before upload. Windows, FreeBSD, and Android/Termux artifacts have
+no manual path (the FreeBSD tarball must be built on a FreeBSD host); if CI is
+unavailable for them, skip those assets for the release or wait for CI (a
+re-pushed tag after `gh release delete` re-triggers it).
 
 ### Linux box
 

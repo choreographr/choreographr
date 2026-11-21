@@ -134,10 +134,12 @@ bump checklist. The manual steps that must stay in lockstep:
   desktop `.deb` targets old-dpkg distros (Ubuntu 22.04's dpkg 1.21.1), and
   Termux's dpkg has no zstd at all. Both build scripts pass `-Zxz` and assert
   the `debian-binary + control.tar.xz + data.tar.xz` member set.
-- **Binaries are stripped.** The workspace `[profile.release]` sets
-  `strip = "symbols"` (root `Cargo.toml`), so the tarball, `.deb`, and `.rpm`
-  all ship stripped binaries (~22% smaller). (Thin LTO was removed from the
-  profile because it made release links slow — see `ARCHITECTURE.md`.) Panic
+- **Binaries are stripped.** The workspace `[profile.dist]` — the shipped-artifact
+  profile every release-pipeline build selects with `--profile dist` — sets
+  `strip = "symbols"` (root `Cargo.toml`, where the fat-LTO + single-codegen-unit
+  tuning and why it lives there instead of `[profile.release]` are documented),
+  so the tarball, `.deb`, and `.rpm` all ship stripped binaries (~22% smaller).
+  Panic
   `file:line` locations survive (compiled-in
   constants); only `RUST_BACKTRACE=1` symbolization is lost. `panic = "abort"`
   is deliberately NOT set (the daemon catches request-worker panics with

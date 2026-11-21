@@ -218,6 +218,16 @@ if [ "$TARGET" = "x86_64-unknown-linux-musl" ]; then
     # exact mechanism with a different value.
     RUSTFLAGS="-C target-cpu=x86-64-v2" ./scripts/build-stable.sh zigbuild --locked --profile dist -p choreographr -p choreo-tui --target x86_64-unknown-linux-musl --features choreographr/metrics,choreographr/blockchain,choreographr/mimalloc,choreo-tui/mimalloc
     TARBALL_JOBS+=("x86_64-unknown-linux-musl target/x86_64-unknown-linux-musl/dist")
+    # Expected, benign output of this link (once per binary): "warning: linker
+    # stderr: ignoring deprecated linker optimization setting '1'"
+    # (#[warn(linker_messages)]). rustc emits `-Wl,-O1` for every optimized
+    # GNU-flavor link itself (GccLinker::optimize() in
+    # rustc_codegen_ssa/src/back/linker.rs) — a GNU-ld output-optimization hint
+    # that zig's bundled lld knows as deprecated and drops. It never appears on
+    # `cargo -v`'s rustc line because rustc builds linker args internally at
+    # link time (same as the relro args), which is why pinning it down needs a
+    # spy-linker. Do NOT silence it with `-A linker_messages`: that hides real
+    # linker warnings too.
 elif [ "$TARGET" = "aarch64-unknown-linux-musl" ]; then
     echo "==> building release binaries (daemon + TUI packages)"
     # aarch64 musl: the SAME fully-static-musl + mimalloc story as x86_64,
