@@ -10,6 +10,16 @@
 //! lands on this struct, and keeping it beside the `App` definition would make
 //! that one file the bottleneck for unrelated edits.
 //!
+//! The per-turn visibility mutators (reasoning collapse/expand, tool-result
+//! collapse/expand) live here rather than with the history model's other
+//! `SessionDisplayState` methods: they are the only writers of
+//! [`SessionDisplayState::reasoning_override`],
+//! [`SessionDisplayState::reasoning_mode`] and
+//! [`SessionDisplayState::tool_collapse_override`], so they sit beside the state
+//! they mutate.  What they share with the history model is the *invalidation*:
+//! each records the user's choice and then calls `mark_content_changed`, which
+//! schedules the height-model rebuild the new visibility requires.
+//!
 //! Every item is re-exported from `state` (`pub(crate) use display::*`), so
 //! `crate::state::SessionDisplayState` and friends keep resolving.
 
@@ -17,8 +27,11 @@ use super::{
     HistoryScrollState, Marker, RenderedCache, ResponsePin, ScrollRestore, StreamingResponseCache,
     TurnLayout,
 };
+use crate::markdown_render::{
+    reasoning_expanded_default, tool_result_default_collapsed, turn_has_reasoning,
+};
 use choreo_client_core::SessionView;
-use choreo_proto::{ReasoningCapability, TokenUsage};
+use choreo_proto::{ReasoningCapability, TokenUsage, ToolResultRecord};
 use std::collections::{HashMap, HashSet};
 
 /// Bulk reasoning-visibility mode for one session — the two-state setting
@@ -250,5 +263,123 @@ impl Default for SessionDisplayState {
             draft: String::new(),
             draft_cursor: 0,
         }
+    }
+}
+
+// The per-turn visibility overrides and the mode they fall back to.  Every reader
+// resolves an override first and the content-derived default second, in that
+// order, so a header click always wins over the session-wide mode; every writer
+// records the user's explicit choice and then invalidates the render model,
+// because a changed visibility changes the wrapped lines as much as new content
+// does.
+impl SessionDisplayState {
+    /// Effective reasoning visibility for a turn: an explicit override from
+    /// clicking the header wins; otherwise the session's bulk mode resolves the
+    /// caller-provided derived default ([`ReasoningViewMode::default_expanded`] —
+    /// the collapsed mode hides every body, the expanded mode defers to the
+    /// content default).  Callers compute the default either from the turn
+    /// content (`reasoning_expanded_default`) or from the precomputed
+    /// `TurnLayout` when one is available (per-frame render path).
+    pub(crate) fn effective_reasoning_expanded(&self, turn_id: u32, default: bool) -> bool {
+        self.reasoning_override
+            .get(&turn_id)
+            .copied()
+            .unwrap_or_else(|| self.reasoning_mode.default_expanded(default))
+    }
+
+    /// Toggle the reasoning section's visibility for a turn (clicking the
+    /// header).  Records the explicit user preference in `reasoning_override`
+    /// and invalidates the turn's render cache so the change takes effect on
+    /// the next frame.
+    pub(crate) fn toggle_reasoning(&mut self, turn_id: u32) {
+        let Some(turn) = self.view.turns.get(&turn_id) else {
+            return;
+        };
+        let current = self.effective_reasoning_expanded(turn_id, reasoning_expanded_default(turn));
+        self.reasoning_override.insert(turn_id, !current);
+        if let Some(idx) = self.visible_turn_ids.iter().position(|id| *id == turn_id)
+            && let Some(slot) = self.render_cache.get_mut(idx)
+        {
+            *slot = None;
+        }
+        self.mark_content_changed();
+    }
+
+    /// Flip the session's bulk reasoning-visibility mode — the body of
+    /// `Alt+Shift+R` and `/reasoning-toggle`.
+    ///
+    /// The decision is made from the *effective* state of every reasoning-bearing
+    /// turn, so a turn the user manually expanded in the collapsed mode counts as
+    /// not-collapsed and the next press collapses the transcript again:
+    ///
+    /// - any turn showing its reasoning ⇒ switch to collapsed;
+    /// - every turn already collapsed (including a session with no reasoning at
+    ///   all, vacuously) ⇒ switch to expanded.
+    ///
+    /// Switching drops every per-turn override: the mode is a bulk statement of
+    /// intent, so a header-clicked preference from the previous mode must not
+    /// survive it and leave one turn contradicting the mode.  Clicks made after
+    /// the switch still override individual turns, in either mode.
+    pub(crate) fn toggle_all_reasoning(&mut self) {
+        let any_expanded = self.view.turns.iter().any(|(&turn_id, turn)| {
+            !turn.undone
+                && turn_has_reasoning(turn)
+                && self.effective_reasoning_expanded(turn_id, reasoning_expanded_default(turn))
+        });
+        self.reasoning_mode = if any_expanded {
+            ReasoningViewMode::Collapsed
+        } else {
+            ReasoningViewMode::Expanded
+        };
+        self.reasoning_override.clear();
+        // Every cached rendering was built with the previous visibility, so drop
+        // the whole cache rather than trusting the per-key comparison (the mode
+        // is not part of `RenderCacheKey`; the key's `reasoning_expanded` flag is,
+        // but a turn whose reasoning is hidden either way would compare equal).
+        self.render_cache.fill(None);
+        self.mark_content_changed();
+    }
+
+    /// Effective collapse state for a tool result: an explicit override from
+    /// clicking the header wins; otherwise the derived default (quiet tools
+    /// collapsed, everything else expanded — see
+    /// [`tool_result_default_collapsed`]) is used.
+    pub(crate) fn effective_tool_result_collapsed(
+        &self,
+        turn_id: u32,
+        record: &ToolResultRecord,
+    ) -> bool {
+        // Nested (turn → call_id → state) lookup borrows the record's
+        // call_id — this runs per result per frame, so avoiding a clone
+        // here keeps the render path allocation-free for the common case.
+        self.tool_collapse_override
+            .get(&turn_id)
+            .and_then(|by_call| by_call.get(&record.call_id))
+            .copied()
+            .unwrap_or_else(|| tool_result_default_collapsed(record))
+    }
+
+    /// Toggle a tool result's collapse state (clicking its header row).
+    /// Records the explicit user preference in `tool_collapse_override` and
+    /// invalidates the turn's render cache so the change takes effect on
+    /// the next frame.
+    pub(crate) fn toggle_tool_result(&mut self, turn_id: u32, call_id: &str) {
+        let Some(turn) = self.view.turns.get(&turn_id) else {
+            return;
+        };
+        let Some(record) = turn.tool_results.iter().find(|r| r.call_id == call_id) else {
+            return;
+        };
+        let current = self.effective_tool_result_collapsed(turn_id, record);
+        self.tool_collapse_override
+            .entry(turn_id)
+            .or_default()
+            .insert(call_id.to_string(), !current);
+        if let Some(idx) = self.visible_turn_ids.iter().position(|id| *id == turn_id)
+            && let Some(slot) = self.render_cache.get_mut(idx)
+        {
+            *slot = None;
+        }
+        self.mark_content_changed();
     }
 }

@@ -1,7 +1,9 @@
 //! The TUI's full application state: the `App` struct, the input plumbing, and
 //! the page/overlay states.  The per-session display model (`SessionDisplayState`
-//! and `SessionNote`), the history pane's render model (height prefix-sum,
-//! markers, scroll, viewport, render cache), the streaming response auto-pin,
+//! and `SessionNote`, with the per-turn visibility overrides), the history pane's
+//! render model (a directory module: viewport, render cache, height prefix-sum
+//! and markers, scroll, plus the viewport-invalidation policy that drives them),
+//! the streaming response auto-pin,
 //! the provider catalog, text-input machinery, page states, picker geometry,
 //! displayed-image fetch plumbing, the turn-event handlers, the model selector,
 //! the staged account/model/reasoning flow and the reasoning dialog, the
