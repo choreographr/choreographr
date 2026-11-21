@@ -43,6 +43,9 @@ pub enum RequestCompression {
     #[default]
     Identity,
     /// Send the JSON body gzip-compressed with `Content-Encoding: gzip`.
+    ///
+    /// The codec is `flate2`'s pure-Rust backend — the same one ureq enables
+    /// for response decoding — so a build needs no C zlib.
     Gzip,
     /// Send the JSON body zstd-compressed with `Content-Encoding: zstd`.
     Zstd,

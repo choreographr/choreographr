@@ -8,8 +8,15 @@
 //! supplies the *facts* — provider slugs/names, base URLs, and per-model
 //! reasoning/context data — and the bundled `catalog/models-overlay.toml`
 //! policy layer (`include_str!`, merged at load time) supplies everything
-//! models.dev cannot express: wire-protocol selection, endpoint policy,
-//! per-model passback exceptions, and the providers models.dev does not cover.
+//! models.dev cannot express: wire-protocol selection, endpoint and
+//! default-model policy, per-model passback exceptions, the prompt-cache TTL
+//! tiers, the per-model extended-cache-retention spelling, the
+//! request-body-compression opt-in, the per-session cache-affinity dialect, and
+//! the wholesale overlay-only providers models.dev does not cover. That file's
+//! header is the schema reference (every key, its default, and the merge
+//! precedence); an unknown key warns and is skipped rather than failing the
+//! load.
+//!
 //! The merge entry points ([`normalize_modelsdev`], [`merge_overlay`], and
 //! [`load_bundled_base`]) are the public seam S4 reuses for the runtime user
 //! overlay + cache.

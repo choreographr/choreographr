@@ -631,49 +631,26 @@ the matching client. All wire-format knowledge stays in `choreo-ai-protocols`;
 the daemon supplies the account-config, metrics, and session concerns at the
 boundary.
 
-Two contracts cross that boundary and are public surfaces in their own right:
-
-- **Streaming.** A turn is delivered as a sequence of `StreamEvent`s
-  (`Answer`/`Reasoning`, `src/types.rs`) through a `&mut dyn FnMut` callback
-  (kept object-safe); a non-streaming turn is converted to the identical event
-  sequence by `emit_non_streaming_events` (`src/shared.rs`), so one event-driven
-  path serves both a streaming and a non-streaming configuration without
-  per-provider duplication.
-- **Metrics.** `InferenceProvider` records `record_api_call` /
-  `record_api_error` around every turn — timing lives in the daemon so
-  `choreo-ai-protocols` stays free of daemon concerns. The `endpoint` label is
-  the **catalog slug**, not the protocol name (e.g. `"opencode"` rather than
-  `"openai"`): more precise, but part of the public Prometheus contract, so
-  renaming a slug changes that provider's series. Error labels come from
-  `InferenceError::metric_label()` in `choreo-proto`, the single canonical
-  mapping shared by all providers.
-
-Each client maps the account's `&str` reasoning-effort slug onto its own wire
-format (OpenAI-compatible `reasoning_effort`, Anthropic a `thinking` block with
-`budget_tokens`, Google `thinkingConfig`); each adapter module documents its
-exact mapping. Mistral speaks the OpenAI wire format
-(`POST /v1/chat/completions`), so it is catalogued under `OpenAi`, not a
-protocol of its own.
+One contract crosses that boundary as a public surface in its own right:
+**metrics**. `InferenceProvider` records `record_api_call` / `record_api_error`
+around every turn — timing lives in the daemon so `choreo-ai-protocols` stays
+free of daemon concerns. The `endpoint` label is the **catalog slug**, not the
+protocol name (e.g. `"opencode"` rather than `"openai"`): more precise, but part
+of the public Prometheus contract, so renaming a slug changes that provider's
+series. Error labels come from `InferenceError::metric_label()` in `choreo-proto`,
+the single canonical mapping shared by all providers.
 
 ### models.dev + overlay
 
 The catalog is a two-layer pipeline in `choreo-ai-protocols/src/catalog/`: a
 **normalized models.dev base** supplies the facts (provider slugs/names, base
-URLs, and per-model context/reasoning/cost data), and a **bundled policy
-overlay** (`catalog/models-overlay.toml`) supplies everything models.dev cannot
-express (wire-protocol selection, endpoint and default-model policy, per-model
-passback exceptions, the prompt-cache TTL tiers, the per-model extended-cache
-retention spelling, the request-body-compression opt-in, the per-session
-cache-affinity dialect, and the wholesale overlay-only providers models.dev does
-not cover). The overlay is merged **at load time**,
-never baked into the committed blob `catalog/catalog.bin`, so the runtime
+URLs, per-model context/reasoning/cost data), and a **bundled policy overlay**
+supplies everything models.dev cannot express. The overlay is merged **at load
+time**, never baked into the committed blob `catalog/catalog.bin`, so the runtime
 refresh (S4) can re-merge the same base with a user overlay. The pipeline, the
-per-model normalization, the exact overlay schema, and the merge precedence
-(provider scalars field-wise replace; a named model overrides that entry's
-fields onto the base; unknown keys warn and are skipped rather than failing the
-daemon) are documented in-source (the `catalog` module and
-`catalog/models-overlay.toml`), held complete by the `#![warn(missing_docs)]` +
-`doc-check` gate.
+exact overlay schema, and the merge precedence are documented in-source (the
+`catalog` module and `catalog/models-overlay.toml`), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate.
 
 #### Two model identities: wire id versus canonical metadata link
 
@@ -731,46 +708,20 @@ account (a grant with no cached access token) becomes a clean error rather than 
 request with an empty bearer. `choreo-ai-protocols` gains no `choreo-shared`
 dependency: only the already-derived `RequestAuth` crosses into it.
 
-`from_account_config` stays the single protocol dispatch. For the OpenAI protocol
-it converts the grant to `RequestAuth` and builds the chat client from it, while
-image generation — API-key-only — gets an image backend only for an API-key
-grant (an OAuth account simply has none). The Anthropic and Google protocols have
-no OAuth path in this stack, so they extract the API key and reject an OAuth grant
-with the existing "no API key" guidance. `RequestAuth` is threaded through the
-OpenAI request path to the retry layer (`openai/retry.rs`), which builds the
-`Authorization: Bearer …` value from it and **merges** its credential-derived
-extra headers with the opencode gateway routing headers (both apply to one
-request).
-
-The credential-derived headers are policy, kept in one function
-(`auth.rs::derive_headers`) so a later provider is added as data: the
-`ChatGPT`/Codex `chatgpt-account-id` header (the `account_id` claim extracted at
-login, sent only when present) and a stable `originator` app id, scoped on the
-same catalog `responses_stateless` fact the rest of the Codex handling reads
-rather than on a second hand-kept slug list — in the catalog that stateless
-dialect *is* the Codex backend, and the header is a client identification that
-backend checks. A stateless Responses backend that is not Codex would need its
-own overlay key instead of a wider gate. An API-key grant sends none of them.
+`from_account_config` stays the single protocol dispatch, and the credential
+headers are policy kept in one function (`auth.rs::derive_headers`) so a later
+provider is added as data.
 
 Two facts drive the auth shape, and each lives in exactly one place. The
-**catalog `oauth` profile** (`choreo-ai-protocols/src/catalog/`) is user-editable
-**data** — an optional `[provider.<slug>.oauth]` overlay block carrying the
-issuer, endpoint paths, scopes, redirect ports, per-endpoint grant encodings
-(form versus JSON), a device-code flag, and a public client id. A provider's auth
-kind is **derived** from it (`ProviderEntry::auth_kind`: an `oauth` profile means
-OAuth, its absence API key), never a separate attribute, so models.dev stays the
-one fact source and the overlay the one policy layer. The **client-identity
+**catalog `oauth` profile** is user-editable **data**, and a provider's auth kind
+is **derived** from it (`ProviderEntry::auth_kind`: an `oauth` profile means
+OAuth, its absence an API key), never a separate attribute — so models.dev stays
+the one fact source and the overlay the one policy layer. The **client-identity
 table** (`choreo-ai-protocols/src/identity.rs`) is compiled **policy** — which
 posture (register our own client, borrow the vendor CLI's id, or delegate) applies
 per provider slug — and is deliberately not overlay-overridable. Shipping or
 using a borrowed vendor client id is gated behind an explicit per-install opt-in
 (`borrowed_ids_enabled`, default off).
-
-The **token cache** (`DaemonState::access_tokens`, keyed by account) holds the
-ephemeral access token plus its expiry and receipt time, in daemon memory only —
-never persisted, since the refresh token in the credential blob is the durable
-root. It is owned by the command loop (single writer) and wiped on `/lock`
-alongside the credentials map.
 
 #### Provider OAuth login (frontend)
 
@@ -911,31 +862,19 @@ server must decompress, so compression is **opt-in policy**, and a provider the
 overlay does not pin is sent an uncompressed body. Because the coding is baked
 into the provider client at construction, an overlay edit reaches live sessions
 only through the catalog-swap client invalidation (see Runtime catalog refresh).
-The bundled overlay pins exactly one provider, `deepinfra` (`gzip`), the only
-in-catalog endpoint whose documentation states it decodes a compressed request
-body; models.dev carries no such fact, so the list is hand-curated in this
-overlay file.
+The bundled overlay pins a provider's coding one entry at a time, each backed by
+that endpoint's own documentation.
 
-The compression is applied once, in `choreo-ai-protocols`'s
-`retry::HookedJsonBody` (after the compact-JSON serialize, alongside the
-retained plain bytes), so every retry attempt reuses the compressed
-`Arc<[u8]>` and the upload-complete hook — the v9 `Waiting` boundary, see the
-wire-protocol section — still fires on the last compressed byte: both the
-dispatch/upload boundary and the length-delimited send are unchanged. The
-coding and its codecs live in `retry/compression.rs`; two codings are
-supported, each chosen per provider by which its endpoint decodes: `gzip` (the
-broadly-supported one, via the same pure-Rust `flate2` backend ureq enables) and
-`zstd` (targeting endpoints known to decode it, via the same pure-Rust
-`structured-zstd` codec the DB uses). A provider that
-answers a compressed request with `415 Unsupported Media Type` is downgraded to
-identity in place and retried once uncompressed
-(`retry::retry_loop_with_provider_policies`); the downgrade is then remembered per
-provider for the process, so later requests skip compression entirely. The
-memory is the process-wide `retry::compression::COMPRESSION_DOWNGRADED` set —
-the **thirteenth** sanctioned shared-state exception (see AGENTS.md), read under
-a shared lock on each request of a compression-opted-in provider (the identity
-default skips the lookup) and written once per provider on a 415, so it carries
-no protocol data and readers never contend.
+The process-wide downgrade learned from a provider's `415` is the **thirteenth**
+sanctioned shared-state exception (see AGENTS.md). The coding, its codecs, the
+serialized body, and the 415 trigger all live in `choreo-ai-protocols`'s `retry`
+module: a provider that answers a compressed request with
+`415 Unsupported Media Type` is downgraded to identity in place and retried once
+uncompressed, so later requests skip compression entirely. That memory —
+`retry::compression::COMPRESSION_DOWNGRADED` — is read under a shared lock on each
+request of a compression-opted-in provider (the identity default skips the lookup)
+and written once per provider on a 415, so it carries no protocol data and readers
+never contend.
 
 The downgrade triggers on `415` only, the spec-correct signal for an
 unsupported request coding: `400` is deliberately not treated as an encoding
@@ -1668,7 +1607,7 @@ Currently supports 209 providers (184 from the models.dev base + 25 overlay-only
 > | Provider(s) | Reason deferred |
 > |---|---|
 > | `amazon-bedrock`, `google-vertex`, `azure-foundry`, `azure-openai-responses` | Multi-field credentials (AWS keys/region, GCP service account, Azure resource + key). The daemon's single-API-key credential model cannot represent them yet. |
-> | `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above), and the provider OAuth **sign-in and refresh** flow ships for the `chatgpt` (Codex) and token-sharing `openai` routes (the Codex backend is a non-standard Responses dialect: the system prompt rides the top-level `instructions` field, never a `system`-role input item, reasoning continuity comes from replaying captured reasoning items into `input` rather than a `previous_response_id` chain, and only `gpt-5.6`+ models are accepted for a ChatGPT account); these remaining providers are added through the catalog `oauth` profile and the client-identity table as data. |
+> | `copilot`/`copilot-acp`, `qwen-oauth`, `kimi-code` OAuth, `github-copilot` OAuth, `radius` | OAuth-only / dynamic-catalog auth — no static API-key path. The catalog carries an `oauth` profile mechanism and a per-slug client-identity table (see Provider auth above), and the provider OAuth **sign-in and refresh** flow ships for the `chatgpt` (Codex) and token-sharing `openai` routes; these remaining providers are added through the catalog `oauth` profile and the client-identity table as data. |
 > | `cursor` | t3code subprocess driver (spawns the Cursor CLI), not a direct HTTP provider. |
 >
 > Adding the multi-field-credential providers requires a credential generalization (a `Fields` credential variant); the OAuth providers are added through the catalog `oauth` profile and the client-identity table, not a code change.
@@ -1705,10 +1644,9 @@ RunInput received
   └► extract/validate session, check active requests
      └► if chat_completions + tools:
         └► tool-call loop (daemon-wide configurable cap, default 0 = unlimited):
-           0.5. build system content (skills + context with fingerprint cache + loaded skills + subdirectory hints)
-           1. send messages + tools → model
+           1. build the system content (skills + project context), send messages + tools → model
            2. receive response
-           3. if tool_call → execute Tool → persist loaded skill bodies → collect subdirectory hints → goto 0.5
+           3. if tool_call → execute Tool, refresh the system content → goto 1
            4. else → emit final text, Done
      └► if responses or chat_completions (no tools):
         └► stream chunks via SSE → emit OutputChunk per token → Done
