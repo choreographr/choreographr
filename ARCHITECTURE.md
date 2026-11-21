@@ -3588,7 +3588,7 @@ renderer sizes the notice against the area's remaining rows after reserving the
 closing `alt+h` hint, and degrades in three explicit steps: the whole notice, the
 headline alone, or nothing. Room is counted in **drawn rows**, not in line
 counts: every line is charged for the rows it wraps onto at the panel's width
-(the fixed checklist included), and the panel's own height is that same sum — a
+(the panel's own copy included), and the panel's own height is that same sum — a
 line count would size the panel too short for its own content on a narrow
 terminal. Both the budget and the height are measured with ratatui's own
 `Paragraph::line_count` (via `state::wrapped_lines_rows`), so the rows charged are

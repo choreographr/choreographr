@@ -1,18 +1,17 @@
-//! The welcome panel drawn in place of an empty chat history: a short setup
-//! checklist (add an account with its API key, use it in this session, pick a
-//! model) that ticks itself off as the daemon confirms each step, followed by
-//! a "ready" line once nothing is left. It is the first thing a new user sees,
-//! so it names the exact keys for each step rather than leaving them to find
-//! `/account` or the help modal on their own.
+//! The welcome panel drawn in place of an empty chat history: the first thing a
+//! user sees on a fresh session, so it names the one thing to do next and the
+//! exact key for it, in a single plain sentence per setup state. Once nothing is
+//! left to set up it says so and invites the first message.
 //!
-//! When the terminal or its host layer costs this client a feature it uses,
-//! the panel also carries the advice derived in `state/onboarding.rs`. That
-//! block sits between the checklist and the closing `alt+h` hint, and is
+//! When the terminal or its host layer costs this client a feature it uses, the
+//! panel also carries the advice derived in `state/terminal_notice.rs`. That
+//! block sits between the sentence and the closing `alt+h` hint, and is
 //! degraded explicitly when the area is too short for it — see
 //! [`append_notice`].
 
 use super::style::{dim_style, heading_style};
-use crate::state::{App, TerminalNotice};
+use crate::state::{App, TerminalNotice, alt_chord_label};
+use crate::terminal::profile::Platform;
 use choreo_client_core::SetupProgress;
 use ratatui::{
     Frame,
@@ -24,27 +23,20 @@ use ratatui::{
 
 /// Widest the panel grows; wider terminals centre it instead of stretching
 /// the lines across the screen.
-const MAX_WIDTH: u16 = 72;
+///
+/// The value is the width of the longest sentence the panel can print — the
+/// "no provider yet" line with the accounts chord spelled `Alt+A`, the widest
+/// of the platform spellings (`⌥A` on macOS) — so the copy and this constant
+/// move together. A sentence that no longer fits fails the width guard in the
+/// tests below by name, instead of word-wrapping into a ragged second row.
+const MAX_WIDTH: u16 = 75;
 
-/// Column the step labels are padded to so the key hints align: the longest
-/// label plus a two-space gap.
-const LABEL_WIDTH: usize = 45;
+/// The sentence that invites the first message once nothing is left to set up.
+const READY: &str = "You're all set. Type a message below and press Enter to start.";
 
-/// One checklist row: what to do and the keys that do it.
-struct Step {
-    label: &'static str,
-    keys: &'static str,
-    done: bool,
-}
-
-/// A step that is already done.
+/// A finished setup.
 fn done_style() -> Style {
     Style::default().fg(Color::Green)
-}
-
-/// The next step to do.
-fn next_style() -> Style {
-    Style::default().add_modifier(Modifier::BOLD)
 }
 
 /// Key chords, so every `alt+` hint reads as a key rather than prose.
@@ -60,43 +52,67 @@ fn notice_style() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// The checklist rows for `progress`. Step 1's hint depends on whether an
-/// account already exists without a key (set its key with `c`) or none
-/// exists at all (create one with `n`, which then asks for the key).
-fn steps(progress: SetupProgress, has_accounts: bool) -> [Step; 3] {
-    [
-        Step {
-            label: "Add an AI provider account and its API key or sign in",
-            keys: if has_accounts && !progress.has_keyed_account {
-                "alt+a, select it, c (key) or /login <account>"
-            } else {
-                "alt+a, then n"
-            },
-            done: progress.has_keyed_account,
-        },
-        Step {
-            label: "Use that account in this session",
-            keys: "alt+a, select it, Enter",
-            done: progress.session_has_account,
-        },
-        Step {
-            label: "Choose a model",
-            keys: "alt+m",
-            done: progress.session_has_model,
-        },
-    ]
+/// The panel's one sentence of guidance for `progress`: what is left to do, and
+/// the chord that does it, spelled for `platform`.
+///
+/// `has_accounts` is what separates "nothing is set up yet" (create an account,
+/// which then asks for its key) from "an account exists but holds no key"
+/// (select it and set the key). A missing key is named before a missing session
+/// account for a reason: an account must hold a key before a session can use
+/// it, so the key is the thing to fix first.
+///
+/// The attached session's model is no longer a reachable gap — an account is
+/// committed to a session together with its model and reasoning effort — so it
+/// produces no branch here. A keyed account whose session carries a model but
+/// no account is therefore unreachable too; it falls through to the ready
+/// sentence rather than naming a state the user cannot be in.
+fn guidance_line(progress: SetupProgress, has_accounts: bool, platform: Platform) -> Line<'static> {
+    if progress.is_complete() {
+        return Line::from(Span::styled(READY, done_style()));
+    }
+    if !progress.has_keyed_account {
+        let (before, after) = if has_accounts {
+            (
+                "An account still needs its API key. Press ",
+                ", select it, then c.",
+            )
+        } else {
+            (
+                "No AI provider is set up yet. Press ",
+                " to add one and paste its API key.",
+            )
+        };
+        return Line::from(vec![
+            Span::raw(before),
+            Span::styled(alt_chord_label(platform, "A"), key_style()),
+            Span::raw(after),
+        ]);
+    }
+    if !progress.session_has_account {
+        return Line::from(vec![
+            Span::raw("This session has no account. Press "),
+            Span::styled(alt_chord_label(platform, "A"), key_style()),
+            Span::raw(", then Enter on one to start it up."),
+        ]);
+    }
+    Line::from(Span::styled(READY, done_style()))
 }
 
 /// Build the panel's lines for a panel `width` columns wide and `max_height`
 /// rows tall. Split from the drawing so tests can check the content without a
 /// terminal.
 ///
+/// `platform` decides how the `Alt` modifier is spelled in the two chords the
+/// panel prints, and is injected rather than read from
+/// [`Platform::current`] so both spellings are testable.
+///
 /// `notice` is the launch-time terminal advice; it is appended after the
-/// checklist and before the closing hint, truncated by [`append_notice`] when
-/// the area cannot hold it.
+/// guidance sentence and before the closing hint, truncated by [`append_notice`]
+/// when the area cannot hold it.
 pub(super) fn welcome_lines(
     progress: SetupProgress,
     has_accounts: bool,
+    platform: Platform,
     notice: Option<&TerminalNotice>,
     width: u16,
     max_height: u16,
@@ -104,49 +120,8 @@ pub(super) fn welcome_lines(
     let mut lines = vec![
         Line::from(Span::styled("Welcome to Choreographr", heading_style())),
         Line::default(),
+        guidance_line(progress, has_accounts, platform),
     ];
-
-    if progress.is_complete() {
-        lines.push(Line::from(Span::styled(
-            "You're all set. Type a message below and press Enter to start.",
-            done_style(),
-        )));
-    } else {
-        lines.push(Line::from("Before your first message, finish these steps:"));
-        lines.push(Line::default());
-        // Only the first unfinished step is highlighted: the steps depend on
-        // each other in order, so that is the one to do now.
-        let mut next_marked = false;
-        for (index, step) in steps(progress, has_accounts).into_iter().enumerate() {
-            let number = index + 1;
-            let line = if step.done {
-                Line::from(vec![
-                    Span::styled(format!("  ✓ {number}. "), done_style()),
-                    Span::styled(step.label, dim_style()),
-                ])
-            } else {
-                let is_next = !next_marked;
-                next_marked = true;
-                let (marker, label_style) = if is_next {
-                    ("→", next_style())
-                } else {
-                    ("○", dim_style())
-                };
-                // Pad the label so every step's keys line up in one column.
-                Line::from(vec![
-                    Span::styled(format!("  {marker} {number}. "), label_style),
-                    Span::styled(format!("{:<LABEL_WIDTH$}", step.label), label_style),
-                    Span::styled(step.keys, key_style()),
-                ])
-            };
-            lines.push(line);
-        }
-        lines.push(Line::default());
-        lines.push(Line::from(Span::styled(
-            "Adding a key selects the account and opens the model list for you.",
-            dim_style(),
-        )));
-    }
 
     // The closing hint is reserved *before* the notice is sized: the panel is
     // drawn top-down and clamped to the area, so without reserving these rows
@@ -154,7 +129,7 @@ pub(super) fn welcome_lines(
     let hint = [
         Line::default(),
         Line::from(vec![
-            Span::styled("alt+h", key_style()),
+            Span::styled(alt_chord_label(platform, "H"), key_style()),
             Span::styled(" shows every shortcut · type ", dim_style()),
             Span::styled("/", key_style()),
             Span::styled(" to browse commands", dim_style()),
@@ -208,7 +183,7 @@ fn append_notice(
         .saturating_sub(reserved);
     let mut block = Vec::with_capacity(notice.lines.len() + 2);
     // The blank line is part of the block: it separates the notice from the
-    // checklist above it, so a headline-only degradation takes both.
+    // guidance sentence above it, so a headline-only degradation takes both.
     block.push(Line::default());
     block.push(Line::from(Span::styled(
         notice.headline.clone(),
@@ -242,6 +217,7 @@ pub(super) fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = welcome_lines(
         app.setup_progress(),
         !app.ai_providers.accounts.is_empty(),
+        Platform::current(),
         app.terminal_advice(),
         width,
         area.height,
@@ -269,6 +245,7 @@ pub(super) fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::markdown_render::display_width;
 
     /// A height no test panel runs out of, so the notice is never truncated.
     const TALL: u16 = 100;
@@ -277,17 +254,18 @@ mod tests {
     /// line count in the tests that reason in lines.
     const WIDE: u16 = 200;
 
+    /// The platform whose chord spelling is the widest (`Alt+A` rather than
+    /// `⌥A`), used by the tests that are about the copy rather than the
+    /// platform.
+    const LINUX: Platform = Platform::Linux;
+
+    /// One line's text, styles discarded.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     fn text(lines: &[Line<'_>]) -> String {
-        lines
-            .iter()
-            .map(|l| {
-                l.spans
-                    .iter()
-                    .map(|s| s.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
     }
 
     /// A two-line notice whose lines are distinctive enough to assert on.
@@ -298,75 +276,195 @@ mod tests {
         }
     }
 
-    /// Rows the checklist occupies before the notice and the closing hint.
+    /// Every state the panel can be in: a name for failure messages, the setup
+    /// progress, and whether any account exists at all.
+    fn states() -> [(&'static str, SetupProgress, bool); 5] {
+        let unkeyed = SetupProgress::default();
+        let sessionless = SetupProgress {
+            has_keyed_account: true,
+            session_has_account: false,
+            session_has_model: false,
+        };
+        [
+            (
+                "setup complete",
+                SetupProgress {
+                    has_keyed_account: true,
+                    session_has_account: true,
+                    session_has_model: true,
+                },
+                true,
+            ),
+            ("no provider at all", unkeyed, false),
+            ("an account with no key", unkeyed, true),
+            (
+                "a keyed account the session does not use",
+                sessionless,
+                true,
+            ),
+            // Unreachable (an account is committed with its model), but the
+            // panel still has to render something sensible for it.
+            (
+                "a keyed account whose session has a model but no account",
+                SetupProgress {
+                    has_keyed_account: true,
+                    session_has_account: false,
+                    session_has_model: true,
+                },
+                true,
+            ),
+        ]
+    }
+
+    /// Rows the panel's own copy occupies before the notice and the closing
+    /// hint.
     ///
-    /// The panel's fixed hint is two rows (a blank and the `alt+h` line), so
-    /// the no-notice line count minus those is the budget the notice competes
-    /// for.
+    /// The closing hint is a blank plus the chord line, so the no-notice row
+    /// count minus those is the budget the notice competes for.
     fn base_len() -> u16 {
         let rows = lines_rows(
-            &welcome_lines(SetupProgress::default(), false, None, WIDE, TALL),
+            &welcome_lines(SetupProgress::default(), false, LINUX, None, WIDE, TALL),
             usize::from(WIDE),
         );
         u16::try_from(rows.saturating_sub(2)).unwrap_or(u16::MAX)
     }
 
     #[test]
-    fn fresh_setup_points_at_adding_an_account() {
+    fn every_panel_line_fits_the_panel_width() {
+        // The panel draws its lines at `MAX_WIDTH` without wrapping them; a
+        // longer line would wrap raggedly and push its tail onto rows the
+        // layout did not budget. Widths are charged in display columns, so a
+        // wide glyph (macOS's `⌥`) costs what it draws.
+        //
+        // The notice is short here on purpose: the real advice lines are long
+        // prose that the panel wraps and budgets by drawn rows (see
+        // `append_notice`), so holding them to one line would be wrong. What
+        // this guard covers is the panel's own copy — the heading, the guidance
+        // sentence and the closing hint — under each state.
+        for platform in [Platform::MacOs, Platform::Linux] {
+            for (state, progress, has_accounts) in states() {
+                for notice in [None, Some(sample_notice())] {
+                    let lines = welcome_lines(
+                        progress,
+                        has_accounts,
+                        platform,
+                        notice.as_ref(),
+                        MAX_WIDTH,
+                        TALL,
+                    );
+                    let (widest, line) = lines
+                        .iter()
+                        .map(|line| {
+                            let text = line_text(line);
+                            (display_width(&text), text)
+                        })
+                        .max_by_key(|(width, _)| *width)
+                        .expect("the panel always draws at least its heading");
+                    assert!(
+                        widest <= usize::from(MAX_WIDTH),
+                        "{state} on {platform} draws a {widest}-column line, over the \
+                         {MAX_WIDTH}-column panel: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_fresh_setup_names_adding_a_provider_and_its_key() {
         let out = text(&welcome_lines(
             SetupProgress::default(),
             false,
+            LINUX,
             None,
             WIDE,
             TALL,
         ));
-        assert!(out.contains("→ 1. Add an AI provider account"));
-        assert!(out.contains("alt+a, then n"));
-        assert!(out.contains("○ 2."));
-        assert!(out.contains("○ 3."));
+        assert!(out.contains(
+            "No AI provider is set up yet. Press Alt+A to add one and paste its API key."
+        ));
     }
 
     #[test]
-    fn keyless_account_points_at_setting_its_key() {
+    fn a_keyless_account_names_setting_its_key() {
         let out = text(&welcome_lines(
             SetupProgress::default(),
             true,
+            LINUX,
             None,
             WIDE,
             TALL,
         ));
-        assert!(out.contains("alt+a, select it, c"));
+        assert!(
+            out.contains("An account still needs its API key. Press Alt+A, select it, then c.")
+        );
     }
 
     #[test]
-    fn finished_steps_are_ticked_and_the_next_one_is_marked() {
+    fn a_keyed_account_the_session_does_not_use_names_selecting_it() {
         let progress = SetupProgress {
             has_keyed_account: true,
-            session_has_account: true,
+            session_has_account: false,
             session_has_model: false,
         };
-        let out = text(&welcome_lines(progress, true, None, WIDE, TALL));
-        assert!(out.contains("✓ 1."));
-        assert!(out.contains("✓ 2."));
-        assert!(out.contains("→ 3. Choose a model"));
+        let out = text(&welcome_lines(progress, true, LINUX, None, WIDE, TALL));
+        assert!(out.contains(
+            "This session has no account. Press Alt+A, then Enter on one to start it up."
+        ));
     }
 
     #[test]
-    fn complete_setup_says_ready() {
+    fn complete_setup_says_ready_and_names_no_chord() {
         let progress = SetupProgress {
             has_keyed_account: true,
             session_has_account: true,
             session_has_model: true,
         };
-        let out = text(&welcome_lines(progress, true, None, WIDE, TALL));
-        assert!(out.contains("You're all set"));
-        assert!(!out.contains("1."));
+        let out = text(&welcome_lines(progress, true, LINUX, None, WIDE, TALL));
+        assert!(out.contains(READY));
+        assert!(!out.contains("Alt+A"));
+    }
+
+    #[test]
+    fn the_chords_are_spelled_for_the_platform() {
+        // Both chords in the panel — the accounts shortcut in the guidance
+        // sentence and the help shortcut in the closing hint — go through the
+        // shared spelling, so a Mac carries neither `Alt+` label.
+        let mac = text(&welcome_lines(
+            SetupProgress::default(),
+            false,
+            Platform::MacOs,
+            None,
+            WIDE,
+            TALL,
+        ));
+        assert!(mac.contains("Press ⌥A to add one"), "{mac}");
+        assert!(mac.contains("⌥H shows every shortcut"), "{mac}");
+        assert!(!mac.contains("Alt+"), "{mac}");
+
+        let linux = text(&welcome_lines(
+            SetupProgress::default(),
+            false,
+            Platform::Linux,
+            None,
+            WIDE,
+            TALL,
+        ));
+        assert!(linux.contains("Press Alt+A to add one"), "{linux}");
+        assert!(linux.contains("Alt+H shows every shortcut"), "{linux}");
     }
 
     #[test]
     fn a_tall_panel_shows_the_whole_notice_before_the_hint() {
         let notice = sample_notice();
-        let lines = welcome_lines(SetupProgress::default(), false, Some(&notice), WIDE, TALL);
+        let lines = welcome_lines(
+            SetupProgress::default(),
+            false,
+            LINUX,
+            Some(&notice),
+            WIDE,
+            TALL,
+        );
         let out = text(&lines);
         assert!(out.contains("NOTICE-HEADLINE"));
         assert!(out.contains("NOTICE-LINE-1"));
@@ -383,6 +481,7 @@ mod tests {
         let out = text(&welcome_lines(
             SetupProgress::default(),
             false,
+            LINUX,
             Some(&notice),
             WIDE,
             height,
@@ -394,7 +493,7 @@ mod tests {
 
     #[test]
     fn a_wrapping_notice_line_is_budgeted_as_the_rows_it_draws() {
-        // A narrow panel wraps both the fixed checklist and the advice, so the
+        // A narrow panel wraps both the panel's own copy and the advice, so the
         // budget has to be counted in drawn rows. Under a line count this
         // four-line block would look like it fits and then be clipped
         // mid-sentence by the paragraph widget.
@@ -404,7 +503,7 @@ mod tests {
             lines: vec!["x".repeat(2 * usize::from(width))],
         };
         let base = lines_rows(
-            &welcome_lines(SetupProgress::default(), false, None, width, TALL),
+            &welcome_lines(SetupProgress::default(), false, LINUX, None, width, TALL),
             usize::from(width),
         );
         // Two free rows: the separator and the headline, nothing else.
@@ -412,6 +511,7 @@ mod tests {
         let out = text(&welcome_lines(
             SetupProgress::default(),
             false,
+            LINUX,
             Some(&notice),
             width,
             height,
@@ -426,17 +526,19 @@ mod tests {
     #[test]
     fn a_panel_with_no_room_drops_the_notice_entirely() {
         let notice = sample_notice();
-        // Exactly the checklist and the hint, with no row left for a notice.
+        // Exactly the panel's own copy and the hint, with no row left for a
+        // notice.
         let height = base_len() + 2;
         let out = text(&welcome_lines(
             SetupProgress::default(),
             false,
+            LINUX,
             Some(&notice),
             WIDE,
             height,
         ));
         assert!(!out.contains("NOTICE"));
-        // The checklist the panel exists for is untouched.
+        // The guidance the panel exists for is untouched.
         assert!(out.contains("Welcome to Choreographr"));
     }
 }

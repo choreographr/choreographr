@@ -29,9 +29,9 @@ pub const FEATURED_PROVIDERS: &[&str] = &[
 ];
 
 /// How far the attached session is through first-run setup. Each flag is one
-/// step of the welcome checklist, in the order the user has to do them: an
-/// account must hold an API key before a session can use it, and the model
-/// list is fetched through the session's account.
+/// precondition the welcome panel judges, in the order the user has to satisfy
+/// them: an account must hold an API key before a session can use it, and the
+/// model list is fetched through the session's account.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SetupProgress {
     /// The account the session will use holds a stored credential (see

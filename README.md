@@ -558,8 +558,11 @@ emits to any terminal that honours them), which Rex authors and implements.
 
 ### First conversation
 
-Start `choreo-tui`. An empty session shows a **welcome checklist** that ticks
-itself off as you go, and names the keys for each step:
+Start `choreo-tui`. An empty session shows a **welcome panel** carrying a single
+line: the one thing left to set up and the exact key for it — no AI provider is
+set up yet, an account still needs its API key, or this session has no account —
+and once you are set up it invites your first message. Setting up takes three
+steps:
 
 1. **Add an account** — `Alt+A`, then `n`. Pick a provider (the most common
    ones are listed first; type to filter), keep the suggested account name or
@@ -579,7 +582,7 @@ itself off as you go, and names the keys for each step:
    cancels the whole choice and leaves the session untouched, so a session can
    never end up with an account but no model.
 
-`choreo-gui` opens the same checklist as a **setup popup** over an empty
+`choreo-gui` opens the same setup as a **popup checklist** over an empty
 session, with each step's controls built into it: pick a provider (or type its
 id), keep or change the suggested account name, paste the API key, and click
 **Save key**. Naming an existing account that has no key just adds the key.

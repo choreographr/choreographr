@@ -1,5 +1,5 @@
 //! First-run setup guidance: the App-side glue over the shared setup rules
-//! in `choreo_client_core::onboarding` — reading the checklist state off the
+//! in `choreo_client_core::onboarding` — reading the setup state off the
 //! attached session and pre-filling the new-account wizard's name — plus the
 //! terminal advice the welcome panel shows when the detected terminal or its
 //! host layer costs this client a feature it actually uses.

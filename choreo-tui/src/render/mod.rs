@@ -282,8 +282,8 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
     // Layout::horizontal([Min(1), Length(1)]) always yields exactly 2 chunks;
     // a zero-area fallback rect is harmless to render into.
     let history_area = history_chunks.first().copied().unwrap_or_default();
-    // An empty session shows the setup checklist instead of a blank pane, so
-    // a first-time user is told what to do before their first message.
+    // An empty session shows the welcome panel instead of a blank pane, so a
+    // first-time user is told what to do before their first message.
     if app.show_welcome() {
         render_welcome(frame, history_area, app);
     } else {
