@@ -1,13 +1,16 @@
-//! First-run setup rules shared by the front-ends: the three-step "what is
-//! left before I can chat" checklist ([`SetupProgress`]), the follow-through
-//! that walks a freshly keyed account into the attached session and on to
-//! model selection ([`SetupFollow`]), and the default account name a new
+//! First-run setup rules shared by the front-ends: the "what is left before I
+//! can chat" state ([`SetupProgress`]) and the default account name a new
 //! account is offered ([`suggest_account_name`]).
 //!
 //! Everything here is pure derivation over values the front-ends already
 //! hold (the account list and the attached session's account/model), so the
 //! TUI and GUI judge setup identically and the rules are testable without a
 //! daemon. Each front-end owns only its rendering and the sends.
+//!
+//! What happens *after* the state is judged is per front-end: the TUI stages
+//! the account, model and reasoning choice itself (`choreo-tui`'s
+//! `state::setup_flow`) and commits them in one write, so it needs no
+//! cross-stage bookkeeping here.
 
 use crate::is_valid_account_name;
 use choreo_proto::AccountInfo;
@@ -74,34 +77,6 @@ impl SetupProgress {
     #[must_use]
     pub fn is_complete(self) -> bool {
         self.has_keyed_account && self.session_has_account && self.session_has_model
-    }
-}
-
-/// The two-stage first-run follow-through after the user saves an API key
-/// while the attached session has no account. Each stage waits for the
-/// daemon's confirmation rather than firing optimistically: selecting an
-/// account whose key the daemon rejected would only produce a second error,
-/// and the model list is fetched through the session's account, so asking
-/// for models before the selection lands would list nothing.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum SetupFollow {
-    /// Waiting for `CredentialAdded` for this account; then select it for
-    /// the attached session.
-    AwaitCredential(String),
-    /// Waiting for `SessionAccountSet` for this account; then move on to
-    /// model selection.
-    AwaitAccountSet(String),
-}
-
-impl SetupFollow {
-    /// The follow-through to arm when `account`'s key is being saved: only
-    /// when a session is attached and has no account yet. A session that
-    /// already has an account keeps it — adding a second key must not
-    /// silently switch what an in-use session talks to.
-    #[must_use]
-    pub fn arm(account: &str, session_attached: bool, session_has_account: bool) -> Option<Self> {
-        (session_attached && !session_has_account)
-            .then(|| Self::AwaitCredential(account.to_string()))
     }
 }
 
@@ -239,17 +214,5 @@ mod tests {
             }
             .is_complete()
         );
-    }
-
-    #[test]
-    fn follow_is_armed_only_for_an_attached_session_without_an_account() {
-        // No attached session: nothing to select the account into.
-        assert_eq!(SetupFollow::arm("anthropic", false, false), None);
-        assert_eq!(
-            SetupFollow::arm("anthropic", true, false),
-            Some(SetupFollow::AwaitCredential("anthropic".to_string()))
-        );
-        // A session already using an account keeps it.
-        assert_eq!(SetupFollow::arm("anthropic", true, true), None);
     }
 }

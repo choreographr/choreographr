@@ -14,8 +14,8 @@
 //! (`AccountAdded`), so a rejected account never leaves a stored key behind
 //! under a name nothing uses.
 //!
-//! Saving a key while the session has no account arms the shared
-//! [`SetupFollow`] chain: the daemon's `CredentialAdded` selects the account
+//! Saving a key while the session has no account arms this popup's own
+//! [`Follow`] chain: the daemon's `CredentialAdded` selects the account
 //! for the session, and its `SessionAccountSet` fetches the model list, so a
 //! new user goes from pasting a key to picking a model without another click.
 //!
@@ -26,8 +26,7 @@
 use crate::client::DaemonHandle;
 use crate::state::AppState;
 use choreo_client_core::{
-    SetupFollow, SetupProgress, build_add_credential_message, is_valid_account_name,
-    suggest_account_name,
+    SetupProgress, build_add_credential_message, is_valid_account_name, suggest_account_name,
 };
 use choreo_proto::{
     AccountInfo, ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent,
@@ -46,6 +45,22 @@ pub(crate) const MODEL_LIST_CAP: usize = 40;
 /// keep its id for the rest of the run; the popup has at most a few requests
 /// in flight, so evicting the oldest past this bound never drops a live one.
 const QUIET_REQUEST_CAP: usize = 16;
+
+/// The two-stage follow-through armed when the user saves a key while the
+/// attached session has no account. Each stage waits for the daemon's
+/// confirmation rather than firing optimistically: selecting an account whose
+/// key the daemon rejected would only produce a second error, and the model
+/// list is fetched through the session's account, so asking for models before
+/// the selection lands would list nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Follow {
+    /// Waiting for `CredentialAdded` for this account; then select it for the
+    /// attached session.
+    AwaitCredential(String),
+    /// Waiting for `SessionAccountSet` for this account; then move on to model
+    /// selection.
+    AwaitAccountSet(String),
+}
 
 /// Where a checklist step stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,7 +113,7 @@ pub(crate) struct SetupState {
     /// judges one session's setup by another's account and model.
     pub(crate) seeded_session: Option<u64>,
     /// The armed first-run follow-through, if any (see the module docs).
-    pub(crate) follow: Option<SetupFollow>,
+    pub(crate) follow: Option<Follow>,
     /// A new account's key, held until the daemon confirms the account.
     pub(crate) pending_key: Option<PendingKey>,
     /// Ids of the popup's own `ListAccounts`/`ListModels`/`ListSessions`
@@ -356,11 +371,12 @@ fn send_key(state: &mut AppState, handle: &DaemonHandle, account: &str, key: Str
         Ok(message) => {
             info!(%account, "setup: storing API key");
             handle.send(message);
-            state.setup.follow = SetupFollow::arm(
-                account,
-                state.attached_session_id.is_some(),
-                state.setup.session_account.is_some(),
-            );
+            // Arm the chain only for a session that has no account yet: a
+            // session already using one keeps it, because adding a second key
+            // must not silently switch what an in-use session talks to.
+            state.setup.follow = (state.attached_session_id.is_some()
+                && state.setup.session_account.is_none())
+            .then(|| Follow::AwaitCredential(account.to_string()));
         }
         Err(e) => state.setup.form.error = Some(e.to_string()),
     }
@@ -454,12 +470,12 @@ pub(crate) fn track_setup_message(
                 request_accounts(state, handle);
                 // Follow-through, first stage: the new key is confirmed and
                 // the session has no account, so select it.
-                if state.setup.follow == Some(SetupFollow::AwaitCredential(service.clone())) {
+                if state.setup.follow == Some(Follow::AwaitCredential(service.clone())) {
                     info!(%service, "setup: key confirmed, selecting the account");
                     handle.send(ClientMessageType::SetSessionAccount {
                         name: service.clone(),
                     });
-                    state.setup.follow = Some(SetupFollow::AwaitAccountSet(service.clone()));
+                    state.setup.follow = Some(Follow::AwaitAccountSet(service.clone()));
                 }
             }
         }
@@ -578,8 +594,7 @@ fn track_attached_session_event(
             state.setup.models.clear();
             // Follow-through, second stage — and any account change on a
             // session without a model: fetch the list step 3 offers.
-            let followed =
-                state.setup.follow == Some(SetupFollow::AwaitAccountSet(account.clone()));
+            let followed = state.setup.follow == Some(Follow::AwaitAccountSet(account.clone()));
             if followed {
                 info!(%account, "setup: account selected, fetching models");
                 state.setup.follow = None;
@@ -775,7 +790,7 @@ mod tests {
         assert!(state.setup.pending_key.is_none());
         assert_eq!(
             state.setup.follow,
-            Some(SetupFollow::AwaitCredential("anthropic".to_string()))
+            Some(Follow::AwaitCredential("anthropic".to_string()))
         );
     }
 
@@ -883,7 +898,7 @@ mod tests {
     fn a_confirmed_key_selects_the_account_then_fetches_models_quietly() {
         let (handle, rx) = connected();
         let mut state = attached_state();
-        state.setup.follow = Some(SetupFollow::AwaitCredential("anthropic".to_string()));
+        state.setup.follow = Some(Follow::AwaitCredential("anthropic".to_string()));
 
         let added = DaemonMessage::broadcast(DaemonMessageType::CredentialAdded {
             service: "anthropic".to_string(),
@@ -935,7 +950,7 @@ mod tests {
     fn a_rejected_key_ends_the_follow_and_reports_inline() {
         let mut state = attached_state();
         state.setup.form.account_name = "anthropic".to_string();
-        state.setup.follow = Some(SetupFollow::AwaitCredential("anthropic".to_string()));
+        state.setup.follow = Some(Follow::AwaitCredential("anthropic".to_string()));
         let failed = DaemonMessage::broadcast(DaemonMessageType::CredentialAddFailed {
             service: "anthropic".to_string(),
             error: "locked".to_string(),
@@ -1021,7 +1036,7 @@ mod tests {
         state.setup.session_account = Some("work".to_string());
         state.setup.session_model = Some("m".to_string());
         state.setup.models = vec!["m".to_string()];
-        state.setup.follow = Some(SetupFollow::AwaitAccountSet("work".to_string()));
+        state.setup.follow = Some(Follow::AwaitAccountSet("work".to_string()));
 
         // `/attach 9`: the ack lands before the attachment is recorded.
         track_setup_message(
