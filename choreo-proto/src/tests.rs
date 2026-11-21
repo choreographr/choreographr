@@ -81,6 +81,51 @@ fn refresh_models_serde_round_trip() {
 }
 
 #[test]
+fn session_choice_requests_round_trip() {
+    // The first-run flow's one atomic write plus its two candidate-account
+    // queries. `ListModels` keeps its attached-session meaning when the
+    // account is absent, and names a candidate account when it is present.
+    let requests = [
+        ClientMessageType::ListModels { account: None },
+        ClientMessageType::ListModels {
+            account: Some("work".into()),
+        },
+        ClientMessageType::ModelReasoning {
+            account: "work".into(),
+            model: "gpt-5.6".into(),
+        },
+        ClientMessageType::SetSessionChoice {
+            account: "work".into(),
+            model: "gpt-5.6".into(),
+            effort: "medium".into(),
+        },
+    ];
+    for inner in requests {
+        let message = req(inner);
+        let frame = encode_frame(&message).expect("encode");
+        let decoded = decode_frame::<ClientMessage>(&frame[4..]).expect("decode");
+        assert_eq!(decoded, message);
+    }
+    assert_eq!(
+        ClientMessageType::SetSessionChoice {
+            account: "work".into(),
+            model: "gpt-5.6".into(),
+            effort: "medium".into(),
+        }
+        .kind(),
+        MessageKind::SetSessionChoice
+    );
+    assert_eq!(
+        ClientMessageType::ModelReasoning {
+            account: "work".into(),
+            model: "gpt-5.6".into(),
+        }
+        .kind(),
+        MessageKind::ModelReasoning
+    );
+}
+
+#[test]
 fn refresh_messages_serde_round_trip() {
     // DaemonMessage replies: every RefreshStatus variant + the failure arm.
     for status in [

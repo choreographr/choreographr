@@ -145,7 +145,7 @@ fn model_selector_filter_receives_shifted_chars() {
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector
-        .apply_models(vec!["GPT-4O".to_string()], None, false);
+        .apply_models(vec![choreo_proto::ModelInfo::plain("GPT-4O")], None, false);
 
     // While the popup is open, a shifted letter must go to the filter box
     // (uppercased, matching what a legacy terminal would have sent).

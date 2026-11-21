@@ -419,8 +419,9 @@ fn bridge_models() {
     write_message(
         &mut daemon_writer,
         &DaemonMessage::broadcast(DaemonMessageType::Models {
-            models: vec!["gpt-4".into()],
+            models: vec![choreo_proto::ModelInfo::plain("gpt-4")],
             selected_model: Some("gpt-4".into()),
+            suggested_model: Some("gpt-4".into()),
             provisional: false,
         }),
     )

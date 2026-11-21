@@ -9,11 +9,9 @@ fn render_model_selector_shows_title_filter_and_models() {
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_models(
-        vec![
-            "gpt-4o".to_string(),
-            "gpt-4o-mini".to_string(),
-            "claude-3".to_string(),
-        ],
+        ["gpt-4o", "gpt-4o-mini", "claude-3"]
+            .map(choreo_proto::ModelInfo::plain)
+            .to_vec(),
         Some("gpt-4o-mini".to_string()),
         false,
     );

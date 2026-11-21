@@ -273,7 +273,11 @@ pub(crate) fn request_accounts(state: &mut AppState, handle: &DaemonHandle) {
 
 /// Ask for the session account's model list on behalf of the popup.
 pub(crate) fn request_models(state: &mut AppState, handle: &DaemonHandle) {
-    send_quiet(state, handle, ClientMessageType::ListModels);
+    send_quiet(
+        state,
+        handle,
+        ClientMessageType::ListModels { account: None },
+    );
 }
 
 /// Submit the step-1 form: create the account if the name is new, store the
@@ -416,8 +420,9 @@ pub(crate) fn track_setup_message(
             let mut seen = HashSet::new();
             state.setup.models = models
                 .iter()
-                .filter(|m| seen.insert(m.as_str()))
-                .cloned()
+                .map(|m| m.id.as_str())
+                .filter(|id| seen.insert(*id))
+                .map(str::to_string)
                 .collect();
             if selected_model.is_some() {
                 state.setup.session_model.clone_from(selected_model);
@@ -907,14 +912,18 @@ mod tests {
         let models_request = rx.try_recv().expect("models requested");
         assert!(matches!(
             models_request.inner,
-            ClientMessageType::ListModels
+            ClientMessageType::ListModels { .. }
         ));
 
         // The reply to the popup's own request feeds the popup and is kept
         // out of the history.
         let mut reply = DaemonMessage::broadcast(DaemonMessageType::Models {
-            models: vec!["m1".to_string(), "m2".to_string()],
+            models: vec![
+                choreo_proto::ModelInfo::plain("m1"),
+                choreo_proto::ModelInfo::plain("m2"),
+            ],
             selected_model: None,
+            suggested_model: None,
             provisional: false,
         });
         reply.id = Some(models_request.id);
@@ -982,7 +991,7 @@ mod tests {
         assert!(
             sent(&rx)
                 .iter()
-                .any(|m| matches!(m, ClientMessageType::ListModels))
+                .any(|m| matches!(m, ClientMessageType::ListModels { .. }))
         );
     }
 
@@ -1072,8 +1081,11 @@ mod tests {
     fn a_repeated_model_id_is_listed_once() {
         let mut state = attached_state();
         let reply = DaemonMessage::broadcast(DaemonMessageType::Models {
-            models: ["b", "a", "b", "c", "a"].map(str::to_string).to_vec(),
+            models: ["b", "a", "b", "c", "a"]
+                .map(choreo_proto::ModelInfo::plain)
+                .to_vec(),
             selected_model: None,
+            suggested_model: None,
             provisional: true,
         });
         track_setup_message(&mut state, &reply, None);

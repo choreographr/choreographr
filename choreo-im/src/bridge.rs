@@ -523,7 +523,10 @@ fn daemon_to_bridge_events(
             models,
             selected_model: selected,
             ..
-        } => Some(BridgeEvent::Models { models, selected }),
+        } => Some(BridgeEvent::Models {
+            models: models.into_iter().map(|model| model.id).collect(),
+            selected,
+        }),
         DaemonMessageType::Session {
             event: SessionEvent::ModelSelected { model, .. },
             ..
@@ -1104,8 +1107,12 @@ mod tests {
 
         let events = daemon_to_bridge_events(
             DaemonMessage::broadcast(DaemonMessageType::Models {
-                models: vec!["gpt-4".into(), "claude".into()],
+                models: vec![
+                    choreo_proto::ModelInfo::plain("gpt-4"),
+                    choreo_proto::ModelInfo::plain("claude"),
+                ],
                 selected_model: Some("claude".into()),
+                suggested_model: Some("claude".into()),
                 provisional: false,
             }),
             &mut buffers,

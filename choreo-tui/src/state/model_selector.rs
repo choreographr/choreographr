@@ -19,6 +19,7 @@
 use super::InputBuffer;
 use super::display_line::DisplayLine;
 use super::pages::{PROVIDER_PAGE_LINES, filter_matches, picker_window, step_focus};
+use choreo_proto::ModelInfo;
 use crossterm::event::KeyEvent;
 
 /// State for the model-selector popup (Chat page, Alt+M).
@@ -40,8 +41,10 @@ pub(crate) struct ModelSelectorState {
     pub(crate) loading: bool,
     /// All models for the attached session's account, in the daemon's order
     /// (case-insensitively by id — the daemon sorts at the source so `Models`,
-    /// `ModelsUpdated` and `/model` all agree).
-    pub(crate) all_models: Vec<String>,
+    /// `ModelsUpdated` and `/model` all agree). Each row also carries the
+    /// model's reasoning levels, which the picker logic keeps alongside the id
+    /// so a later staged flow can offer the matching effort.
+    pub(crate) all_models: Vec<ModelInfo>,
     /// The currently active model (marked with `●`), if known.
     pub(crate) selected: Option<String>,
     /// Filter text; reuses `InputBuffer` so editing is grapheme-aware and
@@ -118,7 +121,7 @@ impl ModelSelectorState {
     /// [`Self::provisional`]).
     pub(crate) fn apply_models(
         &mut self,
-        models: Vec<String>,
+        models: Vec<ModelInfo>,
         selected: Option<String>,
         provisional: bool,
     ) {
@@ -127,7 +130,7 @@ impl ModelSelectorState {
         // Preselect the active model when it survives the current filter;
         // otherwise the highlight stays at the top of the list.
         if let Some(sel) = &self.selected
-            && let Some(idx) = self.filtered().iter().position(|m| m == sel)
+            && let Some(idx) = self.filtered().iter().position(|m| *m == sel)
         {
             self.focused = idx;
             self.scroll = idx;
@@ -145,7 +148,7 @@ impl ModelSelectorState {
     /// existing scroll hint (clamping it only to the new list length); a row
     /// that disappeared clamps, rather than jumping to the active model. A
     /// refreshed list is always verified, so the provisional flag clears.
-    pub(crate) fn refresh_models(&mut self, models: Vec<String>) {
+    pub(crate) fn refresh_models(&mut self, models: Vec<ModelInfo>) {
         let highlighted = self.highlighted();
         self.install_models(models, false);
         if let Some(idx) = highlighted
@@ -167,7 +170,7 @@ impl ModelSelectorState {
     /// fetch is running. That keeps the waiting row up (see [`Self::loading`])
     /// so the picker never claims the account has no models; the fetch's own
     /// `ModelsUpdated`/`ModelsUnavailable` push is what ends the wait.
-    fn install_models(&mut self, models: Vec<String>, provisional: bool) {
+    fn install_models(&mut self, models: Vec<ModelInfo>, provisional: bool) {
         self.provisional = provisional;
         self.loading = provisional && models.is_empty();
         self.all_models = models;
@@ -184,16 +187,18 @@ impl ModelSelectorState {
     }
 
     /// Models matching the current filter (case-insensitive substring).
-    /// Borrows from `all_models`; an empty query returns every model.
+    /// Borrows from `all_models`; an empty query returns every model id — the
+    /// picker lists and filters on the id, and the reasoning levels travel
+    /// alongside it in `all_models`.
     pub(crate) fn filtered(&self) -> Vec<&str> {
         let needle = self.filter.text.to_lowercase();
         if needle.is_empty() {
-            return self.all_models.iter().map(String::as_str).collect();
+            return self.all_models.iter().map(|m| m.id.as_str()).collect();
         }
         self.all_models
             .iter()
-            .filter(|m| filter_matches(m, &needle))
-            .map(String::as_str)
+            .filter(|m| filter_matches(&m.id, &needle))
+            .map(|m| m.id.as_str())
             .collect()
     }
 
@@ -209,7 +214,7 @@ impl ModelSelectorState {
         }
         self.all_models
             .iter()
-            .filter(|m| filter_matches(m, &needle))
+            .filter(|m| filter_matches(&m.id, &needle))
             .count()
     }
 

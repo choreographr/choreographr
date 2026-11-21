@@ -196,6 +196,26 @@ pub enum SessionCommand {
         /// is sent, so the session thread only ever sees the success path.
         reply: Option<ReplyTarget>,
     },
+    /// Commit an account, its model and that model's reasoning effort to this
+    /// session in ONE write.
+    ///
+    /// The atomicity is the point: the session never passes through a state
+    /// where the account is bound but its model is not, so nothing can observe
+    /// (or persist) an account paired with a model its provider does not serve.
+    /// Every part is validated before any of it is applied; on any rejection the
+    /// session is untouched and only the requester is told.
+    SetSessionChoice {
+        /// The account name to bind.
+        account: String,
+        /// The model id to select for that account.
+        model: String,
+        /// The reasoning-effort slug to set (`"off"` when the model has no
+        /// reasoning support).
+        effort: String,
+        /// The requester's reply target: `Accepted` on success,
+        /// `Failed { kind: SetSessionChoice }` on rejection.
+        reply: Option<ReplyTarget>,
+    },
     /// Drop the session's cached provider client so it is rebuilt lazily on
     /// the next request. Sent by the daemon command loop when the keystore
     /// locks, or a credential/account is removed or reconfigured — the

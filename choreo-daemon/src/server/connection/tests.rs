@@ -693,14 +693,18 @@ fn handle_list_models_sync_ok() {
     std::thread::spawn(move || {
         if let Ok(DaemonCommand::ListModels { reply, .. }) = daemon_rx.recv() {
             let _ = reply.send(Ok(crate::daemon::ListModelsResult {
-                models: vec!["gpt-4".into(), "gpt-3.5".into()],
+                models: vec![
+                    choreo_proto::ModelInfo::plain("gpt-4"),
+                    choreo_proto::ModelInfo::plain("gpt-3.5"),
+                ],
                 selected_model: Some("gpt-4".into()),
+                suggested_model: Some("gpt-4".into()),
                 provisional: false,
             }));
         }
     });
     let handle = ctx.reply_handle();
-    handle_list_models_sync(&mut ctx, handle, None);
+    handle_list_models_sync(&mut ctx, handle, None, None);
     let msg = writer_rx.recv().unwrap();
     assert!(matches!(msg.inner, DaemonMessageType::Models { .. }));
 }
@@ -996,7 +1000,7 @@ fn handle_list_models_sync_err() {
         }
     });
     let handle = ctx.reply_handle();
-    handle_list_models_sync(&mut ctx, handle, None);
+    handle_list_models_sync(&mut ctx, handle, None, None);
     let msg = writer_rx.recv().unwrap();
     assert!(matches!(msg.inner, DaemonMessageType::ModelsFailed { .. }));
     if let DaemonMessageType::ModelsFailed { error } = &msg.inner {

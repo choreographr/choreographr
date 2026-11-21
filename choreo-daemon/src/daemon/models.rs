@@ -36,8 +36,11 @@
 //! rejected only when a cached list exists and does not contain it, because a
 //! list we could not fetch is no evidence that the model is invalid.
 
-use super::{DaemonCommand, DaemonMessageType, DaemonState, ListModelsResult};
-use choreo_ai_protocols::lookup_provider;
+use super::{
+    DaemonCommand, DaemonMessageType, DaemonState, ListModelsResult, ModelReasoningResult,
+};
+use choreo_ai_protocols::{lookup_provider, model_reasoning_capability};
+use choreo_proto::{ModelInfo, ReasoningCapability};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,6 +51,89 @@ use tracing::{debug, warn};
 /// ([`DaemonState::should_prefetch_models`]) so both paths agree on what
 /// "fresh" means.
 pub(super) const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Case-insensitive lookup of `id` among model ids.
+///
+/// The single membership rule shared by the suggestion path and model
+/// validation. It has to be case-insensitive because the daemon orders ids
+/// case-insensitively (`sort_model_ids`) while keeping the provider's casing, so
+/// an exact `==` would call a differently-cased id "unsupported" and reject a
+/// model the list plainly contains. Returns the list's own spelling of the id
+/// so a caller that wants to hand the id back does not echo the caller's casing.
+pub(super) fn match_model_id<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    id: &str,
+) -> Option<&'a str> {
+    ids.into_iter()
+        .find(|candidate| candidate.eq_ignore_ascii_case(id))
+}
+
+/// The model a client should pre-highlight for a pending choice.
+///
+/// Preference order: the current selection when the list serves it (so
+/// re-opening the picker lands on the active row), else the provider catalog's
+/// default model when the list serves that (so a first pick lands somewhere
+/// the provider itself recommends), else the first id. `None` only for an empty
+/// list — a list with any row always has a sensible pre-selection.
+pub(super) fn suggest_model(
+    current: Option<&str>,
+    list: &[ModelInfo],
+    catalog_default: Option<&str>,
+) -> Option<String> {
+    let ids = || list.iter().map(|model| model.id.as_str());
+    if let Some(current) = current
+        && let Some(id) = match_model_id(ids(), current)
+    {
+        return Some(id.to_string());
+    }
+    if let Some(default) = catalog_default
+        && let Some(id) = match_model_id(ids(), default)
+    {
+        return Some(id.to_string());
+    }
+    list.first().map(|model| model.id.clone())
+}
+
+/// The reasoning effort a client should pre-select for a pending choice.
+///
+/// Preference order: the current effort when the model supports it (including
+/// an explicit `"off"` — a user who turned reasoning off stays off), else the
+/// middle supported level. `None` only when the model has no levels at all,
+/// where the only valid effort is `"off"`.
+pub(super) fn suggest_effort(current: Option<&str>, levels: &[String]) -> Option<String> {
+    if levels.is_empty() {
+        return None;
+    }
+    if let Some(current) = current
+        && levels.iter().any(|level| level == current)
+    {
+        return Some(current.to_string());
+    }
+    ReasoningCapability {
+        available_effort_levels: levels.to_vec(),
+    }
+    .middle()
+    .map(str::to_string)
+}
+
+/// Attach one id's reasoning levels: a pure catalog lookup keyed by the
+/// account's provider slug. `slug: None` (an account whose provider the daemon
+/// cannot resolve) yields an empty level set, which every consumer reads as
+/// "this model does not support reasoning".
+fn model_info(slug: Option<&str>, id: String) -> ModelInfo {
+    let reasoning_levels = slug.map_or_else(Vec::new, |slug| {
+        model_reasoning_capability(slug, &id).available_effort_levels
+    });
+    ModelInfo {
+        id,
+        reasoning_levels,
+    }
+}
+
+/// Attach reasoning levels to a whole id list, preserving its order.
+fn model_infos(slug: Option<&str>, ids: &[String]) -> Vec<ModelInfo> {
+    ids.iter().map(|id| model_info(slug, id.clone())).collect()
+}
 
 /// Put model ids in the one order every surface presents: case-insensitively by
 /// id. A provider's `/v1/models` returns whatever order it likes, and the local
@@ -240,6 +326,12 @@ impl DaemonState {
                 // only to the picker showing that account. It rides the ACTIVITY
                 // bus only: the model list is not session-list state, so a
                 // summary subscriber has nothing to do with it.
+                //
+                // The broadcast carries each id's reasoning levels, so a picker
+                // that was painted from a provisional seed never loses the
+                // levels it needs to offer an effort along with the model.
+                let slug = self.account_provider_slug(&account);
+                let models = model_infos(slug.as_deref(), &models);
                 self.handle_broadcast_activity(
                     None,
                     &choreo_proto::DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
@@ -281,22 +373,35 @@ impl DaemonState {
     pub(super) fn handle_validate_model(
         &mut self,
         session_id: u64,
+        account: Option<&str>,
         model: &str,
         reply: &mpsc::Sender<Result<(), String>>,
     ) {
-        debug!("ValidateModel: session_id={}, model={}", session_id, model);
+        debug!(
+            "ValidateModel: session_id={}, explicit_account={}",
+            session_id,
+            account.is_some()
+        );
 
-        let Some(account_name) = self
-            .session_metadata
-            .get(&session_id)
-            .and_then(|m| m.account_name.clone())
-        else {
-            debug!(
-                "ValidateModel: no session or no account attached, \
-                 allowing model '{model}' through"
-            );
-            let _ = reply.send(Ok(()));
-            return;
+        // An explicit account wins: the first-run flow validates a candidate
+        // account's model before the session is bound to it, so the session's
+        // own account would be the wrong list to check against.
+        let account_name = if let Some(name) = account.map(str::to_string) {
+            name
+        } else {
+            let Some(name) = self
+                .session_metadata
+                .get(&session_id)
+                .and_then(|m| m.account_name.clone())
+            else {
+                debug!(
+                    "ValidateModel: no session or no account attached, \
+                     allowing model '{model}' through"
+                );
+                let _ = reply.send(Ok(()));
+                return;
+            };
+            name
         };
 
         // No resolvable client for this account (locked, credential missing,
@@ -319,7 +424,11 @@ impl DaemonState {
         // allow through rather than reject a potentially valid model.
         match self.model_cache.get(&account_name) {
             Some((cached_models, _cached_at)) if !cached_models.is_empty() => {
-                if cached_models.iter().any(|m| m == model) {
+                // Case-insensitive membership: the cache keeps the provider's
+                // casing while the id a client sends may differ in case. This
+                // is the SAME rule the suggestion path uses, so a model the
+                // picker suggests can never be rejected here.
+                if match_model_id(cached_models.iter().map(String::as_str), model).is_some() {
                     let _ = reply.send(Ok(()));
                 } else {
                     let available = humfmt::list(cached_models);
@@ -338,9 +447,9 @@ impl DaemonState {
         }
     }
 
-    /// The `ListModels` handler: resolve the session's account, then answer
-    /// with the best model list available WITHOUT ever performing a fetch on
-    /// the command loop.
+    /// The `ListModels` handler: resolve the requested account (an explicit
+    /// candidate account, else the session's), then answer with the best model
+    /// list available WITHOUT ever performing a fetch on the command loop.
     ///
     /// A fresh, non-empty cache answers immediately; otherwise the fetch is
     /// handed to a detached background thread (dedup-guarded) and the reply is
@@ -353,21 +462,23 @@ impl DaemonState {
     pub(super) fn handle_list_models(
         &mut self,
         session_id: Option<u64>,
+        requested_account: Option<&str>,
     ) -> Result<ListModelsResult, String> {
-        let account_name = session_id
+        // The session's account scopes the defaults (and the active-row marker);
+        // an explicit candidate account overrides it before anything is bound.
+        let session_account = session_id
             .and_then(|sid| self.session_metadata.get(&sid))
-            .and_then(|m| m.account_name.clone())
+            .and_then(|m| m.account_name.clone());
+        let account_name = requested_account
+            .map(str::to_string)
+            .or_else(|| session_account.clone())
             .unwrap_or_default();
 
         debug!(
-            "ListModels: session_id={:?}, account_name='{}', accounts={:?}",
+            "ListModels: session_id={:?}, account_name='{}', explicit={}",
             session_id,
             account_name,
-            self.accounts
-                .all_configs()
-                .iter()
-                .map(|c| c.name.clone())
-                .collect::<Vec<_>>()
+            requested_account.is_some()
         );
 
         // Existence + credential check only — no provider instance is needed
@@ -451,14 +562,75 @@ impl DaemonState {
                 }
             };
 
+        // The active-row marker is the session's own model, which says nothing
+        // about a DIFFERENT account's list: only the account the session is
+        // bound to can carry the model the session currently uses.
         let selected_model = session_id
+            .filter(|_| session_account.as_deref() == Some(account_name.as_str()))
             .and_then(|sid| self.session_metadata.get(&sid))
             .and_then(|m| m.selected_model.clone());
+        let slug = self.account_provider_slug(&account_name);
+        let models = model_infos(slug.as_deref(), &models);
+        // The provider's own default is the second suggestion preference, so a
+        // first pick lands on a model the provider recommends rather than
+        // merely the alphabetically-first one.
+        let catalog_default = slug
+            .as_deref()
+            .and_then(lookup_provider)
+            .map(|entry| entry.default_model);
+        let suggested_model = suggest_model(
+            selected_model.as_deref(),
+            &models,
+            catalog_default.as_deref(),
+        );
         Ok(ListModelsResult {
             models,
             selected_model,
+            suggested_model,
             provisional,
         })
+    }
+
+    /// The `ModelReasoning` handler: describe a candidate model's reasoning
+    /// capability and the effort a client should pre-select for it.
+    ///
+    /// Pure and cheap — a catalog lookup plus a suggestion — because the
+    /// first-run flow asks about every model it lists, and anything heavier
+    /// (a provider instance, a network round-trip) would make the picker lag
+    /// behind the keyboard.
+    pub(super) fn handle_model_reasoning(
+        &self,
+        account: &str,
+        model: &str,
+        session_id: Option<u64>,
+    ) -> ModelReasoningResult {
+        // An unresolvable account has no provider to ask, so the model carries
+        // an empty level set — the same shape a reasoning-free model has.
+        let capability = self.account_provider_slug(account).map_or_else(
+            || ReasoningCapability {
+                available_effort_levels: Vec::new(),
+            },
+            |slug| model_reasoning_capability(&slug, model),
+        );
+        // The session's current effort seeds the suggestion only when a session
+        // is attached; a pre-commit question has no session preference yet.
+        let current_effort = session_id
+            .and_then(|sid| self.session_metadata.get(&sid))
+            .and_then(|m| m.reasoning_effort.clone());
+        let suggested_effort = suggest_effort(
+            current_effort.as_deref(),
+            &capability.available_effort_levels,
+        );
+        debug!(
+            account = %account,
+            levels = capability.available_effort_levels.len(),
+            has_suggestion = suggested_effort.is_some(),
+            "ModelReasoning"
+        );
+        ModelReasoningResult {
+            capability,
+            suggested_effort,
+        }
     }
 
     /// The catalog's curated model ids for `account`'s provider, used to paint

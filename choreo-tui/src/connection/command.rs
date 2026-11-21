@@ -92,7 +92,8 @@ pub(super) fn open_model_selector(
     tracing::debug!("[choreo-tui] opening model selector");
     app.text_selection = None;
     app.model_selector.open();
-    app.pending.send(client_tx, ClientMessageType::ListModels);
+    app.pending
+        .send(client_tx, ClientMessageType::ListModels { account: None });
     Ok(())
 }
 

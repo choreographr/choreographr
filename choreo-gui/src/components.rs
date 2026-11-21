@@ -26,7 +26,11 @@ pub(crate) fn Toolbar(state: Signal<AppState>, tx: Signal<Option<DaemonHandle>>)
         let t = tx;
         move |_| {
             let daemon_tx = t.read().clone();
-            send_client_message(&mut state.write(), daemon_tx, ClientMessageType::ListModels);
+            send_client_message(
+                &mut state.write(),
+                daemon_tx,
+                ClientMessageType::ListModels { account: None },
+            );
         }
     };
 

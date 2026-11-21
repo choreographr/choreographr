@@ -123,19 +123,35 @@ pub(in crate::sessions) fn validate_model_via_daemon(
     model: &str,
     ctx: &RequestContext,
 ) -> Result<(), String> {
+    validate_model_for_account(None, model, ctx)
+}
+
+/// Ask the daemon whether `model` is valid for `account`'s cached list, or for
+/// the attached session's account when `account` is `None`.
+///
+/// Same fail-open contract as [`validate_model_via_daemon`]: a list we could not
+/// fetch is no evidence the model is invalid, so an unreachable daemon and an
+/// absent cache both answer `Ok(())`.
+pub(in crate::sessions) fn validate_model_for_account(
+    account: Option<&str>,
+    model: &str,
+    ctx: &RequestContext,
+) -> Result<(), String> {
     let (reply, rx) = mpsc::channel();
     if ctx
         .daemon_tx
         .send(DaemonCommand::ValidateModel {
             session_id: ctx.session_id,
+            account: account.map(str::to_string),
             model: model.to_string(),
             reply,
         })
         .is_err()
     {
         warn!(
-            "session {}: daemon disconnected during model validation for '{model}'",
-            ctx.session_id
+            session_id = ctx.session_id,
+            model = %model,
+            "daemon disconnected during model validation; allowing through"
         );
         return Ok(());
     }
@@ -145,9 +161,9 @@ pub(in crate::sessions) fn validate_model_via_daemon(
         Ok(Err(msg)) => Err(msg),
         Err(_) => {
             warn!(
-                "session {}: daemon disconnected while waiting for model validation \
-                 of '{model}', allowing through",
-                ctx.session_id
+                session_id = ctx.session_id,
+                model = %model,
+                "daemon disconnected while waiting for model validation; allowing through"
             );
             Ok(())
         }
@@ -490,6 +506,175 @@ pub(in crate::sessions) fn handle_set_account(
     // The account's existence was verified on the connection thread before this
     // command was sent, so reaching here is success: ack the requester in
     // addition to the `SessionAccountSet` broadcast above.
+    if let Some(target) = reply {
+        target.accept();
+    }
+    false
+}
+
+/// Commit an account, its model and that model's reasoning effort to this
+/// session in ONE write.
+///
+/// Every part is validated first — the account exists, the model is in the
+/// account's cached list (fail-open when nothing is cached, the same rule
+/// `SetModel` uses), and the effort is one the model supports — and only then is
+/// any of it applied. A rejection therefore leaves the session exactly as it
+/// was and answers ONLY the requester: unlike `SetModel`/`SetReasoningEffort`
+/// there is no session-scoped failure broadcast, because a rejected candidate
+/// was never session state to begin with.
+///
+/// Re-choosing the account/model/effort the session already has is a harmless
+/// no-op that still succeeds (it re-applies identical values and re-broadcasts
+/// them), so a client can retry a commit without special-casing it.
+pub(in crate::sessions) fn handle_set_session_choice(
+    account: String,
+    model: String,
+    effort: String,
+    reply: Option<ReplyTarget>,
+    state: &mut SessionState,
+    ctx: &RequestContext,
+) -> bool {
+    info!(
+        session_id = ctx.session_id,
+        account = %account,
+        model = %model,
+        effort = %effort,
+        "session choice"
+    );
+
+    // Resolve the account exactly as `handle_set_account` does: the reply
+    // carries both the credential-bound provider ingredients and the provider
+    // slug the capability lookup needs. `None` means the account does not exist,
+    // which must fail the whole choice rather than bind a name the daemon cannot
+    // serve.
+    let (account_reply, rx) = crossbeam_channel::unbounded();
+    let _ = ctx.daemon_tx.send(DaemonCommand::ResolveAccountCmd {
+        account: account.clone(),
+        reply: account_reply,
+    });
+    let Some(resolved) = rx.recv().ok().flatten() else {
+        let msg = format!("account '{account}' not found");
+        warn!(session_id = ctx.session_id, error = %msg, "session choice rejected");
+        if let Some(target) = reply {
+            target.fail(msg);
+        }
+        return false;
+    };
+
+    // Validate the model against the NAMED account's list (not the session's
+    // current one), fail-open when nothing is cached.
+    if let Err(msg) = validate_model_for_account(Some(&account), &model, ctx) {
+        warn!(session_id = ctx.session_id, error = %msg, "session choice rejected");
+        if let Some(target) = reply {
+            target.fail(msg);
+        }
+        return false;
+    }
+
+    // Reject overly long slugs early (defense in depth), mirroring
+    // `handle_set_reasoning_effort`.
+    if effort.len() > 64 {
+        let msg = format!("reasoning effort slug too long ({} bytes)", effort.len());
+        warn!(session_id = ctx.session_id, error = %msg, "session choice rejected");
+        if let Some(target) = reply {
+            target.fail(msg);
+        }
+        return false;
+    }
+
+    // "off" is always valid — every model can disable reasoning. Otherwise the
+    // slug must be in the model's level set, so a model with NO levels accepts
+    // only "off".
+    let slug = resolved.config.provider.clone();
+    let capability = model_reasoning_capability(&slug, &model);
+    let effort_supported = effort == "off"
+        || capability
+            .available_effort_levels
+            .iter()
+            .any(|level| level == &effort);
+    if !effort_supported {
+        let msg = format!("model '{model}' does not support reasoning effort '{effort}'");
+        warn!(session_id = ctx.session_id, error = %msg, "session choice rejected");
+        if let Some(target) = reply {
+            target.fail(msg);
+        }
+        return false;
+    }
+
+    // Everything validated: apply the whole choice at once. The account switch
+    // drops the previous account's client so a request cannot be dialed against
+    // the old provider under the new account name (same rule as
+    // `handle_set_account`); a same-account re-choice keeps the warm client.
+    let crate::daemon::ResolvedAccount {
+        config,
+        auth,
+        warm_policy,
+    } = resolved;
+    if state.config.account_name.as_deref() != Some(account.as_str()) {
+        state.provider = None;
+    }
+    if let Some(provider) = auth.and_then(|auth| {
+        InferenceProvider::from_account_config(&config, auth, &state.registry).ok()
+    }) {
+        state.provider = Some(provider);
+    }
+    state.provider_slug = Some(slug);
+    state.warm_policy = warm_policy;
+
+    state.config.account_name = Some(account.clone());
+    state.config.selected_model = Some(model.clone());
+    state.config.reasoning_effort = Some(effort.clone());
+    // Static catalog facts keyed by the slug recorded above — no credential-
+    // bound client needed, so the context window is exact even before unlock.
+    let context_window = state.resolve_context_window_for_model(&model);
+    state.config.context_window = context_window;
+
+    // One persistence write for the whole choice: a crash cannot leave the
+    // account persisted without the model and effort chosen for it.
+    persist_session_metadata(state, ctx, "SetSessionChoice");
+
+    // The broadcasts mirror the three individual handlers' events, in the order
+    // a client applies them (account, model, effort, then the context window the
+    // model resolved) so a subscriber never sees the effort before the model it
+    // belongs to.
+    broadcast(
+        &mut state.subscribers,
+        ctx,
+        &DaemonMessageType::Session {
+            session_id: Some(ctx.session_id),
+            event: SessionEvent::SessionAccountSet { account },
+        },
+    );
+    broadcast(
+        &mut state.subscribers,
+        ctx,
+        &DaemonMessageType::Session {
+            session_id: Some(ctx.session_id),
+            event: SessionEvent::ModelSelected {
+                model,
+                reasoning_capability: Some(capability),
+            },
+        },
+    );
+    broadcast(
+        &mut state.subscribers,
+        ctx,
+        &DaemonMessageType::Session {
+            session_id: Some(ctx.session_id),
+            event: SessionEvent::ReasoningEffortSet { effort },
+        },
+    );
+    if let Some(context_window) = context_window {
+        broadcast(
+            &mut state.subscribers,
+            ctx,
+            &DaemonMessageType::Session {
+                session_id: Some(ctx.session_id),
+                event: SessionEvent::ContextWindowResolved { context_window },
+            },
+        );
+    }
+
     if let Some(target) = reply {
         target.accept();
     }

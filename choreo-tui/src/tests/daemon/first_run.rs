@@ -163,7 +163,7 @@ fn selected_account_opens_the_model_picker() {
     assert!(
         sent(&rx)
             .iter()
-            .any(|m| matches!(m, ClientMessageType::ListModels))
+            .any(|m| matches!(m, ClientMessageType::ListModels { .. }))
     );
     assert_eq!(app.setup_follow, None);
 }
@@ -191,6 +191,6 @@ fn model_picker_without_an_account_explains_what_is_missing() {
     assert!(
         !sent(&rx)
             .iter()
-            .any(|m| matches!(m, ClientMessageType::ListModels))
+            .any(|m| matches!(m, ClientMessageType::ListModels { .. }))
     );
 }

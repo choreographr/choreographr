@@ -23,10 +23,10 @@ pub use types::{
     ChatReasoningField, ClientMessage, ClientMessageType, ContextConfig, DaemonMessage,
     DaemonMessageType, DiscardedToolCall, DisplayedImageRecord, FinishOutcome, ImageKey,
     ImageMetadata, ImageReference, InferenceError, KeystoreState, McpAuthState, McpOAuthConfig,
-    McpServerStatus, MessageKind, OAuthClientIdentity, OAuthGrantEncoding, OAuthProviderDescriptor,
-    OutputStream, ReasoningArtifact, ReasoningCapability, ReasoningProducer, RefreshStatus,
-    SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolCallCaller,
-    ToolResultRecord, Turn,
+    McpServerStatus, MessageKind, ModelInfo, OAuthClientIdentity, OAuthGrantEncoding,
+    OAuthProviderDescriptor, OutputStream, ReasoningArtifact, ReasoningCapability,
+    ReasoningProducer, RefreshStatus, SessionEvent, SessionStatus, SessionSummary, TimestampMs,
+    TokenUsage, ToolCallCaller, ToolResultRecord, Turn,
 };
 
 #[cfg(test)]

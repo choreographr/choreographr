@@ -28,7 +28,8 @@ mod undo_redo;
 pub(in crate::sessions) use self::config::{
     handle_get_reasoning_effort, handle_get_state, handle_load_tools, handle_set_account,
     handle_set_mcp_overlay, handle_set_model, handle_set_provider_slug,
-    handle_set_reasoning_effort, handle_set_title, handle_set_working_dir, handle_unload_tools,
+    handle_set_reasoning_effort, handle_set_session_choice, handle_set_title,
+    handle_set_working_dir, handle_unload_tools,
 };
 pub(in crate::sessions) use self::inference::{
     handle_cancel, handle_request_finished, handle_run_child_input, handle_run_input,
@@ -86,6 +87,12 @@ pub(super) fn process_command(
         }
         SessionCommand::SetMcpOverlay(overlay) => handle_set_mcp_overlay(*overlay, state, ctx),
         SessionCommand::SetAccount { name, reply } => handle_set_account(name, reply, state, ctx),
+        SessionCommand::SetSessionChoice {
+            account,
+            model,
+            effort,
+            reply,
+        } => handle_set_session_choice(account, model, effort, reply, state, ctx),
         SessionCommand::DropProvider => {
             // The daemon decided the cached client is stale (keystore locked,
             // credential removed/changed, account reconfigured). Drop it so

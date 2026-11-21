@@ -108,7 +108,7 @@ fn palette_enter_runs_the_command_and_clears_the_line() {
     );
     assert_eq!(
         rx.recv().expect("ListModels").inner,
-        ClientMessageType::ListModels
+        ClientMessageType::ListModels { account: None }
     );
     assert!(
         !app.command_palette_active(),
@@ -145,7 +145,7 @@ fn palette_shift_enter_runs_the_command_without_a_newline() {
     );
     assert_eq!(
         rx.recv().expect("ListModels").inner,
-        ClientMessageType::ListModels
+        ClientMessageType::ListModels { account: None }
     );
     assert!(
         !app.command_palette_active(),
@@ -226,7 +226,7 @@ fn palette_enter_on_a_partial_token_runs_the_highlighted_command() {
     );
     assert_eq!(
         rx.recv().expect("ListModels").inner,
-        ClientMessageType::ListModels
+        ClientMessageType::ListModels { account: None }
     );
     assert!(
         !app.command_palette_active(),
@@ -257,7 +257,7 @@ fn palette_enter_runs_the_row_the_arrows_selected() {
     );
     assert_eq!(
         rx.recv().expect("ListModels").inner,
-        ClientMessageType::ListModels
+        ClientMessageType::ListModels { account: None }
     );
     assert!(!app.command_palette_active());
 }
@@ -390,7 +390,7 @@ fn literal_slash_command_line_runs() {
     assert!(app.model_selector.is_open(), "`/model` opens the selector");
     assert_eq!(
         rx.recv().expect("ListModels").inner,
-        ClientMessageType::ListModels
+        ClientMessageType::ListModels { account: None }
     );
     assert!(!app.command_palette_active());
 }
@@ -486,7 +486,7 @@ fn alt_m_opens_selector_and_requests_models() {
     assert!(app.model_selector.is_open());
     assert_eq!(
         rx.recv().expect("ListModels").inner,
-        ClientMessageType::ListModels
+        ClientMessageType::ListModels { account: None }
     );
     assert!(app.status().is_none(), "a bare keypress must not echo");
 }

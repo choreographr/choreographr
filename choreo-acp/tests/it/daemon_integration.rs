@@ -45,12 +45,16 @@ fn daemon_io_send_and_receive() {
 
             // Read the first message from choreo-acp.
             let msg: ClientMessage = read_message(&mut reader).unwrap();
-            assert!(matches!(msg.inner, ClientMessageType::ListModels));
+            assert!(matches!(msg.inner, ClientMessageType::ListModels { .. }));
 
             // Respond with Models to confirm the handshake.
             let response = DaemonMessage::broadcast(DaemonMessageType::Models {
-                models: vec!["claude-4".into(), "gpt-5".into()],
+                models: vec![
+                    choreo_proto::ModelInfo::plain("claude-4"),
+                    choreo_proto::ModelInfo::plain("gpt-5"),
+                ],
                 selected_model: Some("claude-4".into()),
+                suggested_model: Some("claude-4".into()),
                 provisional: false,
             });
             write_message(&mut writer, &response).unwrap();
@@ -111,7 +115,10 @@ fn daemon_io_send_and_receive() {
     // mock here just needs a well-formed frame.
     client
         .writer_tx
-        .send(ClientMessage::request(0, ClientMessageType::ListModels))
+        .send(ClientMessage::request(
+            0,
+            ClientMessageType::ListModels { account: None },
+        ))
         .unwrap();
 
     // Receive the Models response (deterministic: the fake daemon

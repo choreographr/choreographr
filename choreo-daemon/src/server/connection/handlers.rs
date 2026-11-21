@@ -262,11 +262,60 @@ pub(super) fn dispatch_client_message(msg: ClientMessage, ctx: &mut ClientCtx) -
             let handle = ctx.reply_handle();
             handle_acl_add_sync(ctx, handle, &pubkey);
         }
-        ClientMessageType::ListModels => {
-            debug!("client {}: ListModels", ctx.client_id);
+        ClientMessageType::ListModels { account } => {
+            debug!("client {}: ListModels account={:?}", ctx.client_id, account);
             let session_id = *ctx.attached_session_id;
             let handle = ctx.reply_handle();
-            handle_list_models_sync(ctx, handle, session_id);
+            handle_list_models_sync(ctx, handle, session_id, account);
+        }
+        ClientMessageType::ModelReasoning { account, model } => {
+            debug!(
+                "client {}: ModelReasoning account={}",
+                ctx.client_id, account
+            );
+            // The attached session only seeds the suggested effort; the
+            // account and model are the candidate's, so this works with no
+            // session bound at all.
+            let session_id = *ctx.attached_session_id;
+            let handle = ctx.reply_handle();
+            match request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ModelReasoning {
+                account,
+                model,
+                session_id,
+                reply,
+            }) {
+                Ok(result) => handle.send(DaemonMessageType::ModelReasoning {
+                    capability: result.capability,
+                    suggested_effort: result.suggested_effort,
+                }),
+                // Daemon gone: the reply is impossible, not forgotten.
+                Err(_) => handle.abandon(),
+            }
+        }
+        ClientMessageType::SetSessionChoice {
+            account,
+            model,
+            effort,
+        } => {
+            info!(
+                "client {}: SetSessionChoice account={} attached={}",
+                ctx.client_id,
+                account,
+                ctx.attached_session_tx.is_some()
+            );
+            // Routed exactly like `SetModel`: the attached-session check happens
+            // here, and the session thread validates and applies the choice.
+            let target = ctx.reply_target(kind);
+            if let Some(tx) = ctx.attached_session_tx.as_ref() {
+                let _ = tx.send(SessionCommand::SetSessionChoice {
+                    account,
+                    model,
+                    effort,
+                    reply: Some(target),
+                });
+            } else {
+                target.fail("no session attached");
+            }
         }
         ClientMessageType::GetImage {
             session_id,
@@ -705,15 +754,18 @@ pub(super) fn handle_list_models_sync(
     ctx: &mut ClientCtx<'_>,
     handle: ReplyHandle,
     attached_session_id: Option<u64>,
+    account: Option<String>,
 ) {
     let result = request_daemon(ctx.daemon_tx, |reply| DaemonCommand::ListModels {
         session_id: attached_session_id,
+        account,
         reply,
     });
     match result {
         Ok(Ok(list)) => handle.send(DaemonMessageType::Models {
             models: list.models,
             selected_model: list.selected_model,
+            suggested_model: list.suggested_model,
             provisional: list.provisional,
         }),
         Ok(Err(e)) => handle.send(DaemonMessageType::ModelsFailed { error: e }),

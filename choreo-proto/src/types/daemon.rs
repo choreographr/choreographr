@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::client::MessageKind;
-use super::common::{AccountInfo, OAuthProviderDescriptor};
+use super::common::{AccountInfo, ModelInfo, OAuthProviderDescriptor, ReasoningCapability};
 use super::session::{SessionEvent, SessionSummary};
 
 /// Which stream an [`SessionEvent::OutputChunk`](crate::SessionEvent::OutputChunk) belongs to: the model's visible
@@ -372,12 +372,21 @@ pub enum DaemonMessageType {
     },
     /// Liveness reply to a [`ClientMessageType::Ping`](crate::ClientMessageType::Ping).
     Pong,
-    /// The available model ids plus the currently selected one.
+    /// The available models plus the currently selected one.
     Models {
-        /// The available model ids, ordered case-insensitively by id.
-        models: Vec<String>,
-        /// The currently selected model id, if any.
+        /// The available models, ordered case-insensitively by id.
+        models: Vec<ModelInfo>,
+        /// The currently selected model id, if any. `None` when the request was
+        /// scoped to a candidate account the session is not bound to: the
+        /// session's own model says nothing about another account's list, so
+        /// no row is marked active.
         selected_model: Option<String>,
+        /// The model the client should pre-highlight when the choice is still
+        /// pending (nothing selected yet, or the selection is not in this
+        /// list): the current selection when the list has it, else the
+        /// provider catalog's default model when the list has that, else the
+        /// first id. `None` for an empty list.
+        suggested_model: Option<String>,
         /// `true` when the daemon could not supply a list it verified for this
         /// account: the ids are a stale cache entry or the local catalog's
         /// curated set for the account's provider, and a live fetch is still
@@ -391,6 +400,22 @@ pub enum DaemonMessageType {
         /// shows a waiting row rather than claiming the account has no models,
         /// and the wait ends on the `ModelsUpdated`/`ModelsUnavailable` push.
         provisional: bool,
+    },
+    /// Targeted reply to [`ClientMessageType::ModelReasoning`](crate::ClientMessageType::ModelReasoning):
+    /// the candidate model's reasoning capability and the effort a client
+    /// should pre-select for it.
+    ///
+    /// A dedicated reply (rather than a reusable event) because it answers a
+    /// question about a model that is NOT the session's yet: it carries the
+    /// answer to the requester and nothing a broadcast should fan out.
+    ModelReasoning {
+        /// The model's supported effort levels. Empty means the model does not
+        /// support reasoning.
+        capability: ReasoningCapability,
+        /// The effort the client should pre-select: the session's current
+        /// effort when the model supports it, else the middle level, else
+        /// `None` (the effort is then `"off"`).
+        suggested_effort: Option<String>,
     },
     /// The model list could not be produced at all: there are no accounts
     /// configured, or the account in question holds no credential. A list that
@@ -412,9 +437,10 @@ pub enum DaemonMessageType {
     ModelsUpdated {
         /// The account name the list belongs to.
         account: String,
-        /// The freshly fetched model ids, ordered case-insensitively by id.
-        /// A frontend that receives this supersedes any provisional list.
-        models: Vec<String>,
+        /// The freshly fetched models, ordered case-insensitively by id, each
+        /// carrying its reasoning levels. A frontend that receives this
+        /// supersedes any provisional list.
+        models: Vec<ModelInfo>,
     },
     /// Broadcast when a background model-list fetch for `account` FAILED: the
     /// counterpart of [`DaemonMessageType::ModelsUpdated`], so a picker waiting
@@ -728,6 +754,7 @@ impl DaemonMessageType {
             Self::Sessions { .. } => "Sessions",
             Self::Pong => "Pong",
             Self::Models { .. } => "Models",
+            Self::ModelReasoning { .. } => "ModelReasoning",
             Self::ModelsFailed { .. } => "ModelsFailed",
             Self::ModelsUpdated { .. } => "ModelsUpdated",
             Self::ModelsUnavailable { .. } => "ModelsUnavailable",

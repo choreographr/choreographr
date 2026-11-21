@@ -9,8 +9,26 @@
 //! `dead_base_url`, `put_client`, `test_sink`) come in via `super::*`; the
 //! moved items themselves are named explicitly below.
 
-use super::super::models::MODEL_CACHE_TTL;
+use super::super::models::{MODEL_CACHE_TTL, match_model_id, suggest_effort, suggest_model};
 use super::*;
+
+/// Build a wire model record for the suggestion tests.
+fn info(id: &str, levels: &[&str]) -> choreo_proto::ModelInfo {
+    choreo_proto::ModelInfo {
+        id: id.to_string(),
+        reasoning_levels: levels.iter().map(|l| (*l).to_string()).collect(),
+    }
+}
+
+/// The ids of a wire model list, in order, for composition assertions.
+fn ids(models: &[choreo_proto::ModelInfo]) -> Vec<&str> {
+    models.iter().map(|model| model.id.as_str()).collect()
+}
+
+/// The ids of a plain cached id list, in order.
+fn ids_of(models: &[String]) -> Vec<&str> {
+    models.iter().map(String::as_str).collect()
+}
 
 #[test]
 fn handle_validate_model_allows_through_when_no_session() {
@@ -18,6 +36,7 @@ fn handle_validate_model_allows_through_when_no_session() {
     let (reply, rx) = mpsc::channel();
     state.handle_command(DaemonCommand::ValidateModel {
         session_id: 999,
+        account: None,
         model: "gpt-4".into(),
         reply,
     });
@@ -52,6 +71,7 @@ fn handle_validate_model_rejects_when_no_provider() {
     let (reply, rx) = mpsc::channel();
     state.handle_command(DaemonCommand::ValidateModel {
         session_id: 1,
+        account: None,
         model: "gpt-4".into(),
         reply,
     });
@@ -97,6 +117,7 @@ fn handle_validate_model_rejects_unknown_model() {
     let (reply, rx) = mpsc::channel();
     state.handle_command(DaemonCommand::ValidateModel {
         session_id: 1,
+        account: None,
         model: "nonexistent-model".into(),
         reply,
     });
@@ -142,6 +163,7 @@ fn handle_validate_model_allows_known_model() {
     let (reply, rx) = mpsc::channel();
     state.handle_command(DaemonCommand::ValidateModel {
         session_id: 1,
+        account: None,
         model: "gpt-4".into(),
         reply,
     });
@@ -250,7 +272,7 @@ fn handle_model_prefetch_result_success_broadcasts_models_updated() {
     match &msg.inner {
         DaemonMessageType::ModelsUpdated { account, models } => {
             assert_eq!(account, "acct");
-            assert_eq!(models, &["m1".to_string(), "m2".to_string()]);
+            assert_eq!(ids(models), ["m1", "m2"]);
         }
         other => panic!("expected ModelsUpdated, got {other:?}"),
     }
@@ -275,17 +297,14 @@ fn handle_model_prefetch_result_sorts_ids_case_insensitively() {
 
     // Case-insensitive: "claude-3" < "GPT-4O" < "o3", and the cache holds the
     // same order the broadcast carries.
-    let expected = vec![
-        "claude-3".to_string(),
-        "GPT-4O".to_string(),
-        "o3".to_string(),
-    ];
+    let expected = vec!["claude-3", "GPT-4O", "o3"];
     match &writer_rx.recv().unwrap().inner {
-        DaemonMessageType::ModelsUpdated { models, .. } => assert_eq!(models, &expected),
+        DaemonMessageType::ModelsUpdated { models, .. } => assert_eq!(ids(models), expected),
         other => panic!("expected ModelsUpdated, got {other:?}"),
     }
+    // The cache keeps plain ids; the wire record carries the levels.
     let (cached, _) = state.model_cache.get("acct").expect("cache populated");
-    assert_eq!(cached, &expected);
+    assert_eq!(ids_of(cached), expected);
 }
 
 #[test]
@@ -349,7 +368,7 @@ fn handle_model_prefetch_result_stale_unchanged_list_broadcasts_to_clear_provisi
     match &writer_rx.recv().unwrap().inner {
         DaemonMessageType::ModelsUpdated { account, models } => {
             assert_eq!(account, "acct");
-            assert_eq!(models, &["m1".to_string(), "m2".to_string()]);
+            assert_eq!(ids(models), ["m1", "m2"]);
         }
         other => panic!("expected ModelsUpdated (stale→fresh confirms), got {other:?}"),
     }
@@ -585,9 +604,9 @@ fn list_models_serves_stale_cache_without_duplicate_fetch_while_prefetch_in_flig
     state.model_prefetch_in_flight.insert("acct".into());
 
     let list = state
-        .handle_list_models(Some(1))
+        .handle_list_models(Some(1), None)
         .expect("stale list served");
-    assert_eq!(list.models, vec!["old-model".to_string()]);
+    assert_eq!(ids(&list.models), ["old-model"]);
     assert!(
         list.provisional,
         "a stale cache entry is a stand-in for the live list"
@@ -607,7 +626,7 @@ fn list_models_with_cold_cache_serves_catalog_seed_and_warms_background() {
     let (mut state, rx) = state_with_session_account("acct");
 
     let list = state
-        .handle_list_models(Some(1))
+        .handle_list_models(Some(1), None)
         .expect("catalog seed served");
     assert!(
         list.provisional,
@@ -650,7 +669,7 @@ fn list_models_with_nothing_to_paint_and_a_fetch_running_answers_empty_provision
     state.model_prefetch_in_flight.insert("acct".into());
 
     let list = state
-        .handle_list_models(Some(1))
+        .handle_list_models(Some(1), None)
         .expect("an unpaintable list with a fetch running is not an error");
     assert!(
         list.models.is_empty(),
@@ -672,7 +691,7 @@ fn list_models_with_nothing_to_paint_and_no_fetch_answers_an_error() {
     let (mut state, _rx) = state_with_session_account_provider("acct", "not-in-catalog");
 
     let err = state
-        .handle_list_models(Some(1))
+        .handle_list_models(Some(1), None)
         .expect_err("nothing to paint and nothing running");
     assert!(err.contains("acct"), "the error names the account: {err}");
     assert!(
@@ -691,9 +710,9 @@ fn list_models_with_a_fresh_cache_is_not_provisional() {
         .insert("acct".into(), (vec!["fresh-model".into()], Instant::now()));
 
     let list = state
-        .handle_list_models(Some(1))
+        .handle_list_models(Some(1), None)
         .expect("fresh cache served");
-    assert_eq!(list.models, vec!["fresh-model".to_string()]);
+    assert_eq!(ids(&list.models), ["fresh-model"]);
     assert!(
         !list.provisional,
         "a fresh cache entry is the verified list"
@@ -713,7 +732,7 @@ fn list_models_treats_an_empty_fresh_cache_as_absent() {
         .insert("acct".into(), (Vec::new(), Instant::now()));
 
     let list = state
-        .handle_list_models(Some(1))
+        .handle_list_models(Some(1), None)
         .expect("catalog seed served");
     assert!(
         !list.models.is_empty(),
@@ -742,9 +761,9 @@ fn list_models_with_stale_cache_and_no_prefetch_serves_stale_and_warms_backgroun
     );
 
     let list = state
-        .handle_list_models(Some(1))
+        .handle_list_models(Some(1), None)
         .expect("stale list served");
-    assert_eq!(list.models, vec!["old-model".to_string()]);
+    assert_eq!(ids(&list.models), ["old-model"]);
     assert!(
         state.model_prefetch_in_flight.contains("acct"),
         "stale cache must trigger a background refresh"
@@ -774,4 +793,220 @@ fn prefetch_result_for_removed_account_is_discarded_not_cached() {
 
     assert!(!state.model_prefetch_in_flight.contains("acct"));
     assert!(!state.model_cache.contains_key("acct"), "result discarded");
+}
+
+// ── Suggestion policy (pure) ──────────────────────────────────────────
+
+#[test]
+fn match_model_id_is_case_insensitive_and_returns_the_list_spelling() {
+    // The daemon sorts ids case-insensitively while keeping the provider's
+    // casing, so a client that echoes a differently-cased id must still hit.
+    let ids = ["GPT-4O", "claude-3"];
+    assert_eq!(match_model_id(ids, "gpt-4o"), Some("GPT-4O"));
+    assert_eq!(match_model_id(ids, "Claude-3"), Some("claude-3"));
+    assert_eq!(match_model_id(ids, "o3"), None);
+    assert_eq!(match_model_id(Vec::<&str>::new(), "gpt-4o"), None);
+}
+
+#[test]
+fn suggest_model_prefers_current_then_catalog_default_then_first() {
+    let list = [info("alpha", &[]), info("Beta", &[]), info("gamma", &[])];
+    let cases: &[(Option<&str>, Option<&str>, Option<&str>)] = &[
+        // The current selection wins, reported in the LIST's casing.
+        (Some("beta"), Some("gamma"), Some("Beta")),
+        (Some("alpha"), None, Some("alpha")),
+        // Current not in the list → the catalog default, when the list serves it.
+        (Some("gone"), Some("gamma"), Some("gamma")),
+        (None, Some("gamma"), Some("gamma")),
+        // Neither is servable → the first id.
+        (Some("gone"), Some("gone"), Some("alpha")),
+        (None, None, Some("alpha")),
+    ];
+    for (current, default, expected) in cases {
+        assert_eq!(
+            suggest_model(*current, &list, *default).as_deref(),
+            *expected,
+            "suggest_model(current={current:?}, default={default:?})"
+        );
+    }
+    // An empty list has nothing to offer.
+    assert_eq!(suggest_model(Some("alpha"), &[], Some("alpha")), None);
+}
+
+#[test]
+fn suggest_effort_prefers_current_then_the_middle_level() {
+    let full = ["off", "low", "medium", "high"];
+    let full: Vec<String> = full.iter().map(|l| (*l).to_string()).collect();
+    let two: Vec<String> = ["off", "high"].iter().map(|l| (*l).to_string()).collect();
+    let none: Vec<String> = Vec::new();
+
+    // An explicit "off" is honoured — a user who turned reasoning off stays off.
+    assert_eq!(suggest_effort(Some("off"), &full).as_deref(), Some("off"));
+    assert_eq!(suggest_effort(Some("high"), &full).as_deref(), Some("high"));
+    // An unsupported current effort falls back to the middle level.
+    assert_eq!(
+        suggest_effort(Some("xhigh"), &full).as_deref(),
+        Some("medium")
+    );
+    assert_eq!(suggest_effort(None, &full).as_deref(), Some("medium"));
+    // The two-element ladder suggests its only non-off level, not "off".
+    assert_eq!(suggest_effort(None, &two).as_deref(), Some("high"));
+    // A model without reasoning has no suggestion at all; the effort is "off".
+    assert_eq!(suggest_effort(None, &none), None);
+    assert_eq!(suggest_effort(Some("off"), &none), None);
+}
+
+#[test]
+fn model_reasoning_reports_the_catalog_levels_and_a_suggestion() {
+    let (mut state, _rx) = make_daemon_state();
+    seed_credentialed_account(&mut state, "acct", "openai");
+
+    let result = state.handle_model_reasoning("acct", "gpt-5.4", None);
+    assert_eq!(
+        result.capability.available_effort_levels,
+        ["off", "low", "medium", "high", "xhigh"]
+    );
+    assert_eq!(
+        result.suggested_effort.as_deref(),
+        Some("medium"),
+        "no session attached, so the suggestion is the middle level"
+    );
+
+    // A reasoning-free model answers an empty capability and no suggestion.
+    let result = state.handle_model_reasoning("acct", "gpt-4.1", None);
+    assert_eq!(
+        result.capability.available_effort_levels,
+        Vec::<String>::new()
+    );
+    assert_eq!(result.suggested_effort, None);
+
+    // An unknown account has no provider to ask, so the capability is empty.
+    let result = state.handle_model_reasoning("nobody", "gpt-5.4", None);
+    assert_eq!(
+        result.capability.available_effort_levels,
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn model_reasoning_seeds_the_suggestion_from_the_attached_session() {
+    let (mut state, _rx) = make_daemon_state();
+    seed_credentialed_account(&mut state, "acct", "openai");
+    state.session_metadata.insert(
+        1,
+        SessionMetadata {
+            title: None,
+            selected_model: Some("gpt-5.4".into()),
+            reasoning_effort: Some("low".into()),
+            parent_session_id: None,
+            working_dir: None,
+            created_at: 1000,
+            last_modified: 1000,
+            turn_count: 0,
+            status: SessionStatus::Inactive,
+            active_tool_groups: vec![],
+            account_name: Some("acct".into()),
+            accumulated_usage: TokenUsage::default(),
+            context_window: None,
+            last_prompt_tokens: None,
+            pinned: false,
+            archived_at: None,
+        },
+    );
+
+    // The session's current effort is supported by the model, so it is kept.
+    let result = state.handle_model_reasoning("acct", "gpt-5.4", Some(1));
+    assert_eq!(result.suggested_effort.as_deref(), Some("low"));
+}
+
+// ── Account-scoped listing and suggestions ────────────────────────────
+
+#[test]
+fn list_models_for_a_candidate_account_reads_that_accounts_cache() {
+    // The first-run flow inspects an account the session is not bound to, so the
+    // reply must come from THAT account's cache — and it must not borrow the
+    // session's model as an active-row marker, which belongs to another list.
+    let (mut state, _rx) = state_with_session_account("acct");
+    seed_credentialed_account(&mut state, "candidate", "openai");
+    state.model_cache.insert(
+        "candidate".into(),
+        (vec!["cand-a".into(), "cand-b".into()], Instant::now()),
+    );
+    state.model_cache.insert(
+        "acct".into(),
+        (vec!["session-model".into()], Instant::now()),
+    );
+    if let Some(metadata) = state.session_metadata.get_mut(&1) {
+        metadata.selected_model = Some("session-model".into());
+    }
+
+    let list = state
+        .handle_list_models(Some(1), Some("candidate"))
+        .expect("the candidate's cached list is served");
+
+    assert_eq!(ids(&list.models), ["cand-a", "cand-b"]);
+    assert_eq!(
+        list.selected_model, None,
+        "the session's own model marks no row in another account's list"
+    );
+    assert!(
+        !list.provisional,
+        "a fresh cache entry is the verified list"
+    );
+}
+
+#[test]
+fn list_models_suggests_the_catalog_default_when_nothing_is_selected() {
+    // Nothing is selected, so the suggestion falls to the provider's catalog
+    // default — but only when the list actually serves it.
+    let (mut state, _rx) = state_with_session_account("acct");
+    state.model_cache.insert(
+        "acct".into(),
+        (vec!["gpt-4.1".into(), "gpt-5.4".into()], Instant::now()),
+    );
+
+    let list = state
+        .handle_list_models(Some(1), None)
+        .expect("the cached list is served");
+    assert_eq!(
+        list.suggested_model.as_deref(),
+        Some("gpt-5.4"),
+        "openai's catalog default is gpt-5.4, which the list serves"
+    );
+
+    // Serve only ids the catalog default does not match: the first id wins.
+    state.model_cache.insert(
+        "acct".into(),
+        (vec!["aaa-model".into(), "zzz-model".into()], Instant::now()),
+    );
+    let list = state
+        .handle_list_models(Some(1), None)
+        .expect("the cached list is served");
+    assert_eq!(list.suggested_model.as_deref(), Some("aaa-model"));
+}
+
+#[test]
+fn list_models_carries_each_models_reasoning_levels() {
+    let (mut state, _rx) = state_with_session_account("acct");
+    state.model_cache.insert(
+        "acct".into(),
+        (vec!["gpt-4.1".into(), "gpt-5.4".into()], Instant::now()),
+    );
+
+    let list = state
+        .handle_list_models(Some(1), None)
+        .expect("the cached list is served");
+
+    let levels = |id: &str| {
+        list.models
+            .iter()
+            .find(|model| model.id == id)
+            .map(|model| model.reasoning_levels.clone())
+            .expect("the id is in the list")
+    };
+    assert!(
+        levels("gpt-4.1").is_empty(),
+        "gpt-4.1 supports no reasoning"
+    );
+    assert_eq!(levels("gpt-5.4"), ["off", "low", "medium", "high", "xhigh"]);
 }

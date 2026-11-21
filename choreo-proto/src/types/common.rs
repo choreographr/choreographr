@@ -15,6 +15,25 @@ pub struct ReasoningCapability {
 }
 
 impl ReasoningCapability {
+    /// The middle supported level — the default the first-run flow suggests
+    /// for a model before the user picks one.
+    ///
+    /// The level list includes `"off"`, so a plain floor-division index lands
+    /// on the middle of the *whole* ladder: `["off", "low", "medium", "high"]`
+    /// → `"medium"` and `["off", "low", "medium", "high", "xhigh"]` →
+    /// `"medium"`. A three-level ladder rounds down (`["off", "low", "high"]`
+    /// → `"low"`), and the two-element ladder `["off", "high"]` deliberately
+    /// answers `"high"`: the index is `2 / 2 == 1`, and a suggestion that
+    /// degrades to `"off"` would be indistinguishable from having no
+    /// reasoning at all. `None` for an empty set (the model does not support
+    /// reasoning; callers then use `"off"`).
+    #[must_use]
+    pub fn middle(&self) -> Option<&str> {
+        self.available_effort_levels
+            .get(self.available_effort_levels.len() / 2)
+            .map(String::as_str)
+    }
+
     /// Cycle from `current` to the next slug, wrapping around.
     /// Logs a warning if `current` is not found — indicates a desync
     /// between the caller's state and this capability set.
@@ -33,6 +52,53 @@ impl ReasoningCapability {
         let next = (pos + 1) % self.available_effort_levels.len();
         // The modulo guarantees `next` is in bounds; .get keeps the lint total.
         self.available_effort_levels.get(next).cloned()
+    }
+}
+
+/// One model a provider offers, with the reasoning levels it supports.
+///
+/// The model lists the daemon hands a client carry each id's capability so a
+/// picker can present (and pre-select) reasoning effort without a second
+/// round-trip per row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// The model id, as the provider spells it.
+    pub id: String,
+    /// The effort-level slugs this model supports (e.g. `["off", "low",
+    /// "medium", "high"]`). Empty means the model does not support reasoning.
+    pub reasoning_levels: Vec<String>,
+}
+
+impl ModelInfo {
+    /// Build a `ModelInfo` with no reasoning support.
+    #[must_use]
+    pub fn plain(id: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            reasoning_levels: Vec::new(),
+        }
+    }
+
+    /// This model's reasoning capability, as the shared capability type.
+    #[must_use]
+    pub fn reasoning_capability(&self) -> ReasoningCapability {
+        ReasoningCapability {
+            available_effort_levels: self.reasoning_levels.clone(),
+        }
+    }
+}
+
+// A bare id is the zero-reasoning model, so a caller that only has an id
+// (a test fixture, a stub reply) can hand one where a `ModelInfo` is expected.
+impl From<&str> for ModelInfo {
+    fn from(id: &str) -> Self {
+        Self::plain(id)
+    }
+}
+
+impl From<String> for ModelInfo {
+    fn from(id: String) -> Self {
+        Self::plain(id)
     }
 }
 

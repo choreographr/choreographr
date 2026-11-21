@@ -88,22 +88,36 @@ mod subscriber_handlers;
 // `open` module.
 pub use open::OpenOptions;
 
-/// Result of a `ListModels` request: the account's model ids, the currently
-/// selected model id, and whether the list is a provisional stand-in rather
-/// than the account's verified live list (see [`DaemonMessageType::Models`]).
+/// Result of a `ListModels` request: the account's models (each with its
+/// reasoning levels), the currently selected model id, the model a client should
+/// pre-highlight, and whether the list is a provisional stand-in rather than the
+/// account's verified live list (see [`DaemonMessageType::Models`]).
 ///
-/// A named struct rather than a tuple so the three fields read at every call
+/// A named struct rather than a tuple so the four fields read at every call
 /// site (the command dispatch, the connection handler, and the tests) and a
 /// reordering cannot silently swap the id list for the flag.
 #[derive(Debug, Clone)]
 pub struct ListModelsResult {
-    /// The model ids, ordered case-insensitively by id.
-    pub models: Vec<String>,
+    /// The models, ordered case-insensitively by id.
+    pub models: Vec<choreo_proto::ModelInfo>,
     /// The currently selected model id, if any.
     pub selected_model: Option<String>,
+    /// The model to pre-highlight while the choice is still pending.
+    pub suggested_model: Option<String>,
     /// `true` when `models` is a stand-in (a stale cache entry or the catalog
     /// seed) the daemon could not verify for this account.
     pub provisional: bool,
+}
+
+/// Result of a `ModelReasoning` request: one model's supported effort levels
+/// plus the effort a client should pre-select for it.
+#[derive(Debug, Clone)]
+pub struct ModelReasoningResult {
+    /// The model's supported effort-level slugs (empty: no reasoning).
+    pub capability: choreo_proto::ReasoningCapability,
+    /// The effort to pre-select, or `None` when the model has no reasoning
+    /// levels at all (the effort is then `"off"`).
+    pub suggested_effort: Option<String>,
 }
 
 /// Reply type for the `ListModels` command.
@@ -634,15 +648,33 @@ pub enum DaemonCommand {
         /// Replies with the new trusted-client count, or an error string.
         reply: mpsc::Sender<Result<usize, String>>,
     },
-    /// List the models available to a session's account (or, with no session,
-    /// the default account context).
+    /// List the models available to a session's account, or to a named
+    /// candidate account the session is not bound to yet.
     ListModels {
         /// The session whose account scope applies; `None` uses the default
         /// account context.
         session_id: Option<u64>,
-        /// Replies with the model names and the selected model, or an error
-        /// string.
+        /// An explicit account to list models for, overriding the attached
+        /// session's account. Used by the first-run flow to inspect a candidate
+        /// account before committing it.
+        account: Option<String>,
+        /// Replies with the models, the selected and suggested model ids, and
+        /// the provisional flag, or an error string.
         reply: ListModelsReply,
+    },
+    /// Answer a candidate model's reasoning capability and the effort to
+    /// pre-select for it. Pure catalog lookup: no provider instance, no
+    /// network.
+    ModelReasoning {
+        /// The account whose provider the model belongs to.
+        account: String,
+        /// The model to describe.
+        model: String,
+        /// The session whose current effort seeds the suggestion, when one is
+        /// attached (otherwise the suggestion is the model's middle level).
+        session_id: Option<u64>,
+        /// Replies with the capability and suggested effort.
+        reply: mpsc::Sender<ModelReasoningResult>,
     },
     /// A client requested `/refresh-models`. The daemon does NOT do the HTTP
     /// fetch here — it hands the request to the maintenance thread over its
@@ -992,6 +1024,10 @@ pub enum DaemonCommand {
     ValidateModel {
         /// The session whose account scope applies.
         session_id: u64,
+        /// An explicit account whose cached list is checked, overriding the
+        /// session's account. Used to validate a candidate account's model
+        /// before the session is bound to it.
+        account: Option<String>,
         /// The model name to validate.
         model: String,
         /// Replies `Ok`, or a guidance error string.
@@ -1360,12 +1396,28 @@ impl DaemonState {
             DaemonCommand::OAuthClear { key } => self.handle_oauth_clear(&key),
             DaemonCommand::McpAuthRejected { key } => self.handle_mcp_auth_rejected(&key),
             DaemonCommand::AclAddCmd { pubkey, reply } => self.handle_acl_add(&pubkey, &reply),
-            DaemonCommand::ListModels { session_id, reply } => {
+            DaemonCommand::ListModels {
+                session_id,
+                account,
+                reply,
+            } => {
                 // The handler returns the result instead of taking the reply
                 // channel, so the send stays at the dispatch boundary where
                 // every other arm answers its caller.
-                debug!("ListModels: session_id={:?}", session_id);
-                let _ = reply.send(self.handle_list_models(session_id));
+                debug!(
+                    "ListModels: session_id={:?}, explicit_account={}",
+                    session_id,
+                    account.is_some()
+                );
+                let _ = reply.send(self.handle_list_models(session_id, account.as_deref()));
+            }
+            DaemonCommand::ModelReasoning {
+                account,
+                model,
+                session_id,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_model_reasoning(&account, &model, session_id));
             }
             DaemonCommand::RefreshModels { force, reply } => {
                 self.handle_refresh_models(force, &reply);
@@ -1516,9 +1568,10 @@ impl DaemonState {
             }
             DaemonCommand::ValidateModel {
                 session_id,
+                account,
                 model,
                 reply,
-            } => self.handle_validate_model(session_id, &model, &reply),
+            } => self.handle_validate_model(session_id, account.as_deref(), &model, &reply),
             DaemonCommand::CancelRequest {
                 session_id,
                 stream_id,

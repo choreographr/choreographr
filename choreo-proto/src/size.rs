@@ -153,6 +153,21 @@ fn named_field_overhead(fields: usize) -> usize {
     40 + fields * 24
 }
 
+/// Byte length of one [`ModelInfo`] record: the two named-mode field keys
+/// (`id`, `reasoning_levels`), the id string, and the level array's per-element
+/// string headers plus slugs. The fixed base over-covers a four-level set, so
+/// only the variable strings are added on top.
+fn model_info_size(model: &crate::ModelInfo) -> usize {
+    named_field_overhead(2)
+        + model.id.len()
+        + model.reasoning_levels.len()
+        + model
+            .reasoning_levels
+            .iter()
+            .map(String::len)
+            .sum::<usize>()
+}
+
 /// Byte length of a `SessionStatus` payload.
 ///
 /// Every arm must cover the msgpack named-mode encoding (`rmp_serde`), which
@@ -405,22 +420,40 @@ impl DaemonMessage {
                 DaemonMessageType::Models {
                     models,
                     selected_model,
+                    suggested_model,
                     ..
                 } => {
-                    // 3 named fields (models, selected_model, provisional): the
-                    // model ids and the selected id carry the payload, and the
+                    // 4 named fields (models, selected_model, suggested_model,
+                    // provisional): the model ids, their reasoning levels and
+                    // the two selected/suggested ids carry the payload, and the
                     // field allowance covers the `provisional` tag.
-                    named_field_overhead(3)
-                        + models.iter().map(String::len).sum::<usize>()
+                    named_field_overhead(4)
+                        + models.iter().map(model_info_size).sum::<usize>()
                         + option_str_len(selected_model.as_ref())
+                        + option_str_len(suggested_model.as_ref())
+                }
+                DaemonMessageType::ModelReasoning {
+                    capability,
+                    suggested_effort,
+                } => {
+                    // 2 named fields (capability, suggested_effort): the level
+                    // slugs plus their field names, and the suggested slug.
+                    named_field_overhead(2)
+                        + capability
+                            .available_effort_levels
+                            .iter()
+                            .map(|level| level.len() + 8)
+                            .sum::<usize>()
+                        + option_str_len(suggested_effort.as_ref())
                 }
                 DaemonMessageType::ModelsFailed { error } => named_field_overhead(1) + error.len(),
                 DaemonMessageType::ModelsUpdated { account, models } => {
                     // 2 named fields (account, models): the account string plus
-                    // the summed model ids cover the variable payload.
+                    // the summed models (`id` + its reasoning levels) cover the
+                    // variable payload.
                     named_field_overhead(2)
                         + account.len()
-                        + models.iter().map(String::len).sum::<usize>()
+                        + models.iter().map(model_info_size).sum::<usize>()
                 }
                 DaemonMessageType::ModelsUnavailable { account, error } => {
                     // 2 named fields (account, error): both variable-length.

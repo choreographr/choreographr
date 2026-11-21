@@ -389,7 +389,7 @@ mod tests {
         let mut pending = PendingReplies::new();
         let t0 = Instant::now();
         let a = pending.send_at(&tx, ClientMessageType::Ping, t0);
-        let b = pending.send_at(&tx, ClientMessageType::ListModels, t0);
+        let b = pending.send_at(&tx, ClientMessageType::ListModels { account: None }, t0);
         // Resolve the second request first — the table is keyed by id, not
         // order.
         assert_eq!(pending.resolve(b).expect("b").kind, MessageKind::ListModels);

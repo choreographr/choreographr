@@ -962,11 +962,12 @@ mod in_process_tests {
                     ClientMessageType::Ping => {
                         DaemonMessage::reply(msg.id, DaemonMessageType::Pong)
                     }
-                    ClientMessageType::ListModels => DaemonMessage::reply(
+                    ClientMessageType::ListModels { .. } => DaemonMessage::reply(
                         msg.id,
                         DaemonMessageType::Models {
-                            models: vec!["m1".to_string()],
+                            models: vec![choreo_proto::ModelInfo::plain("m1")],
                             selected_model: None,
+                            suggested_model: Some("m1".to_string()),
                             provisional: false,
                         },
                     ),
@@ -985,7 +986,7 @@ mod in_process_tests {
 
         let requests = [
             ClientMessage::request(0, ClientMessageType::Ping),
-            ClientMessage::request(1, ClientMessageType::ListModels),
+            ClientMessage::request(1, ClientMessageType::ListModels { account: None }),
             ClientMessage::request(2, ClientMessageType::Lock),
         ];
         for request in requests {
@@ -1012,8 +1013,9 @@ mod in_process_tests {
                 DaemonMessage::reply(
                     1,
                     DaemonMessageType::Models {
-                        models: vec!["m1".to_string()],
+                        models: vec![choreo_proto::ModelInfo::plain("m1")],
                         selected_model: None,
+                        suggested_model: Some("m1".to_string()),
                         provisional: false,
                     },
                 ),

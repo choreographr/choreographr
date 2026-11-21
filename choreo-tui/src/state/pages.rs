@@ -1051,11 +1051,9 @@ mod tests {
         // can never disagree about the list length.
         let mut sel = ModelSelectorState::new();
         sel.apply_models(
-            vec![
-                "gpt-4o".to_string(),
-                "gpt-4o-mini".to_string(),
-                "claude-3".to_string(),
-            ],
+            ["gpt-4o", "gpt-4o-mini", "claude-3"]
+                .map(choreo_proto::ModelInfo::plain)
+                .to_vec(),
             None,
             false,
         );

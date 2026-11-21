@@ -14,7 +14,9 @@ fn an_empty_provisional_reply_keeps_the_popup_waiting() {
     app.attached_account_slug = Some("anthropic".to_string());
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.model_selector.open();
-    let id = app.pending.send(&tx, ClientMessageType::ListModels);
+    let id = app
+        .pending
+        .send(&tx, ClientMessageType::ListModels { account: None });
 
     handle_daemon_message(
         DaemonMessage::reply(
@@ -22,6 +24,7 @@ fn an_empty_provisional_reply_keeps_the_popup_waiting() {
             DaemonMessageType::Models {
                 models: Vec::new(),
                 selected_model: None,
+                suggested_model: None,
                 provisional: true,
             },
         ),
@@ -55,7 +58,9 @@ fn a_models_updated_push_paints_the_list_and_ends_the_wait() {
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
             account: "anthropic".to_string(),
-            models: vec!["claude-3".to_string(), "claude-4".to_string()],
+            models: ["claude-3", "claude-4"]
+                .map(choreo_proto::ModelInfo::plain)
+                .to_vec(),
         }),
         &mut app,
         &tx,
@@ -67,7 +72,14 @@ fn a_models_updated_push_paints_the_list_and_ends_the_wait() {
         !app.model_selector.provisional,
         "the list is the verified one"
     );
-    assert_eq!(app.model_selector.all_models, vec!["claude-3", "claude-4"]);
+    assert_eq!(
+        app.model_selector
+            .all_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["claude-3", "claude-4"]
+    );
     assert_eq!(app.model_selector.error.get(), None);
     assert!(app.status().is_none(), "the push must not print to chat");
 }
@@ -155,7 +167,9 @@ fn a_models_failed_reply_is_shown_without_waiting() {
     let mut app = test_app();
     let (tx, _rx) = crossbeam_channel::unbounded();
     app.model_selector.open();
-    let id = app.pending.send(&tx, ClientMessageType::ListModels);
+    let id = app
+        .pending
+        .send(&tx, ClientMessageType::ListModels { account: None });
 
     handle_daemon_message(
         DaemonMessage::reply(

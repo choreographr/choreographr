@@ -614,6 +614,7 @@ pub(crate) fn handle_daemon_message(
         DaemonMessageType::Models {
             models,
             selected_model,
+            suggested_model: _,
             provisional,
         } => {
             // A `Models` reply that resolved a pending `ListModels` slot is the

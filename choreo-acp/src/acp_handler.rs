@@ -323,7 +323,7 @@ fn dispatch_new_session(
                 .map(String::from)
         });
 
-    daemon.send(ClientMessageType::ListModels)?;
+    daemon.send(ClientMessageType::ListModels { account: None })?;
     pending.set_models_pending(ModelsPending::CreateSession {
         jsonrpc_id: req.id,
         account_name,

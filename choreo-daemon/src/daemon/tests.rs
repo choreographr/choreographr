@@ -2896,8 +2896,9 @@ fn handle_broadcast_activity_sends_when_no_session_id() {
     drain_send_on_subscribe(&rx);
 
     let msg = DaemonMessageType::Models {
-        models: vec!["gpt-4".into()],
+        models: vec![choreo_proto::ModelInfo::plain("gpt-4")],
         selected_model: Some("gpt-4".into()),
+        suggested_model: Some("gpt-4".into()),
         provisional: false,
     };
     state.handle_command(DaemonCommand::BroadcastActivity {

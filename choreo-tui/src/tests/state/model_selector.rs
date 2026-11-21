@@ -10,7 +10,10 @@ fn selector_with_models(models: &[&str]) -> ModelSelectorState {
     let mut sel = ModelSelectorState::new();
     sel.open();
     sel.apply_models(
-        models.iter().map(|s| (*s).to_string()).collect(),
+        models
+            .iter()
+            .map(|s| choreo_proto::ModelInfo::plain(*s))
+            .collect(),
         None,
         false,
     );
@@ -92,7 +95,9 @@ fn model_selector_apply_models_keeps_the_daemon_order() {
     );
     assert_eq!(
         sel.all_models,
-        vec!["GPT-4O", "claude-3", "gpt-4o-mini", "o3-deep-research"]
+        ["GPT-4O", "claude-3", "gpt-4o-mini", "o3-deep-research"]
+            .map(choreo_proto::ModelInfo::plain)
+            .to_vec()
     );
 }
 
@@ -335,7 +340,7 @@ fn a_landed_list_clears_the_waiting_row() {
     sel.refresh_models(vec!["m".into()]);
     assert!(!sel.loading, "the list replaced the waiting row");
     assert!(!sel.provisional, "a fetched list is verified");
-    assert_eq!(sel.all_models, vec!["m".to_string()]);
+    assert_eq!(sel.all_models, vec![choreo_proto::ModelInfo::plain("m")]);
 }
 
 #[test]

@@ -3,6 +3,28 @@ use choreo_shared::ServiceCredential;
 use std::collections::BTreeMap;
 
 #[test]
+fn reasoning_capability_middle_is_the_middle_supported_level() {
+    // The level list includes "off", so the floor-division index lands on the
+    // middle of the WHOLE ladder; the two-element case deliberately answers
+    // the only non-off level rather than degrading to "off".
+    let levels = |names: &[&str]| ReasoningCapability {
+        available_effort_levels: names.iter().map(|n| (*n).to_string()).collect(),
+    };
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (&[], None),
+        (&["off"], Some("off")),
+        (&["off", "high"], Some("high")),
+        (&["off", "low", "high"], Some("low")),
+        (&["off", "low", "medium", "high"], Some("medium")),
+        (&["off", "low", "medium", "high", "xhigh"], Some("medium")),
+        (&["low", "medium", "high", "xhigh"], Some("high")),
+    ];
+    for (names, expected) in cases {
+        assert_eq!(levels(names).middle(), *expected, "middle() of {names:?}");
+    }
+}
+
+#[test]
 fn session_status_idle_and_active_partition_busy_states() {
     // `is_idle` is exactly `Inactive`; `is_active` covers the six
     // processing states.  `Sleeping` is neither — it is the exit marker of
@@ -733,16 +755,44 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
         (
             "Models",
             DaemonMessageType::Models {
-                models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
+                models: vec![
+                    ModelInfo::plain("gpt-4"),
+                    ModelInfo {
+                        id: "gpt-4o".into(),
+                        reasoning_levels: vec!["off".into(), "low".into(), "medium".into()],
+                    },
+                    ModelInfo::plain("gpt-5.6"),
+                ],
                 selected_model: Some("gpt-5.6".into()),
+                suggested_model: Some("gpt-5.6".into()),
                 provisional: false,
+            },
+        ),
+        (
+            "ModelReasoning",
+            DaemonMessageType::ModelReasoning {
+                capability: ReasoningCapability {
+                    available_effort_levels: vec![
+                        "off".into(),
+                        "low".into(),
+                        "medium".into(),
+                        "high".into(),
+                    ],
+                },
+                suggested_effort: Some("medium".into()),
             },
         ),
         (
             "ModelsUpdated",
             DaemonMessageType::ModelsUpdated {
                 account: "default".into(),
-                models: vec!["gpt-4".into(), "gpt-4o".into(), "gpt-5.6".into()],
+                models: vec![
+                    ModelInfo::plain("gpt-4"),
+                    ModelInfo {
+                        id: "gpt-5.6".into(),
+                        reasoning_levels: vec!["off".into(), "low".into(), "high".into()],
+                    },
+                ],
             },
         ),
         (

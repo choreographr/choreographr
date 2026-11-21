@@ -89,6 +89,21 @@ use zeroize::Zeroizing;
 /// wait — no client-side retry schedule is needed or wanted. When no fetch can
 /// even be started (the account has no buildable provider) the reply is a
 /// genuine error instead, so a waiting client is never waiting on nothing.
+/// Under the same policy, 9 gained the atomic account/model/effort choice:
+/// `ClientMessage::SetSessionChoice { account, model, effort }` commits an
+/// account, its model and the model's reasoning effort to the attached session
+/// in ONE write, so an account is never observable bound to a model its
+/// provider does not serve. The two small queries that let a client *suggest* a
+/// choice before committing it ride the same version: `ListModels` gained an
+/// `account: Option<String>` field (`Some(name)` asks about a candidate account
+/// the session is not bound to yet, `None` keeps the attached session's
+/// account), `DaemonMessage::Models` and `ModelsUpdated` now carry
+/// `Vec<ModelInfo>` (each id with its supported reasoning levels) plus, on
+/// `Models`, a `suggested_model` to pre-highlight while the choice is pending,
+/// and the new `ClientMessage::ModelReasoning { account, model }` ⇄
+/// `DaemonMessage::ModelReasoning { capability, suggested_effort }` pair
+/// answers a candidate model's levels and the effort to pre-select for it
+/// without a provider instance or a network round-trip.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

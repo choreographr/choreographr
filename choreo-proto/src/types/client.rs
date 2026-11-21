@@ -120,8 +120,20 @@ pub enum ClientMessageType {
         /// The service key whose stored credential is requested.
         service: String,
     },
-    /// Request the available model ids and the currently selected model.
-    ListModels,
+    /// Request the available models and the currently selected model.
+    ///
+    /// `account: None` asks about the attached session's account (the list the
+    /// session's own model picker shows). `account: Some(name)` asks about a
+    /// *candidate* account the client is about to commit to but has not bound
+    /// to the session yet — the account/model/effort choice a first-run flow
+    /// collects before [`ClientMessageType::SetSessionChoice`] commits it. The
+    /// daemon verifies the named account exists and holds a credential exactly
+    /// as it does for the attached one.
+    ListModels {
+        /// The account to list models for, or `None` for the attached
+        /// session's account.
+        account: Option<String>,
+    },
     /// Ask the daemon to refresh the models.dev catalog from upstream: a
     /// conditional GET against the cached etag, then a catalog swap when the
     /// remote changed. `force` bypasses the etag (`Cache-Control: no-cache`).
@@ -136,6 +148,37 @@ pub enum ClientMessageType {
     SetModel {
         /// The model id to select.
         model: String,
+    },
+    /// Ask for a candidate model's reasoning capability and the effort the
+    /// client should pre-select for it, before anything is committed.
+    ///
+    /// The account is explicit (rather than taken from the attached session)
+    /// because the first-run flow asks about an account it has not bound yet.
+    /// Pure catalog lookup: no provider instance, no network.
+    ModelReasoning {
+        /// The account whose provider the model belongs to.
+        account: String,
+        /// The model id to describe.
+        model: String,
+    },
+    /// Commit an account, model and reasoning effort to the attached session
+    /// in ONE atomic write.
+    ///
+    /// This is the invariant the first-run flow depends on: an account is only
+    /// ever bound together with the model and effort chosen for it, so no
+    /// client can observe (or persist) an account with a model the account's
+    /// provider does not serve. It replaces the earlier sequence of
+    /// [`ClientMessageType::SetSessionAccount`] → [`ClientMessageType::SetModel`]
+    /// → [`ClientMessageType::SetReasoningEffort`] writes, which the GUI and the
+    /// typed `/model` / `/reasoning` commands still use individually.
+    SetSessionChoice {
+        /// The account name to bind the session to.
+        account: String,
+        /// The model id to select for that account.
+        model: String,
+        /// The reasoning-effort slug to set (`"off"` when the model has no
+        /// reasoning support).
+        effort: String,
     },
     /// Unlock the daemon's keystore by presenting the bound unlock key.
     Unlock {
@@ -394,6 +437,10 @@ pub enum MessageKind {
     RefreshModels,
     /// Select a model for the attached session.
     SetModel,
+    /// Ask for a candidate model's reasoning capability and suggested effort.
+    ModelReasoning,
+    /// Commit an account, model and reasoning effort atomically.
+    SetSessionChoice,
     /// Unlock the keystore.
     Unlock,
     /// Lock the keystore.
@@ -473,9 +520,11 @@ impl From<&ClientMessageType> for MessageKind {
             ClientMessageType::Cancel { .. } => Self::Cancel,
             ClientMessageType::Ping => Self::Ping,
             ClientMessageType::GetCredential { .. } => Self::GetCredential,
-            ClientMessageType::ListModels => Self::ListModels,
+            ClientMessageType::ListModels { .. } => Self::ListModels,
             ClientMessageType::RefreshModels { .. } => Self::RefreshModels,
             ClientMessageType::SetModel { .. } => Self::SetModel,
+            ClientMessageType::ModelReasoning { .. } => Self::ModelReasoning,
+            ClientMessageType::SetSessionChoice { .. } => Self::SetSessionChoice,
             ClientMessageType::Unlock { .. } => Self::Unlock,
             ClientMessageType::Lock => Self::Lock,
             ClientMessageType::BindKeystore { .. } => Self::BindKeystore,

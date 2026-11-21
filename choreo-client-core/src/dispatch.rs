@@ -280,6 +280,7 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         DaemonMessageType::Models {
             models,
             selected_model,
+            suggested_model: _,
             provisional,
         } => {
             if models.is_empty() {
@@ -287,12 +288,12 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
             } else {
                 let mut lines = vec![format!("[daemon] supported models ({})", models.len())];
                 for model in models {
-                    let prefix = if selected_model.as_deref() == Some(model.as_str()) {
+                    let prefix = if selected_model.as_deref() == Some(model.id.as_str()) {
                         "*"
                     } else {
                         "-"
                     };
-                    lines.push(format!("{prefix} {model}"));
+                    lines.push(format!("{prefix} {}", model.id));
                 }
                 // A provisional list stands in for a fetch that has not landed
                 // (a stale cache entry or the catalog's curated set), so say so
@@ -508,6 +509,9 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         // - ModelsRefreshed/ModelsRefreshFailed/ModelsUpdated/ModelsUnavailable/
         //   CatalogUpdated: catalog-level replies/broadcasts surfaced by the
         //   connection layer, not by the generic text dispatch.
+        // - ModelReasoning: the answer to a client's own candidate-model query,
+        //   consumed by the front-end that asked (a picker that wants an effort
+        //   suggestion); there is nothing to put in a status line.
         // - Evicted: the best-effort advisory travels ahead of the
         //   disconnect and the connection layer shows it.
         // The `@` binding keeps the whole value available so the debug line can
@@ -517,6 +521,7 @@ fn dispatch_flat_message(msg: DaemonMessageType, handler: &mut impl TurnEventHan
         | DaemonMessageType::ModelsRefreshFailed { .. }
         | DaemonMessageType::ModelsUpdated { .. }
         | DaemonMessageType::ModelsUnavailable { .. }
+        | DaemonMessageType::ModelReasoning { .. }
         | DaemonMessageType::CatalogUpdated { .. }
         | DaemonMessageType::Evicted) => {
             debug!(

@@ -46,7 +46,7 @@ fn chat_alt_m_opens_selector_and_requests_models() {
     assert!(app.model_selector.is_open(), "alt+m opens the selector");
     assert!(app.model_selector.loading, "selector waits for the reply");
     let msg = rx.recv().expect("sent message");
-    assert_eq!(msg.inner, ClientMessageType::ListModels);
+    assert_eq!(msg.inner, ClientMessageType::ListModels { account: None });
 }
 
 #[test]
@@ -87,18 +87,19 @@ fn model_selector_populates_from_models_reply() {
     // The reply populates the popup only when it resolves this client's own
     // `ListModels` request (correlation by id), so register the pending slot
     // the selector's open would have sent, then answer it targeted.
-    let id = app.pending.send(&tx, ClientMessageType::ListModels);
+    let id = app
+        .pending
+        .send(&tx, ClientMessageType::ListModels { account: None });
 
     handle_daemon_message(
         DaemonMessage::reply(
             id,
             DaemonMessageType::Models {
-                models: vec![
-                    "claude-3".to_string(),
-                    "gpt-4o".to_string(),
-                    "gpt-4o-mini".to_string(),
-                ],
+                models: ["claude-3", "gpt-4o", "gpt-4o-mini"]
+                    .map(choreo_proto::ModelInfo::plain)
+                    .to_vec(),
                 selected_model: Some("gpt-4o-mini".to_string()),
+                suggested_model: Some("gpt-4o-mini".to_string()),
                 provisional: false,
             },
         ),
@@ -117,8 +118,12 @@ fn model_selector_populates_from_models_reply() {
     // The list is alphabetical, case-insensitively: claude-3, gpt-4o,
     // gpt-4o-mini.
     assert_eq!(
-        app.model_selector.all_models,
-        vec!["claude-3", "gpt-4o", "gpt-4o-mini"]
+        app.model_selector
+            .all_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["claude-3", "gpt-4o", "gpt-4o-mini"]
     );
     // The reply must not leak into the chat status line.
     assert!(app.status().is_none());
@@ -135,14 +140,16 @@ fn models_updated_broadcast_refreshes_the_open_picker_for_the_attached_account()
     app.model_selector.open();
     // A cold picker paints the daemon's provisional stand-in (the catalog seed).
     app.model_selector
-        .apply_models(vec!["seed-a".to_string()], None, true);
+        .apply_models(vec![choreo_proto::ModelInfo::plain("seed-a")], None, true);
     assert!(app.model_selector.provisional);
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
             account: "acct".to_string(),
             // The daemon already sorted this; the picker presents it verbatim.
-            models: vec!["a-model".to_string(), "z-model".to_string()],
+            models: ["a-model", "z-model"]
+                .map(choreo_proto::ModelInfo::plain)
+                .to_vec(),
         }),
         &mut app,
         &tx,
@@ -150,8 +157,12 @@ fn models_updated_broadcast_refreshes_the_open_picker_for_the_attached_account()
     .expect("handle ModelsUpdated");
 
     assert_eq!(
-        app.model_selector.all_models,
-        vec!["a-model", "z-model"],
+        app.model_selector
+            .all_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["a-model", "z-model"],
         "the broadcast replaced the seed with the live list"
     );
     assert!(
@@ -171,12 +182,12 @@ fn models_updated_broadcast_is_ignored_for_a_different_account() {
     app.attached_account_slug = Some("acct".to_string());
     app.model_selector.open();
     app.model_selector
-        .apply_models(vec!["seed-a".to_string()], None, false);
+        .apply_models(vec![choreo_proto::ModelInfo::plain("seed-a")], None, false);
 
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
             account: "someone-else".to_string(),
-            models: vec!["other".to_string()],
+            models: vec![choreo_proto::ModelInfo::plain("other")],
         }),
         &mut app,
         &tx,
@@ -184,8 +195,12 @@ fn models_updated_broadcast_is_ignored_for_a_different_account() {
     .expect("handle ModelsUpdated");
 
     assert_eq!(
-        app.model_selector.all_models,
-        vec!["seed-a"],
+        app.model_selector
+            .all_models
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["seed-a"],
         "a different account's refresh must not touch this picker"
     );
 }
@@ -199,7 +214,7 @@ fn models_updated_broadcast_is_ignored_when_the_picker_is_closed() {
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::ModelsUpdated {
             account: "acct".to_string(),
-            models: vec!["a-model".to_string()],
+            models: vec![choreo_proto::ModelInfo::plain("a-model")],
         }),
         &mut app,
         &tx,
@@ -218,7 +233,9 @@ fn model_selector_enter_sends_set_model_and_closes() {
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_models(
-        vec!["gpt-4o".to_string(), "claude-3".to_string()],
+        ["gpt-4o", "claude-3"]
+            .map(choreo_proto::ModelInfo::plain)
+            .to_vec(),
         Some("gpt-4o".to_string()),
         false,
     );
@@ -266,11 +283,9 @@ fn model_selector_filter_narrows_and_submits_highlighted() {
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_models(
-        vec![
-            "gpt-4o".to_string(),
-            "gpt-4o-mini".to_string(),
-            "claude-3".to_string(),
-        ],
+        ["gpt-4o", "gpt-4o-mini", "claude-3"]
+            .map(choreo_proto::ModelInfo::plain)
+            .to_vec(),
         Some("claude-3".to_string()),
         false,
     );
@@ -314,7 +329,7 @@ fn model_selector_down_moves_highlight() {
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.apply_models(
-        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        ["a", "b", "c"].map(choreo_proto::ModelInfo::plain).to_vec(),
         None,
         false,
     );
@@ -338,8 +353,9 @@ fn model_selector_models_reply_falls_through_when_closed() {
     // Selector closed: `/model` behavior — the reply prints into the status.
     handle_daemon_message(
         DaemonMessage::broadcast(DaemonMessageType::Models {
-            models: vec!["gpt-4o".to_string()],
+            models: vec![choreo_proto::ModelInfo::plain("gpt-4o")],
             selected_model: Some("gpt-4o".to_string()),
+            suggested_model: Some("gpt-4o".to_string()),
             provisional: false,
         }),
         &mut app,
@@ -360,7 +376,9 @@ fn model_selector_failed_reply_shows_error_when_open() {
     app.model_selector.open();
     // The failure lands in the popup only when it resolves this client's own
     // `ListModels` request.
-    let id = app.pending.send(&tx, ClientMessageType::ListModels);
+    let id = app
+        .pending
+        .send(&tx, ClientMessageType::ListModels { account: None });
 
     handle_daemon_message(
         DaemonMessage::reply(
@@ -384,8 +402,11 @@ fn model_selector_paste_goes_to_filter() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
-    app.model_selector
-        .apply_models(vec!["gpt-4o-mini".to_string()], None, false);
+    app.model_selector.apply_models(
+        vec![choreo_proto::ModelInfo::plain("gpt-4o-mini")],
+        None,
+        false,
+    );
 
     handle_terminal_event(Event::Paste("mini".to_string()), &mut app, &tx).expect("handle paste");
 
@@ -404,8 +425,13 @@ fn model_selector_page_keys_jump_highlight() {
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.model_selector.open();
-    app.model_selector
-        .apply_models((0..30).map(|i| format!("model-{i}")).collect(), None, false);
+    app.model_selector.apply_models(
+        (0..30)
+            .map(|i| choreo_proto::ModelInfo::plain(format!("model-{i}")))
+            .collect(),
+        None,
+        false,
+    );
 
     handle_terminal_event(
         Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
@@ -452,8 +478,13 @@ fn model_selector_wheel_down_scrolls_with_pin_behavior() {
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.viewport_height = 10;
-    app.model_selector
-        .apply_models((0..20).map(|i| format!("model-{i}")).collect(), None, false);
+    app.model_selector.apply_models(
+        (0..20)
+            .map(|i| choreo_proto::ModelInfo::plain(format!("model-{i}")))
+            .collect(),
+        None,
+        false,
+    );
 
     // 5 wheel-down notches walk the highlight to the middle row…
     for _ in 0..5 {
@@ -497,8 +528,13 @@ fn model_selector_wheel_up_mirrors_wheel_down() {
     let mut app = test_app();
     app.model_selector.open();
     app.model_selector.viewport_height = 10;
-    app.model_selector
-        .apply_models((0..20).map(|i| format!("model-{i}")).collect(), None, false);
+    app.model_selector.apply_models(
+        (0..20)
+            .map(|i| choreo_proto::ModelInfo::plain(format!("model-{i}")))
+            .collect(),
+        None,
+        false,
+    );
 
     // Park the highlight at the last model with the window at max_scroll.
     app.model_selector.focused = 19;
@@ -540,11 +576,9 @@ fn model_selector_click_row_selects_and_sends_set_model() {
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
     app.model_selector.apply_models(
-        vec![
-            "claude-3".to_string(),
-            "gpt-4o".to_string(),
-            "gpt-4o-mini".to_string(),
-        ],
+        ["claude-3", "gpt-4o", "gpt-4o-mini"]
+            .map(choreo_proto::ModelInfo::plain)
+            .to_vec(),
         None,
         false,
     );
@@ -619,7 +653,7 @@ fn model_selector_click_outside_popup_is_noop() {
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
     app.model_selector
-        .apply_models(vec!["gpt-4o".to_string()], None, false);
+        .apply_models(vec![choreo_proto::ModelInfo::plain("gpt-4o")], None, false);
 
     // (0, 0) is the dimmed area well outside the centered popup.
     send_mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 0, 0, &tx);
@@ -639,7 +673,7 @@ fn model_selector_click_footer_is_noop() {
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
     app.model_selector
-        .apply_models(vec!["gpt-4o".to_string()], None, false);
+        .apply_models(vec![choreo_proto::ModelInfo::plain("gpt-4o")], None, false);
 
     let layout = selector_list_layout(Rect {
         x: 0,
@@ -668,8 +702,13 @@ fn model_selector_click_after_page_jump_maps_to_drawn_row() {
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
     app.model_selector.viewport_height = 10;
-    app.model_selector
-        .apply_models((0..30).map(|i| format!("model-{i}")).collect(), None, false);
+    app.model_selector.apply_models(
+        (0..30)
+            .map(|i| choreo_proto::ModelInfo::plain(format!("model-{i}")))
+            .collect(),
+        None,
+        false,
+    );
     // PgDn jumps the highlight without touching `scroll`: `picker_window`
     // then pushes the drawn window down to keep the jumped focus visible, so
     // the stored `scroll` (still 0) no longer equals the rendered window
@@ -733,7 +772,9 @@ fn model_selector_click_while_loading_is_noop() {
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
     app.model_selector.apply_models(
-        vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+        ["gpt-4o", "gpt-4o-mini"]
+            .map(choreo_proto::ModelInfo::plain)
+            .to_vec(),
         None,
         false,
     );
@@ -773,7 +814,7 @@ fn model_selector_click_after_failed_refresh_is_noop() {
     app.model_selector.open();
     app.last_terminal_size = Some((100, 40));
     app.model_selector
-        .apply_models(vec!["gpt-4o".to_string()], None, false);
+        .apply_models(vec![choreo_proto::ModelInfo::plain("gpt-4o")], None, false);
     // A failed refresh leaves the stale list in place but replaces the body
     // with the error text — no rows are drawn, so a click must not select one.
     app.model_selector.apply_error("daemon unreachable");

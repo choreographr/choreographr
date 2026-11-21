@@ -884,5 +884,6 @@ mod broadcast;
 mod commands;
 mod reply_correlation;
 mod runtime_state;
+mod session_choice;
 mod token_usage;
 mod undo_redo;
