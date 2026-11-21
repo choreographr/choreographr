@@ -35,9 +35,11 @@ use ratatui::buffer::{Buffer, Cell};
 /// cell *styling* or cell *positions* (a background-colour span, a scrollbar
 /// column) reads [`drawn_buffer`] instead.
 ///
-/// Shared by nearly every submodule (they all assert on drawn symbols), so it
-/// lives here rather than in any one consumer.
-pub(super) fn drawn_cells(app: &mut crate::state::App, w: u16, h: u16) -> String {
+/// Shared by nearly every submodule (they all assert on drawn symbols) and by
+/// a white-box test module that draws a frame to check what a widget reaches
+/// the screen as (e.g. `crate::render::history`'s clipping tests), so it lives
+/// here rather than in any one consumer.
+pub(crate) fn drawn_cells(app: &mut crate::state::App, w: u16, h: u16) -> String {
     drawn_buffer(app, w, h)
         .content()
         .iter()
@@ -50,7 +52,7 @@ pub(super) fn drawn_cells(app: &mut crate::state::App, w: u16, h: u16) -> String
 /// inked column, a specific `(x, y)` symbol) rather than the flat symbol string
 /// [`drawn_cells`] hands back.  Both paths draw through the same backend and
 /// `render`, so a positional assertion and a `contains` assertion always agree.
-pub(super) fn drawn_buffer(app: &mut crate::state::App, w: u16, h: u16) -> Buffer {
+pub(crate) fn drawn_buffer(app: &mut crate::state::App, w: u16, h: u16) -> Buffer {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 

@@ -6,14 +6,22 @@
 //! `ModelsRefreshFailed`, `ModelsUpdated` and `ModelsUnavailable` all concern
 //! the model picker / the staged flow's model step, so they share one file.
 //! Several arms correlate on the resolved pending slot
-//! ([`super::is_list_models_reply`]) — the reply that answers this client's own
+//! (`is_list_models_reply`) — the reply that answers this client's own
 //! `ListModels` populates the selector popup and must not fall through to the
 //! generic dispatch.
 use super::super::setup_flow;
 use super::Consumed;
 use crate::state::App;
 use choreo_client_core::Pending;
-use choreo_proto::{ClientMessage, ModelInfo, ReasoningCapability, RefreshStatus};
+use choreo_proto::{ClientMessage, MessageKind, ModelInfo, ReasoningCapability, RefreshStatus};
+
+/// Whether a resolved pending slot names a `ListModels` request — i.e. the
+/// reply answers THIS client's model-list request (the only requester of
+/// `ListModels`), so it belongs in the model-selector popup rather than the
+/// chat history.
+fn is_list_models_reply(resolved: Option<&Pending>) -> bool {
+    resolved.is_some_and(|pending| pending.kind == MessageKind::ListModels)
+}
 
 /// A `Models` reply: populate the selector popup (or the staged flow's staged
 /// picker) when it answers our own `ListModels`, else fall through so `/model`
@@ -33,7 +41,7 @@ pub(super) fn on_models(
     // would print the whole list into the chat history). Correlating on
     // the request id replaces the old "is the selector open?" guess:
     // the requester is known structurally.
-    if super::is_list_models_reply(resolved) {
+    if is_list_models_reply(resolved) {
         // While the staged flow awaits its list, the reply is the
         // flow's: the account it names is a candidate the session is
         // not bound to, so the popup is opened from the flow's staged
@@ -107,7 +115,7 @@ pub(super) fn on_models_failed(
     resolved: Option<&Pending>,
     error: &str,
 ) -> Consumed {
-    if super::is_list_models_reply(resolved) {
+    if is_list_models_reply(resolved) {
         // The flow's own request was refused: end it and surface the
         // refusal where the user is looking. The session is untouched —
         // nothing has been written yet.

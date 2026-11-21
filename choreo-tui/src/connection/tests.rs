@@ -1,0 +1,925 @@
+//! Unit tests for the connection glue in `connection/mod.rs` and the event
+//! plumbing it dispatches into: the scrollbar-marker click maths and the
+//! scrollbar-column click gating, select-to-copy mouse gestures, the
+//! connection-level termination wording (reader closed, protocol-version
+//! mismatch, transient status), and the OSC 22 pointer-shape sampling.
+//!
+//! Every subject here reaches the code under test through `super::…` paths that
+//! are `pub(super)` or crate-visible, so nothing it asserts on is private to a
+//! sibling module — a test that needs such an item stays in that module's own
+//! inline block instead. Fixtures shared with the rest of the suite
+//! (`test_app`, `insert_turn`) come from `crate::tests::support`, never a local
+//! copy.
+
+use super::*;
+use crate::state::{Marker, UiEvent};
+use crate::tests::support::{insert_turn, test_app};
+use choreo_proto::Turn;
+// Only `Event` is not pulled in through `super::*`; the mouse types the
+// page handlers import (`MouseEvent`, `MouseButton`, `MouseEventKind`,
+// `KeyModifiers`) and `handle_terminal_event` come through `super::*`.
+use crossterm::event::Event;
+
+// ── Marker click logic ──
+//
+// The scrollbar click handler in `chat::handle_chat_event` maps a mouse row to
+// virtual half-slots and looks up matching markers in app.markers.  These tests
+// verify that the data flow — from rebuild_height_prefix through marker
+// creation and the lookup pattern — produces correct scroll positions.
+
+/// Simulate the scrollbar click handler's marker lookup: compute
+/// half-slots for the given `mouse_row` and scan `app.markers` for
+/// a match.  Returns the matched marker if found.
+fn find_marker_by_row(app: &App, mouse_row: u16) -> Option<&Marker> {
+    let top_slot = 2 * mouse_row as usize;
+    let bot_slot = top_slot + 1;
+    app.active_display_ref().and_then(|d| {
+        d.markers
+            .iter()
+            .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot)
+    })
+}
+
+#[test]
+fn marker_lookup_finds_marker_at_mouse_row() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+
+    // Two user-text turns → two markers.
+    insert_turn(&mut app, 0, "user a", "assistant a");
+    insert_turn(&mut app, 1, "user b", "assistant b");
+    app.rebuild_height_prefix();
+
+    assert_eq!(
+        app.active_display_ref().unwrap().markers.len(),
+        2,
+        "should have 2 markers"
+    );
+
+    // Each marker's virtual_slot must be findable by the click handler's
+    // row-to-slot mapping (slot = 2*row or slot = 2*row+1).
+    let markers: Vec<Marker> = app.active_display_ref().unwrap().markers.clone();
+    for marker in &markers {
+        let row = marker.virtual_slot / 2;
+        // `virtual_slot` is a u16 track coordinate, so halving it always
+        // fits back into u16.
+        #[expect(clippy::cast_possible_truncation)]
+        let found = find_marker_by_row(&app, row as u16);
+        assert!(
+            found.is_some(),
+            "marker at virtual_slot {} should be findable at row {}",
+            marker.virtual_slot,
+            row,
+        );
+        if let Some(f) = found {
+            assert_eq!(
+                f.content_line, marker.content_line,
+                "found marker should match content_line"
+            );
+        }
+    }
+}
+
+#[test]
+fn marker_click_scrolls_to_content_line() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+
+    // Three user-text turns.
+    insert_turn(&mut app, 0, "first", "response a");
+    insert_turn(&mut app, 1, "second", "response b");
+    insert_turn(&mut app, 2, "third", "response c");
+    app.rebuild_height_prefix();
+
+    let total = app.total_history_height();
+    let vh = app.history_viewport.height as usize;
+
+    // Collect content_lines first to avoid borrow conflict with
+    // scroll_to_content_line which takes &mut self.
+    let content_lines: Vec<usize> = app
+        .active_display_ref()
+        .unwrap()
+        .markers
+        .iter()
+        .map(|m| m.content_line)
+        .collect();
+
+    // Clicking on each marker should scroll so that the marker's
+    // content_line is at the top of the viewport.
+    for &cl in &content_lines {
+        app.scroll_to_content_line(cl);
+
+        let scroll = app.effective_scroll();
+        // The first visible content line at the top of the viewport
+        // should be the marker's content_line.
+        let first_visible = total.saturating_sub(scroll + vh);
+        assert_eq!(
+            first_visible, cl,
+            "click on marker at content_line {cl} should make it the first visible line",
+        );
+    }
+}
+
+#[test]
+fn marker_click_after_content_change_still_correct() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+
+    // Initial turns.
+    insert_turn(&mut app, 0, "a", "resp a");
+    insert_turn(&mut app, 1, "b", "resp b");
+    app.rebuild_height_prefix();
+
+    // Add more content — markers should be recomputed.
+    insert_turn(&mut app, 2, "c", "resp c");
+    app.rebuild_height_prefix();
+
+    assert_eq!(
+        app.active_display_ref().unwrap().markers.len(),
+        3,
+        "should have 3 markers after adding content"
+    );
+
+    // Collect content_lines first to avoid borrow conflict.
+    let content_lines: Vec<usize> = app
+        .active_display_ref()
+        .unwrap()
+        .markers
+        .iter()
+        .map(|m| m.content_line)
+        .collect();
+
+    // Each marker should scroll to the correct content_line.
+    for &cl in &content_lines {
+        app.scroll_to_content_line(cl);
+        let scroll = app.effective_scroll();
+        let total = app.total_history_height();
+        let vh = app.history_viewport.height as usize;
+        let first_visible = total.saturating_sub(scroll + vh);
+        assert_eq!(
+            first_visible, cl,
+            "click on recomputed marker should scroll correctly"
+        );
+    }
+}
+
+#[test]
+fn marker_slot_uses_final_total_as_denominator() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+
+    // Add turns of varying heights.
+    insert_turn(&mut app, 0, "short", "short");
+    insert_turn(&mut app, 1, "longer text here", "some response that wraps");
+    app.rebuild_height_prefix();
+
+    let total = app.total_history_height();
+    let virtual_track = 2 * app.history_viewport.height as usize;
+
+    let markers: Vec<Marker> = app.active_display_ref().unwrap().markers.clone();
+    for marker in &markers {
+        let expected_slot = marker.content_line * virtual_track / total.max(1);
+        assert_eq!(
+            marker.virtual_slot,
+            expected_slot.min(virtual_track.saturating_sub(1)),
+            "virtual_slot should be proportional to content_line using final total as denominator"
+        );
+    }
+}
+
+// ── Scrollbar-column click gating ──
+
+fn click_scrollbar_column(app: &mut App, row: u16) {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    handle_terminal_event(
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.history_viewport.width,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        app,
+        &tx,
+    )
+    .expect("handle click");
+}
+
+#[test]
+fn scrollbar_column_click_ignored_when_no_scrollbar_rendered() {
+    // Short session: the history fits the viewport, so no scrollbar is
+    // drawn.  Clicking the reserved rightmost column must not arm the
+    // drag state (which would otherwise swallow the next history click,
+    // e.g. on the reasoning header).
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+    insert_turn(&mut app, 0, "short", "short");
+    app.rebuild_height_prefix();
+    assert!(
+        !app.scrollbar_visible(),
+        "content must fit the viewport for this test"
+    );
+
+    click_scrollbar_column(&mut app, 0);
+    assert!(
+        !app.scrollbar_dragging,
+        "a hidden scrollbar must not arm the drag state"
+    );
+}
+
+#[test]
+fn scrollbar_column_click_arms_drag_when_scrollbar_rendered() {
+    // Tall session: the history overflows the viewport, so the scrollbar
+    // is drawn and clicking its column must arm the drag as before.
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    for i in 0..20 {
+        insert_turn(&mut app, i, "user text", "assistant response");
+    }
+    app.rebuild_height_prefix();
+    assert!(
+        app.scrollbar_visible(),
+        "content must overflow the viewport for this test"
+    );
+
+    click_scrollbar_column(&mut app, 0);
+    assert!(
+        app.scrollbar_dragging,
+        "a visible scrollbar should arm the drag state"
+    );
+}
+
+#[test]
+fn marker_lookup_no_match_on_empty_track() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+
+    // No markers (no user_text turns).
+    app.display_for(0).view.turns.clear();
+    let turn = Turn {
+        created_at: choreo_proto::TimestampMs::now(),
+        undone: false,
+        error: None,
+        user_text: None,
+        assistant_text: Some("assistant only".into()),
+        assistant_reasoning: None,
+        tool_calls: vec![],
+        token_usage: None,
+        tool_results: vec![],
+        displayed_images: vec![],
+        reasoning_artifact: None,
+        reasoning_producer: None,
+    };
+    app.display_for(0).view.insert_or_replace(0, turn);
+    app.rebuild_height_prefix();
+    assert!(
+        app.display_for(0).markers.is_empty(),
+        "should have no markers"
+    );
+
+    // No marker should be found at any row.
+    for row in 0..10 {
+        assert!(
+            find_marker_by_row(&app, row).is_none(),
+            "row {row} should not match any marker"
+        );
+    }
+}
+
+// ── Mouse text selection (select-to-copy) ───────────────────────────
+
+/// Drive one mouse event through the full `handle_terminal_event` path
+/// (kitty normalization → page dispatch → Chat page mouse arms).
+fn send_mouse(app: &mut App, kind: MouseEventKind, column: u16, row: u16) {
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    handle_terminal_event(
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }),
+        app,
+        &tx,
+    )
+    .expect("handle mouse event");
+}
+
+/// The first viewport row that maps to a *content* line (one whose
+/// rendered text is selectable per the renderer's content ranges — box
+/// chrome rows like separators and padding are excluded).  `None` when
+/// the history has no selectable content.
+fn first_content_row(app: &App) -> Option<u16> {
+    let display = app.active_display_ref()?;
+    for (turn_idx, _turn_id) in display.visible_turn_ids.iter().enumerate() {
+        let Some(cached) = display.render_cache[turn_idx].as_ref() else {
+            continue;
+        };
+        let turn_start = display
+            .height_prefix
+            .get(turn_idx.wrapping_sub(1))
+            .copied()
+            .unwrap_or(0);
+        for (line_idx, content) in cached.rendered.content_ranges.iter().enumerate() {
+            if !content.is_some_and(|(lo, hi)| lo < hi) {
+                continue;
+            }
+            let row_lo = cached
+                .rendered
+                .visual_offsets
+                .get(line_idx.wrapping_sub(1))
+                .copied()
+                .unwrap_or(0);
+            // Reuse the selection module's content→screen mapping rather
+            // than re-deriving the bottom-anchored formula by hand (and
+            // keep scanning: an off-screen line is not the answer yet).
+            if let Some(screen_row) =
+                crate::selection::content_to_screen_row(app, turn_start + row_lo)
+            {
+                return Some(screen_row);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn mouse_drag_selects_copies_and_reports_status() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+    insert_turn(&mut app, 0, "user a", "assistant a");
+    insert_turn(&mut app, 1, "user b", "assistant b");
+    app.rebuild_height_prefix();
+
+    let start_row = first_content_row(&app).expect("selectable content row");
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        0,
+        start_row,
+    );
+    assert!(
+        app.text_selection.is_some(),
+        "mouse-down in the history box arms a selection"
+    );
+    assert!(
+        !app.text_selection.unwrap().active,
+        "armed but not active before any drag"
+    );
+
+    send_mouse(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        5,
+        start_row + 1,
+    );
+    assert!(
+        app.text_selection.unwrap().active,
+        "drag activates the selection"
+    );
+
+    send_mouse(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        5,
+        start_row + 1,
+    );
+    assert!(
+        app.text_selection.is_none(),
+        "selection cleared after release"
+    );
+    let status = app.status().expect("copy sets a status message");
+    assert_eq!(status, "Selection copied to clipboard.");
+}
+
+#[test]
+fn mouse_click_without_drag_does_not_copy() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+    insert_turn(&mut app, 0, "user a", "assistant a");
+    app.rebuild_height_prefix();
+
+    let start_row = first_content_row(&app).expect("selectable content row");
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        3,
+        start_row,
+    );
+    send_mouse(
+        &mut app,
+        MouseEventKind::Up(MouseButton::Left),
+        3,
+        start_row,
+    );
+    assert!(
+        app.text_selection.is_none(),
+        "a plain click must not leave a selection armed"
+    );
+    assert!(
+        app.status().is_none(),
+        "a plain click must not trigger a copy status"
+    );
+}
+
+#[test]
+fn mouse_scroll_during_selection_keeps_selection_and_scrolls() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    for i in 0..20 {
+        insert_turn(&mut app, i, "user text", "assistant response");
+    }
+    app.rebuild_height_prefix();
+    assert!(
+        app.scrollbar_visible(),
+        "history must overflow the viewport"
+    );
+
+    let start_row = first_content_row(&app).expect("selectable content row");
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        0,
+        start_row,
+    );
+    send_mouse(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        3,
+        start_row + 1,
+    );
+    // A scroll wheel mid-gesture keeps the selection (the anchor stays
+    // pinned to the text while the head tracks the cursor) AND the wheel
+    // input lands immediately: the scroll is applied synchronously, not
+    // swallowed by the gesture.
+    let scroll_before = app.effective_scroll();
+    send_mouse(&mut app, MouseEventKind::ScrollUp, 0, start_row);
+    assert!(
+        app.text_selection.is_some_and(|s| s.active),
+        "scrolling must keep the active selection"
+    );
+    assert!(
+        app.effective_scroll() > scroll_before,
+        "the wheel scroll must land during the gesture"
+    );
+}
+
+#[test]
+fn mouse_scroll_during_selection_tracks_cursor_and_keeps_anchor() {
+    // The anchor stays pinned to the text it was placed on (content
+    // coordinates) while the live drag head re-resolves to the content
+    // now under the cursor — so scrolling mid-gesture updates the
+    // selection immediately, without waiting for the next drag event.
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    for i in 0..20 {
+        insert_turn(&mut app, i, "user text", "assistant response");
+    }
+    app.rebuild_height_prefix();
+
+    let start_row = first_content_row(&app).expect("selectable content row");
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        3,
+        start_row,
+    );
+    send_mouse(
+        &mut app,
+        MouseEventKind::Drag(MouseButton::Left),
+        80,
+        start_row + 5,
+    );
+    let ((anchor0, _), (head0, _)) = selection::selection_range(&app).expect("active selection");
+
+    // Scroll up mid-gesture (the wheel event is reported at the cursor
+    // position): older content moves under the cursor, so the head moves
+    // to an earlier content line while the anchor stays put.
+    send_mouse(&mut app, MouseEventKind::ScrollUp, 80, start_row + 5);
+    let ((anchor1, _), (head1, _)) = selection::selection_range(&app).expect("active selection");
+    assert_eq!(anchor0, anchor1, "the anchor stays pinned to its text");
+    assert!(
+        head1 < head0,
+        "the head tracks the content under the cursor"
+    );
+    assert!(
+        app.text_selection.is_some_and(|s| s.active),
+        "scrolling must keep the active selection"
+    );
+}
+
+#[test]
+fn mouse_down_in_scrollbar_column_does_not_arm_selection() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+    for i in 0..20 {
+        insert_turn(&mut app, i, "user text", "assistant response");
+    }
+    app.rebuild_height_prefix();
+    assert!(
+        app.scrollbar_visible(),
+        "content must overflow the viewport"
+    );
+
+    // Click in the scrollbar column (viewport width) — that is a
+    // scrollbar interaction, never a text selection.
+    let vp_width = app.history_viewport.width;
+    send_mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        vp_width,
+        0,
+    );
+    assert!(
+        app.text_selection.is_none(),
+        "scrollbar-column clicks must not arm a text selection"
+    );
+}
+
+// ── Connection-level termination ────────────────────────────────────
+
+#[test]
+fn version_mismatch_quit_message_is_actionable() {
+    // A daemon built against an older PROTOCOL_VERSION must read as a
+    // version incompatibility with a restart hint, never as a raw
+    // codec error the user cannot act on.
+    let error = ClientError::Proto(choreo_proto::ProtoError::UnsupportedVersion { version: 99 });
+    let msg = crate::connection_quit_message(&error);
+    assert!(
+        msg.contains("protocol version is incompatible"),
+        "must name the incompatibility, got: {msg}"
+    );
+    assert!(
+        msg.contains("restart the daemon"),
+        "must carry the restart hint, got: {msg}"
+    );
+    // The prefix stays stable for anything upstream that matches on it.
+    assert!(msg.starts_with("connection to the daemon failed: "));
+}
+
+#[test]
+fn version_mismatch_wording_survives_the_quit_message_ingest() {
+    // The quit message is normalized as it is stored (it is printed outside
+    // ratatui, see `run_app`), so the actionable wording must be clean
+    // enough to pass through that ingest byte-for-byte — otherwise the one
+    // message that tells the user to restart the daemon would reach the
+    // terminal mangled by escaping.
+    let error = ClientError::Proto(choreo_proto::ProtoError::UnsupportedVersion { version: 99 });
+    let wording = crate::connection_quit_message(&error);
+
+    let mut app = test_app();
+    app.set_quit_message(wording.clone());
+
+    assert_eq!(
+        app.quit_message(),
+        Some(wording.as_str()),
+        "the actionable wording must survive ingest unchanged"
+    );
+    assert!(
+        app.quit_message()
+            .is_some_and(|m| m.contains("restart the daemon")),
+        "the restart hint must stay readable"
+    );
+}
+
+#[test]
+fn ordinary_connection_errors_keep_the_generic_wording() {
+    // Only the version-mismatch case is remapped; everything else keeps
+    // the historical "connection to the daemon failed: {error}" shape.
+    let error = ClientError::Io(std::io::Error::new(
+        std::io::ErrorKind::ConnectionRefused,
+        "refused",
+    ));
+    assert_eq!(
+        crate::connection_quit_message(&error),
+        format!("connection to the daemon failed: {error}")
+    );
+}
+
+#[test]
+fn reader_closed_quits_with_message() {
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+
+    assert!(
+        !handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed"),
+        "ReaderClosed is a control-flow event, not a re-render"
+    );
+    assert!(app.should_quit);
+    assert_eq!(
+        app.quit_message(),
+        Some("the connection to the daemon was closed"),
+        "a bare EOF must report the dropped connection"
+    );
+}
+
+#[test]
+fn status_event_sets_the_status_line_and_requests_a_repaint() {
+    // The autostart wait's "no daemon running — starting choreographr…"
+    // feedback travels as a Status event: it must land on the status line
+    // (and count as a re-render trigger) but never touch the views or
+    // quit state.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+
+    let dirty = handle_ui_event(
+        UiEvent::Status("no daemon running — starting choreographr…".to_string()),
+        &mut app,
+        &tx,
+    )
+    .expect("handle Status");
+
+    assert!(dirty, "a status change must trigger a repaint");
+    assert_eq!(
+        app.status(),
+        Some("no daemon running — starting choreographr…")
+    );
+    assert!(
+        app.status_is_transient,
+        "a connection-task status must be flagged transient"
+    );
+    assert!(!app.should_quit, "a status event must never quit");
+    assert!(app.quit_message().is_none());
+}
+
+#[test]
+fn first_daemon_message_clears_a_transient_status() {
+    // The autostart reassurance must not linger once real daemon traffic
+    // arrives: the "daemon started" text is cleared on the first daemon
+    // message. `AccountListFailed` is used because it surfaces an ERROR
+    // and returns early without touching the status line, so the cleared
+    // (blank) status is observable rather than being overwritten by the
+    // handler itself.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    handle_ui_event(UiEvent::Status("daemon started".to_string()), &mut app, &tx)
+        .expect("handle Status");
+    assert_eq!(app.status(), Some("daemon started"));
+
+    handle_ui_event(
+        UiEvent::Daemon(Box::new(DaemonMessage::broadcast(
+            DaemonMessageType::AccountListFailed {
+                error: "boom".to_string(),
+            },
+        ))),
+        &mut app,
+        &tx,
+    )
+    .expect("handle Daemon");
+    assert!(
+        app.status().is_none(),
+        "the transient status must be cleared by the first daemon message"
+    );
+    assert!(!app.status_is_transient);
+    assert!(app.error().is_some(), "the daemon's error still lands");
+}
+
+#[test]
+fn daemon_message_does_not_clear_a_daemon_status() {
+    // A status the daemon itself set must survive subsequent daemon
+    // traffic — only the transient connection-task flag is cleared.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    app.set_status("a daemon-set status".to_string());
+    app.status_is_transient = false;
+
+    handle_ui_event(
+        UiEvent::Daemon(Box::new(DaemonMessage::broadcast(
+            DaemonMessageType::AccountListFailed {
+                error: "boom".to_string(),
+            },
+        ))),
+        &mut app,
+        &tx,
+    )
+    .expect("handle Daemon");
+    assert_eq!(app.status(), Some("a daemon-set status"));
+}
+
+#[test]
+fn reader_closed_keeps_existing_quit_message() {
+    // The daemon flushes `ShuttingDown` before closing the socket, so the
+    // TUI normally learns the reason from the message and only then sees
+    // the EOF. ReaderClosed must not overwrite that reason with the
+    // generic "connection closed" text.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    handle_daemon_message(
+        DaemonMessage::broadcast(DaemonMessageType::ShuttingDown),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ShuttingDown");
+
+    handle_ui_event(UiEvent::ReaderClosed, &mut app, &tx).expect("handle ReaderClosed");
+
+    assert_eq!(
+        app.quit_message(),
+        Some("the server is shutting down"),
+        "the specific reason must survive the trailing EOF"
+    );
+}
+
+// ── Pointer shape (OSC 22) ──────────────────────────────────────────
+
+/// Build a mouse event for the given kind at `(column, row)`.
+fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+    Event::Mouse(MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+
+#[test]
+fn pointer_motion_changes_the_shape_once_and_never_dirties_the_frame() {
+    use crate::terminal::pointer::PointerShape;
+
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    for id in 0..20 {
+        insert_turn(&mut app, id, "user text", "assistant response");
+    }
+    app.rebuild_height_prefix();
+    assert!(app.scrollbar_visible(), "the scrollbar must be drawn");
+
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let column = app.history_viewport.width;
+
+    // Motion over the scrollbar column: the frame is NOT dirtied (nothing on
+    // screen changed), and the hand is emitted once for the new target.
+    assert!(
+        !dispatch_terminal_event(mouse_event(MouseEventKind::Moved, column, 0), &mut app, &tx)
+            .expect("dispatch motion"),
+        "pointer motion must not dirty the frame"
+    );
+    assert_eq!(app.pointer_hover, Some((column, 0)));
+    assert_eq!(app.sync_pointer(), Some(PointerShape::Pointer));
+
+    // Repeated motion within the same target emits nothing further.
+    assert!(
+        !dispatch_terminal_event(mouse_event(MouseEventKind::Moved, column, 1), &mut app, &tx)
+            .expect("dispatch motion")
+    );
+    assert_eq!(app.sync_pointer(), None, "the shape is unchanged");
+
+    // Moving onto the history pane's text changes it to the I-beam.
+    assert!(
+        !dispatch_terminal_event(mouse_event(MouseEventKind::Moved, 0, 1), &mut app, &tx)
+            .expect("dispatch motion")
+    );
+    assert_eq!(app.sync_pointer(), Some(PointerShape::Text));
+
+    // A click still dirties the frame — the pointer path suppressed only
+    // bare motion.
+    assert!(
+        dispatch_terminal_event(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), column, 0),
+            &mut app,
+            &tx,
+        )
+        .expect("dispatch click"),
+        "a click must still trigger a repaint"
+    );
+}
+
+#[test]
+fn pointer_hover_is_sampled_from_drags_clicks_and_wheel_not_only_motion() {
+    use crate::terminal::pointer::PointerShape;
+
+    // A terminal reports button-less motion as `Moved` only while no button
+    // is held; with a button latched it reports the same movement as a
+    // `Drag`, and a surface whose any-event mode lapsed reports only clicks
+    // and wheel notches.  All of them carry the pointer's cell, so every one
+    // must refresh the hover — a hover refreshed from motion alone freezes
+    // on the last target for the rest of the session, because the shape is
+    // emitted only when it changes.
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 10;
+    for id in 0..20 {
+        insert_turn(&mut app, id, "user text", "assistant response");
+    }
+    app.rebuild_height_prefix();
+    assert!(app.scrollbar_visible(), "the scrollbar must be drawn");
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let scrollbar = app.history_viewport.width;
+
+    // Establish the hand over the scrollbar column, then move off it as the
+    // terminal does while a button is held.
+    dispatch_terminal_event(
+        mouse_event(MouseEventKind::Moved, scrollbar, 0),
+        &mut app,
+        &tx,
+    )
+    .expect("dispatch motion");
+    assert_eq!(app.sync_pointer(), Some(PointerShape::Pointer));
+
+    dispatch_terminal_event(
+        mouse_event(MouseEventKind::Drag(MouseButton::Left), 3, 2),
+        &mut app,
+        &tx,
+    )
+    .expect("dispatch drag");
+    assert_eq!(app.pointer_hover, Some((3, 2)), "a drag samples the hover");
+    assert_eq!(app.sync_pointer(), Some(PointerShape::Text));
+
+    // A wheel notch back over the scrollbar column.
+    dispatch_terminal_event(
+        mouse_event(MouseEventKind::ScrollDown, scrollbar, 4),
+        &mut app,
+        &tx,
+    )
+    .expect("dispatch wheel");
+    assert_eq!(
+        app.pointer_hover,
+        Some((scrollbar, 4)),
+        "a wheel samples it"
+    );
+    assert_eq!(app.sync_pointer(), Some(PointerShape::Pointer));
+
+    // And a click over the text.
+    dispatch_terminal_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), 3, 2),
+        &mut app,
+        &tx,
+    )
+    .expect("dispatch click");
+    assert_eq!(app.pointer_hover, Some((3, 2)), "a click samples it");
+    assert_eq!(app.sync_pointer(), Some(PointerShape::Text));
+}
+
+#[test]
+fn a_click_where_no_motion_was_reported_requests_a_tracking_reassert() {
+    // The mouse-tracking mode is terminal-side state the client cannot read
+    // back, so a surface that stops reporting motion is detected from the
+    // input itself: a click or wheel notch at a cell the motion stream never
+    // reported means the terminal is delivering mouse input but not motion.
+    let mut app = test_app();
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    let click = |app: &mut App,
+                 tx: &crossbeam_channel::Sender<choreo_proto::ClientMessage>,
+                 column,
+                 row| {
+        dispatch_terminal_event(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), column, row),
+            app,
+            tx,
+        )
+        .expect("dispatch click")
+    };
+
+    // No hover has ever been sampled: the click arrives with no motion
+    // behind it, so the mode is re-asserted.
+    assert!(!app.mouse_tracking_reassert);
+    click(&mut app, &tx, 5, 5);
+    assert!(
+        app.mouse_tracking_reassert,
+        "a click with no known hover re-asserts the mode"
+    );
+
+    // A click on the cell the last sample left us on proves motion is
+    // reaching us; nothing needs re-asserting.
+    app.mouse_tracking_reassert = false;
+    click(&mut app, &tx, 5, 5);
+    assert!(!app.mouse_tracking_reassert);
+
+    // A click somewhere motion never reported means the motion stream lapsed.
+    click(&mut app, &tx, 40, 9);
+    assert!(
+        app.mouse_tracking_reassert,
+        "a click off the last sample re-asserts the mode"
+    );
+
+    // Drags arrive per cell crossed, so they never ask (the latched-button
+    // case they cover is fixed by sampling them, not by the mode set), and
+    // motion is the healthy signal itself.
+    app.mouse_tracking_reassert = false;
+    dispatch_terminal_event(
+        mouse_event(MouseEventKind::Drag(MouseButton::Left), 41, 9),
+        &mut app,
+        &tx,
+    )
+    .expect("dispatch drag");
+    assert!(!app.mouse_tracking_reassert, "a drag never re-asserts");
+
+    // Suspend and exit hand the terminal back, so a pending request is
+    // dropped with the rest of the pointer state.
+    app.mouse_tracking_reassert = true;
+    app.forget_pointer();
+    assert!(!app.mouse_tracking_reassert);
+    assert_eq!(app.pointer_hover, None);
+}

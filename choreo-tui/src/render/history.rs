@@ -419,31 +419,24 @@ mod tests {
         assert!(l2 - f2 < vh);
     }
 
-    /// Draw a whole frame and return its cells row-major (mirrors the shared
-    /// `tests/render` harness), syncing the history viewport to the frame's
-    /// layout first so the window math and the drawn area agree.
-    fn drawn(app: &mut crate::state::App) -> String {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
+    /// The frame the deep-scroll test draws, sized so a 40-turn transcript
+    /// overflows the history chunk.
+    const FRAME_WIDTH: u16 = 40;
+    const FRAME_HEIGHT: u16 = 12;
 
-        let [history, _, _, _] = app.chat_page_layout(40, 12);
+    /// Point `history_viewport` at the Chat page's history chunk for the frame
+    /// [`FRAME_WIDTH`] x [`FRAME_HEIGHT`] draws.  The clipping window and the
+    /// scroll maths read the viewport, while the drawn area is whatever the
+    /// layout hands the history chunk — so the two must be the same rectangle
+    /// or the assertion compares a window against a differently-sized drawing.
+    fn sync_history_viewport(app: &mut crate::state::App) {
+        let [history, _, _, _] = app.chat_page_layout(FRAME_WIDTH, FRAME_HEIGHT);
         app.history_viewport.update(Rect {
             x: 0,
             y: 0,
             width: history.width.saturating_sub(1),
             height: history.height,
         });
-        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("backend");
-        terminal
-            .draw(|frame| crate::render::render(frame, app))
-            .expect("render a frame");
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(ratatui::buffer::Cell::symbol)
-            .collect()
     }
 
     #[test]
@@ -452,7 +445,8 @@ mod tests {
 
         // At the bottom the newest turn is drawn and the oldest is not.
         app.scroll_to(0);
-        let bottom = drawn(&mut app);
+        sync_history_viewport(&mut app);
+        let bottom = crate::tests::render::drawn_cells(&mut app, FRAME_WIDTH, FRAME_HEIGHT);
         assert!(
             bottom.contains("UU39"),
             "newest turn must be visible at the bottom"
@@ -465,7 +459,8 @@ mod tests {
         // Scrolled to the top, the oldest turn is drawn and the newest is not.
         let max = app.max_scroll_offset();
         app.scroll_to(max);
-        let top = drawn(&mut app);
+        sync_history_viewport(&mut app);
+        let top = crate::tests::render::drawn_cells(&mut app, FRAME_WIDTH, FRAME_HEIGHT);
         assert!(
             top.contains("UU00"),
             "oldest turn must be visible at the top"

@@ -41,6 +41,6 @@ mod lib_api;
 mod login;
 mod model_selector;
 mod panic_hook;
-mod render;
+pub(crate) mod render;
 mod session;
 mod state;
