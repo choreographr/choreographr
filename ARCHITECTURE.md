@@ -947,191 +947,61 @@ GET, the burst coalescing, and the fingerprint gate are documented in-source
 
 ### Client-facing MCP surfaces
 
-- **`/mcp`.** The TUI's `/mcp` slash command (and the `choreographr mcp` CLI)
-  surfaces the state of the configured MCP servers. `ClientMessage::McpStatusRequest`
-  is translated by the connection thread into `DaemonCommand::McpStatus` (the
-  command loop is the sole owner of the `McpManager`) and the reply is
-  converted to the wire `McpServerStatus` records and sent as
-  `DaemonMessage::McpStatus`; the TUI renders one server per line (slug,
-  transport, target, connected state, tool count, or the recorded last error).
-  `ClientMessage::McpReconnect { slug }` maps to `DaemonCommand::McpReconnect`,
-  which rebuilds the server's connection and swaps the tool catalogue; on
-  success the connection replies with a refreshed `DaemonMessage::McpStatus`,
-  on failure with `DaemonMessage::McpReconnectFailed { slug, error }`.
-  `ClientMessage::McpReload` maps to `DaemonCommand::McpReload`, which re-reads
-  the config files and reconciles the running server set with them
-  (add/remove/restart) before swapping the tool catalogue; it replies with
-  `DaemonMessage::McpReloaded { summary, servers }` (a change summary plus the
-  refreshed list) on success, or `DaemonMessage::McpReloadFailed { error }` when
-  the config cannot be read or parsed. The
-  offline CLI subcommands (`mcp list`/`add`/`remove`) read and edit the same
-  `mcp.json` shape directly, so they work without a running daemon
-  (and without the `mcp` cargo feature); `choreographr mcp reconnect`/
-  `reload` are minimal one-shot Unix-socket clients for a running daemon.
+`/mcp` shows the state of every MCP server visible to the session:
+`ClientMessage::McpStatusRequest` is answered with one `McpServerStatus` per
+server, and that record is what every frontend reads. It carries the slug, tier,
+transport, target, connected state, tool count, the recorded last error, the
+target-scoped keystore key (`mcp:<slug>|<target-hash>`), and an `McpAuthState`,
+so a client derives its sign-in/sign-out action from the status alone instead of
+holding a copy of the server's config. The daemon is the sole authority for that
+key (one derivation feeds both provisioning and connect-time load, so the two
+cannot drift), and the wire `oauth` block carries no literal secret: a
+confidential client's `clientSecretEnv` names the environment variable that does.
+A terminally rejected grant is quarantined, and the two surfaces treat it
+differently on purpose — the connect-path snapshot withholds it, so a connect
+surfaces a re-login rather than re-spending a spent token, while the status reads
+the quarantine from the store and reports `Reauthentication`, so the server that
+needs that re-login stays visible to the operator.
 
-- **MCP remote-server OAuth.** A remote server may declare an `oauth` block
-  (`{ clientId?, callbackPort?, scopes?, authorizationServer?, clientSecretEnv? }`;
-  never a literal `clientSecret` — `clientSecretEnv` names the environment
-  variable holding a confidential client's secret) in `mcp.json`
-  or a trusted project `.mcp.json`. Sign-in is a standard OAuth 2.1 PKCE flow
-  owned by the frontend login library (`choreo-client-core`'s `oauth::mcp`,
-  split into `mcp::{mod,discovery,register,authorize}`): an unauthenticated
-  `initialize` elicits the server's `WWW-Authenticate` challenge (RFC 9728
-  §5.1), whose `resource_metadata` URL is preferred as the
-  protected-resource metadata location; failing that it falls back to probing
-  the well-known path, discovering the
-  authorization server (RFC 9728 protected-resource metadata → RFC 8414 or
-  OpenID Connect Discovery), building each well-known URL with the segment
-  inserted *before* a path-bearing issuer/resource and also appending it
-  *after* (the `{issuer}/.well-known/openid-configuration` form a path-issuer
-  provider such as Entra/Keycloak/Okta serves — the root document remains the
-  fallback); an explicit `authorizationServer` names the issuer directly,
-  skipping protected-resource probing. It rejects a
-  metadata document whose `issuer` does not match the authorization-server URL
-  it was fetched from (RFC 8414 §3.3), tolerating a single trailing-slash
-  difference (one shared `issuers_match`); each discovery GET follows a small,
-  bounded number of redirects, re-vetting every hop so a redirect cannot steer
-  discovery onto a cleartext or internal host. It
-  dynamically registers a client
-  (SEP-837) when no `clientId` is configured, runs PKCE over a loopback callback
-  (paste-URL fallback; no device code), and stores the durable grant as
-  `ServiceCredential::OAuth { kind: Mcp }`. A server that issues no refresh
-  token — GitHub's remote MCP through an OAuth App is the motivating case, and
-  it does so even with `offline_access` requested — has no grant root to store,
-  so the long-lived access token it does return is persisted in the credential
-  as the deliberate exception to the usual "access token never persisted" rule:
-  with nothing to refresh, it is the only credential that can authenticate the
-  connect and the only thing that survives a restart. A confidential client's
-  secret is read from the `clientSecretEnv` variable, sent at the token endpoint
-  (`client_secret_basic` or `client_secret_post`, chosen from the server's
-  advertised methods), and stored in the grant so connect-time refresh
-  re-authenticates the token endpoint; a `clientSecretEnv` with no `clientId` is
-  rejected, because a client with no id is dynamically registered and would
-  receive its own credentials, so a configured secret could never match. The
-  authorization response's `iss` is
-  validated against the discovered issuer when the server advertises RFC 9207
-  support (or whenever the parameter is present), rejecting a mix-up before the
-  code is exchanged. The check uses the same shared `issuers_match` as
-  discovery, so a trailing-slash difference in how the server spells its issuer
-  does not force a needless re-login. The scopes requested follow the spec's
-  precedence — the configured `scopes`, else the challenge's `scope`, else the
-  protected resource's `scopes_supported`, else the authorization server's
-  advertised scopes — and the `scope` parameter is omitted when nothing
-  applies. The authorization endpoint taken from the discovered metadata is
-  vetted with the same policy before the browser is opened, so a server
-  advertising a cleartext remote endpoint is refused.
+The requests beyond the status record are `McpReconnect` (rebuild one server — a
+refreshed list on success, `McpReconnectFailed { slug, error }` otherwise),
+`McpReload` (re-read the config and reconcile the running set with it —
+`McpReloaded { summary, servers }` or `McpReloadFailed { error }`), and the
+`McpTrust`/`McpUntrust`/`McpTrustList` trio that admits, revokes, or lists a
+trusted project root. The connection thread translates each into a
+`DaemonCommand`, because the command loop is the sole owner of the manager and
+the tool catalogue. The variants and their replies are documented on
+`choreo-proto`'s `ClientMessage`/`DaemonMessage`, the handling in
+`choreo-daemon`'s `daemon::mcp_commands` and `mcp::trust`, and the user-facing
+commands (`/mcp`, `/mcp reconnect`, `/mcp reload`, `/mcp trust`, and the
+`choreographr mcp` CLI, whose offline `list`/`add`/`remove` edit `mcp.json` with
+neither a daemon nor the `mcp` cargo feature) in the README.
 
-  The policy is **earned by the resource**: the flow computes a `HopPolicy` once
-  from the resource URL and permits a loopback `http` hop only when the resource
-  itself is loopback (the in-repo mock server), and a non-public IP-literal hop
-  (private, link-local, or another internal-purpose range) only when the
-  resource is itself loopback or such an IP literal
-  (a LAN self-hosted server). Every hop a fetched document chooses — a discovery
-  GET or its redirect, the dynamic-registration endpoint, the discovered
-  authorization and token endpoints — is vetted under that policy, so a hostile
-  protected-resource or authorization-server document cannot steer a hop onto
-  `http://127.0.0.1:<port>` or an internal address — `10/8`/`192.168/16`, link-local,
-  the `100.64/10` shared (carrier-grade NAT) block, `198.18/15` benchmarking, the
-  unspecified address, or `0.0.0.0/8` — and probe the host's own network. The
-  IP-literal range check is the
-  one shared classifier in `choreo-shared`'s `net` module (the same one the
-  provider media download uses). The provider login and the runtime refresh keep
-  the permissive default, since their endpoints come from the trusted
-  descriptor/credential rather than a fetched document.
-  `mcp login <slug>` reads the server's resolved identity, `oauth` block, and
-  credential key from the extended `McpStatus` and sends the grant over the
-  existing `AddCredential`; storing an `mcp:`-keyed credential makes the
-  command loop reconnect the server the key names (the key encodes its slug)
-  and refresh the catalogue, so a sign-in is self-sufficient; `mcp logout
-  <slug>` removes it via `RemoveCredential` and reconnects. The unlock tail
-  (run by both `Unlock` and `BindKeystore`) likewise reconnects every
-  `mcp:`-keyed server on the locked→unlocked transition: the daemon starts
-  locked and connects its servers before any grant is decryptable, so a restart
-  brings signed-in servers up without a manual reconnect, while a redundant
-  re-unlock (the TUI auto-unlocks on every connect) leaves the live connections
-  alone. Refresh at connect
-  is owned by `rmcp`'s `AuthorizationManager`, driven through a
-  `CredentialStore` adapter in `choreo-mcp`'s `auth` module that normally strips
-  the access token on `save` (serving
-  it from an in-process cache; a cold start returns no usable token so `rmcp`
-  refreshes) and maps to and from `ServiceCredential::OAuth`. Because `rmcp`
-  loads the credential on every request, that cache is a fast path: a cached
-  token with more than a 60-second margin of life (deliberately above `rmcp`'s
-  own 30-second refresh buffer) is served with no backend read and no durable
-  credential clone, while anything nearer expiry — and any cache the remembered
-  durable fields no longer describe — falls through to the full load, which is
-  what re-reads a rotated single-use refresh token under the refresh guard. The
-  exception is a
-  grant with no refresh token: there is nothing to refresh, so the adapter
-  persists the (possibly rotated) access token in the durable grant on `save`
-  and serves it directly as the bearer on a cold `load` (no `expires_in` and no
-  receipt time, so `rmcp` skips its expiry check), keeping a server that issues
-  only an access token usable across a restart. A configured
-  `authorizationServer` overrides that connect-time discovery too, exactly as it
-  does at sign-in: `rmcp` has no explicit-issuer setter, so the override URL's
-  metadata is resolved by `rmcp`'s own discovery and seeded onto the manager
-  (whose base stays the resource, so the RFC 8707 `resource` parameter remains
-  the MCP endpoint). The module splits
-  the durable↔`StoredCredentials` mapping (`auth::adapter`) from the connect-time
-  `rmcp` `AuthClient`/`AuthorizationManager` wiring (`auth::connect`), so each
-  `rmcp`-facing concern owns one module.
+**Remote-server OAuth** is the part that spans crates. The interactive PKCE
+sign-in — discovery, dynamic client registration, loopback callback — belongs to
+the frontend (`choreo-client-core`'s `oauth::mcp`), the durable
+`ServiceCredential::OAuth { kind: Mcp }` is stored under the key above, and
+connect-time refresh is `rmcp`'s own `AuthorizationManager`, driven through
+`choreo-mcp`'s `auth` module, which keeps every `rmcp` type on its side of the
+crate boundary and exposes only its own `CredentialBackend`. Two policies are
+contractual rather than incidental: a load is **fail-closed** on the canonical
+target and on the issuer, so a re-pointed server never receives a token minted
+for another; and trust gates *use*, not existence — an untrusted project's
+stored grant is neither loaded nor sent, yet survives un-trust and works again on
+re-trust with no new login.
 
-  The credential row is **target-scoped**: `mcp:<slug>|<target-hash>`, where the
-  hash is the repo's stable FNV-1a over the canonicalized server URL joined to
-  the slug. The daemon computes the key (one authority for provisioning and
-  connect-time load) and exposes it, the resolved `oauth` block, and an auth
-  state (`NotApplicable`/`BearerToken`/`NotLoggedIn`/`OAuth`/`Reauthentication`)
-  per server in `McpServerStatus`. Load is **fail-closed**: a
-  stored credential whose `resource` no longer matches the configured URL is
-  treated as absent, and — once the authorization server has been re-discovered
-  at connect — so is one whose `issuer` differs from that server (compared with
-  the shared `issuers_match`, which tolerates a trailing slash so a spelling
-  difference does not force a needless re-login). A re-pointed
-  server therefore never receives a token minted by the previous authorization
-  server; the connect surfaces a re-login instead. Trust gates *use*, not
-  existence — an untrusted project's
-  `oauth` block is never expanded or offered, and its stored credential is never
-  loaded or sent while untrusted, but survives un-trust and is usable again on
-  re-trust with no new login.
-
-  The `CredentialBackend` trait (`load`/`save`/`clear`/`acquire_refresh_guard`/
-  `mark_reauthentication`) is implemented by the daemon (`choreo-daemon`'s
-  `mcp::oauth`): no `rmcp` type crosses the crate boundary. Because a server can
-  connect while the command loop is blocked resolving a session overlay, the
-  backend never round-trips the loop for a read — the command loop publishes a
-  credential snapshot the backend reads under a short-lived lock (the
-  **fifteenth** sanctioned shared-state exception, see AGENTS.md). The slot is
-  re-installable: a restarted embedded daemon installs a fresh runtime (empty
-  snapshot, its own command sender) so it never keeps a dead command sender or
-  the previous daemon's credentials. The snapshot **withholds a quarantined
-  grant** (`dead_oauth`): a terminally rejected refresh token is not served
-  again, so the connect proceeds unauthenticated and surfaces a re-login rather
-  than re-spending a spent token. The `/mcp` status still reports the
-  quarantine: the daemon refines each server's `McpAuthState` from the store (a
-  quarantined key refines to `Reauthentication`) and the server summary line
-  appends that state's label, so a server needing a re-login is visible to the
-  operator. The backend's writes are
-  fire-and-forget `DaemonCommand`s (`OAuthSave`/`OAuthClear`/`McpAuthRejected`)
-  that persist to the binding public key when the loop is next free, but before
-  enqueuing each durable command the backend first advances the read-view
-  snapshot synchronously (publishing a rotation, or removing the entry on a
-  clear/rejection), so a concurrent refresh of the same grant re-reads the
-  rotated credential without a command-loop round-trip rather than spending an
-  already-rotated single-use refresh token. A save the command loop drops — the
-  credential was removed (logout/clear), or a re-login replaced it mid-refresh —
-  republishes that key's entry from the durable store, so the synchronous publish
-  cannot leave the read view serving a grant the store rejected. Every single-key
-  credential mutation publishes **only that key** (`publish_mcp_oauth_key`); the
-  whole-map `publish()` is reserved for the two places the entire credential set
-  changes wholesale (lock clears it, unlock decrypts it afresh). That per-key
-  granularity is what prevents another key's mutation from clobbering a rotation
-  that is published ahead of its not-yet-durable `OAuthSave` — a whole-map
-  republish built from the durable store would revert such a key to its
-  already-spent refresh token, and a concurrent refresh would then spend it. The
-  single-flight refresh guard reuses `OAuthRefreshLocks`, keyed by the MCP
-  credential key: the registry's one semaphore-backed `OwnedRefreshLock` serves
-  both engines, and the async adapter takes its owned `Send` guard from a
-  `spawn_blocking` task so it can be held across the refresh `await`.
+The daemon's backend reads the command-loop-published credential snapshot rather
+than round-tripping the loop, which would deadlock a connect that runs while the
+loop is blocked resolving a session overlay. Its writes are fire-and-forget
+`DaemonCommand`s, and each one first advances that snapshot synchronously, so a
+concurrent refresh of the same grant re-reads the rotation instead of spending an
+already-rotated single-use token. That two-writer read view is the **fifteenth**
+sanctioned shared-state exception (AGENTS.md): a single-key mutation publishes
+only its own key, a whole-map republish is reserved for the two wholesale changes
+(lock clears the set, unlock decrypts it afresh), and the slot is re-installable
+so a restarted embedded daemon gets a fresh snapshot and its own command sender.
+It carries no per-message data — only credential values the command loop already
+owns.
 
 ### Slug renames (one-time migration)
 
@@ -1671,8 +1541,8 @@ data, never as instructions or configuration:
   keeps the same broadcast/visibility semantics as every other tool.
 - **Egress.** A remote server is contacted only when explicitly configured; there is no
   discovery of servers from arbitrary content. Credentials are a static token in
-  `headers` or a keystore-stored OAuth grant (see the MCP remote-server OAuth
-  section), never shared across issuers.
+  `headers` or a keystore-stored OAuth grant (see **Remote-server OAuth** under
+  **Client-facing MCP surfaces**), never shared across issuers.
 
 ### MCP connection lifecycle (off the command loop)
 
@@ -2051,252 +1921,7 @@ same-model provenance check drops it after a mid-session model switch — see
   `Failed { error: "session is not idle" }`; the TUI applies the same idle check
   client-side to skip the doomed round-trip.
 
----
-
-
-**Service config:** `~/.config/choreographr/config.toml`
-
-```toml
-max_turns = 0      # daemon-wide tool-loop budget; 0 = unlimited (default)
-
-[context]
-context_file_names = ["AGENTS.md", "CLAUDE.md"]
-context_file_max_bytes = 32768
-
-[cache_warming]          # prompt-cache warming — off by default; see the cache_warm.rs module
-mode = "off"             # off | streaming (warm the prompt cache while a tool call blocks)
-min_prefix_tokens = 32000    # `tokens`-metered gate: minimum cacheable prefix
-min_expected_savings = 0.05  # `payg`-metered gate: minimum USD saved per ping
-```
-
-> **Note:** Provider-level settings (`base_url`, `streaming`, `retry_*`, timeouts, endpoint paths, request format) have moved to per-account overrides in `accounts.toml`. See `README.md` for the full list.
-
-**Cache warming is off by default.** A warm ping re-sends the last
-request with a 1-token output cap to refresh the provider's in-memory prompt
-cache before its TTL expires. Whether that pays off depends on how the account
-is billed, so a per-account `meter` gates it: `payg` warms when the expected
-dollar saving clears `min_expected_savings`, `tokens` warms when the cacheable
-prefix is at least `min_prefix_tokens`, and `requests`/`flat`/`unknown` never
-warm (a ping burns request budget on a request-metered plan and saves nothing
-on an unmetered one). The dollar gate is only meaningful under pay-as-you-go,
-which is why the meter is explicit and defaults to `unknown` (never warm).
-When `mode = "streaming"` (and the account's meter gate clears) the agent loop
-spawns a per-request warmer thread that fires while a tool call blocks; the
-ping is a single non-streaming, non-retrying 1-token request that never
-touches session or turn state. Warming is also declined outright when the
-provider rejected the per-session cache-affinity hint the ping would rely on to
-land on the backend holding the cache — see **Cache warming declines a
-downgraded hint** under **Per-session cache affinity** — which is a static
-eligibility check, not a meter rule. Status is observable through the
-`choreo_cache_warm_attempts_total` / `choreo_cache_warm_skips_total{reason}`
-metrics and `tracing` logs only — no `SessionEvent` is emitted (a status
-event is a deliberate follow-up).
-
-**Credential storage:** Credentials are encrypted per-credential in the `redb` database (`state.redb`). Each daemon's keystore is bound to one client-held unlock key (the daemon stores only the derived public binding, created once via the `BindKeystore` wire path — TOFU-once, no rotation); the legacy `identity.pk` / `public.pk` pair is removed, and the legacy raw `identity.pk` file is an unlock-verification fallback that is copied into `known_servers.toml` on first use (never deleted, never binds). `AddCredential` carries the credential as typed plaintext with no key: the DAEMON encrypts it to its own stored binding public key before persisting, so the client never holds or transmits the encryption key on the add path (which requires an already-unlocked keystore).
-
-**Database:** `~/.local/share/choreographr/state.redb` (override via `CHOREOGRAPHR_DB_PATH` env var). The data directory is created owner-only (`0700`) and the database file is `0600`, re-applied on every open; pre-migration `state.redb.bak-v*` backups are `0600` too, so transcripts and tool output stay unreadable by other local users.
-
-**Socket path:** `$XDG_RUNTIME_DIR/choreographr.sock`, created `0600` inside an owner-only directory; when no runtime dir exists it falls back to `temp_dir()/choreographr-<uid>/choreographr.sock` (per-uid, so the parent can be private). Override via `CHOREOGRAPHR_SOCKET_PATH` env var. See **Local trust domain** under **Security model**
-
-**Tool loop limit:** `CHOREOGRAPHR_MAX_TURNS` env var overrides `config.toml` `max_turns`. Resolution
-chain: `CHOREOGRAPHR_MAX_TURNS` env var → `config.toml` → default 0 (unlimited).
-A value of `0` means *unlimited* — the agent loop runs until the model
-produces a final answer, is cancelled, or hits an error. This is a daemon-wide
-cap; individual sessions no longer carry their own `max_turns`.
-
-**A turn that yields nothing runnable is recovered, not dispatched.** Two
-conditions make a turn unrunnable: a tool call whose arguments were not one
-complete JSON value (a provider that cuts a reply off mid-arguments leaves a
-fragment), and a reply whose tool
-calls carry a **name no provider will accept** — an empty or whitespace-only
-name, but also a non-blank one a strict endpoint rejects (`multi_tool_use.parallel`,
-a long shell command a weak model emitted as a name), which would otherwise be
-dispatched under that name, answered "no such tool", and (with `max_turns = 0`,
-no loop limit at all) never bounded. **Arguments are validated whole or not at
-all: no structural repair, no schema-aware salvage.** Closing an open string
-fabricates a value — a half-written file body, a *shorter* shell command than
-the model wrote — and would execute it as if the model had meant it, so a
-malformed call is dropped for the turn and its bytes are kept only for
-diagnosis. An **absent** argument list is not a malformed one: an empty or
-whitespace-only string, or the JSON literal `null`, is what several
-OpenAI-compatible endpoints send for a tool that declares no parameters, so it
-is a legal no-argument call normalized to `{}` at ingest and run as such — never
-discarded and never reported as a truncation, which is what keeps a no-argument
-call from spending the truncated-call recovery budget on a complete reply. The
-same owner judges those bytes on both sides of the transcript:
-`choreo_ai_protocols::tool_name::classify_arguments` is the rule the adapters
-apply at ingest and the rule the daemon's replay repair applies to a recorded
-call, so a call accepted at ingest cannot be replayed as anything other than
-what ran. That rule must survive progressive argument streaming: showing a
-partial payload while it arrives is fine, executing one never is, and a call
-that fails validation ends in an aborted state rather than a committed one.
-A JSON parser is deliberately **not** the safety boundary here — the client
-refuses anything that did not arrive complete, instead of trusting what a
-repair made parseable.
-
-The rejection also keeps the **position** the parser itself reported
-(`serde_json`'s line/column, surfaced on `DiscardedToolCall`): that is the only
-"where did it stop" a reader needs, and computing a deeper one would mean
-scanning the fragment for no decision it could change. Each rejection records
-the **finish outcome** — length / stop / filtered / other / absent — because
-did the provider hit its own output cap is exactly the question that separates
-a client-side unfixable truncation from arguments the model mangled, and a
-stream may end naming no reason at all. **Truncation is a casualty even when the
-turn also carries prose.** A reply whose calls were all cut off but that also
-said something is a `FinalText` — the answer is kept, not replaced by an error —
-and it **carries the discarded calls** so the daemon can tell the two apart: a
-`FinalText` with a non-empty `discarded_tool_calls` is recovered exactly like a
-text-less one (the same `truncated_tool_call` cause and budget) rather than
-being read as a finished answer. Without that signal a model that announces a
-step and then overflows its output limit ends the request mid-task, leaving the
-announcement as the last thing in the transcript. The gate for an unacceptable
-name is the shared `choreo_ai_protocols::tool_name::is_provider_safe` rule, which
-the daemon re-exports under the name `is_provider_safe_function_name` (one
-owner, so the daemon cannot drift from it), deliberately wider than the
-adapters' blank-only merge rule: an adapter *reports* what the provider sent,
-and the daemon *governs* whether it may run. The calls are never recorded or
-dispatched, the turn keeps the model's prose plus a bracketed note naming what
-was discarded, and the model is told in the next **user** message what went
-wrong and how to retry. Each cause has its own small budget of consecutive recoveries
-(`truncated_tool_call`, `unidentified_tool_calls` — the label keeps its name and
-its alignment with `InferenceError::UnidentifiedToolCalls::metric_label()` even
-though the cause now covers any unacceptable name) and the request ends once one
-is spent; **both budgets reset whenever a turn produces runnable output**, so
-they bound a stuck model rather than a long productive request. A reply mixing
-valid calls with a bad one runs the valid calls and gets the same notice, taking
-no strike — and a reply that loses calls **both** ways (an unacceptable name and
-a truncated call) puts both instructions into that one user message rather than
-letting the second overwrite the first. The transcript note claims an
-output-token limit **only** when the provider reported one; any other finish
-outcome says the arguments were incomplete when the reply ended and names that
-outcome, instead of asserting a cause nobody observed. The recovery deliberately
-answers with a user-role instruction and no
-synthesized tool result (there is no call id to answer, and an unpaired tool
-result is invalid on several wire formats), drops the response-id chain
-(chaining the retry would replay an unanswered call, which providers reject),
-and never lists the tool catalog (a blank name usually comes from a model
-imitating tool-call markup it read in data). A blank provider call id is minted
-into a deterministic id **before the turn is recorded** — `seed_tool_results`
-keys placeholders by id and the streaming update matches by id, so two blank ids
-in one reply would otherwise collide on `""` — but names and arguments are
-recorded exactly as the provider sent them; repairing those is the wire layer's
-job. This recovery unit — the cause table, the note/instruction builders, and the
-per-cause consecutive-recovery bookkeeping — lives in its own module
-(`choreo-daemon`'s `requests/recovery.rs`), which the agent loop drives through a
-single `RecoveryBudget` state machine: `note_progress` resets every cause on a
-turn that produced runnable output, and `note_recovery` advances one cause and
-reports `Continue`/`Stop` at its budget, so the reset-on-progress rule is
-structural rather than a bare assignment a new branch could forget. Its buckets
-are a fixed two-slot array indexed by a typed `RecoveryCause`, not a map keyed
-by the log label — the identity of a cause is the enum, so two causes can never
-collide on one bucket and the budget never allocates. The recovery warning
-reports the cause label, the consecutive count, the budget and the **length** of
-the note detail, never the detail text itself: that detail echoes tool names the
-model authored, which is assistant-response content that could carry control
-characters into the log file, while the transcript note keeps the text so what
-was discarded stays visible to the user.
-
-**The request copy is repaired, never the transcript.** A stored turn keeps
-whatever bytes a reply carried, but a stored call is not always one a later
-request can legally replay: a strict endpoint rejects the *whole* request when a
-replayed call carries an empty or provider-invalid name, an empty id, or
-arguments that are not a JSON object, so one bad reply would poison the session
-for good. The request builder (`choreo-daemon`'s `wire` module — `reasoning`
-owns replay *policy*, `wire` owns mechanical repair) therefore passes its
-fully-assembled message list through `wire::repair_replayed_calls` as the last
-step, working only on that throwaway copy. Names are coerced to a provider-safe
-form by the shared `choreo_ai_protocols::tool_name` rules — the single owner of
-the blank stream-merge rule, the provider-safe validity rule (of which blank is
-a strict subset) and the arguments classifier the adapters also apply at ingest
-— an unsalvageable name becomes the `invalid_tool_call`
-sentinel, a legal name that labels a *past* call whose result the transcript
-already holds, so nothing is dispatched under it. A call id is judged by that
-same validity rule — a call id draws on the same `[A-Za-z0-9_-]` alphabet and the
-same byte cap as a function name because it is an opaque token the provider must
-accept and echo back, not a name looked up in the catalog. A blank id becomes a
-deterministic `call_<12 hex>` minted from the call's name, arguments and
-position, and an absent or non-object argument list becomes `{}`. Calls and
-results are then paired so every recorded call is answered by exactly one
-`tool` message — an unanswered call gets a stub result, a result that answers no
-call is dropped, and an assistant message left with nothing is dropped too.
-Pairing tries the recorded id first, for every result in the block, before any
-fallback runs; then a blank id answers the first open call, and an unmatched
-non-blank id answers the only open call when exactly one is left (a mangling
-proxy or a pre-mint transcript costs the tool's output otherwise). With two or more candidates open
-it declines, so a stray result can never take a call a genuine answer later in
-the block still claims by id. The repair is
-byte-deterministic and never re-serializes a valid object, so it does not churn
-the prompt-cache prefix. A chained Responses route keeps its non-blank ids
-byte-identical, duplicates included (it sends only the post-assistant tail, and
-the `function_call_output`'s `call_id` must match the id the service minted, so
-inventing a suffixed copy would answer nothing and cost the tool's real result)
-while still minting a blank one — the id guarantee is structural on that route,
-not a reliance on the service never minting a duplicate. The repair reports what
-it changed per request — the counts are its return value, never a side effect.
-Only the send path
-(`build_chat_request_messages_recording`, called once per provider round-trip)
-logs the counts at `debug` (numbers only, never a name, an id or message
-content) and exports them as the labelled counter
-`choreo_wire_repairs_total{provider,model,kind}`; the diagnostic build
-(`session_inspect`) and the tests use the non-recording builder so they cannot
-inflate it. That non-recording build returns the counts too, and
-`session_inspect` reports them: it rebuilds the exact request the model would
-receive, so a `wire repair for this request:` line names what the repair rewrote
-for that copy (per-kind counts, or `none` when nothing changed) and states that
-only the request copy is repaired while the stored transcript keeps its
-bytes — otherwise a session whose stored call is unusable would read as clean
-while every real send is being rewritten. Because the whole transcript is
-re-repaired on every send, the
-counter measures repair *work per send*, not distinct bad replies — a single
-unusable recorded call accumulates one increment per later turn — but the
-provider/model labels still make a model that emits unusable tool calls visible
-without reading a log.
-
-**Logging:** every binary uses `tracing` with `tracing-subscriber`. Default level is `info`.
-CLI flags `-v` (debug), `-vv` (trace), or `-q` (warn) override the level, and
-**explicit flags take precedence over `RUST_LOG`** (the Unix convention; `RUST_LOG`
-is a per-target directive language, applied verbatim when no flag is given). The
-flag parsing (`Verbosity`), the level resolution (`LoggingConfig::resolve`), and
-the one subscriber initializer (`logging::init`) live in `choreo-shared::logging`,
-so all five binaries — daemon, TUI, GUI, IM, and ACP — share the exact same
-policy and the exact same sink layout: diagnostics always go to a **hardened,
-pid-keyed file** (`<binary>-<pid>.log` in `{base}/log`, else
-`$XDG_STATE_HOME/choreographr`, else the platform temp dir; create-new `O_EXCL` +
-`O_NOFOLLOW` + 0600) **and**, where a console
-exists, are **mirrored to stderr** from the same filter. Which binaries mirror,
-and whether the mirror is unconditional or terminal-gated, is chosen per binary:
-the daemon and IM bridge always mirror (their stderr is the console *or*
-journald/launchd); the GUI and ACP adapter mirror only when stderr is a terminal
-(a desktop-icon / editor launch has none); the TUI never mirrors (it owns the
-alternate screen). A file open that fails is never fatal for any binary: it
-degrades to the console sink (with a warning), so an unwritable log directory
-cannot take a binary down. `--log-file <path>` on any binary chooses the
-file's path only (used verbatim, with no pid key) — it never affects the level
-and never mutes the console; with no base dir and no XDG state dir the file falls
-back to the platform temp dir (Termux/Android included).
-
-Every binary also **prunes** the shared log directory on startup: any log the
-suite names older than **one week** is removed — its own `<binary>-<pid>.log`
-and the captured MCP server `mcp-<…>.log` files alike. Retention is time-based
-(not a fixed file count), so a quiet instance keeps a full week of history while
-a busy one never accumulates unbounded files. A user's `--log-file` under any
-other name is never touched.
-
-**Logs never carry message payloads.** A log line (and any `bail!`/`anyhow!`
-message, which is printed and may be logged) holds only an *id*, *kind tag*,
-*length*, or *count* — never a user prompt, an assistant response, tool
-arguments/output, a request body, or a secret. The protocol and event enums
-derive `Debug` and several variants carry exactly this content, so they are
-never `?`-formatted into a line; a payload-free projection (`MessageKind`,
-`DaemonMessageType::kind` / `SessionEvent::kind`, `BridgeEvent::kind`) or a
-length is used instead (see AGENTS.md → Logging).
-
-**Session persistence:** On daemon start, sessions are loaded from the database into
-`session_metadata` (in-memory). Model selection (`/model <name>`) updates both the
-in-memory metadata and the database via `UpdateMetadata → db::write_session`. The
-`AttachSession` handler also populates `session_metadata` when re-loading a session
-from the database, ensuring `ListModels` and metadata queries see the correct
-`selected_model`.
+### Cancellation and connection accounting
 
 Two sanctioned shared-state exceptions (see AGENTS.md) underpin session
 cancellation and the daemon's connection accounting. Each session owns a
@@ -2710,11 +2335,10 @@ gate.
     name through verbatim, and each one is responsible only for its own wire's shape — Gemini's
     name-matched `functionResponse` grouping and minted positional call ids, Anthropic's
     whole-or-nothing `input_json_delta` validation, the responses adapter's streamed-call
-    assembly. Whether such a reply is runnable is decided once, in the daemon's agent loop (see
-    **A turn that yields nothing runnable is recovered, not dispatched**), which is the single
-    convergence point for all four wire formats; replay repair of an already-recorded call is
-    likewise the daemon's job (see **The request copy is repaired, never the transcript**), on
-    the request copy only.
+    assembly. Whether such a reply is runnable is decided once, in the daemon's agent loop
+    (`choreo-daemon`'s `requests::recovery`), which is the single convergence point for all four
+    wire formats; replay repair of an already-recorded call is likewise the daemon's job
+    (`choreo-daemon`'s `wire` module), on the request copy only.
 
 ---
 
