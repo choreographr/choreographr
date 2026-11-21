@@ -119,9 +119,12 @@ pub(crate) fn binary_exists(name: &str) -> bool {
 
 /// Resolve the working directory the child process should start in.
 ///
-/// In-process path confinement was removed in favour of OS-level sandboxing
-/// (Landlock on Linux, Seatbelt on macOS), so this only resolves the directory
-/// — it no longer verifies that it stays inside the session working directory.
+/// This only *resolves* the directory — it does not verify that it stays inside
+/// the session working directory, and nothing in this crate confines the child.
+/// Confinement is meant to be OS-level (Landlock on Linux, Seatbelt on macOS);
+/// until that lands (see README → Future Functionality → Sandboxing) the session
+/// working directory is a default, not a boundary, for anything a shell tool
+/// spawns.
 pub(crate) fn resolve_workdir(workdir: Option<&str>, working_dir: Option<&Path>) -> PathBuf {
     super::resolve_path(workdir.unwrap_or("."), working_dir)
 }
@@ -143,10 +146,13 @@ pub(crate) fn sanitize_env(cmd: &mut Command) {
 /// in its own process group here covers `sh`, `fish`, `nu`, `exec`, and the
 /// streaming variants in one place.
 ///
-/// Resource limits are deliberately not applied here — the OS-level sandbox
-/// (Landlock on Linux, Seatbelt on macOS) is the confinement boundary. A
-/// `setrlimit` pre-exec hook was removed as dead code; see git history if
-/// in-process rlimits are ever needed again.
+/// Resource limits and path confinement are deliberately not applied here: the
+/// confinement boundary is meant to be an OS-level sandbox (Landlock on Linux,
+/// Seatbelt on macOS), which is not in force yet (see README → Future
+/// Functionality → Sandboxing), so a spawned child is currently bounded only by
+/// the watchdog's timeout and the output cap. A `setrlimit` pre-exec hook was
+/// removed as dead code; see git history if in-process rlimits are ever needed
+/// again.
 fn setup_child(cmd: &mut Command) {
     sanitize_env(cmd);
     // Put the child in its own process group (pgid == child pid) so a

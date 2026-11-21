@@ -84,7 +84,10 @@ pub struct ToolResultRecord {
     /// Whether the tool reported the call as failed.
     pub is_error: bool,
     /// Human-readable description of the invocation (e.g. the command run),
-    /// rendered alongside the result.
+    /// rendered alongside the result. Set from
+    /// `ToolOutput.invocation_description` and shown by clients as the first
+    /// line of the tool-result block; it is deliberately excluded when the turn
+    /// is rebuilt as provider messages, so the model never sees it.
     pub invocation_description: String,
     /// A vision image this tool result produced, stored as a *reference* that
     /// carries the normalized image **bytes** (`ImageReference::data`), so the

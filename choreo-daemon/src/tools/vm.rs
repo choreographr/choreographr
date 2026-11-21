@@ -1,3 +1,32 @@
+//! The `run_riscv` tool: compile-and-run in a `ckb-vm` RISC-V sandbox, with
+//! the guest's ecalls dispatched back into the live [`ToolRegistry`].
+//!
+//! The guest is supplied as exactly one of inline Rust `source` (compiled here
+//! with the generated `#![no_std]` boilerplate prepended, then run), a
+//! pre-compiled base64 `program`, or a `program_path` to an ELF on disk.
+//!
+//! **Isolation.** The machine is a single-hart RISC-V `DefaultMachine` over flat
+//! memory with the A (atomic) extension disabled. It has no host syscall
+//! passthrough: the only host effect a guest can have is the choreographr ABI
+//! (`TOOL_CALL`, `WRITE`, `BATCH_TOOL_CALL`, and Linux `EXIT`), so the guest
+//! cannot read the host's memory, files, environment, or clock directly. Every
+//! effect it does have goes through a tool in the registry — and the syscall
+//! handler hands those calls the *caller's* `x_credentials`, `working_dir`, and
+//! `ToolContext`, so a guest's tool calls run with the same authority as the host
+//! agent's own (the reason [`RunRiscV`] is a manual [`Tool`] impl rather than a
+//! `define_tool!` one, which wires only args + working dir).
+//!
+//! Dispatch is by registry name and ignores tool-group state: group gating is a
+//! *discovery* mechanism for the model's API `tools` array, not access control,
+//! so a guest can reach every registered tool.
+//!
+//! **Bounds.** Guest `WRITE` output is charged against the shared
+//! [`MAX_TOOL_OUTPUT_BYTES`](crate::tools::MAX_TOOL_OUTPUT_BYTES) budget at the
+//! syscall (accumulated and streamed copies alike), so a chatty guest cannot
+//! flood the transcript or the live view; the VM's address space and cycle
+//! budget are [`DEFAULT_VM_MEMORY`]/[`DEFAULT_MAX_CYCLES`] (4 MiB is ckb-vm's
+//! own hard cap), both overridable per call within their validation bounds.
+
 use crate::tools::{
     MAX_TOOL_OUTPUT_BYTES, Tool, ToolExecError, ToolOutput, ToolRegistry, context::ToolContext,
     finish_tool_output_sanitized, tool_err, tool_ok,
@@ -1085,9 +1114,10 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
 /// Default VM memory size in bytes — currently 4MB, the hard cap of ckb-vm.
 ///
 /// This is intentionally tied to `ckb_vm::RISCV_MAX_MEMORY` rather than a
-/// literal: ckb-vm 0.24.14 (the latest release on crates.io) defines
-/// `RISCV_MAX_MEMORY = 4 << 20` in the `ckb-vm-definitions` crate and
-/// enforces it in two places that we cannot work around:
+/// literal: ckb-vm 0.24.15 (the latest release on crates.io, and what the
+/// lockfile pins) defines `RISCV_MAX_MEMORY = 4 << 20` in the
+/// `ckb-vm-definitions` crate and enforces it in two places that we cannot
+/// work around:
 ///
 /// 1. `FlatMemory::new_with_memory` **asserts** `memory_size <= RISCV_MAX_MEMORY`
 ///    (ckb-vm/src/memory/flat.rs) — a larger size would panic, not error.
@@ -1097,7 +1127,7 @@ fn compile(source: &str) -> Result<Vec<u8>, String> {
 ///
 /// So 4MB is the largest VM this dependency can construct; raising it to
 /// 16MB requires a ckb-vm release with the cap removed (upstream `develop`
-/// has refactored this, but nothing newer than 0.24.14 is published).
+/// has refactored this, but 0.24.15 — the latest published — still carries it).
 /// Keeping the default and the validation bound on the upstream constant
 /// means the tool follows automatically if the dependency is ever upgraded.
 const DEFAULT_VM_MEMORY: usize = ckb_vm::RISCV_MAX_MEMORY;

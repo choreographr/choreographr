@@ -1996,268 +1996,59 @@ counterpart, the `ToolRegistry` that owns and dispatches every tool, and the
 module, `cargo doc -p choreo-daemon` / `just doc`), held complete by the
 `#![warn(missing_docs)]` + `doc-check` gate.
 
-The system has three dispatch paths with distinct callers:
-
-| Path | Input | Output | Caller |
-|---|---|---|---|
-| `ToolDyn::execute_json` | `&str` (JSON) | `Result<ToolOutput, ToolError>` | LLM tool calls (OpenAI/Anthropic …) |
-| `ToolDyn::execute_streaming_json` | `&str` (JSON) | `Result<ToolOutput, ToolError>` | streaming shell/VM tools |
-| `ToolDyn::execute_postcard` | `&[u8]` (postcard) | `Vec<u8>` | RISC-V VM guest ecalls (see "Postcard binary encoding") |
-
-The two JSON paths take a `ToolOutputFormat` so the caller chooses `Text`
-(human/LLM rendering via `Tool::return_string`) or `Json` (Programmatic Tool
-Calling — the typed return serialized with `serde_json`). A tool's `Error`
-associated type is per-tool: simple tools use the string-wrapper `ToolExecError`;
-tools whose structured errors are consumed by VM guests (e.g. `DbError`,
-`HttpError`) define a `thiserror` enum that is serde-serializable, so the guest
-can pattern-match on specific variants. Tools gate which callers may invoke them
-via `allowed_callers()` (direct model call, programmatic PTC call, or both), and
-tools that need session context receive it through `ToolContext`. A tool that
+Three dispatch paths cross the tool boundary, and the split is a contract, not
+an implementation detail: two JSON paths (`ToolDyn::execute_json` and
+`execute_streaming_json`) serve LLM tool calls and return a `ToolOutput` rendered
+as `Text` (human/LLM) or `Json` (Programmatic Tool Calling), while
+`ToolDyn::execute_postcard` serves RISC-V VM guest ecalls and answers in postcard
+bytes — the guest↔host wire format described under "Postcard binary encoding"
+below. A tool's `Error` type stays structured per tool so a guest can match on its
+own variants (`DbError::NotFound`, `HttpError::InvalidUrl`, …), and a tool that
 produces an image carries it on its typed return value, drained by the request
 worker over an out-of-band multi-message channel (an MCP result may carry several
 image blocks) rather than embedded in the response struct.
 
-**Invocation descriptions.** The human-readable sentence `Tool::describe_invocation`
-produces before execution is stored in `ToolOutput.invocation_description`, carried
-onto `ToolResultRecord.invocation_description`, and rendered by clients as the
-first line of the tool-result block. It is seeded onto every placeholder result
-when the model's tool calls are recorded, so clients render the tool's context
-(e.g. "Running command: `…`.") the moment the seeded turn is broadcast — before
-any output streams. It is deliberately excluded from LLM message construction:
-the model never sees it.
-
-Each tool call executes with an optional `working_dir` — the session's working
-directory — that filesystem and Git tools resolve relative paths against. A
-leading `~` or `~/` in any path argument is expanded to the user's home directory;
-the `~user` form is passed through unchanged.
-
 ### Tool output sanitization and bounding
 
-Tool output is defended in three layers — at the **source** (the tool that produces the
-bytes), at the **transcript** (what the model sees on the next call), and at the
-**sink** (the terminal that renders it):
+Tool output is defended in three layers — at the **source** (the tool that produces
+the bytes), at the **transcript** (what the model sees on the next call), and at the
+**sink** (the terminal that renders it). One Unicode policy and one byte budget sit
+behind all three, so the layers cannot drift: `choreo-sanitize` owns the spoofing
+predicates (`is_unsafe_unicode` / `is_non_joiner_format_char`), the 128 KiB
+`MAX_TOOL_OUTPUT_BYTES` budget with its `...[truncated]` marker, the incremental
+`ByteBudget` a streaming path is charged against, and the shared child-env injection
+list. Its consumers are the daemon's line sanitizers and transcript choke point, the
+TUI's terminal render filter, `choreo-blockchain`'s node-output sanitizer,
+`choreo-client-core`'s live accumulation, and `choreo-mcp`'s stdio children — so a
+character class is defined once, not re-implemented per layer.
 
-- **Source.** `sanitize_text` / `sanitize_name` / `sanitize_content` (in `tools/sanitize.rs`)
-  escape C0/C1 controls, the line/paragraph separators U+2028/U+2029, and every Unicode
-  *format* character (general category Cf) except the joiners U+200C/U+200D, via
-  `char::escape_default`. The spoofing predicate itself is the shared
-  `choreo_sanitize::is_unsafe_unicode` (the leaf crate that owns the policy — the
-  blockchain tools and the TUI use the same one). The line-oriented tools use them so
-  every listing stays one
-  line per entry and a hostile name/line cannot inject terminal escapes (`grep` on match
-  and context lines; `find` and `list_files` on paths and symlink targets; `pdf_*` on
-  log fields and invocation descriptions; the file tools on their path labels and
-  invocation descriptions — `read_file`'s header, `line_count`'s result, `edit_file`'s
-  result, and every file tool's `describe_*_invocation` path). The same policy now
-  covers the raw-content readers: `render_streamed_line` sanitizes every `read_file` line,
-  and `http_request` runs response bodies through `sanitize_multiline` (a
-  newline-preserving variant for content that legitimately spans lines) and header
-  values through `sanitize_name` — so a hostile file or HTTP response cannot inject
-  terminal escapes or bidi-spoof the model no matter which tool delivers it.
-- **Transcript.** `sanitize_transcript` escapes only the Cf format chars (the spoofing
-  class — bidi overrides, ZWSP, invisible operators, …) at the single point where every
-  tool result is recorded (`record_tool_completion` in `requests/tool_execution.rs`), preserving
-  ESC/ANSI, newlines, and tabs so shell/VM colors survive. Because escaping *expands*
-  (a Cf char becomes `\u{202e}`), the choke point re-applies the byte cap **after**
-  sanitizing (`truncate_tool_output(&sanitize_transcript(…))`), so content that was
-  capped at the source as raw bytes (shell/VM/series) cannot exceed the budget once
-  escaped. Tools that append a critical tail to *raw* output (the VM exit footer,
-  `format_shell_output`'s `Exit code:` line, `pdf_to_markdown`'s closing
-  untrusted-content delimiter) sanitize **before** the cap instead, via
-  `finish_tool_output_sanitized` (in `tools/sanitize.rs`): `sanitize_transcript` is
-  idempotent on its own ASCII escape output, so the choke point's re-sanitize is a
-  no-op and its re-cap cannot cut the tail off — closing the residual gap where a
-  Cf-heavy raw body near the cap would expand past the budget and lose its footer.
-  This closes the remaining
-  LLM-spoofing gap for the streaming tools whose raw output is deliberately not
-  source-escaped.
-- **Sink.** `choreo-tui`'s terminal-safety filter (`src/text_filter.rs`, the one home
-  of the policy, shared by the markdown renderer, the plain widgets, the stored
-  status text, and the OSC field strippers) exposes `normalize_ansi_text`, which
-  runs over every tool-result body before rendering: it keeps complete SGR color
-  sequences (`ESC [ … m`, so ANSI
-  coloring still works) and escapes everything else — OSC/CSI/DCS sequences, C0/C1
-  controls (including lone CR: a carriage return not followed by a line feed
-  would let hostile content overwrite its own rendered line; a CRLF pair is folded to
-  a single `\n`, matching the daemon's line sanitizers), U+2028/U+2029, and the Cf spoofing class (via the same shared
-  `choreo_sanitize::is_unsafe_unicode`). The same pass expands tabs to 4-column
-  spaces, so the text measured is the text drawn. This is what makes the raw
-  shell/VM streams safe to draw; it defends against terminal-escape injection (OSC-52
-  clipboard writes, clear-screen, title changes, …) for every tool at once, including
-  the tools that never sanitize at the source. The module's third entry point,
-  `sanitize_pasted_text`, is the *editing* rule described under the two-tier policy
-  below: it rewrites rather than escapes, because its output is stored and submitted
-  rather than drawn.
-- **Model output is filtered at the same sink.** The markdown renderer (the
-  response, the reasoning body, user text, and tool descriptions) runs
-  `normalize_display_text` over its source before parsing it: the same fused pass with
-  SGR passthrough **off** (nothing there parses escape
-  sequences, so a kept one would only draw as literal `[31m`), tabs expanded in the
-  same scan. Besides making hostile model output inert, this closes a
-  measurement/drawing desync: `unicode-width` counts a control character as one
-  column while ratatui filters it out of the drawn grapheme stream, so a row
-  carrying one measures wider than it renders — which rags a code box's right
-  border on tab-indented lines. The same normalizer is applied by every
-  plain widget that *displays* rather than authors its text — the status bar's session
-  identity fields (working directory, account, model, reasoning effort, tool
-  groups), the session-status label (whose tool name is MCP-supplied), tool-result
-  labels, the session table and detail pane (title, model, working dir, account,
-  tool groups), image block titles (including the model-chosen tool-call id in a
-  placeholder), the provider/model/credential modals and their delete
-  confirmations, and the OAuth login popup (whose status, authorize URL, and
-  device code come from the authorization server) — via `render::display_text`.
-  The rule the renderer holds to is that **every row measures exactly what
-  ratatui draws**; any producer that hands a widget text it did not author must
-  normalize it first (clean text borrows, so the common case costs one scan).
+- **Source.** The line-oriented tools escape C0/C1 controls, U+2028/U+2029, and the
+  non-joiner format class as they render a listing or a content body, so one entry
+  stays one line and a hostile name or line cannot inject terminal escapes.
+- **Transcript.** The single point where every tool result is recorded escapes
+  *only* the Cf spoofing class, preserving ESC/ANSI, newlines, and tabs so shell/VM
+  colors survive into the model's history.
+- **Sink.** `choreo-tui`'s terminal-safety filter keeps complete SGR colour
+  sequences and escapes everything else. That is what makes the raw shell/VM
+  streams safe to draw at all, including for the tools that never sanitize at the
+  source.
 
-  **The OSC fields classify the same characters.** The OSC 2 window title and the
-  OSC 7501 `title`/`msg` values are free text shown outside the grid, and their
-  strippers use the identical Unicode policy — C0/DEL/C1 plus the shared
-  `choreo_sanitize::is_unsafe_unicode` class (every non-joiner format character and
-  U+2028/U+2029). Only the action differs: the grid **escapes** (the text stays
-  readable and keeps measuring exactly what it draws), while an OSC payload
-  **drops** (a payload body cannot carry an escape sequence at all, and OSC 7501
-  forbids control bytes — a decoded one makes the terminal discard the whole
-  report).
+Each layer's per-tool application is documented where it lives (`tools/sanitize.rs`,
+`choreo-tui`'s `text_filter`), including the ordering rule the budget depends on:
+escaping *expands* text, so a body capped as raw bytes can exceed the budget once a
+Cf character becomes `\u{202e}`. The transcript choke point therefore re-caps after
+sanitizing, and a tool that appends a critical tail (the VM exit footer, the shell
+`Exit code:` line, the PDF untrusted-content delimiter) sanitizes before capping via
+`finish_tool_output_sanitized`, whose output is plain ASCII — which makes the choke
+point's re-sanitize and re-cap no-ops, so the tail cannot be cut off.
 
-  **The program-status record set.** Every OSC 7501 report is a *child* record —
-  one per session (`id=<session id>`) plus one for a live `/login` flow
-  (`id=login`) — because OSC 9;4 owns the terminal-wide root record and a 7501
-  report replaces its record wholesale. The login flow has no session to hang
-  off: it is blocked on the user finishing a sign-in in a browser, so it reports
-  `state=blocked:kind=auth` with the account as `title` and the streamed status
-  line as `msg`. `kind` is state-gated to `blocked` and `progress` to
-  `working`/`blocked`, so a key is emitted only where the spec gives it meaning.
-  The only honest `progress` figure the client has is a retrying request's
-  attempt count; the context-window fill percentage is a gauge, not
-  work-completion, and stays on 9;4.
-
-  **The other output-only escapes.** Two terminal-integration escapes carry no
-  free text, so the strip policy above does not apply to them, but they share the
-  same rule that keeps them off the input stream: they are **set commands, never
-  queries**. The OSC 22 pointer shape (`terminal/pointer.rs`, wired through
-  `state/pointer.rs`) names one of three CSS cursor keywords — `default`, `text`,
-  `pointer` — chosen from the same hit-tests click handling uses (the scrollbar
-  column, the history pane's text, the composer box, and the reasoning /
-  tool-result header ranges), and is emitted from the UI loop outside
-  `terminal.draw` only when the shape changes, so mouse motion never dirties a
-  frame; it is reset to `default` on suspend and exit. The hover position behind
-  it is sampled from **every** mouse event, not only from motion: a terminal
-  reports button-less motion as `Moved` only while its any-event tracking
-  (DECSET 1003) is in force and no button is held, reports the same movement as
-  a `Drag` while it believes a button is down, and reports no motion at all once
-  the mode lapses. Because the shape is emitted only on change, a hover
-  refreshed from motion alone would freeze on the last target for the rest of
-  the session, which is unrecoverable from inside the app; sampling clicks,
-  drags and wheel notches keeps it tracking, and a click or wheel notch landing
-  where the motion stream never reported asks the loop to re-assert the tracking
-  mode (an idempotent private-mode set, the client's only self-recovery — the
-  mode itself is terminal-side state it cannot read back). The
-  synchronized-update markers (DECSET 2026) are written by the `Backend::draw`
-  wrapper (`backend.rs`) as a begin/end pair around each frame's cell stream,
-  through the same writer and with no flush between them, so the terminal
-  presents a frame atomically. Neither is capability-probed: an unsupported
-  terminal ignores a private-mode set or an unknown cursor keyword, while a
-  *query* reply would land on stdin, where crossterm parses it as individual
-  keystrokes and types it into the user's prompt.
-
-  The policy is tiered, and which tier a value belongs to is decided by whether
-  anything other than a widget reads it:
-
-  1. **Ingest** — daemon-authored text that is *only* displayed is normalized
-     once, where it is stored: the chat status/error line and the quit message
-     `run_app` prints with `println!` once the alternate screen is gone
-     (`App::set_status`/`App::set_error`/`App::set_quit_message` writing a
-     private `DisplayLine` field, so no call site can store raw bytes and the
-     height math measures exactly the drawn text without re-scanning), the
-     AI-providers sub-modal error lines, the session-manager and model-selector
-     error rows, and the login modal's status text, authorize URL and device
-     code (both halves). Because the stored value is already inert, it stays
-     inert at every place it is later read — including a non-ratatui consumer
-     with no widget sink of its own to route through (a `println!` output path,
-     a log line, a clipboard copy).
-  2. **Sink** — identity-bearing or keyed values stay byte-exact in state and
-     are normalized at the draw sink instead: a model id, a reasoning effort,
-     an account slug, a session title (which also feeds the OSC 2 window title,
-     where the policy is applied by *dropping* rather than escaping — see
-     above), a tool name compared against
-     `MARKDOWN_TOOLS`, a tool-call id — and, in the login modal, `provider` and
-     `account`, because the account name is the credential key the modal hands
-     back and the provider selects the auth descriptor. Escaping those in place
-     would change what is sent back to the daemon, what is compared, or what
-     key it is looked up by, so the rewriting happens at the last moment.
-
-  The two tiers compose safely: the normalizer is idempotent and borrows text
-  that is already normalized, so a sink pass over an ingest-normalized string
-  costs one scan and allocates nothing. The sink therefore stays as
-  belt-and-braces for whatever a future widget forgets to place on the ingest
-  tier.
-
-  The rule covers text the TUI only *displays*, not text the user is *editing*.
-  The prompt buffer and the picker filter fields (command palette, model
-  selector, provider wizard) draw their raw bytes deliberately: those bytes are
-  exactly what reaches the daemon, and the buffer's cursor is a byte offset into
-  them, so normalizing on the way to the screen would desync the cursor from the
-  row it is drawn on and alter the text that gets submitted.  That exemption
-  costs no measurement honesty, because a paste is sanitized at the paste choke
-  point before it reaches any of those buffers: `sanitize_pasted_text` drops
-  every character the terminal filter rejects (C0/C1 controls and DEL, the
-  line/paragraph separators, the non-joiner format class), expands tabs to
-  4-column stops, and folds CR to `\n` — rewriting rather than escaping, since an
-  injected `\u{1b}` would be text nobody typed. The buffer's bytes therefore stay
-  exactly what the daemon receives *and* measure exactly what draws.  Everything
-  the user merely reads — including their own submitted turn text, once it is out
-  of the buffer — is normalized like any other displayed content.
-
-**Streaming is byte-bounded end to end.** The bounded streaming channel only bounds
-*in-flight* chunks (backpressure); the *total* is capped too, so the live view can never
-diverge unboundedly from the recorded result. (Note the two independent bounds: this
-section is about `ByteBudget` capping a single tool's *content*; the lossless delivery
-design separately bounds *delivery* — the per-client in-flight bytes that trigger
-lag-eviction — see the `choreo-daemon` `broadcast` module docs. They don't collide: content is capped
-at the source, delivery is capped per client queue.)
-
-- `spawn_with_streaming` (sh/exec/fish/nu) streams **both** stdout and stderr:
-  the two pipes are drained in background threads, split into lines (CRLF
-  folded; oversized unterminated lines are flushed forward as partial chunks
-  that never split a UTF-8 char and hold back a trailing `\r` so CRLF still
-  folds), and merged onto one channel in arrival order; a single consumer
-  escapes the Cf spoofing class (`sanitize_transcript`) *before* the bytes
-  enter the shared `ByteBudget`, then forwards the escaped lines (the same
-  "first N bytes + one marker" engine) and accumulates the same capped bytes
-  into the returned body. Budgeting the *escaped* form is what makes the
-  record byte-identical to the live view even for Cf-heavy output — escaping
-  expands, and charging the budget for the expanded bytes keeps
-  `finish_tool_output`'s cap a no-op (no re-cut, single marker). The stream
-  budget reserves `format_shell_output`'s framing (the `$ {cmd}\n` header —
-  measured at its escaped size — the exit-code footer, and the truncation
-  marker) *inside* the cap via `RecordFraming`, so the final cap is a no-op
-  and the exit-code footer always survives (including the transcript re-cap
-  in `record_tool_completion`). A tool that writes progress to stderr (cargo,
-  nextest, make, …) streams live instead of appearing all at once. On a
-  timeout the watchdog kills the child and signals an abort channel; the
-  merger selects on it while blocked on a full output channel, so a stalled
-  subscriber can never wedge the tool past its timeout.
-- `find`'s walk enforces the byte budget during collection (charging each rendered line
-  plus its joining newline), stopping the walk and reporting the collected count in the
-  marker — the streamed view and the final result now agree. The walk's budget reserves
-  the finish tail *inside* it (the truncation marker plus the generic `...[truncated]`
-  suffix `finish_tool_output` holds back), so the final cap never re-cuts the body.
-- `run_riscv` caps guest `WRITE` output at the syscall via `ByteBudget` (both the
-  accumulated and the streamed copies): a write that would cross the cap is kept as a
-  fitting prefix, the one-shot truncation signal fires, and the streamed live view gets
-  the shared marker. `finish_tool_output` then wraps the final content, reserving
-  room inside the budget for the exit footer (and the truncation marker, when
-  output was cut) so the signal always survives — including the transcript re-cap
-  in `record_tool_completion`.
-- `run_series` caps the aggregated step JSON with `finish_tool_output` (each step is
-  capped, but N steps joined could exceed the budget).
-- The clients cap their *live* accumulation too: `SessionView::tool_result_chunk` in
-  `choreo-client-core` stops at the same shared `MAX_TOOL_OUTPUT_BYTES` (128 KiB)
-  budget with the same one-time `...[truncated]` marker (a chunk landing exactly on the
-  cap still marks the next chunk truncated, matching the daemon's `ByteBudget`), so a
-  chatty tool cannot balloon client memory before the (authoritative, capped) final
-  record replaces it.
+**Content is capped; delivery is bounded separately.** `ByteBudget` caps a single
+tool's content at the source and the clients cap their own live accumulation at the
+same shared budget with the same marker, so the streamed view and the authoritative
+recorded result agree. Delivery is a different bound: the lossless delivery design
+separately bounds the per-client in-flight bytes that trigger lag-eviction (see the
+`choreo-daemon` `broadcast` module docs). They do not collide — content is capped at
+the source, delivery per client queue.
 
 ### PDF tools
 
@@ -2268,53 +2059,32 @@ never executes embedded files, `/Launch` actions, or external references, so the
 classic PDF malware *execution* vectors are excluded by construction. The tool
 layout and per-tool contracts are documented in-source (see `tools/pdf/`).
 
-> **Dependency — security.** `pdf-inspector` is an **unconditional registry dependency**
-> of `choreo-daemon` (`pdf-inspector = "1"`, version 1.x, no feature gate). The old
-> arrangement — a crates.io 0.1 dep behind the optional `pdf` feature plus a
-> workspace-root `[patch.crates-io]` redirect to a contributor fork
-> (`omeileo/pdf-inspector@f86decf`, upstream PR firecrawl/pdf-inspector#198) — was removed
-> in the 1.15.0 update: crates.io 0.1.x shipped `lopdf ^0.41.0`, vulnerable to
-> RUSTSEC-2026-0187 (a ~21 KB crafted PDF with ~10,000-deep nested objects aborts the
-> process via stack overflow — a SIGABRT that `catch_unwind` **cannot** intercept), and the
-> fork bumped `lopdf` to 0.42.0 (MAX_NESTING_DEPTH). Upstream 1.15.0 now ships
-> `lopdf >= 0.42` with `default = []`, so the pin, the `[patch.crates-io]` entry, and the
-> `pdf` feature gates in the root and `choreo-daemon` `Cargo.toml` were all deleted. The
-> regression guard `nested_array_poc_does_not_abort_process` in
-> `tests/it/pdf_tool_integration.rs` still covers the vuln: with `lopdf >= 0.42` the parser
-> caps nesting depth, so the PoC yields a clean parse error or a graceful `SCANNED`
-> classification (exit 0) instead of SIGABRT.
+> **Dependency — security.** `pdf-inspector` 1.x ships `lopdf >= 0.42`, whose
+> MAX_NESTING_DEPTH cap fixes RUSTSEC-2026-0187: a ~21 KB crafted PDF with
+> ~10,000-deep nested objects aborted the process via stack overflow — a SIGABRT
+> that `catch_unwind` **cannot** intercept. The regression guard
+> `nested_array_poc_does_not_abort_process` in `tests/it/pdf_tool_integration.rs`
+> still covers it: with `lopdf >= 0.42` the PoC yields a clean parse error or a
+> graceful `SCANNED` classification (exit 0) instead of SIGABRT. The dependency
+> sits behind `choreo-daemon`'s `pdf` feature, which is in `default` so every
+> desktop consumer keeps the tools; the iOS embedded-daemon build opts out because
+> pdf-inspector's build script links a C dylib the Linux validation shim cannot
+> produce. There is no `[patch.crates-io]` redirect — `choreo-daemon/Cargo.toml`
+> carries the full rationale.
 
-Both tools funnel through `read_validated_pdf`, which resolves the path (working dir + `~`),
-requires a regular file, caps input at 50 MiB, and rejects anything without the `%PDF-` magic
-header *before* the parser sees it. The magic check tolerates a UTF-8 BOM and leading
-whitespace exactly as `pdf-inspector`'s own validator does, and the size cap + magic check
-run against the **same open file handle** as the (bounded) read, so a file swapped or grown
-between check and read cannot slip past the gates (TOCTOU). Extracted markdown is treated as
-**untrusted data end-to-end**: it is wrapped in an explicit `UNTRUSTED content extracted from
-PDF…` delimiter (prompt-injection guard) whose closing line is appended *past* the shared
-128 KiB `MAX_TOOL_OUTPUT_BYTES` budget, so a truncated extraction still closes its frame;
-the framing literals are **redacted from extracted text**, so a hostile PDF that embeds
-`--- end untrusted content ---` cannot close the frame early (frame-spoofing guard);
-C0 control characters other than tab/newline/CR are escaped (terminal-escape guard).
-Extracted markdown is additionally bounded by a 256 MiB **post-decompress budget**
-(`MAX_PDF_DECOMPRESSED_BYTES`) — a decompression-bomb stopgap that refuses to ship a giant
-string into the context and returns an actionable error instead (the hard `RLIMIT_AS`
-backstop remains the sandbox phase). The hygiene passes (control-char escaping and frame
-redaction) run only over the first `MAX_TOOL_OUTPUT_BYTES` of the extraction — the region
-the output cap can ever show — so a just-under-budget, control-char-heavy string cannot be
-amplified into multiple multi-hundred-MiB copies (a frame literal straddling the window
-edge is only a partial match and cannot close the frame). Out-of-range `pages` requests are
-rejected against the authoritative parsed page count (`result.page_count` — the *full*
-document count regardless of the filter) *after* the same parse that produced the
-markdown, so the pages path stays a single document parse; an entirely-out-of-range
-request is still cheap because the parser skips markdown rendering for a filter that
-matches nothing, and it is rejected before the scanned/OCR-routing branch can mislead the
-agent. Input-gate rejections (non-regular file, size cap, missing `%PDF-` magic) are logged
-via `tracing::warn!` with the control-char-sanitized path. `PdfError`
-variants map to actionable one-line messages (e.g. encrypted → “pass a decrypted copy”).
-Malformed-PDF panics from `lopdf` are contained by the request worker's `catch_unwind`
-boundary (see the worker thread discussion above); OS-level sandboxing
-(Landlock/seccomp/Seatbelt) for extension-process parsing is a planned follow-up.
+Extracted markdown is **untrusted data end-to-end**: `pdf_to_markdown` frames it in
+an explicit `UNTRUSTED content extracted from PDF…` block whose closing delimiter is
+reserved *inside* the shared byte budget (so a truncated extraction still closes its
+frame) and whose literals are redacted from the extracted text (so a hostile PDF
+cannot close the frame early and have the rest read as trusted output). Both tools
+parse only validated bytes — the path resolved, a regular-file check, a 50 MiB size
+cap, and the `%PDF-` magic header, all checked against the same open handle so a
+file swapped or grown between check and read cannot slip past. The individual gates,
+the post-decompress budget, and the page-range checks are documented in-source
+(`tools/pdf/`), as is the containment story: `lopdf` panics on malformed input are
+caught by the request worker's `catch_unwind` boundary (see the worker thread
+discussion above), while OS-level sandboxing (Landlock/seccomp/Seatbelt) for
+extension-process parsing is a planned follow-up.
 
 ### Postcard binary encoding
 
@@ -2365,32 +2135,11 @@ capture, the `is_session_config_tool` predicate, and the Phase-3 worker-copy
 mirror that carries successful session-config mutations onto the request
 worker's config copy live in `requests/config_tools.rs`.
 
-The dispatch and execution machinery (channel wiring, per-tool timeout
+The dispatch and execution machinery — channel wiring, per-tool timeout
 resolution, the wait loops, the streaming forwarder, and per-tool result
-recording) lives in `requests/tool_execution.rs`, and the system-prompt /
-tool-result side-effect helpers live in `requests/system_content.rs`. The
-forward-only streaming phase and its chunk/status broadcasters live in
-`requests/stream.rs`, and the prompt-size estimate the context-window display
-uses in `requests/tokens.rs`. The agent loop's two largest result arms have
-their own modules as well: `requests/final_text.rs` owns the final-answer arm
-(the finish-reason truncation marker, the answer record, and the routing of a
-reply that still lost tool calls to truncation into the shared recovery unit),
-and `requests/tool_use_turn.rs` owns the tool-use arm — the ingest gate that
-drops provider-unacceptable call names, the mixed-reply guidance, the call-id
-minting, the turn recording with its seeded placeholders, the cache-warmer
-arming, and the three dispatch phases above. The tool-use helper also owns the
-turn counter for its arm, advancing it on every exit that lets the loop
-continue, so `run_agent_loop`'s loop-tail increment serves only the
-truncated-tool-call error recovery. Every extracted unit except those two
-turn-arm helpers is re-exported from `requests.rs` (a `pub(crate) use <mod>::*;`
-glob, or an explicit named list where the surface is small); the helpers are
-called only from `run_agent_loop` and stay private. `requests.rs` itself holds
-`run_agent_loop` — its setup, the provider call (including the OAuth 401
-refresh-and-retry), the thin dispatch to those helpers, and the small error
-arms. Each concurrent tool runs on a dedicated
-execution thread, a forwarding thread, and a wait-loop thread — see the
-`requests/tool_execution.rs` module docs for the thread topology and the
-per-tool timeout budgets.
+recording — lives in-source: `requests/tool_execution.rs`'s module docs own the
+thread topology (execution, forwarding, and wait-loop thread per concurrent tool)
+and the per-tool timeout budgets.
 
 Cancellation is fully event-driven: every wait blocks on a
 `crossbeam_channel::select_biased!` between its result channel, the request's
@@ -2420,48 +2169,58 @@ the repo's channel-only thread-communication rule (see AGENTS.md).
 ### spawn_subsession
 
 `spawn_subsession` is a core-group `Tool` implementation that runs in the
-concurrent dispatch path. Invoked, it creates a child session
-(`DaemonCommand::CreateSession`, parent as `parent_session_id`, inheriting the
-parent's working directory and tool groups), pushes the prompt as a `SystemText`
-message, drives the child's own `run_agent_loop()` (subject to the daemon-wide
-`max_turns` cap), and returns the child's assistant text to the parent; the child
-persists as a normal session. The tool's contract is documented in-source
-(`choreo-daemon`'s `tools/subsession.rs`).
-
-The child inherits the working directory and tool groups only — **not the
-parent's conversation**. Its first and only input is the prompt string, so the
-parent has to write a self-contained brief; a prompt referring to earlier turns
-is empty to the child. Because a child can spawn its own children, the same rule
-reapplies at every level (see AGENTS.md → Task Execution).
+concurrent dispatch path: it asks the daemon command loop for a child session
+(parent recorded as `parent_session_id`; working directory, model, and tool groups
+inherited), drives the child's own agent loop to completion under the daemon-wide
+`max_turns` cap, and returns the child's assistant text. Its contract is documented
+in-source (`choreo-daemon`'s `tools/subsession.rs`).
 
 The daemon tracks the parent→child relationship (`DaemonState::children`) so a
-parent's cancellation, exit, or deletion also stops its children — see the
-daemon's session-lifecycle docs for the cancellation-propagation and
-cascade-deletion rules.
+parent's cancellation, exit, or deletion also stops its children — see the daemon's
+`cancel_children_of` and cascade-deletion docs. The TUI's navigation round trip
+(entering the child a spawn created, and switching back when it finishes) is
+documented in `choreo-tui`'s `state/subsession.rs`.
 
-The TUI gives a spawn a navigation round trip. Because the child is created
-server-side by the tool (not by the client), it reaches the TUI only as the
-`SessionCreated` **broadcast** — which is normally notification-only and must
-never move the view. The TUI makes exactly one exception: when the `SessionCreated`
-broadcast names the currently attached session as the parent **and** exactly one
-`spawn_subsession` call is in flight for that session (tracked from
-`ToolCallStarted`/`Finished`/`Failed`, keyed by `tool_name`), it enters the child.
-The in-flight-count gate is what separates the user's own session's spawn from a
-sub-session created by another client (no local call → no navigation) and keeps
-parallel spawns in one turn from thrashing the view; the tally is reconciled at
-request end and on session deletion so a lost `ToolCallFinished` cannot poison it.
-Entering the child records a summary-independent
-`SpawnedChildNav { child_id, parent_id, seen_active }` from the creation event's
-authoritative ids. The child finishes by one of **two signals, both consuming the
-one record** so exactly one switches back: the child's own active→idle status
-transition (its first **active** status latches `seen_active`, so the daemon's
-creation-time `Inactive` broadcast cannot bounce the view back), or — for a child
-that finished before ever being observed active — the parent's blocking
-`spawn_subsession` tool returning, which is a definitive completion signal. Either
-switches back to the parent with the same `switch_back_to_parent` notification the
-manual-open path uses; the record is also abandoned when the user attaches
-elsewhere or the parent/child is deleted. See `choreo-tui`'s
-`state/subsession.rs`.
+### `run_riscv` — RISC-V sandboxed code execution
+
+The guest runs in a `ckb-vm` RISC-V machine with no host syscall passthrough: it
+cannot reach host memory, files, or the environment except through the choreographr
+ABI's tool calls, and every one of those dispatches through the same `ToolRegistry`
+the host agent uses — with the caller's `x_credentials`, `working_dir`, and
+`ToolContext` — so a guest inherits exactly the authority of the session that ran
+it. Dispatch is by registry name, so group state is discovery, not access control
+(see "Tool groups"). The compile-and-run flow, the guest ABI and syscall set, and
+the ckb-vm memory/cycle bounds are documented in-source (`choreo-daemon`'s
+`tools/vm.rs`).
+
+### `sh` — POSIX shell command execution
+
+The shell/exec tools (`sh`, `nushell`, `fish`, `powershell`, `exec`) share one
+sandbox contract, implemented in `tools/shell_util.rs` and documented in-source:
+a watchdog kills the child's process tree on timeout; the child's environment is
+stripped of the canonical injection variables (one shared list, the same one the
+MCP stdio transport strips); stdin is not connected, so a command that reads from
+it hangs until the timeout; and output is bounded by the shared 128 KiB cap.
+**No confinement is applied today** — neither in-process path checks nor resource
+limits — so a spawned child can reach whatever the daemon's own user can. The
+intended boundary is OS-level (Landlock on Linux, Seatbelt on macOS), still
+planned per README → Future Functionality → Sandboxing. The shell the `sh` tool
+runs under is resolved once at daemon startup (see `tools/shell_resolver.rs`).
+
+On Windows the same helpers swap in the platform analogues: `setup_child` has
+no process group to create, so the child is assigned to a Job Object
+(`ChildJob`, created right after spawn — `Command` has no pre-exec hook — with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` making the handle a whole-tree kill
+switch), and the watchdog's timeout kill is gated on a `ProcessIsAlive` probe
+(a zero-timeout `WaitForSingleObject` on a copy of the child's process handle)
+so a child that already exited is not misreported as killed — the Windows
+analogue of the Unix pidfd/ESRCH check. The `Arc<ChildJob>` and `ProcessIsAlive`
+handle copies are the fifth sanctioned shared-state exception (see AGENTS.md
+#5): a `HANDLE` is a kernel-table index, not an address-space pointer, and every
+Job Object operation is thread-safe kernel-side, so the watchdog and drain
+threads share one immutable value whose handle is closed exactly once by `Drop`
+on the last owner. The kernel-handle rationale is in `choreo-daemon`'s
+`tools/shell_util.rs`.
 
 ---
 
@@ -3964,43 +3723,6 @@ loop then persists the body into `SessionState::loaded_skill_bodies`, re-injecte
 under `<skill name="...">` on every later turn so its instructions stay visible
 after the tool result scrolls out of the context window. Documented in-source
 (`choreo-daemon`'s `tools/admin/load_skill.rs` and `requests/system_content.rs`).
-
-### `run_riscv` — RISC-V sandboxed code execution
-
-The guest runs in an isolated VM: it cannot reach host memory, syscalls, or files
-except through the registered tools, and every guest tool call goes through the
-same `ToolRegistry` the host agent uses, so it honours the same `x_credentials`
-and `working_dir` context. The tool's own contract — the compile-and-run flow,
-the guest ABI and syscall set, and the ckb-vm memory/cycle bounds — is documented
-in-source (`choreo-daemon`'s `tools/vm.rs`).
-
-### `sh` — POSIX shell command execution
-
-The shell/exec tools (`sh`, `nushell`, `fish`, `powershell`, `exec`) share one
-sandbox contract, implemented in `tools/shell_util.rs` and documented in-source:
-a watchdog kills the child's process tree on timeout; the child's environment is
-stripped of the canonical injection variables; stdin is not connected, so a
-command that reads from it hangs until the timeout; and output is bounded by the
-shared 128 KiB cap. Confinement is OS-level — the session working directory is the
-boundary, enforced by [Landlock](https://landlock.io/) on Linux and
-[Seatbelt](https://theapplewiki.com/wiki/Dev:Seatbelt) on macOS (see README) — so
-no in-process path confinement or resource limits are applied. The shell the `sh`
-tool runs under is resolved once at daemon startup (see `tools/shell_resolver.rs`).
-
-On Windows the same helpers swap in the platform analogues: `setup_child` has
-no process group to create, so the child is assigned to a Job Object
-(`ChildJob`, created right after spawn — `Command` has no pre-exec hook — with
-`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` making the handle a whole-tree kill
-switch), and the watchdog's timeout kill is gated on a `ProcessIsAlive` probe
-(a zero-timeout `WaitForSingleObject` on a copy of the child's process handle)
-so a child that already exited is not misreported as killed — the Windows
-analogue of the Unix pidfd/ESRCH check. The `Arc<ChildJob>` and `ProcessIsAlive`
-handle copies are the fifth sanctioned shared-state exception (see AGENTS.md
-#5): a `HANDLE` is a kernel-table index, not an address-space pointer, and every
-Job Object operation is thread-safe kernel-side, so the watchdog and drain
-threads share one immutable value whose handle is closed exactly once by `Drop`
-on the last owner. The kernel-handle rationale is in `choreo-daemon`'s
-`tools/shell_util.rs`.
 
 ## Testing
 

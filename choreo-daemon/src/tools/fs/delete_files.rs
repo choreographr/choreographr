@@ -56,8 +56,10 @@ pub(crate) fn execute_delete_files_tool(
                 })?);
         } else {
             // Literal paths are resolved against the session working directory.
-            // Boundary enforcement is the OS-level sandbox's job (Landlock on
-            // Linux, Seatbelt on macOS) — no in-process confinement here.
+            // No in-process confinement is applied: boundary enforcement is meant
+            // to be an OS-level sandbox's job (Landlock on Linux, Seatbelt on
+            // macOS), which is not in force yet (see README → Future
+            // Functionality → Sandboxing).
             targets.push(resolve_path(trimmed, working_dir));
         }
     }
