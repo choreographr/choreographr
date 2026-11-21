@@ -9,6 +9,9 @@
 //! [`cached_or_compute_lines`], the `App` and [`SessionDisplayState`] methods
 //! that rebuild the height model, scroll it, classify a viewport change
 //! ([`classify_viewport_change`]), and the row→turn mapping (`find_turn_at_row`).
+//! It also owns [`Marker`], the row→scrollbar-slot projection of a transcript
+//! marker: a marker is a position in this same height model, so it belongs
+//! with the model it indexes.
 //! The streaming auto-pin ([`ResponsePin`] / `maybe_pin_response_top`) lives in
 //! [`super::pin`]; it consumes the `TurnLayout::response_start_row` anchor this
 //! module computes.
@@ -29,9 +32,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use std::sync::Arc;
 
-use super::{
-    App, Marker, ReasoningViewMode, SessionDisplayState, selector_list_layout, turn_image_count,
-};
+use super::{App, ReasoningViewMode, SessionDisplayState, selector_list_layout, turn_image_count};
 
 /// What a recomputed history viewport implies for the per-session render caches
 /// and the in-progress selection.
@@ -268,6 +269,15 @@ pub(crate) fn cached_or_compute_lines(
         });
     }
     turn
+}
+
+/// A transcript marker projected onto the scrollbar: the content line it sits
+/// on, and the virtual scrollbar slot (of the scrollbar's own resolution) that
+/// line maps to.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Marker {
+    pub content_line: usize,
+    pub virtual_slot: usize,
 }
 
 #[derive(Clone, Copy)]

@@ -1,8 +1,8 @@
 //! Session-manager page state: the session list/detail view model
 //! (`SessionManagerState`), its view selector (`SessionManagerView`), and the
-//! per-session detail snapshot (`SessionDetailData`).  Split out of
-//! `state/pages.rs`, which had grown to hold several unrelated page/popup
-//! states — this module owns only the session manager.
+//! per-session detail snapshot (`SessionDetailData`).  It is one subject of the
+//! page/overlay state (`state/pages/`), which holds several unrelated page and
+//! popup states — this module owns only the session manager.
 //!
 //! The rendered list is a *derived* view: `all` is the full list as delivered
 //! by the daemon and `sessions` is the partition of it the current `view`

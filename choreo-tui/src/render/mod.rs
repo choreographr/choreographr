@@ -22,7 +22,7 @@
 //! `crate::render::<name>` and never learns which file an item lives in. The
 //! submodules reach back here for the shared sink normalizer via `super::`.
 //! Popup sizing/centering and the LIST-popup 3-band layout live in
-//! `state/pages.rs` (`centered_popup`, `selector_list_layout`) so the renderers,
+//! `state/layout.rs` (`centered_popup`, `selector_list_layout`) so the renderers,
 //! the connection-layer mouse handlers, and the viewport cache share one
 //! geometry.
 

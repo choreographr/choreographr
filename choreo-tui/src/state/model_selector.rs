@@ -3,12 +3,12 @@
 //!
 //! The selector lists the models available on the attached session's account
 //! (requested from the daemon via `ClientMessageType::ListModels`) and lets the
-//! user pick one with the keyboard. It is a sibling of `state/pages.rs` — which
-//! keeps the new-account wizard's provider picker — because the two pickers are
-//! separate concerns that only share geometry: [`picker_window`],
-//! [`step_focus`], [`PROVIDER_PAGE_LINES`], and [`filter_matches`] stay in
-//! `pages.rs` and are used here unchanged, so both popups track focus and
-//! scroll identically.
+//! user pick one with the keyboard. It is a sibling of the `state/pages/`
+//! directory module — which keeps the new-account wizard's provider picker —
+//! because the two pickers are separate concerns that only share geometry:
+//! [`picker_window`], [`step_focus`], [`PROVIDER_PAGE_LINES`], and
+//! [`filter_matches`] stay in `state/pages/` and are used here unchanged, so
+//! both popups track focus and scroll identically.
 //!
 //! The state is deliberately free of I/O: it holds what the daemon reported and
 //! what the user has typed. Nothing here schedules a re-request — the daemon
