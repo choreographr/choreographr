@@ -649,19 +649,11 @@ pub(crate) fn handle_daemon_message(
                     error_len = error.len(),
                     "model selector: failed to list models"
                 );
-                // A fresh account has no cached list yet: the daemon starts a
-                // background fetch and says so. Ask again shortly rather than
-                // showing that as a failure.
-                if choreo_proto::is_models_warming_error(error) {
-                    if app.model_selector.schedule_warming_retry(error.clone()) {
-                        tracing::debug!(
-                            retries = app.model_selector.retries,
-                            "model selector: list still warming, retry scheduled"
-                        );
-                    }
-                } else {
-                    app.model_selector.apply_error(error.clone());
-                }
+                // A genuine refusal ("no accounts configured", "no credential
+                // stored for account …"), not a pending fetch: a list that is
+                // merely still being fetched comes back as an empty provisional
+                // `Models` reply and is settled by a push.
+                app.model_selector.apply_error(error.clone());
                 return Ok(());
             }
             // Not our reply: fall through to the generic error handling.
@@ -981,8 +973,8 @@ pub(crate) fn handle_daemon_message(
         DaemonMessageType::ModelsUpdated { account, models } => {
             // A background model-list fetch finished. If the picker is open
             // for the attached session's account, swap its list in place:
-            // this replaces the instant catalog seed (or a stale "warming"
-            // state) with the live list, so newly-available models appear
+            // this replaces the instant catalog seed (or the empty "fetching…"
+            // waiting row) with the live list, so newly-available models appear
             // without the user reopening the picker. Ignore other accounts —
             // the picker is scoped to the attached session only.
             let attached = app.attached_account_slug.as_deref();
@@ -994,8 +986,26 @@ pub(crate) fn handle_daemon_message(
                 // `refresh_models`, NOT `apply_models`: this replaces a list the
                 // user may already be navigating, so it keeps the highlighted
                 // row's model (and the scroll window) instead of re-deriving the
-                // cursor from the active model.
+                // cursor from the active model. It also ends the waiting row.
                 app.model_selector.refresh_models(models.clone());
+            }
+            // Never falls through to the generic dispatch (nothing to render).
+            return Ok(());
+        }
+        DaemonMessageType::ModelsUnavailable { account, error } => {
+            // The fetch that an empty provisional `Models` reply announced can
+            // fail. Announcing it here is what ends the waiting row: the picker
+            // shows the provider's error inline (`apply_error`) instead of a
+            // "fetching…" row that could never end. Same account guard as
+            // `ModelsUpdated` — the picker is scoped to the attached session,
+            // and another account's failed fetch is none of its business.
+            let attached = app.attached_account_slug.as_deref();
+            if app.model_selector.is_open() && attached == Some(account.as_str()) {
+                tracing::warn!(
+                    error_len = error.len(),
+                    "model selector: background fetch failed"
+                );
+                app.model_selector.apply_error(error.clone());
             }
             // Never falls through to the generic dispatch (nothing to render).
             return Ok(());

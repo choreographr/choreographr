@@ -79,7 +79,16 @@ use zeroize::Zeroizing;
 /// gained `provisional: bool`, set when the reply carries ids the daemon could
 /// not verify for the account (a stale cache entry or the catalog's curated set
 /// for the provider while the live fetch runs), so a picker can present them as
-/// a first paint rather than as the account's live list.
+/// a first paint rather than as the account's live list. Under the same policy,
+/// 9 gained the `DaemonMessage::ModelsUnavailable { account, error }` broadcast:
+/// the counterpart of `ModelsUpdated`, emitted when that background fetch
+/// FAILS, so a picker waiting on it shows the provider's error instead of
+/// waiting forever. `Models` with `provisional: true` and an empty `models` list
+/// is how the daemon reports "nothing is cached or seedable here and a fetch is
+/// running", so the two pushes above are the only things that end a client's
+/// wait — no client-side retry schedule is needed or wanted. When no fetch can
+/// even be started (the account has no buildable provider) the reply is a
+/// genuine error instead, so a waiting client is never waiting on nothing.
 ///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and

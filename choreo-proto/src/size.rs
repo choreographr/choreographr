@@ -422,6 +422,10 @@ impl DaemonMessage {
                         + account.len()
                         + models.iter().map(String::len).sum::<usize>()
                 }
+                DaemonMessageType::ModelsUnavailable { account, error } => {
+                    // 2 named fields (account, error): both variable-length.
+                    named_field_overhead(2) + account.len() + error.len()
+                }
                 DaemonMessageType::Unlocked
                 | DaemonMessageType::Locked
                 | DaemonMessageType::Bound

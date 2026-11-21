@@ -385,9 +385,19 @@ pub enum DaemonMessageType {
         /// paint rather than claiming they are the account's live list; the
         /// follow-up [`DaemonMessageType::ModelsUpdated`] broadcast supersedes
         /// it with the verified list.
+        ///
+        /// `provisional` with an EMPTY `models` is the daemon's way of saying
+        /// it has nothing to paint at all and a live fetch is running: a picker
+        /// shows a waiting row rather than claiming the account has no models,
+        /// and the wait ends on the `ModelsUpdated`/`ModelsUnavailable` push.
         provisional: bool,
     },
-    /// The model list could not be produced.
+    /// The model list could not be produced at all: there are no accounts
+    /// configured, or the account in question holds no credential. A list that
+    /// is merely still being fetched is NOT this variant — it is a
+    /// [`DaemonMessageType::Models`] reply with `provisional` set (possibly with
+    /// an empty list), superseded by the `ModelsUpdated`/`ModelsUnavailable`
+    /// push.
     ModelsFailed {
         /// Why the model list failed.
         error: String,
@@ -405,6 +415,18 @@ pub enum DaemonMessageType {
         /// The freshly fetched model ids, ordered case-insensitively by id.
         /// A frontend that receives this supersedes any provisional list.
         models: Vec<String>,
+    },
+    /// Broadcast when a background model-list fetch for `account` FAILED: the
+    /// counterpart of [`DaemonMessageType::ModelsUpdated`], so a picker waiting
+    /// on that fetch is never left waiting. An open picker for the account
+    /// shows `error` inline; every other frontend ignores it. Keyed by account
+    /// name for the same reason as `ModelsUpdated`.
+    ModelsUnavailable {
+        /// The account name the failed fetch was for.
+        account: String,
+        /// Why the fetch failed, as the provider reported it. Client-facing
+        /// text: a frontend displays it, so it is never logged verbatim.
+        error: String,
     },
     /// Targeted reply to [`ClientMessageType::Unlock`](crate::ClientMessageType::Unlock): the presented key matched
     /// the binding and the daemon decrypted its credentials. This is an
@@ -708,6 +730,7 @@ impl DaemonMessageType {
             Self::Models { .. } => "Models",
             Self::ModelsFailed { .. } => "ModelsFailed",
             Self::ModelsUpdated { .. } => "ModelsUpdated",
+            Self::ModelsUnavailable { .. } => "ModelsUnavailable",
             Self::Unlocked => "Unlocked",
             Self::Locked => "Locked",
             Self::Keystore { .. } => "Keystore",
@@ -744,43 +767,5 @@ impl DaemonMessageType {
             Self::Accepted { .. } => "Accepted",
             Self::Failed { .. } => "Failed",
         }
-    }
-}
-
-/// The fixed tail of a [`DaemonMessageType::ModelsFailed`] error that means
-/// "nothing is cached yet, a background fetch is running — ask again
-/// shortly", as opposed to a real failure. Shared so the daemon that writes
-/// the message and the clients that retry on it cannot drift apart.
-const MODELS_WARMING_SUFFIX: &str = "is warming in the background; retry in a moment";
-
-/// The [`DaemonMessageType::ModelsFailed`] error for an account whose model
-/// list is still being fetched in the background.
-#[must_use]
-pub fn models_warming_error(account: &str) -> String {
-    format!("model list for account '{account}' {MODELS_WARMING_SUFFIX}")
-}
-
-/// Whether a [`DaemonMessageType::ModelsFailed`] error is the transient
-/// "still warming" case built by [`models_warming_error`], which a client
-/// should retry rather than show as a failure.
-#[must_use]
-pub fn is_models_warming_error(error: &str) -> bool {
-    error.ends_with(MODELS_WARMING_SUFFIX)
-}
-
-#[cfg(test)]
-mod warming_tests {
-    use super::{is_models_warming_error, models_warming_error};
-
-    #[test]
-    fn warming_error_round_trips() {
-        assert!(is_models_warming_error(&models_warming_error("anthropic")));
-    }
-
-    #[test]
-    fn other_errors_are_not_warming() {
-        assert!(!is_models_warming_error(
-            "no credential stored for account 'anthropic'"
-        ));
     }
 }

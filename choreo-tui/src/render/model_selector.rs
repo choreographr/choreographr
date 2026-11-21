@@ -81,9 +81,14 @@ pub(super) fn render_model_selector(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
     if app.model_selector.loading {
+        // The daemon has not painted a list yet: either the reply is still in
+        // flight, or the reply was empty and provisional — the account has
+        // nothing cached or seedable and the live fetch is running. Either way
+        // the wait ends on a daemon push (`ModelsUpdated` with the list, or
+        // `ModelsUnavailable` with the error), never on a timer of ours.
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                " Loading models…",
+                " Fetching this account's model list…",
                 Style::default().fg(Color::DarkGray),
             ))),
             body,

@@ -746,6 +746,13 @@ fn approx_wire_size_never_underestimates_encoded_payload() {
             },
         ),
         (
+            "ModelsUnavailable",
+            DaemonMessageType::ModelsUnavailable {
+                account: "default".into(),
+                error: "provider unreachable".into(),
+            },
+        ),
+        (
             "ModelsFailed",
             DaemonMessageType::ModelsFailed {
                 error: "failed to list models".into(),

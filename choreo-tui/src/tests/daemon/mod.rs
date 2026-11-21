@@ -9,8 +9,8 @@
 //! cycling key and the model/reasoning/account messages it reads back;
 //! `flags` covers the per-session pin/archive flags from `SessionFlagsChanged`;
 //! `first_run` follows the first-run chain from a saved key through account
-//! selection to the model picker; `model_list` covers the warming-model-list
-//! retry that keeps a not-yet-ready list out of the error line.
+//! selection to the model picker; `model_list` covers the daemon's empty
+//! provisional "fetching" answer and the pushes that end it.
 
 mod entries;
 mod first_run;

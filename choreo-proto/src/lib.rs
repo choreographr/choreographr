@@ -26,7 +26,7 @@ pub use types::{
     McpServerStatus, MessageKind, OAuthClientIdentity, OAuthGrantEncoding, OAuthProviderDescriptor,
     OutputStream, ReasoningArtifact, ReasoningCapability, ReasoningProducer, RefreshStatus,
     SessionEvent, SessionStatus, SessionSummary, TimestampMs, TokenUsage, ToolCallCaller,
-    ToolResultRecord, Turn, is_models_warming_error, models_warming_error,
+    ToolResultRecord, Turn,
 };
 
 #[cfg(test)]

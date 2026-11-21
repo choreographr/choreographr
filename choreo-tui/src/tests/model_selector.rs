@@ -127,8 +127,8 @@ fn model_selector_populates_from_models_reply() {
 #[test]
 fn models_updated_broadcast_refreshes_the_open_picker_for_the_attached_account() {
     // A background fetch that lands while the picker is open replaces the
-    // instant catalog seed (or empty "warming" state) in place, without the
-    // user reopening the picker and without printing into the chat.
+    // instant catalog seed (or the empty "fetching…" waiting state) in place,
+    // without the user reopening the picker and without printing into the chat.
     let (tx, _rx) = crossbeam_channel::unbounded();
     let mut app = test_app();
     app.attached_account_slug = Some("acct".to_string());

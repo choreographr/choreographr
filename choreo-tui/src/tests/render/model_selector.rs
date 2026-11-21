@@ -34,7 +34,10 @@ fn render_model_selector_loading_and_error_states() {
     let mut app = test_app();
     app.model_selector.open();
     let content = drawn_cells(&mut app, 80, 24);
-    assert!(content.contains("Loading models"), "loading row is drawn");
+    assert!(
+        content.contains("Fetching this account"),
+        "waiting row is drawn"
+    );
 
     // Error state (the daemon rejected the model list request).
     let mut app = test_app();

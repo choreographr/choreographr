@@ -1,8 +1,8 @@
 //! Unit tests for the model-list handling in `daemon/models.rs`: the prefetch
 //! gate and its in-flight dedup guard, the prefetch result's cache insert /
 //! broadcast / discard paths, the `ListModels` never-block contract (stale
-//! cache, catalog seed, "warming" error), `ValidateModel`, and the catalog seed
-//! helper `catalog_models_for_account`.
+//! cache, catalog seed, empty provisional "fetching" answer), `ValidateModel`,
+//! and the catalog seed helper `catalog_models_for_account`.
 //!
 //! The fixtures shared with the parent (`make_daemon_state`,
 //! `seed_credentialed_account`, `seed_credentialed_account_with_url`,
@@ -391,9 +391,35 @@ fn handle_model_prefetch_result_failure_releases_guard_without_caching() {
 
     // A failed fetch must NOT wedge the account: guard released, cache
     // untouched, so the next session join retries the prefetch and the
-    // on-demand ListModels path serves stale data or a retryable "warming"
-    // error in the meantime.
+    // on-demand ListModels path answers with an empty provisional list (plus
+    // the `ModelsUnavailable` push) in the meantime.
     assert!(!state.model_prefetch_in_flight.contains("acct"));
+    assert!(!state.model_cache.contains_key("acct"));
+}
+
+#[test]
+fn handle_model_prefetch_result_failure_broadcasts_models_unavailable() {
+    // A picker showing the empty provisional "fetching…" row waits on exactly
+    // this fetch, so its failure must be announced — otherwise that waiting
+    // row would never end.
+    let (mut state, _rx) = make_daemon_state();
+    seed_credentialed_account(&mut state, "acct", "openai");
+    state.model_prefetch_in_flight.insert("acct".into());
+    let (writer_tx, writer_rx) = test_sink();
+    put_client(&mut state, 1, &writer_tx, false, true, &[]);
+
+    state.handle_command(DaemonCommand::ModelPrefetchResult {
+        account: "acct".into(),
+        result: Err("provider unreachable".into()),
+    });
+
+    match &writer_rx.recv().unwrap().inner {
+        DaemonMessageType::ModelsUnavailable { account, error } => {
+            assert_eq!(account, "acct");
+            assert_eq!(error, "provider unreachable");
+        }
+        other => panic!("expected ModelsUnavailable, got {other:?}"),
+    }
     assert!(!state.model_cache.contains_key("acct"));
 }
 
@@ -613,17 +639,46 @@ fn list_models_with_cold_cache_serves_catalog_seed_and_warms_background() {
 
 #[test]
 #[serial_test::serial(catalog)]
-fn list_models_with_no_cache_and_no_catalog_models_reports_warming() {
-    // An account whose provider is unknown to the catalog has no seed to paint:
-    // the caller gets the retryable "warming" error so it can ask again once
-    // the live fetch lands (rather than an empty list that looks like "no
-    // models").
+fn list_models_with_nothing_to_paint_and_a_fetch_running_answers_empty_provisional() {
+    // Nothing is cached, nothing is seedable, and a fetch is running: the
+    // answer is an EMPTY provisional list, which is the client's cue to show a
+    // waiting row. The wait is finite because that fetch settles with a
+    // `ModelsUpdated` or `ModelsUnavailable` push — never with a client-side
+    // retry. The in-flight guard is seeded here to stand in for the fetch a
+    // session join already started (a unit test cannot hold the provider open).
+    let (mut state, _rx) = state_with_session_account_provider("acct", "not-in-catalog");
+    state.model_prefetch_in_flight.insert("acct".into());
+
+    let list = state
+        .handle_list_models(Some(1))
+        .expect("an unpaintable list with a fetch running is not an error");
+    assert!(
+        list.models.is_empty(),
+        "nothing is cached or seedable for this account yet"
+    );
+    assert!(
+        list.provisional,
+        "an empty list the daemon could not verify is provisional"
+    );
+}
+
+#[test]
+#[serial_test::serial(catalog)]
+fn list_models_with_nothing_to_paint_and_no_fetch_answers_an_error() {
+    // No seed and no fetch that could be spawned (this account's provider is
+    // not buildable): there is nothing to wait FOR, so the reply is a real
+    // error rather than an empty provisional list that would leave the picker
+    // showing a waiting row that can never end.
     let (mut state, _rx) = state_with_session_account_provider("acct", "not-in-catalog");
 
     let err = state
         .handle_list_models(Some(1))
-        .expect_err("no seed → warming");
-    assert!(err.contains("warming"), "unexpected error: {err}");
+        .expect_err("nothing to paint and nothing running");
+    assert!(err.contains("acct"), "the error names the account: {err}");
+    assert!(
+        !state.model_prefetch_in_flight.contains("acct"),
+        "no fetch could be started for an unbuildable provider"
+    );
 }
 
 #[test]

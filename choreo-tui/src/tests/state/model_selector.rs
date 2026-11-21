@@ -1,7 +1,7 @@
 //! `ModelSelectorState`: open/close, filtering, focus movement, windowing,
 //! submit, and key handling.
 
-use crate::state::{MODEL_LIST_MAX_RETRIES, ModelSelectorState};
+use crate::state::ModelSelectorState;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 // ── ModelSelectorState ──
@@ -308,59 +308,67 @@ fn model_selector_filter_key_ignores_enter() {
 }
 
 #[test]
+fn an_empty_provisional_reply_keeps_the_waiting_row() {
+    // The daemon could not paint anything and is fetching: an empty provisional
+    // list is a WAITING state, not an empty result. Keeping `loading` set is
+    // what makes the renderer show the waiting row instead of "No models
+    // available", and it is ended by the daemon's next push.
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(Vec::new(), None, true);
+    assert!(
+        sel.loading,
+        "an empty provisional list is still being fetched"
+    );
+    assert!(sel.provisional, "the daemon has not verified anything yet");
+    assert_eq!(sel.error.get(), None, "waiting is not a failure");
+}
+
+#[test]
+fn a_landed_list_clears_the_waiting_row() {
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(Vec::new(), None, true);
+    assert!(sel.loading);
+
+    // The fetch settled with the live list.
+    sel.refresh_models(vec!["m".into()]);
+    assert!(!sel.loading, "the list replaced the waiting row");
+    assert!(!sel.provisional, "a fetched list is verified");
+    assert_eq!(sel.all_models, vec!["m".to_string()]);
+}
+
+#[test]
+fn an_error_ends_the_waiting_row() {
+    // Covers both the terminal `ModelsFailed` reply and the
+    // `ModelsUnavailable` push for a fetch that started from an empty
+    // provisional reply: the daemon's text replaces the waiting row.
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(Vec::new(), None, true);
+    assert!(sel.loading);
+
+    sel.apply_error("provider unreachable");
+    assert!(!sel.loading, "the waiting row must never outlive its fetch");
+    assert_eq!(sel.error.get(), Some("provider unreachable"));
+}
+
+#[test]
+fn a_non_empty_provisional_list_is_painted_not_waited_on() {
+    // A stale entry or the catalog seed is something to show: the wait is over,
+    // but the list is labelled provisional until the live fetch confirms it.
+    let mut sel = ModelSelectorState::new();
+    sel.open();
+    sel.apply_models(vec!["seed-a".into()], None, true);
+    assert!(!sel.loading, "a paint-ready stand-in ends the wait");
+    assert!(sel.provisional);
+}
+
+#[test]
 fn model_selector_apply_error_records_and_clears_loading() {
     let mut sel = ModelSelectorState::new();
     sel.open();
     sel.apply_error("no credential".to_string());
     assert!(!sel.loading);
     assert_eq!(sel.error.get(), Some("no credential"));
-}
-
-#[test]
-fn warming_retries_stop_at_the_budget() {
-    let mut selector = ModelSelectorState::new();
-    selector.open();
-    for _ in 0..MODEL_LIST_MAX_RETRIES {
-        assert!(selector.schedule_warming_retry("warming"));
-        assert!(selector.take_retry());
-    }
-    // Budget spent: the daemon's message is shown and nothing is re-armed.
-    assert!(!selector.schedule_warming_retry("warming"));
-    assert_eq!(selector.error.get(), Some("warming"));
-    assert!(selector.retry_timer.is_none());
-}
-
-#[test]
-fn a_closed_selector_does_not_retry() {
-    let mut selector = ModelSelectorState::new();
-    selector.open();
-    assert!(selector.schedule_warming_retry("warming"));
-    selector.close();
-    assert!(!selector.take_retry());
-}
-
-#[test]
-fn a_landed_list_disarms_an_armed_warming_retry() {
-    let mut selector = ModelSelectorState::new();
-    selector.open();
-    assert!(selector.schedule_warming_retry("warming"));
-
-    // A `Models` reply that raced the timer must cancel it: otherwise the UI
-    // loop fires one redundant `ListModels` after the list already landed.
-    selector.apply_models(vec!["m".to_string()], None, false);
-    assert!(selector.retry_timer.is_none());
-    assert!(!selector.take_retry());
-}
-
-#[test]
-fn a_terminal_error_disarms_an_armed_warming_retry() {
-    let mut selector = ModelSelectorState::new();
-    selector.open();
-    assert!(selector.schedule_warming_retry("warming"));
-
-    // A real failure replaces the warming state, so the retry must stop.
-    selector.apply_error("no credential");
-    assert_eq!(selector.error.get(), Some("no credential"));
-    assert!(selector.retry_timer.is_none());
-    assert!(!selector.take_retry());
 }

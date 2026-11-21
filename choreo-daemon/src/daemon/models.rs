@@ -26,10 +26,11 @@
 //!   running, so a burst of session joins (or an account switch per request)
 //!   cannot stack duplicate HTTP fetches for the same account.
 //! - **`ListModels` never blocks.** [`DaemonState::handle_list_models`] answers
-//!   from the cache, from the local catalog's curated ids, or with the
-//!   retryable "warming" error — it only *triggers* a background prefetch,
-//!   whose landing broadcast (`ModelsUpdated`) replaces whatever an already-open
-//!   picker painted.
+//!   from the cache, from the local catalog's curated ids, or with an empty
+//!   PROVISIONAL list when it has neither ("nothing to paint, a fetch is
+//!   running") — it only *triggers* a background prefetch, whose landing is
+//!   pushed to clients as `ModelsUpdated` (or `ModelsUnavailable` on failure)
+//!   and replaces whatever an already-open picker painted.
 //!
 //! `ValidateModel` is the fail-open consumer of the same cache: a model is
 //! rejected only when a cached list exists and does not contain it, because a
@@ -172,10 +173,11 @@ impl DaemonState {
 
     /// Receive a background model-prefetch outcome: release the account's
     /// in-flight guard and, on success, populate `model_cache` (the command
-    /// loop is its single writer).  Failures are logged only — the next
-    /// session join re-prefetches, and the on-demand path in
-    /// [`Self::handle_list_models`] remains the fallback while nothing is
-    /// cached.
+    /// loop is its single writer).  A failure is pushed to clients as
+    /// `ModelsUnavailable` so a picker waiting on this fetch learns it is over
+    /// instead of waiting forever; the on-demand path in
+    /// [`Self::handle_list_models`] keeps serving whatever it can in the
+    /// meantime, and the next session join re-prefetches.
     pub(super) fn handle_model_prefetch_result(
         &mut self,
         account: String,
@@ -247,10 +249,23 @@ impl DaemonState {
                 );
             }
             Err(e) => {
+                // A client may be showing a waiting row for exactly this
+                // fetch (an empty provisional `Models` reply), so its failure
+                // is announced rather than only logged. The text is the
+                // provider's own message: it goes on the wire, where the
+                // client displays it, but never into the log verbatim — only
+                // its length, like every other payload field.
                 warn!(
                     account = %account,
-                    error = %e,
-                    "background model prefetch failed; will retry on the next join"
+                    error_len = e.len(),
+                    "background model prefetch failed; announcing ModelsUnavailable"
+                );
+                self.handle_broadcast_activity(
+                    None,
+                    &choreo_proto::DaemonMessage::broadcast(DaemonMessageType::ModelsUnavailable {
+                        account,
+                        error: e,
+                    }),
                 );
             }
         }
@@ -382,15 +397,19 @@ impl DaemonState {
         //     are served as an instant first paint, so the picker opens without
         //     waiting on a slow endpoint (api.openai.com's /v1/models can take
         //     ~10 s per attempt and trip a 504 retry);
-        //   - only when none of those exist does it return the retryable
-        //     "warming" error.
+        //   - only when none of those exist does it answer with an EMPTY list
+        //     flagged `provisional` — "there is nothing to paint and a fetch is
+        //     running" (or, if no fetch could even be started, a genuine
+        //     error).
         // Both stand-ins report `provisional = true`. An EMPTY cached list is
         // treated as absent (see `fresh_model_list`) so the seed stands in for
-        // it. When the background fetch lands it broadcasts `ModelsUpdated`,
-        // which replaces whatever was painted in an already-open picker — and,
-        // because a stale or absent entry is always re-announced even when the
-        // ids are identical, an open picker's provisional label clears once the
-        // live fetch confirms the list.
+        // it. When the background fetch settles it broadcasts `ModelsUpdated`
+        // (or, on failure, `ModelsUnavailable`), which replaces whatever was
+        // painted in an already-open picker — and, because a stale or absent
+        // entry is always re-announced even when the ids are identical, an open
+        // picker's provisional label clears once the live fetch confirms the
+        // list. Those two pushes are what end the waiting state: a client packs
+        // no timer for an answer the daemon promises to send.
         let now = Instant::now();
         let (models, provisional) =
             if let Some(models) = self.fresh_model_list(&account_name, now).cloned() {
@@ -412,10 +431,24 @@ impl DaemonState {
                     None
                 };
                 self.maybe_spawn_model_prefetch(&account_name);
-                let models = stale
-                    .or(seed)
-                    .ok_or_else(|| choreo_proto::models_warming_error(&account_name))?;
-                (models, true)
+                if let Some(models) = stale.or(seed) {
+                    (models, true)
+                } else {
+                    // No cache, no stale entry, no catalog seed. Answer with an
+                    // EMPTY provisional list ONLY when a fetch is actually
+                    // running, because that list is the client's cue to show a
+                    // waiting row: it ends when the fetch pushes
+                    // `ModelsUpdated` or `ModelsUnavailable`. A prefetch that
+                    // could not be spawned (no buildable provider for the
+                    // account) has nothing behind it, so say so plainly instead
+                    // of leaving the client waiting for a push that never comes.
+                    if !self.model_prefetch_in_flight.contains(&account_name) {
+                        return Err(format!(
+                            "no model list available for account '{account_name}'"
+                        ));
+                    }
+                    (Vec::new(), true)
+                }
             };
 
         let selected_model = session_id
@@ -432,8 +465,8 @@ impl DaemonState {
     /// the model picker instantly while the live `/v1/models` fetch runs. `None`
     /// when the account or its provider is unknown to the catalog, or the
     /// catalog lists no models for that provider — in which case
-    /// `handle_list_models` falls back to the retryable "warming" error rather
-    /// than an empty list.
+    /// `handle_list_models` answers with an empty provisional list (a waiting
+    /// state, not an error).
     pub(super) fn catalog_models_for_account(&self, account: &str) -> Option<Vec<String>> {
         let slug = self.account_provider_slug(account)?;
         let entry = lookup_provider(&slug)?;

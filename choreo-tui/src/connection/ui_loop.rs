@@ -641,21 +641,11 @@ fn run_ui_loop(
     app.flush_image_fetches(client_tx);
 
     let mut dirty = false;
-    // Stand-in for the model selector's retry timer while none is armed, so
-    // the select below always has the arm.
-    let no_retry = channel::never::<std::time::Instant>();
     // Stand-in for the login worker's event receiver while no login is running,
     // so the select below always has the arm.
     let no_login = channel::never::<LoginEvent>();
 
     while !app.should_quit {
-        // Cloned out so the select's receiver borrow does not overlap the
-        // arm bodies' `&mut app` (crossbeam receivers are cheap handles).
-        let model_retry_rx = app
-            .model_selector
-            .retry_timer
-            .clone()
-            .unwrap_or_else(|| no_retry.clone());
         // The login worker's event receiver, or the never channel when no
         // login is active.
         let login_rx = app
@@ -696,13 +686,6 @@ fn run_ui_loop(
                     app.apply_image_result(result);
                     dirty = true;
                 }
-            }
-            recv(model_retry_rx) -> _ => {
-                // The model list was still warming; ask the daemon again.
-                if app.model_selector.take_retry() {
-                    app.pending.send(client_tx, ClientMessageType::ListModels);
-                }
-                dirty = true;
             }
             recv(login_rx) -> msg => {
                 if let Ok(event) = msg

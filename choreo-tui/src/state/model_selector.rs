@@ -1,5 +1,5 @@
 //! The model-selector popup state (Chat page, Alt+M): the `ModelSelectorState`
-//! the picker renders from, plus its warming-retry budget constants.
+//! the picker renders from.
 //!
 //! The selector lists the models available on the attached session's account
 //! (requested from the daemon via `ClientMessageType::ListModels`) and lets the
@@ -11,15 +11,15 @@
 //! scroll identically.
 //!
 //! The state is deliberately free of I/O: it holds what the daemon reported and
-//! what the user has typed, and every decision about *when* to ask the daemon
-//! again is the event loop's (which waits on `retry_timer` like any other
-//! event, never polling).
+//! what the user has typed. Nothing here schedules a re-request — the daemon
+//! answers a `ListModels` immediately and pushes the live list (or the failure)
+//! when its background fetch settles, so waiting is a state this struct holds
+//! and the connection layer's event arms end.
 
 use super::InputBuffer;
 use super::display_line::DisplayLine;
 use super::pages::{PROVIDER_PAGE_LINES, filter_matches, picker_window, step_focus};
 use crossterm::event::KeyEvent;
-use std::time::{Duration, Instant};
 
 /// State for the model-selector popup (Chat page, Alt+M).
 ///
@@ -32,8 +32,11 @@ use std::time::{Duration, Instant};
 pub(crate) struct ModelSelectorState {
     /// Whether the popup is currently visible.
     pub(crate) open: bool,
-    /// True between `open()` and the arrival of the `Models`/`ModelsFailed`
-    /// reply; the popup shows a "loading" row instead of the list.
+    /// True while the popup waits for a list it can paint: from `open()` until
+    /// the `Models`/`ModelsFailed` reply, and again after an EMPTY provisional
+    /// reply (the daemon has nothing cached or seedable and is fetching) until
+    /// the `ModelsUpdated`/`ModelsUnavailable` push arrives. The popup shows a
+    /// waiting row rather than an empty list in both cases.
     pub(crate) loading: bool,
     /// All models for the attached session's account, in the daemon's order
     /// (case-insensitively by id — the daemon sorts at the source so `Models`,
@@ -64,25 +67,7 @@ pub(crate) struct ModelSelectorState {
     /// renderer says so, so a seeded list is never mistaken for the live one.
     /// A `ModelsUpdated` broadcast clears it.
     pub(crate) provisional: bool,
-    /// Fires when the list should be requested again: armed while the daemon
-    /// reports the account's list as still warming (a fresh account's first
-    /// fetch runs in the background). A `crossbeam_channel::after` timer, so
-    /// the UI loop waits on it like any other event instead of polling.
-    pub(crate) retry_timer: Option<crossbeam_channel::Receiver<Instant>>,
-    /// Warming retries spent since the popup opened, capped at
-    /// [`MODEL_LIST_MAX_RETRIES`] so a fetch that never lands ends in the
-    /// daemon's own message instead of a spinner that never stops.
-    pub(crate) retries: u32,
 }
-
-/// Delay between model-list requests while the daemon's background fetch is
-/// still running. A provider's model endpoint usually answers in well under
-/// a second.
-pub(crate) const MODEL_LIST_RETRY_DELAY: Duration = Duration::from_millis(750);
-
-/// Most warming retries per popup opening (about 15 s in total) — longer
-/// than the daemon's own fetch takes to succeed or fall back.
-pub(crate) const MODEL_LIST_MAX_RETRIES: u32 = 20;
 
 impl ModelSelectorState {
     pub(crate) fn new() -> Self {
@@ -97,35 +82,11 @@ impl ModelSelectorState {
             viewport_height: 0,
             error: DisplayLine::none(),
             provisional: false,
-            retry_timer: None,
-            retries: 0,
         }
     }
 
     pub(crate) fn is_open(&self) -> bool {
         self.open
-    }
-
-    /// Handle a `ModelsFailed` reply that says the list is still warming:
-    /// keep showing "loading" and arm the retry timer, or — once the retry
-    /// budget is spent — show the error like any other failure. Returns
-    /// whether a retry was scheduled.
-    pub(crate) fn schedule_warming_retry(&mut self, error: impl Into<String>) -> bool {
-        if !self.open || self.retries >= MODEL_LIST_MAX_RETRIES {
-            self.apply_error(error);
-            return false;
-        }
-        self.retries += 1;
-        self.loading = true;
-        self.error.clear();
-        self.retry_timer = Some(crossbeam_channel::after(MODEL_LIST_RETRY_DELAY));
-        true
-    }
-
-    /// Take the fired retry timer. Returns whether the list should be
-    /// requested again — only while the popup is still open.
-    pub(crate) fn take_retry(&mut self) -> bool {
-        self.retry_timer.take().is_some() && self.open
     }
 
     /// Open the selector and request a fresh model list.
@@ -137,8 +98,6 @@ impl ModelSelectorState {
         self.open = true;
         self.loading = true;
         self.error.clear();
-        self.retry_timer = None;
-        self.retries = 0;
         self.filter.clear();
         self.focused = 0;
         self.scroll = 0;
@@ -150,7 +109,6 @@ impl ModelSelectorState {
         self.open = false;
         self.loading = false;
         self.error.clear();
-        self.retry_timer = None;
     }
 
     /// Populate the model list from a `Models` reply and preselect the
@@ -201,26 +159,28 @@ impl ModelSelectorState {
 
     /// The shared body of `apply_models`/`refresh_models`: install a new list
     /// and drop the per-request state that the arrival of a list makes moot
-    /// (loading row, error text, armed warming retry). Focus/scroll staying
-    /// put is what the two callers differ on, so it is not touched here.
+    /// (error text). Focus/scroll staying put is what the two callers differ
+    /// on, so it is not touched here.
+    ///
+    /// An EMPTY provisional list is not a list to paint: it is the daemon
+    /// saying it has nothing cached or seedable for this account and a live
+    /// fetch is running. That keeps the waiting row up (see [`Self::loading`])
+    /// so the picker never claims the account has no models; the fetch's own
+    /// `ModelsUpdated`/`ModelsUnavailable` push is what ends the wait.
     fn install_models(&mut self, models: Vec<String>, provisional: bool) {
-        self.all_models = models;
         self.provisional = provisional;
-        self.loading = false;
+        self.loading = provisional && models.is_empty();
+        self.all_models = models;
         self.error.clear();
-        // The list landed, so any armed warming retry is moot: disarming it
-        // here stops the UI loop from firing one more `ListModels` after a
-        // success that raced the timer.
-        self.retry_timer = None;
     }
 
-    /// Record a `ModelsFailed` reply so the popup can show the error inline.
+    /// Record a model-list failure so the popup can show it inline. Ends the
+    /// waiting row: the daemon's own error text is the answer, whether it came
+    /// from the `ModelsFailed` reply to a request or from the
+    /// `ModelsUnavailable` push for a fetch that started that way.
     pub(crate) fn apply_error(&mut self, error: impl Into<String>) {
         self.loading = false;
         self.error.set(error);
-        // A terminal error ends the warming retry: an armed timer here would
-        // re-request a list the daemon has already refused.
-        self.retry_timer = None;
     }
 
     /// Models matching the current filter (case-insensitive substring).
