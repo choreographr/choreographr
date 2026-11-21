@@ -4,6 +4,8 @@
 //! the version-gated entries depend on the parsed version, and keeping each
 //! terminal's row in one block is what makes a row auditable against its
 //! source. A new terminal is a new arm here and nothing else.
+//!
+//! The research behind every row is recorded in `docs/plans/terminal-profile.md`.
 
 use super::types::{Capabilities, Host, ImageSupport, NO, NativeImages, TerminalKind, YES};
 use super::version::Version;

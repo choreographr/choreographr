@@ -53,6 +53,14 @@ use std::collections::{HashMap, HashSet};
 ///   (its answer is the primary content) and a turn whose answer *starts* while
 ///   it is expanded collapses itself the moment the response arrives.
 ///
+/// What the mode therefore changes is the **reasoning-only turns**: an answered
+/// turn stays collapsed in [`Expanded`](Self::Expanded) too, so a transcript
+/// whose every reasoning block already has its answer renders identically in
+/// both modes and the chord is a no-op there. That is the intent — the mode
+/// decides whether live thinking is watched as it streams, not whether finished
+/// reasoning ever reopens — and it is why `Expanded` is the default: it needs no
+/// recorded state, because it simply defers to the content default.
+///
 /// It is per-session view state with no daemon counterpart: it lives and dies
 /// with the TUI process (choreo-tui keeps no state on disk), and it survives
 /// switching away from the session because it hangs off the display state, not

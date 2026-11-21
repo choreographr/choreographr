@@ -168,7 +168,7 @@ pub(crate) struct App {
     /// holds a valid value.
     pub(crate) terminal: crate::terminal::profile::TerminalProfile,
     /// The welcome panel's terminal advice, derived once at launch from
-    /// [`Self::terminal`] beside it (see `state::onboarding::terminal_notice`).
+    /// [`Self::terminal`] beside it (see `state::terminal_notice::terminal_notice`).
     /// Stored rather than re-derived per frame because the profile it reads is
     /// immutable for the process lifetime; `None` means this terminal and its
     /// host cost the client nothing, so the panel stays silent.

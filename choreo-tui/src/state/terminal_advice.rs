@@ -1,5 +1,5 @@
 //! The terminal advice matrix, shared by the welcome panel's notice
-//! (`state/onboarding.rs`) and the Terminal page (`render/terminal_help.rs`).
+//! (`state/terminal_notice.rs`) and the Terminal page (`render/terminal_help.rs`).
 //!
 //! It lives in `state/` rather than `render/` because it is **policy, not
 //! styling**: which terminal to recommend on a platform, which setting turns
