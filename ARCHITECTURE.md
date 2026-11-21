@@ -897,46 +897,31 @@ wire shape is per provider, so it is modelled as a capability
 that provider's `[provider.<slug>]` overlay entry — `off` (the default),
 `prompt-cache-key` (the top-level `prompt_cache_key` field), or
 `openrouter-session` (`OpenRouter`'s preferred top-level `session_id`). The
-overlay pins `openai` and `venice` to `prompt-cache-key` and `openrouter` to
-`openrouter-session`; every other provider stays `off`, in particular `deepseek`
-and `google` (automatic prefix/implicit cache needs no key), `anthropic`
-(`cache_control`, already per-block), and the `opencode` slugs (they already
-route per session via the `x-opencode-session` headers — the affinity field must
-not duplicate that path).
+overlay pins each provider that accepts one and records beside every other why it
+stays `off` (an automatic prefix cache that needs no key, a per-block
+`cache_control` mechanism, or an existing per-session gateway header the field
+must not duplicate).
 
-The value is always the daemon's **real per-session id**, taken from
-`ChatTurnRequest::session_id` and filled in by the single chat-completions body
-builder and the Responses body builder. A *constant* key would be wrong: on older
-OpenAI models it would pin every session to one routing bucket, and on GPT-5.6+
-models — where the key separates cache *accounting* while routing is by a hash of
-the prompt tokens — it would merely partition the accounting rather than improve
-routing. The session-less one-shot prompt API sends no hint. `OpenRouter` ignores
-an id outside `[A-Za-z0-9_-]` or longer than 256 bytes, so the resolver validates
-and omits an invalid id instead of sending a value the provider would drop. The
-dialect and its validation live in `choreo-ai-protocols/src/session_routing.rs`;
-the shared rejection registry every prompt-cache field is filtered through lives
-in `choreo-ai-protocols/src/cache_field_rejection.rs` (see below).
+The value is always the daemon's **real per-session id**, never a constant: a
+fixed key would pin every session to one routing bucket and, on the models that
+bucket cache *accounting* by the key, merely partition the accounting rather than
+improve routing. The dialect, its model-generation semantics, and the
+per-dialect validation (an id the provider would drop is omitted, not sent) live
+in `choreo-ai-protocols/src/session_routing.rs`.
 
 One provider class is withheld outright: the **stateless Responses dialect**
 (the `chatgpt`/Codex backend) never receives an affinity field, whatever the
-overlay or a per-account `prompt_cache_affinity` override says.
-`ServiceConfig::configured_cache_affinity` folds that in — the provider-level
-resolution both readers share, so `ProviderClient::cache_affinity` (what the
-cache-warming gate is told) and `ServiceConfig::effective_cache_affinity` (what
-the body builders resolve through, adding the rejection registry on top) cannot
-disagree — and it is the same single-resolution point the hosted-tool
-withholding uses, so no body builder can emit one. The trait method carries no
-model, so it deliberately stops at the provider level: the rejection registry is
-keyed by the exact `(provider, model)` pair and only the request-time resolution
-consults it. The reason is verification, not preference: that
-backend documents no affinity field, and an unverified body field either 400s the
-turn or is ignored — while the provider's automatic prefix caching still applies
-to the replayed history without a key. Opting the dialect in later means
-verifying the field against the backend, then removing the guard in the one place
-it lives.
-Like the compression coding, the dialect is baked into the provider client at
-construction, so an overlay edit reaches live sessions through the catalog-swap
-client invalidation (`client_config_changed` compares it).
+overlay or a per-account `prompt_cache_affinity` override says — that backend
+documents no field, and an unverified body field either 400s the turn or is
+ignored. `ServiceConfig::configured_cache_affinity` is the one provider-level
+resolution that folds the withholding in, so the cache-warming gate
+(`ProviderClient::cache_affinity`) and the body builders
+(`ServiceConfig::effective_cache_affinity`, which adds the per-model rejection
+registry on top) cannot disagree. Like the compression coding, the dialect is
+baked into the provider client at construction, so an overlay edit reaches live
+sessions through the catalog-swap client invalidation. Opting the dialect in
+later means verifying the field against the backend, then removing the guard in
+the one place it lives.
 
 #### Extended cache retention
 
@@ -945,20 +930,12 @@ provider's short tier (typically a few minutes). Some providers expose a longer
 retention tier a request can ask for, which is what makes **cache warming**
 useful across a longer idle window. The wire shape is not stable across a
 provider's model generations, so it is a **per-model** overlay scalar
-(`cache_retention` on `[provider.<slug>.models."<model>"]`) mapped to
-`choreo-ai-protocols::CacheRetentionDialect`, never a provider-level setting —
-`openai` serves both generations, and one value cannot be right for both:
+(`cache_retention`) mapped to `choreo-ai-protocols::CacheRetentionDialect`, never
+a provider-level setting: an endpoint that serves both a top-level
+`prompt_cache_retention` generation and a nested `prompt_cache_options.ttl` one
+cannot be described by a single value.
 
-- `prompt-cache-retention` — pre-GPT-5.6 OpenAI models: a top-level
-  `prompt_cache_retention` field whose extended value is `"24h"` (accepted on
-  both the Chat Completions and Responses APIs).
-- `prompt-cache-options` — GPT-5.6+ models (`gpt-6*`, `gpt-5.6*`): a nested
-  `prompt_cache_options.ttl`, whose only extended value `"12h"` is
-  **Responses-API only**. On Chat Completions the remaining `"30m"` is the
-  field's default (no extension), so the builder omits the selector entirely.
-- `none` (the default) — emit nothing.
-
-Two gates keep this opt-in and safe. First, nothing is emitted unless the model
+Two gates keep it opt-in and safe. First, nothing is emitted unless the model
 **also declares a long tier** in the existing curated prompt-cache TTL data
 (`ModelEntry::prompt_cache` / `ProviderEntry::prompt_cache`, the
 `PromptCacheTtl { short_secs, long_secs }` pair) — the selector reuses that
@@ -967,104 +944,75 @@ curation instead of adding a parallel source of truth. Second, the dialect is
 because guessing a generation is exactly what breaks when a provider adds a
 model. Anthropic's 1-hour tier is a different mechanism (`anthropic-beta`) and
 stays out of scope; DeepSeek, Gemini, and the Chinese providers expose no
-retention selector. The bundled overlay ships **no seeded model** yet — the
-curated long tier exists only for the Anthropic providers — so the mechanism is
-in place and dormant until a model is pinned with a justified long TTL.
+retention selector. The bundled overlay ships **no seeded model** — the curated
+long tier exists only for the Anthropic providers — so the mechanism is in place
+and dormant until a model is pinned with a justified long TTL. The dialect
+values and each one's per-API restriction live in `cache_retention`.
 
 #### Downgrade on a rejected field
 
-The hint fails safe. A provider that answers a prompt-cache request field with
-an HTTP **400 naming that very field** — `prompt_cache_key`, or `session_id` for
-the `OpenRouter` dialect, or either retention spelling
-(`prompt_cache_retention` / `prompt_cache_options`) — is treated as rejecting
-the parameter, and that `(provider, model)` pair receives none of them for the
-rest of the process. The detector is narrow, so nothing
-unrelated downgrades: only a `400` counts (a `429`, a `5xx`, or any other `4xx`
-never does), and the detail must name one of the fields the request actually
-carried (`cache_field_rejection_field`, which checks every prompt-cache field on
-the built body — never logging it). It checks every field, not just the first:
-the affinity and retention families are chosen by independent resolvers, so a
-single body can carry one of each, and a `400` naming the retention selector
-must downgrade a body that also carries an affinity key — otherwise the rejected
-field would be re-sent (and fail) on every later turn.
-A provider that merely *ignores* an unknown field answers 2xx and is never
-recorded, and a `400` that names some other problem (a malformed request, an
-unknown model) leaves the hint in place. A body that carries none of these
-fields can never be downgraded. The rejection is recorded once the attempt is
-**final** — after the retry loop has exhausted its retries — not per attempt, so
-a retried request cannot record it more than once.
+The hint fails safe: a provider that answers a prompt-cache request field with an
+HTTP **400 naming that very field** is treated as rejecting the parameter, and
+that `(provider, model)` pair receives none of them for the rest of the process.
+The detector is deliberately narrow, so nothing unrelated downgrades — only a
+`400` counts (never a `429`, a `5xx`, or any other `4xx`), the detail must name
+one of the fields the request actually carried, the record is written once the
+attempt is **final** (after the retry loop, never per attempt), and a provider
+that merely *ignores* an unknown field answers 2xx and is never recorded.
 
-The memory is the process-wide `cache_field_rejection::CACHE_FIELD_REJECTED`
-map — the **sixteenth** sanctioned shared-state exception (see AGENTS.md). Its
-field names, the detector, and the registry live in
-`choreo-ai-protocols/src/cache_field_rejection.rs`, while the affinity dialect
-resolver (`session_routing.rs`) and the retention resolver (`cache_retention.rs`)
-consume it, so neither resolver owns the shared memory. It is keyed by
-the exact `(provider, model)` pair, never a provider-wide or model-prefix
-judgment: a provider often accepts a field on one model and rejects it on
-another, so a rejection recorded for one model must not withhold the hint from a
-sibling model the provider still honours it on. It is one registry for the whole
-prompt-cache request surface, so a pair that rejects an affinity key is not
-asked to accept a retention selector (or vice versa). It is read under a shared
-lock when a body is built for an opted-in provider (the `Off` default skips the
-lookup) and written once per pair on a matching `400`, so it carries no protocol
-data and readers never contend. The map is shaped provider → model ids so a
-lookup, which runs on every body build, borrows the caller's `&str`s and
-allocates nothing.
+The memory is `cache_field_rejection::CACHE_FIELD_REJECTED`, the **sixteenth**
+sanctioned shared-state exception (see AGENTS.md). Its field names, the detector,
+and the registry live in `choreo-ai-protocols/src/cache_field_rejection.rs`, and
+both resolvers (`session_routing`, `cache_retention`) consume it, so neither owns
+the shared memory. It is keyed by the exact `(provider, model)` pair — never a
+provider-wide or model-prefix judgment — and covers the **whole** prompt-cache
+request surface, so a pair that rejects an affinity key is not asked to accept a
+retention selector.
 
 The field a request actually sends resolves through three layers, highest
 priority first: a **per-account override** (`prompt_cache_affinity` on
-`AccountConfig`/`ProviderOverrides`; `Some(true)` forces a hint on — keeping a
-dialect the catalog already selected, or lifting an `Off` catalog to
-`prompt_cache_key` — `Some(false)` forces it off, `None` keeps the catalog
-value), then the **catalog's `cache_affinity`** overlay dialect, then the
-**rejection registry**, which is consulted last and can only withhold a hint. So
-the registry overrides even a forced-on override: once the provider has said no,
-it is not asked again. Consult `ServiceConfig::effective_cache_affinity` for the
+`AccountConfig`/`ProviderOverrides`; `Some(true)` forces a hint on, `Some(false)`
+forces it off, `None` keeps the catalog value), then the **catalog's
+`cache_affinity`** overlay dialect, then the **rejection registry**, which is
+consulted last and can only withhold a hint — so the registry overrides even a
+forced-on override. Consult `ServiceConfig::effective_cache_affinity` for the
 resolved value the body builders use.
 
 #### Cache warming declines a downgraded hint
 
 Because the hint is what keeps a session's requests on one backend, losing it
-invalidates the premise of **cache warming**: when the daemon re-sends the last
-request mid-tool-call to refresh the provider's prompt-cache TTL, its economics
+invalidates the premise of **cache warming**: the ping's economics
 (`warm_cost = cache_read * prefix + output`, `miss_cost` = a write instead of a
-read) assume the ping reaches a server that **still holds the prefix**. With the
-hint withheld the ping may be routed anywhere, so it can pay a full-price cache
-write the next real turn never reads — a coin flip the warmer must not take.
+read) assume it reaches a server that **still holds the prefix**, so with the
+hint withheld it can pay a full-price cache write the next real turn never reads.
 
 The gate is deliberately narrow. The arming site delegates to
-`cache_warm::arming` (`arm_for_tool_window`), which resolves the dialect the
-request bodies actually send — `InferenceProvider::cache_affinity`, i.e. the
-catalog dialect folded with the per-account override and less a field the
-provider's dialect never takes, the same provider-level value the body builders
-start from — and asks `session_routing::cache_affinity_downgraded`, which is
-true only when **both** halves hold: the request *intended* to send a hint (that
-dialect is not `Off`) **and** the effective affinity came back `Off` from the
-rejection registry for that `(provider, model)` pair. Resolving the real
-sent-dialect (not the bare catalog value) is what makes a forced-on override
-that was then rejected get caught, and a forced-off override not be mistaken for
-a sent hint. The resulting `WarmFacts::affinity_downgraded` fact rides into the
-pure policy, which returns `SkipReason::AffinityUnavailable` from its static
-ineligibility check — so the plan is never armed, no timer is wasted, and the
-decline shows up in `choreo_cache_warm_skips_total{reason="affinity_unavailable"}`.
-Every provider that sends no hint never sets the fact and warms exactly as
-before.
+`cache_warm::arming`, which resolves the dialect the request bodies actually send
+— `InferenceProvider::cache_affinity`, the provider-level value the body builders
+start from — and asks `session_routing::cache_affinity_downgraded`, true only
+when **both** halves hold: the request *intended* to send a hint and the
+effective affinity came back `Off` from the rejection registry for that
+`(provider, model)` pair. The resulting `WarmFacts::affinity_downgraded` fact
+rides into the pure policy, which returns `SkipReason::AffinityUnavailable` from
+its static ineligibility check — so no plan is armed, no timer is wasted, and the
+decline shows up in
+`choreo_cache_warm_skips_total{reason="affinity_unavailable"}`. A provider that
+sends no hint never sets the fact and warms exactly as before.
 
 #### The warming schedule follows the cache's real lifetime
 
 The same arming step resolves the other half of a ping's address:
-`WarmFacts::retention`, which `WarmPolicy` turns into the TTL the schedule is
+`WarmFacts::retention`, which the policy turns into the TTL the schedule is
 computed against (`RetentionTier::Long` reads the model's curated `long_secs`,
 `Short` its `short_secs`). It is `Long` exactly when the request bodies will
 carry an **extended-retention selector**, answered by
 `ProviderClient::extended_cache_retention` — which defers to the very resolver
-the body builders use, so the tier can never disagree with what is actually
-sent (dialect set, curated long tier declared, the API the body targets, and
-not a field the provider has already rejected). Without that link a model asking
-for a 24 h cache would be re-pinged on the short tier's minutes-long cadence,
-paying for cache writes the extended window never needed, and a model declaring
-only a long tier would never be warmed at all.
+the body builders use, so the tier can never disagree with what is actually sent.
+Without that link a model asking for a 24 h cache would be re-pinged on the short
+tier's minutes-long cadence, paying for cache writes the extended window never
+needed, and a model declaring only a long tier would never be warmed at all.
+
+### Provider-specific 400 handling
 
 #### Transient gateway 400 (message content)
 
@@ -1118,44 +1066,52 @@ invisible on the wire, and nothing here feeds retries or any downgrade.
 
 ### Runtime catalog refresh (S4)
 
+The merged catalog is parsed lazily into `PROVIDER_CATALOG`, a process-global
+`LazyLock<ArcSwap<Vec<ProviderEntry>>>`: the first access deserializes the
+embedded base and merges the bundled overlay once, and every later access goes
+straight to the `ArcSwap` (an atomic load, then lock-free reads / an atomic
+`store` on swap). The `ArcSwap` makes the catalog runtime-swappable: readers are
+lock-free and `replace_catalog()` swaps the whole catalog atomically, so lookups
+return *owned* values cloned out of the atomic guard rather than `&'static`
+references. The module layout, the entry types, and the fact lookups are
+documented in `choreo-ai-protocols`'s `catalog` module.
+
+That single-writer `ArcSwap` shape is the workspace's **fourth** sanctioned
+shared-state exception (see AGENTS.md): the daemon's tool registry
+(`DaemonState::tool_registry`, an `Arc<ArcSwap<ToolRegistry>>` shared with every
+session and request worker) is read lock-free and swapped only by the command
+loop, on `DaemonCommand::McpListChanged` — a wholesale registry swap is what lets
+a live MCP list change reach in-flight sessions without a restart.
+
 The compiled-in catalog is only the *fallback*: at runtime the daemon layers a
 local cache and a user overlay on top and keeps the base fresh from models.dev.
-One maintenance thread (`choreo-daemon/src/catalog/`) owns the whole pipeline
-but never mutates the catalog itself — every change is sent to the daemon
-command loop, the single writer of the `ArcSwap`, over a channel. The thread
-holds **no copy of the base** between events: it keeps only the small pacing
-scalars (etag, attempt anchor, overlay fingerprint), a fetch moves its fresh
-base straight into the swap command, and an overlay edit carries the overlay
-alone (`CatalogOverlayChanged`) — so the process's sole resident catalog is the
-merged `ArcSwap`, and `catalog.bin` is the base's home between events.
-
-That file's single reader is therefore its single writer: the command loop, the
-only code that writes `catalog.bin`, resolves the base when an overlay edit
-arrives (re-decoding the cache, or the embedded blob on a cache miss). Owning
-both sides is what makes the re-merge race-free — a base captured on the
-maintenance thread could already be superseded by a fetch whose swap command
-the loop had not yet applied, silently reverting that fetch (and the new etag
-would then 304 the downgrade into place for a whole revalidation period). The
-one case where the disk is behind the live catalog is a fetch whose cache write
-**failed**: the loop then retains that base in memory
-(`DaemonState::catalog_applied_base`) and re-merges from it until a persist
-succeeds, so a later overlay edit cannot revert the fetch to the stale on-disk
-base.
+One maintenance thread (`choreo-daemon/src/catalog/`) owns the whole pipeline but
+never mutates the catalog itself — every change is sent to the daemon command
+loop, the single writer of the `ArcSwap`, over a channel. The thread holds **no
+copy of the base** between events: it keeps only the small pacing scalars, a
+fetch moves its fresh base straight into the swap command, and an overlay edit
+carries the overlay alone, so the process's sole resident catalog is the merged
+`ArcSwap` and `catalog.bin` is the base's home between events. That file's single
+reader is therefore its single writer: the command loop resolves the base when an
+overlay edit arrives, which is what makes the re-merge race-free — a base
+captured on the maintenance thread could already be superseded by a fetch whose
+swap command the loop had not yet applied, silently reverting that fetch.
 
 The cross-cutting invariants: the normalized base is cached in the data dir in
 the same postcard format as the embedded blob, written atomically, with the
-models.dev etag persisted in the DB *after* the bin is on disk so a crash
-between the two self-heals (a new etag over stale content would 304 forever).
-A models.dev fetch is attempted at most once per 25 h, whatever the last
-outcome, anchored on a wall-clock attempt timestamp written *before* the fetch
-so the cadence survives restarts — the 25 h period (not 24 h) spreads load
-across the daemon population; `/refresh-models` bypasses the cooldown but still
-records the attempt. The user overlay (`$XDG_CONFIG_HOME/choreographr/
-models-overlay.toml`, the same schema as the bundled layer, merged last at
-highest precedence) is watched by the unified config transport, which surfaces
-edits to the maintenance thread through a fingerprint gate so editor save-event
-storms collapse; deleting the file falls back to bundled-only. Two wire surfaces
-ride the refresh: `/refresh-models` (TUI slash command →
+models.dev etag persisted in the DB *after* the bin is on disk so a crash between
+the two self-heals (a new etag over stale content would 304 forever). A models.dev
+fetch is attempted at most once per 25 h, whatever the last outcome, anchored on
+a wall-clock attempt timestamp written *before* the fetch so the cadence survives
+restarts — the 25 h period (not 24 h) spreads load across the daemon population;
+`/refresh-models` bypasses the cooldown but still records the attempt. The user
+overlay (`$XDG_CONFIG_HOME/choreographr/models-overlay.toml`, the same schema as
+the bundled layer, merged last at highest precedence) is watched by the unified
+config transport, which surfaces edits to the maintenance thread through a
+fingerprint gate so editor save-event storms collapse; deleting the file falls
+back to bundled-only.
+
+Two wire surfaces ride the refresh: `/refresh-models` (TUI slash command →
 `ClientMessage::RefreshModels` → the maintenance thread → `DaemonMessage::
 ModelsRefreshed` with `RefreshStatus`, or `ModelsRefreshFailed`; a burst of
 requests is coalesced into one fetch) and `CatalogUpdated`, broadcast on every
@@ -1163,15 +1119,16 @@ catalog swap to all activity subscribers so the TUI's provider picker tracks the
 live catalog. A swap is not a bare table replacement: because a provider client
 bakes its catalog entry's protocol, base URL, `request_compression`, and
 `cache_affinity` in at construction (and caches itself on the session), the
-command loop compares the
-pre- and post-swap entries and sends `DropProvider` to every session whose
-account's provider had one of those change — or vanish — so an overlay edit
-reaches a live session's next request instead of being masked by a stale
-client. Only those client-relevant fields are compared: a models.dev refresh
-that merely rewrites model lists leaves warm clients (and their connection
-pools) untouched. The cache/etag/cooldown mechanics, the conditional GET, and the
-fingerprint gate are documented in-source (`choreo-daemon`'s `catalog` module
-and `choreo-ai-protocols`'s `catalog::refresh`).
+command loop compares the pre- and post-swap entries and sends `DropProvider` to
+every session whose account's provider had one of those change — or vanish — so
+an overlay edit reaches a live session's next request instead of being masked by
+a stale client. Only those client-relevant fields are compared: a models.dev
+refresh that merely rewrites model lists leaves warm clients (and their
+connection pools) untouched. The cache/etag/cooldown mechanics, the conditional
+GET, the burst coalescing, and the fingerprint gate are documented in-source
+(`choreo-daemon`'s `catalog` module and `choreo-ai-protocols`'s `catalog::refresh`).
+
+### Client-facing MCP surfaces
 
 - **`/mcp`.** The TUI's `/mcp` slash command (and the `choreographr mcp` CLI)
   surfaces the state of the configured MCP servers. `ClientMessage::McpStatusRequest`
@@ -1371,25 +1328,6 @@ is a one-time data migration (accounts.toml / keystore service names / TUI
 runtime alias resolution**. The metrics `endpoint` label changes with the slug
 (Prometheus series change accepted, pre-1.0).
 
-The merged catalog is parsed lazily into `PROVIDER_CATALOG`, a process-global
-`LazyLock<ArcSwap<Vec<ProviderEntry>>>` (`catalog/mod.rs` +
-`catalog/loader.rs`, with the entry types themselves in `catalog/entry.rs`, the
-fact lookups in `catalog/lookup.rs`, and the OAuth login descriptors assembled
-from an entry's profile in `catalog/oauth.rs`): the first access deserializes the embedded base and
-merges the bundled overlay once; every later access goes straight to the
-`ArcSwap` (an atomic load, then lock-free reads / atomic `store` on swap). The
-`ArcSwap` makes the catalog runtime-swappable: readers are lock-free and
-`replace_catalog()` atomically swaps the whole catalog (single writer: the
-daemon command loop), so lookups return *owned* values cloned out of the
-atomic guard rather than `&'static` references.
-
-The same single-writer `ArcSwap` shape is the workspace's **fourth** sanctioned
-shared-state exception (see AGENTS.md): the daemon's tool registry
-(`DaemonState::tool_registry`, an `Arc<ArcSwap<ToolRegistry>>` shared with every
-session and request worker) is read lock-free and swapped only by the command
-loop, on `DaemonCommand::McpListChanged` — a wholesale registry swap is what
-lets a live MCP list change reach in-flight sessions without a restart.
-
 ### Reasoning round-trip (capture → carry → re-emit)
 
 For Anthropic (thinking blocks + signatures), DeepSeek/Kimi
@@ -1407,11 +1345,9 @@ interprets the bytes; and the chat adapter's lowering (`ChatWireMessage`) decide
 provenance (`Turn.reasoning_producer` versus the current provider + model, so a
 mid-session model switch drops every old artifact) plus the passback policy —
 with the empty-message fallback (a reasoning-only turn is never shipped as a
-wholly empty assistant message), the data-driven `reasoning_echo` /
-`reasoning_echo_required` facts (ingested from the snapshot's `interleaved` field
-name, with no name-based heuristic, and overridable per model by the overlay),
-and the `previous_response_id` continuity
-chain.
+wholly empty assistant message) — plus the `previous_response_id` continuity
+chain. The artifact never leaves the daemon process — client-bound
+`SessionEvent`s carry it as `None`.
 
 **Two Responses continuity modes.** The standard `OpenAI` Responses API
 *chains*: `store: true` plus `previous_response_id` keeps the transcript
@@ -1445,136 +1381,47 @@ production.
 **Which key wins.** The catalog's declared echo field is authoritative and
 outranks the field a payload was *observed* under: `ReasoningArtifact::
 ChatReasoning` records the observation (a hint, used only when the route declares
-nothing) while `ModelEntry::reasoning_echo` states the destination — and, when
-the separate `ModelEntry::reasoning_echo_required` fact says so, that the field
-must be present. There are **two destinations**: a declared scalar field
-(`reasoning_content`, `reasoning`, or `reasoning_text`) or the declared
-structured `reasoning_details` array. Destination and presence are **two
+nothing) while `ModelEntry::reasoning_echo` states the destination — a declared
+scalar field (`reasoning_content`, `reasoning`, or `reasoning_text`) or the
+declared structured `reasoning_details` array. Destination and presence are **two
 independent catalog facts**, each pinnable on its own — a presence requirement
 with no declared destination resolves to the chat default key
 (`field: None, require_present: true`), which the lowering emits empty — and the
-lowering (`choreo-ai-protocols`'
-`openai::chat_projection`, which owns the projection) applies both in one place so they
-cannot drift apart. Writing a scalar destination on *every* assistant message —
-the artifact's text when there is something to replay, an empty string when
-there is not — is exactly the presence case (`require_present`), not a
-consequence of declaring a field. Ingestion keeps the two aligned with what the
-upstream actually enforces: `interleaved` naming a scalar field sets BOTH facts
-(a scalar name has always meant the upstream demands the key echoed), while
-`interleaved` naming the structured array sets only the destination. This is
-why a gateway that streams
-DeepSeek thinking under `reasoning` while
-rejecting any history without `reasoning_content` cannot starve the required
-field. The artifact never leaves the daemon process — client-bound
-`SessionEvent`s carry it as `None`. The variant semantics and the resolver
-contracts are documented on `ReasoningPassback`, `ChatReasoningEcho`, and the
-resolver functions.
+lowering (`choreo-ai-protocols`' `openai::chat_projection`, which owns the
+projection) applies both in one place so they cannot drift apart. Ingestion keeps
+the two aligned with what upstream actually enforces: `interleaved` naming a
+scalar field sets BOTH facts (a scalar name has always meant the upstream demands
+the key echoed), while `interleaved` naming the structured array sets only the
+destination. This is why a gateway that streams DeepSeek thinking under
+`reasoning` while rejecting any history without `reasoning_content` cannot starve
+the required field. The variant semantics and the resolver contracts are
+documented on `ReasoningPassback`, `ChatReasoningEcho`, and the resolver
+functions.
 
 **Structured details.** Some chat routes carry reasoning as a structured
-`reasoning_details` array instead of a scalar string (models.dev's `interleaved`
-names it for the OpenRouter resellers and a few gateways). The artifact then
-stores the array as JSON under `ChatReasoningField::ReasoningDetails` rather than
-text: display text is derived from its text/summary entries when no scalar field
-streamed, and an encrypted-only array still counts as model output (never an
-empty response). The live display comes from exactly one channel — whichever
-channel produced a fragment first claims it for the rest of the turn, and the
-other channel then contributes nothing to the display — because a route that
-populates both sends the same reasoning twice and emitting both renders it twice
-in the client. The rule is symmetric: a route may stream the scalar field first
-and the structured array later just as easily as the reverse, so neither channel
-is privileged. Processing order inside a delta stays details-first, then the
-scalar fields, so a chunk carrying both lets the structured entries claim first.
-Both channels are still captured regardless of who owns the display — the scalar
-text is accumulated all the same, since it stays the display and artifact
-fallback for a route that streams only the scalar field, and the array is
-captured even while the scalar field is on screen. All three capture paths —
-both streaming request paths and the non-streaming response conversion —
-delegate those rules to one shared state machine
-(`openai/chat_completions/reasoning_stream.rs`) rather than each reimplementing
-them, which is what keeps the plain prompt path, the tool path, and the
-non-streaming turn result interpreting reasoning identically (including the
-first-non-empty scalar precedence that stops an empty field masking a populated
-one). Capture normalizes the array under a
-documented per-turn byte cap, beyond which the *replay payload* is dropped and
-logged rather than failing the request. Three answers are kept apart here, which
-is what stops a storage bound from costing anything but the echo: the turn's
-display text is a fold over the fragments (unbounded, like the scalar channel), the
-payload is what the cap bounds, and "did the model produce output" is a fact
-reported by the fold — never inferred from whether a payload survived. An
-over-cap turn therefore still shows its reasoning, and an encrypted-only turn whose
-payload was over the cap is a `FinalText` with no visible text rather than an
-`EmptyResponse` error. That bound and the per-request replay budget below are
-**one number** (`reasoning_details::MAX_REASONING_BYTES`): an artifact larger
-than the request budget could only ever ride as its "newest always
-replays" overshoot, so a larger per-turn cap would have no replay path. Two
-bounds still work together, because the payload is persisted per
-turn and replayed on *every* later request of the tool loop: the per-turn cap
-limits what one turn may persist, and the request build that lowers the history
-applies a separate per-request budget to the total artifact bytes it replays
-across all assistant messages. The request walks the history **newest-first**:
-the most recent artifact-carrying assistant turn always replays, even when that
-single artifact alone exceeds the budget, and each older turn replays only while
-the bytes already accepted stay within the budget. A turn the budget skips is
-lowered with no artifact but under the same echo policy, so a route that
-requires the key still emits its presence marker (an empty string, or the empty
-details array) and only the payload is lost. Without that second bound a long
-tool loop would build a request body that grows roughly with `turns × cap` until
-the provider rejects it outright: losing an old turn's echo degrades a route
-that requires it, while an oversized body fails the whole turn. The scalar
-artifacts are not capped at capture at all — real thinking can exceed the
-per-turn cap and the DeepSeek/GLM echo requirement needs it replayed — so they
-are bounded by that same request budget rather than by capture. The fragments of
-one stream slot merge into one block: a slot is the entry's `index` (equal
-`index` on both entries) or, where the provider names none, the newest
-index-less entry of that kind, and each slot remembers its own accumulating
-entry — so a route that interleaves two slots across deltas still merges both
-rather than starting a fresh entry per fragment. Entries carried by one delta are
-distinct blocks and never merge on absent-index evidence, and a mixed presence
-is ambiguous and stays unmerged, because fusing on absent evidence could rewrite
-a sequence the upstream requires to match. A merge is also refused when the two
-entries state a conflicting identity — a different `id`, `format`, or
-`signature` — since that is two distinct blocks sharing a slot number. OpenRouter
-states the rule this protects: the entire sequence of reasoning blocks must match
-the output of the original request and may not be rearranged or modified
-([docs](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#preserving-reasoning)),
-and GLM says the same of its preserved-thinking blocks
-([docs](https://docs.z.ai/guides/capabilities/thinking-mode)). Encrypted entries
-stay discrete (they are individually opaque), and an entry whose `type` is not
-modelled is kept and replayed **verbatim** — it contributes nothing to display
-text, but dropping it would again alter the sequence the model produced. The
-lowering replays OpenRouter's namespace-prefixed `reasoning.*` entries verbatim
-(index, format, and signature intact, as its documented array shape specifies —
-[spec](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens#reasoning_details-array-structure)).
-A **bare** entry (an undocumented single-word `type`) is the one exception to
-verbatim replay: it loses only the stream-only `index` and keeps everything else,
-the payload key included, because no upstream documents that shape — Kimi's own
-documentation uses solely `reasoning_content`
-([docs](https://platform.kimi.ai/docs/guide/use-thinking-models)) and models.dev's
-snapshot vocabulary is `reasoning_content` or `reasoning_details`
-([schema](https://github.com/anomalyco/models.dev/blob/dev/packages/core/src/schema.ts)) —
-so a rebuilt entry could drop an opaque block under a guessed key. The array is
-the **only** reasoning field such a message carries — a scalar mirror beside it
-would be a shape no upstream documents, and OpenRouter's guidance is one form
-*or* the other, so the companion is not emitted. The array is a **destination
-fact only**: a declared details route with nothing to echo emits *no* reasoning
-key,
-because no upstream is known to reject a history that omits the array and an
-invented `reasoning_details: []` would send an unverified array to a gateway
-that is strict about its contents. An **undeclared** route is the same shape for
-a different reason: it only reaches the array through the observation, so when
-the artifact lowers to nothing (corrupt or over the cap) no key is emitted at
-all. A route whose separate presence fact (`reasoning_echo_required`) demands
-the array still carries it empty on every assistant message — an empty array is
-a presence marker, not a payload, so it never keeps an otherwise-empty assistant
-message alive. Capture tolerates a value that is not an array or object only as
-far as one JSON decode: a proxy that double-encodes the array as a JSON string is
-decoded once and folded like a real array, and anything still not an array or
-object (a bare number, a string of non-JSON) is ignored and logged by kind alone
-— never logged by content, never invented into an entry. A scalar payload
-reaching a structured route (a catalog or overlay flip changes a model's
-declared field) is replayed as one `reasoning.text` entry rather than discarded,
-the counterpart of deriving display text from a structured payload on a scalar
-route.
+`reasoning_details` array instead of a scalar string; the artifact then stores
+the array as JSON under `ChatReasoningField::ReasoningDetails` rather than text,
+with display text derived from its text/summary entries when no scalar field
+streamed. An encrypted-only array still counts as model output, never an empty
+response. The upstreams require the replayed sequence to match what the model
+produced (OpenRouter states the rule, and GLM says the same of its
+preserved-thinking blocks), so nothing is dropped or rewritten on the way back
+out — including entries whose `type` this client does not model. Three answers
+stay apart, which is what stops a storage bound from costing anything but the
+echo: the turn's display text is a fold over the fragments (unbounded), the
+replay payload is what the cap bounds, and "did the model produce output" is a
+fact reported by the fold — never inferred from whether a payload survived. The
+per-turn capture cap and the per-request replay budget are **one number**
+(`reasoning_details::MAX_REASONING_BYTES`): an artifact larger than the request
+budget could only ever ride the budget's "newest always replays" overshoot, so a
+larger per-turn cap would have no replay path. The request walks the history
+newest-first, replaying the most recent artifact even when it alone exceeds the
+budget and older turns only while the bytes fit; without that second bound a long
+tool loop would build a body growing roughly with `turns × cap` until the
+provider rejected it outright. The capture/normalization rules, the single
+display-ownership state machine the streaming and non-streaming paths share, and
+the lowering live in the adapter's `openai/reasoning_details` and
+`openai/chat_projection` modules.
 
 **Empty turns never reach the wire.** An assistant turn that produced no visible
 content (blank text counts as none), no tool calls, and no reasoning payload is
@@ -1658,27 +1505,25 @@ Token usage is the protocol-agnostic `TokenUsage` struct
 (`choreo-proto/src/types/common.rs`) — `input_tokens` / `output_tokens` /
 `total_tokens` plus the prompt-cache `cached_tokens` / `cache_write_tokens`
 counts — whose per-field-max `merge_max` is the merge policy shared by the
-daemon's mid-turn sync and the TUI's attach-snapshot merge. For every provider
-`input_tokens` is the **full** prompt count: the prompt-cache `cached_tokens` /
-`cache_write_tokens` counts are a **subset** of it (priced separately, so
-tracked on their own), and a provider whose raw input counter excludes cache
-(Anthropic's post-breakpoint `input_tokens`) folds the cache counts in at the
-provider boundary — so `last_prompt_tokens` is the live turn's full prompt size.
-`TokenUsage::accumulate` is the per-turn **summation** counterpart to the
-per-field-max `merge_max`: it rebuilds the lifetime total from the turn history
-(on load) and is the same fold the worker uses for its incremental
-accumulation, so the two cannot diverge on which fields they add.
+daemon's mid-turn sync and the TUI's attach-snapshot merge, and whose
+`accumulate` is the per-turn **summation** counterpart: it rebuilds the lifetime
+total from the turn history and is the same fold the worker uses for its
+incremental accumulation, so the two cannot diverge on which fields they add. For
+every provider `input_tokens` is the **full** prompt count: the prompt-cache
+counts are a **subset** of it (priced separately, so tracked on their own), and a
+provider whose raw input counter excludes cache (Anthropic's post-breakpoint
+`input_tokens`) folds the cache counts in at the provider boundary — so
+`last_prompt_tokens` is the live turn's full prompt size.
 
 Every adapter resolves its provider's cache-hit field into `cached_tokens`
 through **one projection per protocol**, shared by that protocol's streaming and
 non-streaming paths, so a newly modelled cache field cannot reach one path and
-miss another: `openai::wire::Usage::to_token_usage` covers chat completions and
-the Responses API (nested `prompt_tokens_details` / `input_tokens_details`,
-falling back to `DeepSeek`'s flat `prompt_cache_hit_tokens`), and Gemini's
-`UsageMetadata::to_token_usage` covers `cachedContentTokenCount`. `cache_write_tokens`
-stays zero for every protocol that reports no write count (all but Anthropic).
-The daemon additionally feeds each turn's `cached_tokens / input_tokens` ratio
-to the `/metrics` prompt-cache-hit histogram, keyed by provider slug and model.
+miss another (`openai::wire::Usage::to_token_usage` covers chat completions and
+the Responses API; Gemini's `UsageMetadata::to_token_usage` covers
+`cachedContentTokenCount`). `cache_write_tokens` stays zero for every protocol
+that reports no write count (all but Anthropic). The daemon additionally feeds
+each turn's `cached_tokens / input_tokens` ratio to the
+`choreo_prompt_cache_hit_ratio` histogram, keyed by provider slug and model.
 
 Two cross-cutting accounting contracts:
 
