@@ -9,7 +9,7 @@
 //! ([`App::edit_input`]), and the exit/clear paths.  All of these are inherent
 //! `App` methods living in this sibling module; their fields (`App::history_index`
 //! and `SessionDisplayState::draft`/`draft_cursor`) stay on those structs in
-//! `state/mod.rs`.
+//! `state/app.rs` and `state/display.rs`.
 //!
 //! Named `draft` rather than `history` because "history" in this crate already
 //! unambiguously means the conversation scrollback pane (`HistoryScrollState`,

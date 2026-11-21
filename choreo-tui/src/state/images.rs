@@ -12,7 +12,7 @@
 //! [`ImageKey`]). The encoded-bitmap jobs are handled separately by
 //! [`App::apply_image_result`]/[`App::submit_image_job`]. All of these are
 //! inherent `App` methods living in this sibling module; their fields stay on
-//! `App` in `state/mod.rs`.
+//! `App` in `state/app.rs`.
 
 use super::App;
 use crate::RenderedImage;
