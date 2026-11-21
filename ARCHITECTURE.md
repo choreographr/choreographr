@@ -2036,16 +2036,23 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   therefore written until the account, the model and the effort are all known: Esc in the
   picker or the effort dialog drops the flow, sends nothing and returns to the accounts page,
   and a disconnect or session switch drops it silently, so no session can be left holding an
-  account without a model or a model without an effort. A model whose level set is empty skips
-  the dialog and commits `"off"`; every failure (`ModelsFailed`, `ModelsUnavailable`, a
-  rejected `SetSessionChoice`) ends the flow with the daemon's error on the status line. The
-  machine is a pure transition function of `(phase, event)` — the driver sends the messages and
-  opens the popups — so every rule is unit-tested without a daemon; `Models`/`ModelReasoning`
-  replies are routed to it by the phase that awaits them, and the effort dialog
-  (`state/reasoning_dialog.rs` + `render/reasoning_dialog.rs`) shows the choice instead of
-  applying one silently. Re-selecting the account a session already uses is a no-op, and the
-  mid-session paths (`Alt+M`, `Alt+R`, `/model`, `/reasoning`) still use the individual
-  commands.
+  account without a model or a model without an effort. Esc in the two in-flight phases drops
+  it the same way; while `Committing` the write is already on the wire, so bare Esc is
+  swallowed there instead of falling through to the Chat page's cancel-the-turn binding. A
+  model whose level set is empty skips the dialog and commits `"off"`; every failure
+  (`ModelsFailed`, `ModelsUnavailable`, a rejected `SetSessionChoice`) ends the flow — the first
+  two with the daemon's error on the status line, the last relying on the generic dispatch that
+  prints `[daemon] SetSessionChoice failed: …` for the same message. Only one flow exists at a
+  time: a second account choice (Enter on the accounts page while one is in flight) is refused
+  with a status line and leaves the first installed, because a `Models` reply carries no
+  account name and would otherwise paint the superseded account's models under the new one's
+  name. The machine is a pure transition function of `(phase, event)` — the driver sends the
+  messages and opens the popups — so every rule is unit-tested without a daemon;
+  `Models`/`ModelReasoning` replies are routed to it by the phase that awaits them, and the
+  effort dialog (`state/reasoning_dialog.rs` + `render/reasoning_dialog.rs`) shows the choice
+  instead of applying one silently. Both entry points share their guards in `start`:
+  re-selecting the account a session already uses is a no-op, and the mid-session paths
+  (`Alt+M`, `Alt+R`, `/model`, `/reasoning`) still use the individual commands.
 - There is no global "default account". Each session carries its own `account_name: Option<String>`
   field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
   This avoids a global mutable fallback and lets different sessions use different accounts.
@@ -3616,6 +3623,18 @@ meaning "we hold this session's transcript", and `attach_failed`, set when a
 attached and cleared by the next attach attempt or a snapshot. `App::session_note`
 derives them into `SessionNote::Error` (wins), else `SessionNote::Loading` while
 an attached session has no snapshot, else `None`.
+
+The failure event **carries no session id**, so which display it marks is decided
+by `App::pending_attach_id`: the session whose `AttachSession` is on the wire,
+recorded by both attach paths (`attach_to_session` and the one-shot
+`--attach <SESSION_ID>` path, `dispatch_pending_attach`) and cleared by the
+confirmed `SessionAttached` for that id. Without it the failure would be recorded
+against `attached_session_id` — right for the optimistic rebind, wrong for
+`--attach <bad-id>`, where no rebind happened and the healthy auto-attached
+session would report `error` until its next snapshot; it is also wrong when a
+slow failure lands after the user switched sessions. An `attach_session` failure
+with no recorded id still falls back to `attached_session_id`, which is the
+optimistic attachment the optimistic path is attaching.
 
 Three rules follow from that, and they are the reason the flags exist:
 

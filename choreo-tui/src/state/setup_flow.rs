@@ -199,36 +199,37 @@ pub(crate) enum FlowEnd {
     Failed,
 }
 
-/// The result of feeding one event to the machine: the phase to install (`None`
-/// once the flow has ended, exactly when `ended` is `Some`) and the steps to
-/// perform.
+/// The result of feeding one event to the machine. A transition either leaves a
+/// phase to install or ends the flow — never both and never neither — and
+/// either way it carries the [`SetupStep`]s to perform.
 #[derive(Clone, Debug)]
-pub(crate) struct Transition {
-    /// The flow after the transition, or `None` when it ended.
-    pub(crate) next: Option<SetupFlow>,
-    /// How it ended, when it did.
-    pub(crate) ended: Option<FlowEnd>,
-    /// What the caller must do next, in order.
-    pub(crate) steps: Vec<SetupStep>,
+pub(crate) enum Transition {
+    /// The flow goes on in `next`: install it, then perform `steps` in order.
+    Continue {
+        /// The phase to install before the steps run.
+        next: SetupFlow,
+        /// What the caller must do next, in order.
+        steps: Vec<SetupStep>,
+    },
+    /// The flow is over: install no phase, perform `steps` (the cleanup) in
+    /// order, and report `end` to a caller that has something to say about it.
+    End {
+        /// How it ended.
+        end: FlowEnd,
+        /// What the caller must do to clean up, in order.
+        steps: Vec<SetupStep>,
+    },
 }
 
 impl Transition {
-    /// Continue in `flow` after performing `steps`.
-    fn next(flow: SetupFlow, steps: Vec<SetupStep>) -> Self {
-        Self {
-            next: Some(flow),
-            ended: None,
-            steps,
-        }
+    /// Continue in `next` after performing `steps`.
+    fn continue_with(next: SetupFlow, steps: Vec<SetupStep>) -> Self {
+        Self::Continue { next, steps }
     }
 
     /// End the flow with `end` after performing `steps`.
-    fn ended(end: FlowEnd, steps: Vec<SetupStep>) -> Self {
-        Self {
-            next: None,
-            ended: Some(end),
-            steps,
-        }
+    fn end_with(end: FlowEnd, steps: Vec<SetupStep>) -> Self {
+        Self::End { end, steps }
     }
 }
 
@@ -236,7 +237,7 @@ impl SetupFlow {
     /// Stage `account` and ask for its model list. Nothing is written to the
     /// session: this only inspects the candidate account.
     pub(crate) fn begin(account: String) -> Transition {
-        Transition::next(
+        Transition::continue_with(
             Self::LoadingModels {
                 account: account.clone(),
             },
@@ -263,13 +264,15 @@ impl SetupFlow {
     /// popups have to be cleaned up.
     pub(crate) fn step(self, event: SetupEvent) -> Transition {
         match event {
-            SetupEvent::Cancelled => Transition::ended(
+            SetupEvent::Cancelled => Transition::end_with(
                 FlowEnd::Cancelled,
                 // Back to the accounts page: the flow was entered from there,
                 // so cancelling returns the user to where they started.
                 vec![SetupStep::ClosePopups, SetupStep::ReturnToAccounts],
             ),
-            SetupEvent::Failed => Transition::ended(FlowEnd::Failed, vec![SetupStep::ClosePopups]),
+            SetupEvent::Failed => {
+                Transition::end_with(FlowEnd::Failed, vec![SetupStep::ClosePopups])
+            }
             // Any other event is only meaningful to the phase that awaits it.
             event => match (self, event) {
                 (
@@ -287,7 +290,7 @@ impl SetupFlow {
                     let suggested = suggested
                         .filter(|id| models.iter().any(|m| &m.id == id))
                         .or_else(|| models.first().map(|m| m.id.clone()));
-                    Transition::next(
+                    Transition::continue_with(
                         Self::ChoosingModel {
                             account,
                             models: models.clone(),
@@ -302,7 +305,7 @@ impl SetupFlow {
                 (flow @ Self::ChoosingModel { .. }, SetupEvent::Models { .. }) => {
                     // One request, one answer: a second `Models` reply is not
                     // this flow's, and must not move the cursor under the user.
-                    Transition::next(flow, Vec::new())
+                    Transition::continue_with(flow, Vec::new())
                 }
                 (
                     Self::ChoosingModel { account, .. },
@@ -310,7 +313,7 @@ impl SetupFlow {
                         account: refreshed,
                         models,
                     },
-                ) if account == refreshed => Transition::next(
+                ) if account == refreshed => Transition::continue_with(
                     Self::ChoosingModel {
                         account,
                         models: models.clone(),
@@ -328,7 +331,7 @@ impl SetupFlow {
                         // A model with no levels has exactly one possible
                         // effort, so there is no choice to show: commit "off"
                         // without opening the dialog.
-                        Transition::next(
+                        Transition::continue_with(
                             Self::Committing {
                                 account: account.clone(),
                             },
@@ -351,7 +354,7 @@ impl SetupFlow {
                             })
                             .or_else(|| capability.available_effort_levels.first().cloned());
                         let levels = capability.available_effort_levels.clone();
-                        Transition::next(
+                        Transition::continue_with(
                             Self::ChoosingReasoning {
                                 account,
                                 model,
@@ -366,12 +369,12 @@ impl SetupFlow {
                     // resolved against a stale window must never carry an id
                     // this account does not offer into the commit.
                     if !models.iter().any(|m| m.id == model) {
-                        return Transition::next(
+                        return Transition::continue_with(
                             Self::ChoosingModel { account, models },
                             Vec::new(),
                         );
                     }
-                    Transition::next(
+                    Transition::continue_with(
                         Self::LoadingReasoning {
                             account: account.clone(),
                             model: model.clone(),
@@ -388,7 +391,7 @@ impl SetupFlow {
                     SetupEvent::ChoseEffort(effort),
                 ) => {
                     if !capability.available_effort_levels.contains(&effort) {
-                        return Transition::next(
+                        return Transition::continue_with(
                             Self::ChoosingReasoning {
                                 account,
                                 model,
@@ -397,7 +400,7 @@ impl SetupFlow {
                             Vec::new(),
                         );
                     }
-                    Transition::next(
+                    Transition::continue_with(
                         Self::Committing {
                             account: account.clone(),
                         },
@@ -417,15 +420,15 @@ impl SetupFlow {
                     // account set by anything else (a typed `/account`, another
                     // client) leaves the flow alone.
                     if flow.account() == account {
-                        Transition::ended(FlowEnd::Completed, vec![SetupStep::ClosePopups])
+                        Transition::end_with(FlowEnd::Completed, vec![SetupStep::ClosePopups])
                     } else {
-                        Transition::next(flow, Vec::new())
+                        Transition::continue_with(flow, Vec::new())
                     }
                 }
                 // Every remaining (phase, event) pair is inert: the reply or key
                 // belongs to a phase that has moved on. Reinstall the phase
                 // unchanged rather than dropping the flow.
-                (flow, _) => Transition::next(flow, Vec::new()),
+                (flow, _) => Transition::continue_with(flow, Vec::new()),
             },
         }
     }
@@ -455,46 +458,61 @@ mod tests {
         }
     }
 
+    /// The phase a continuing transition installs, with the steps it asks for.
+    /// A transition that ended instead fails the test: no assertion below may
+    /// silently accept the other shape.
+    fn continued(transition: Transition) -> (SetupFlow, Vec<SetupStep>) {
+        match transition {
+            Transition::Continue { next, steps } => (next, steps),
+            Transition::End { end, .. } => {
+                panic!("expected the flow to continue, it ended with {end:?}")
+            }
+        }
+    }
+
+    /// How an ending transition ended, with the steps it asks for. A
+    /// transition that continued instead fails the test, for the same reason.
+    fn ended(transition: Transition) -> (FlowEnd, Vec<SetupStep>) {
+        match transition {
+            Transition::End { end, steps } => (end, steps),
+            Transition::Continue { next, .. } => {
+                panic!("expected the flow to end, it continued in {next:?}")
+            }
+        }
+    }
+
     /// A flow advanced to `ChoosingModel` on the test list.
     fn choosing_model() -> SetupFlow {
-        let begin = SetupFlow::begin("anthropic".to_string());
+        let (next, steps) = continued(SetupFlow::begin("anthropic".to_string()));
         assert_eq!(
-            begin.steps,
+            steps,
             vec![SetupStep::RequestModels {
                 account: "anthropic".to_string()
             }]
         );
-        let transition = begin.next.expect("staged").step(SetupEvent::Models {
+        continued(next.step(SetupEvent::Models {
             models: list(),
             suggested: Some("gpt-4o".to_string()),
             provisional: false,
-        });
-        transition.next.expect("choosing")
+        }))
+        .0
     }
 
     /// A flow advanced to `LoadingReasoning` for `model`.
     fn loading_reasoning(id: &str) -> SetupFlow {
-        choosing_model()
-            .step(SetupEvent::ChoseModel(id.to_string()))
-            .next
-            .expect("loading reasoning")
+        continued(choosing_model().step(SetupEvent::ChoseModel(id.to_string()))).0
     }
 
     fn choosing_reasoning() -> SetupFlow {
-        loading_reasoning("claude-3")
-            .step(SetupEvent::Reasoned {
-                capability: capability(&["off", "low", "medium", "high"]),
-                suggested: Some("medium".to_string()),
-            })
-            .next
-            .expect("choosing reasoning")
+        continued(loading_reasoning("claude-3").step(SetupEvent::Reasoned {
+            capability: capability(&["off", "low", "medium", "high"]),
+            suggested: Some("medium".to_string()),
+        }))
+        .0
     }
 
     fn committing() -> SetupFlow {
-        choosing_reasoning()
-            .step(SetupEvent::ChoseEffort("high".to_string()))
-            .next
-            .expect("committing")
+        continued(choosing_reasoning().step(SetupEvent::ChoseEffort("high".to_string()))).0
     }
 
     /// Every phase the machine can be in, so each sweep-the-board rule is
@@ -515,16 +533,15 @@ mod tests {
 
     #[test]
     fn choosing_an_account_only_asks_for_its_models() {
-        let transition = SetupFlow::begin("anthropic".to_string());
+        let (next, steps) = continued(SetupFlow::begin("anthropic".to_string()));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::LoadingModels {
+            next,
+            SetupFlow::LoadingModels {
                 account: "anthropic".to_string()
-            })
+            }
         );
-        assert_eq!(transition.ended, None);
         assert_eq!(
-            transition.steps,
+            steps,
             vec![SetupStep::RequestModels {
                 account: "anthropic".to_string()
             }],
@@ -534,23 +551,21 @@ mod tests {
 
     #[test]
     fn a_model_list_opens_the_picker_on_the_suggestion() {
-        let transition = SetupFlow::begin("anthropic".to_string())
-            .next
-            .expect("staged")
-            .step(SetupEvent::Models {
-                models: list(),
-                suggested: Some("gpt-4o".to_string()),
-                provisional: false,
-            });
+        let staged = continued(SetupFlow::begin("anthropic".to_string())).0;
+        let (next, steps) = continued(staged.step(SetupEvent::Models {
+            models: list(),
+            suggested: Some("gpt-4o".to_string()),
+            provisional: false,
+        }));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::ChoosingModel {
+            next,
+            SetupFlow::ChoosingModel {
                 account: "anthropic".to_string(),
                 models: list(),
-            })
+            }
         );
         assert_eq!(
-            transition.steps,
+            steps,
             vec![SetupStep::ShowModelPicker {
                 models: list(),
                 suggested: Some("gpt-4o".to_string()),
@@ -562,16 +577,14 @@ mod tests {
     #[test]
     fn a_missing_or_unknown_suggestion_falls_back_to_the_first_row() {
         for suggested in [None, Some("not-in-the-list".to_string())] {
-            let transition = SetupFlow::begin("anthropic".to_string())
-                .next
-                .expect("staged")
-                .step(SetupEvent::Models {
-                    models: list(),
-                    suggested,
-                    provisional: false,
-                });
+            let staged = continued(SetupFlow::begin("anthropic".to_string())).0;
+            let (_, steps) = continued(staged.step(SetupEvent::Models {
+                models: list(),
+                suggested,
+                provisional: false,
+            }));
             let SetupStep::ShowModelPicker { suggested, .. } =
-                transition.steps.first().cloned().expect("the picker step")
+                steps.first().cloned().expect("the picker step")
             else {
                 panic!("expected ShowModelPicker");
             };
@@ -581,16 +594,17 @@ mod tests {
 
     #[test]
     fn choosing_a_listed_model_asks_for_its_reasoning_levels() {
-        let transition = choosing_model().step(SetupEvent::ChoseModel("claude-3".to_string()));
+        let (next, steps) =
+            continued(choosing_model().step(SetupEvent::ChoseModel("claude-3".to_string())));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::LoadingReasoning {
+            next,
+            SetupFlow::LoadingReasoning {
                 account: "anthropic".to_string(),
                 model: "claude-3".to_string(),
-            })
+            }
         );
         assert_eq!(
-            transition.steps,
+            steps,
             vec![SetupStep::RequestReasoning {
                 account: "anthropic".to_string(),
                 model: "claude-3".to_string(),
@@ -601,29 +615,27 @@ mod tests {
 
     #[test]
     fn an_unlisted_model_is_refused() {
-        let transition = choosing_model().step(SetupEvent::ChoseModel("gpt-5".to_string()));
+        let (next, steps) =
+            continued(choosing_model().step(SetupEvent::ChoseModel("gpt-5".to_string())));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::ChoosingModel {
+            next,
+            SetupFlow::ChoosingModel {
                 account: "anthropic".to_string(),
                 models: list(),
-            })
+            }
         );
-        assert_eq!(transition.steps, Vec::new(), "nothing is sent");
+        assert_eq!(steps, Vec::new(), "nothing is sent");
     }
 
     #[test]
     fn reasoning_levels_open_the_dialog_on_the_suggestion() {
-        let transition = loading_reasoning("claude-3").step(SetupEvent::Reasoned {
+        let (next, steps) = continued(loading_reasoning("claude-3").step(SetupEvent::Reasoned {
             capability: capability(&["off", "low", "high"]),
             suggested: Some("low".to_string()),
-        });
-        assert!(matches!(
-            transition.next,
-            Some(SetupFlow::ChoosingReasoning { .. })
-        ));
+        }));
+        assert!(matches!(next, SetupFlow::ChoosingReasoning { .. }));
         assert_eq!(
-            transition.steps,
+            steps,
             vec![SetupStep::ShowReasoningDialog {
                 levels: vec!["off".to_string(), "low".to_string(), "high".to_string()],
                 suggested: Some("low".to_string()),
@@ -633,12 +645,12 @@ mod tests {
 
     #[test]
     fn a_missing_effort_suggestion_falls_back_to_the_first_level() {
-        let transition = loading_reasoning("claude-3").step(SetupEvent::Reasoned {
+        let (_, steps) = continued(loading_reasoning("claude-3").step(SetupEvent::Reasoned {
             capability: capability(&["off", "low"]),
             suggested: None,
-        });
+        }));
         let SetupStep::ShowReasoningDialog { suggested, .. } =
-            transition.steps.first().cloned().expect("the dialog step")
+            steps.first().cloned().expect("the dialog step")
         else {
             panic!("expected ShowReasoningDialog");
         };
@@ -647,18 +659,18 @@ mod tests {
 
     #[test]
     fn a_model_without_levels_commits_off_without_a_dialog() {
-        let transition = loading_reasoning("gpt-4o").step(SetupEvent::Reasoned {
+        let (next, steps) = continued(loading_reasoning("gpt-4o").step(SetupEvent::Reasoned {
             capability: capability(&[]),
             suggested: None,
-        });
+        }));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::Committing {
+            next,
+            SetupFlow::Committing {
                 account: "anthropic".to_string()
-            })
+            }
         );
         assert_eq!(
-            transition.steps,
+            steps,
             vec![
                 SetupStep::ClosePopups,
                 SetupStep::Commit {
@@ -673,15 +685,16 @@ mod tests {
 
     #[test]
     fn choosing_an_effort_commits_the_whole_choice() {
-        let transition = choosing_reasoning().step(SetupEvent::ChoseEffort("high".to_string()));
+        let (next, steps) =
+            continued(choosing_reasoning().step(SetupEvent::ChoseEffort("high".to_string())));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::Committing {
+            next,
+            SetupFlow::Committing {
                 account: "anthropic".to_string()
-            })
+            }
         );
         assert_eq!(
-            transition.steps,
+            steps,
             vec![
                 SetupStep::ClosePopups,
                 SetupStep::Commit {
@@ -695,35 +708,32 @@ mod tests {
 
     #[test]
     fn an_unsupported_effort_is_refused() {
-        let transition = choosing_reasoning().step(SetupEvent::ChoseEffort("xhigh".to_string()));
-        assert!(matches!(
-            transition.next,
-            Some(SetupFlow::ChoosingReasoning { .. })
-        ));
-        assert_eq!(transition.steps, Vec::new());
+        let (next, steps) =
+            continued(choosing_reasoning().step(SetupEvent::ChoseEffort("xhigh".to_string())));
+        assert!(matches!(next, SetupFlow::ChoosingReasoning { .. }));
+        assert_eq!(steps, Vec::new());
     }
 
     #[test]
     fn the_sessions_confirmed_account_completes_the_flow() {
-        let transition = committing().step(SetupEvent::Committed {
+        let (end, steps) = ended(committing().step(SetupEvent::Committed {
             account: "anthropic".to_string(),
-        });
-        assert_eq!(transition.next, None);
-        assert_eq!(transition.ended, Some(FlowEnd::Completed));
-        assert_eq!(transition.steps, vec![SetupStep::ClosePopups]);
+        }));
+        assert_eq!(end, FlowEnd::Completed);
+        assert_eq!(steps, vec![SetupStep::ClosePopups]);
     }
 
     #[test]
     fn another_accounts_confirmation_leaves_the_flow_alone() {
         for phase in every_phase() {
-            let transition = phase.step(SetupEvent::Committed {
+            let (next, steps) = continued(phase.clone().step(SetupEvent::Committed {
                 account: "openai".to_string(),
-            });
+            }));
             assert_eq!(
-                transition.ended, None,
+                next, phase,
                 "a foreign account set is not this flow's commit"
             );
-            assert_eq!(transition.steps, Vec::new());
+            assert_eq!(steps, Vec::new());
         }
     }
 
@@ -732,19 +742,15 @@ mod tests {
     #[test]
     fn esc_from_every_phase_closes_and_returns_to_the_accounts() {
         for phase in every_phase() {
-            let transition = phase.step(SetupEvent::Cancelled);
-            assert_eq!(transition.next, None);
-            assert_eq!(transition.ended, Some(FlowEnd::Cancelled));
+            let (end, steps) = ended(phase.step(SetupEvent::Cancelled));
+            assert_eq!(end, FlowEnd::Cancelled);
             assert_eq!(
-                transition.steps,
+                steps,
                 vec![SetupStep::ClosePopups, SetupStep::ReturnToAccounts],
                 "the user goes back to where the flow started"
             );
             assert!(
-                !transition
-                    .steps
-                    .iter()
-                    .any(|s| matches!(s, SetupStep::Commit { .. })),
+                !steps.iter().any(|s| matches!(s, SetupStep::Commit { .. })),
                 "cancelling never commits"
             );
         }
@@ -753,10 +759,9 @@ mod tests {
     #[test]
     fn a_failure_from_every_phase_ends_the_flow() {
         for phase in every_phase() {
-            let transition = phase.step(SetupEvent::Failed);
-            assert_eq!(transition.next, None, "a failure ends the flow");
-            assert_eq!(transition.ended, Some(FlowEnd::Failed));
-            assert_eq!(transition.steps, vec![SetupStep::ClosePopups]);
+            let (end, steps) = ended(phase.step(SetupEvent::Failed));
+            assert_eq!(end, FlowEnd::Failed, "a failure ends the flow");
+            assert_eq!(steps, vec![SetupStep::ClosePopups]);
         }
     }
 
@@ -781,89 +786,81 @@ mod tests {
 
     #[test]
     fn a_second_model_list_does_not_move_the_picker() {
-        let transition = choosing_model().step(SetupEvent::Models {
+        let (next, steps) = continued(choosing_model().step(SetupEvent::Models {
             models: vec![model("other", &[])],
             suggested: Some("other".to_string()),
             provisional: true,
-        });
+        }));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::ChoosingModel {
+            next,
+            SetupFlow::ChoosingModel {
                 account: "anthropic".to_string(),
                 models: list(),
-            })
+            }
         );
-        assert_eq!(transition.steps, Vec::new());
+        assert_eq!(steps, Vec::new());
     }
 
     #[test]
     fn a_live_list_refresh_replaces_the_staged_models() {
         let refreshed = vec![model("claude-3", &["off"]), model("claude-4", &[])];
-        let transition = choosing_model().step(SetupEvent::ModelsRefreshed {
+        let (next, steps) = continued(choosing_model().step(SetupEvent::ModelsRefreshed {
             account: "anthropic".to_string(),
             models: refreshed.clone(),
-        });
+        }));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::ChoosingModel {
+            next,
+            SetupFlow::ChoosingModel {
                 account: "anthropic".to_string(),
                 models: refreshed.clone(),
-            }),
+            },
             "a model the live list added is choosable at once"
         );
         assert_eq!(
-            transition.steps,
+            steps,
             vec![SetupStep::RefreshModelPicker { models: refreshed }]
         );
     }
 
     #[test]
     fn a_refresh_for_another_account_is_ignored() {
-        let transition = choosing_model().step(SetupEvent::ModelsRefreshed {
+        let (next, steps) = continued(choosing_model().step(SetupEvent::ModelsRefreshed {
             account: "openai".to_string(),
             models: vec![model("other", &[])],
-        });
+        }));
         assert_eq!(
-            transition.next,
-            Some(SetupFlow::ChoosingModel {
+            next,
+            SetupFlow::ChoosingModel {
                 account: "anthropic".to_string(),
                 models: list(),
-            })
+            }
         );
-        assert_eq!(transition.steps, Vec::new());
+        assert_eq!(steps, Vec::new());
     }
 
     #[test]
     fn a_reasoning_reply_before_the_model_is_chosen_is_ignored() {
-        let transition = choosing_model().step(SetupEvent::Reasoned {
+        let (next, steps) = continued(choosing_model().step(SetupEvent::Reasoned {
             capability: capability(&["off"]),
             suggested: None,
-        });
-        assert!(matches!(
-            transition.next,
-            Some(SetupFlow::ChoosingModel { .. })
-        ));
-        assert_eq!(transition.steps, Vec::new());
+        }));
+        assert!(matches!(next, SetupFlow::ChoosingModel { .. }));
+        assert_eq!(steps, Vec::new());
     }
 
     #[test]
     fn keys_reach_only_their_own_phase() {
         // A model chosen while the picker is not the phase, and an effort
         // chosen while the dialog is not: both inert.
-        let transition =
-            loading_reasoning("claude-3").step(SetupEvent::ChoseModel("gpt-4o".into()));
-        assert!(matches!(
-            transition.next,
-            Some(SetupFlow::LoadingReasoning { .. })
-        ));
-        assert_eq!(transition.steps, Vec::new());
+        let (next, steps) =
+            continued(loading_reasoning("claude-3").step(SetupEvent::ChoseModel("gpt-4o".into())));
+        assert!(matches!(next, SetupFlow::LoadingReasoning { .. }));
+        assert_eq!(steps, Vec::new());
 
-        let transition = choosing_model().step(SetupEvent::ChoseEffort("high".into()));
-        assert!(matches!(
-            transition.next,
-            Some(SetupFlow::ChoosingModel { .. })
-        ));
-        assert_eq!(transition.steps, Vec::new());
+        let (next, steps) =
+            continued(choosing_model().step(SetupEvent::ChoseEffort("high".into())));
+        assert!(matches!(next, SetupFlow::ChoosingModel { .. }));
+        assert_eq!(steps, Vec::new());
     }
 
     #[test]

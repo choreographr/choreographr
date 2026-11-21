@@ -366,20 +366,30 @@ pub(crate) fn handle_terminal_event(
         handle_polkadot_import_event(&event, app, client_tx);
         return Ok(());
     }
-    // Esc anywhere else in the staged choice abandons it too. While a query is
+    // Esc anywhere else in the staged choice is swallowed here: while a query is
     // in flight no popup is up yet, so the key would otherwise fall through to
     // the page underneath (where a bare Esc on the Chat page cancels the
-    // session's turn). Only the two waiting phases are covered: once the choice
+    // session's turn). The two waiting phases abandon the flow; while the choice
     // is being committed the write is already on the wire and there is nothing
-    // to take back.
-    if matches!(
-        app.setup_flow,
-        Some(SetupFlow::LoadingModels { .. } | SetupFlow::LoadingReasoning { .. })
-    ) && let Event::Key(key) = &event
+    // to take back, so the key does nothing at all — not even a status line.
+    if app.setup_flow.is_some()
+        && let Event::Key(key) = &event
         && key.kind == KeyEventKind::Press
         && key.code == KeyCode::Esc
     {
-        super::setup_flow::cancel(app, client_tx);
+        match app.setup_flow {
+            Some(SetupFlow::LoadingModels { .. } | SetupFlow::LoadingReasoning { .. }) => {
+                super::setup_flow::cancel(app, client_tx);
+            }
+            // Committing, and the two phases whose popup owns the key (the
+            // picker and the dialog are dispatched above): swallowed.
+            Some(
+                SetupFlow::ChoosingModel { .. }
+                | SetupFlow::ChoosingReasoning { .. }
+                | SetupFlow::Committing { .. },
+            )
+            | None => {}
+        }
         return Ok(());
     }
     match app.page {

@@ -223,6 +223,12 @@ impl App {
     pub(crate) fn handle_session_attached(&mut self, session_id: u64) {
         self.active_session_id = Some(session_id);
         self.attached_session_id = Some(session_id);
+        // The attach this client was waiting on has landed, so nothing is on the
+        // wire for it any more. Only the id this attach confirms is cleared: a
+        // second attach issued while this one was in flight owns the record now.
+        if self.pending_attach_id == Some(session_id) {
+            self.pending_attach_id = None;
+        }
         // Attaching (re)points the terminal records at this session.
         self.term_status_dirty = true;
         // Copy session summary fields before borrowing display.
@@ -481,6 +487,11 @@ impl App {
             .send(client_tx, ClientMessageType::UnsubscribeSessionsSummary);
         self.pending
             .send(client_tx, ClientMessageType::AttachSession { session_id });
+        // Record what is now on the wire. The optimistic rebind below makes the
+        // target obvious to every path that runs after this, but an
+        // `attach_session` failure arrives without an id and may land after the
+        // user moved on, so the request itself has to be remembered.
+        self.pending_attach_id = Some(session_id);
         // Discard a command line BEFORE the input hand-off below: it is not a
         // prompt, so it must be dropped (not stashed as the outgoing session's
         // draft) and the target session's draft loaded in its place.
@@ -541,6 +552,10 @@ impl App {
         tracing::info!(session_id, "attaching to session at startup");
         self.pending
             .send(client_tx, ClientMessageType::AttachSession { session_id });
+        // There is no optimistic attach on this path — the view stays where the
+        // snapshot put it until the daemon answers — so the request is the only
+        // record of which session a failure (or the confirmation) is about.
+        self.pending_attach_id = Some(session_id);
         true
     }
 

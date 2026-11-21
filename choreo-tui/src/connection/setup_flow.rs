@@ -20,15 +20,18 @@ use crate::state::{App, FlowEnd, Page, SetupEvent, SetupFlow, SetupStep, Transit
 use choreo_proto::{ClientMessage, ClientMessageType, ModelInfo, ReasoningCapability};
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 
-/// Perform a transition: install the phase it leaves behind and run its steps.
-/// Returns how the flow ended, when it did, so a caller that owns an error
-/// message can surface it.
+/// Perform a transition: install the phase it leaves behind (if it leaves one)
+/// and run its steps. Returns how the flow ended, when it did, so a caller that
+/// owns an error message can surface it.
 fn apply(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
     transition: Transition,
 ) -> Option<FlowEnd> {
-    let Transition { next, ended, steps } = transition;
+    let (next, steps, end) = match transition {
+        Transition::Continue { next, steps } => (Some(next), steps, None),
+        Transition::End { end, steps } => (None, steps, Some(end)),
+    };
     // Install the phase BEFORE the steps run: the picker is opened from the
     // list the phase holds, so the two can never describe different lists.
     app.setup_flow = next;
@@ -125,7 +128,7 @@ fn apply(
             }
         }
     }
-    ended
+    end
 }
 
 /// Feed one event to the flow in flight, if there is one.
@@ -145,6 +148,9 @@ fn feed(
 /// the account, the model and the effort together. An account the attached
 /// session already uses is left alone — re-selecting it is what `Alt+M` and
 /// `/account` are for, and it would throw away the model in use.
+///
+/// These two guards are the only way into a flow, so both live here: the page
+/// switch and the staging below happen only when a choice actually starts.
 pub(super) fn start(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
@@ -154,7 +160,19 @@ pub(super) fn start(
         tracing::debug!(%account, "staged setup: the session already uses this account");
         return;
     }
+    // One flow at a time. A second account choice has nowhere to land: the
+    // superseded account's `Models` reply carries no account name, so it would
+    // be matched by pending-request id alone and paint ITS models under the new
+    // account's name. Refuse the second choice and leave the first in flight.
+    if app.setup_flow.is_some() {
+        tracing::debug!("staged setup: a choice is already in flight");
+        app.set_status("finish choosing the account's model and reasoning effort first");
+        return;
+    }
     tracing::info!(%account, "staged setup: staging an account choice");
+    // The key was saved from the accounts page; the choice that follows is the
+    // chat's setup, so show the chat the popups overlay.
+    app.set_page(Page::Chat);
     apply(app, client_tx, SetupFlow::begin(account));
 }
 
@@ -163,23 +181,18 @@ pub(super) fn start(
 /// left to discover `/account` on their own.
 ///
 /// A session that already has an account keeps it: adding a second key must not
-/// silently switch what an in-use session talks to.
+/// silently switch what an in-use session talks to. The flow itself is then the
+/// same one every other entry point stages.
 pub(super) fn start_after_credential(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
     account: String,
 ) {
-    if app.attached_session_id.is_none()
-        || app.attached_account_slug.is_some()
-        || app.setup_flow.is_some()
-    {
+    if app.attached_session_id.is_none() || app.attached_account_slug.is_some() {
         return;
     }
     tracing::info!(%account, "staged setup: credential confirmed for an accountless session");
-    // The key was saved from the accounts page; the choice that follows is the
-    // chat's setup, so show the chat the popups overlay.
-    app.set_page(Page::Chat);
-    apply(app, client_tx, SetupFlow::begin(account));
+    start(app, client_tx, account);
 }
 
 /// The `Models` reply answering the flow's own `ListModels`.
@@ -330,21 +343,29 @@ pub(super) fn cancel(app: &mut App, client_tx: &crossbeam_channel::Sender<Client
     feed(app, client_tx, SetupEvent::Cancelled);
 }
 
-/// End the flow in failure, surfacing the daemon's error text. The session is
-/// untouched: no step before the terminal `SetSessionChoice` writes anything,
-/// and a rejected `SetSessionChoice` leaves it as it was.
+/// End the flow in failure. The session is untouched: no step before the
+/// terminal `SetSessionChoice` writes anything, and a rejected
+/// `SetSessionChoice` leaves it as it was.
+///
+/// `error` is the daemon's text — `Some` when this arm is the only thing that
+/// will report the failure, `None` when the caller falls through to a generic
+/// dispatch that prints it (so the two cannot both write the status line, the
+/// later write winning). Returns how the flow ended, so a caller can tell a
+/// failure that ended it from one that arrived too late to.
 pub(super) fn fail(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
-    error: &str,
-) {
-    tracing::warn!(
-        error_len = error.len(),
-        "staged setup: abandoned after a failure"
-    );
-    if feed(app, client_tx, SetupEvent::Failed) == Some(FlowEnd::Failed) {
+    error: Option<&str>,
+) -> Option<FlowEnd> {
+    let error_len = error.map_or(0, str::len);
+    tracing::warn!(error_len, "staged setup: abandoned after a failure");
+    let end = feed(app, client_tx, SetupEvent::Failed);
+    if let Some(error) = error
+        && end == Some(FlowEnd::Failed)
+    {
         app.set_error(format!("[daemon] {error}"));
     }
+    end
 }
 
 /// The attached session's account was set to `account`: if that is the flow's

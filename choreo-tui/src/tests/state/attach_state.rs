@@ -236,28 +236,82 @@ fn a_turn_appended_before_the_snapshot_renders_as_a_transcript() {
 
 // ── Setting and clearing the states ──────────────────────────────────
 
-#[test]
-fn a_failed_attach_stays_on_the_session_and_records_the_error() {
-    // The failure event carries no session id, so the client records it against
-    // the session it is attaching to — and leaves the view there. Detaching
-    // would move the user somewhere they did not ask to be.
-    let mut app = loading_app();
+/// An `attach_session` failure as the daemon reports it: no session id, just the
+/// operation and its error.
+fn attach_failure() -> DaemonMessage {
+    DaemonMessage::broadcast(DaemonMessageType::Session {
+        session_id: None,
+        event: SessionEvent::SessionFailed {
+            operation: "attach_session".to_string(),
+            error: "session not found".to_string(),
+        },
+    })
+}
 
-    receive(
-        &mut app,
-        DaemonMessage::broadcast(DaemonMessageType::Session {
-            session_id: None,
-            event: SessionEvent::SessionFailed {
-                operation: "attach_session".to_string(),
-                error: "session not found".to_string(),
-            },
-        }),
+#[test]
+fn a_failed_attach_is_recorded_against_the_session_it_requested() {
+    // `--attach 999` sends `AttachSession` without rebinding the view, so the
+    // attached session is the healthy one the snapshot picked. The failure must
+    // land on the session that was actually requested, or the healthy session
+    // reports `error` until its next snapshot.
+    let mut app = loading_app();
+    app.session_displays.entry(7).or_default();
+    app.pending_attach_id = Some(7);
+
+    receive(&mut app, attach_failure());
+
+    assert!(
+        app.display_for(7).attach_failed,
+        "the requested session carries the failure"
     );
+    assert!(
+        !app.display_for(SESSION).attach_failed,
+        "the optimistically attached session is healthy and must stay so"
+    );
+    assert_eq!(app.session_note(), Some(SessionNote::Loading));
+    assert_eq!(
+        app.pending_attach_id, None,
+        "the attempt is consumed by its own failure"
+    );
+}
+
+#[test]
+fn a_failed_attach_without_a_recorded_request_reports_the_attached_session() {
+    // The fallback: an attach this client issued without the bookkeeping ends up
+    // back on the optimistic attachment — and the view stays there, because
+    // detaching would move the user somewhere they did not ask to be.
+    let mut app = loading_app();
+    assert_eq!(app.pending_attach_id, None);
+
+    receive(&mut app, attach_failure());
 
     assert_eq!(app.attached_session_id, Some(SESSION));
     assert!(app.display_for(SESSION).attach_failed);
     assert_eq!(app.session_note(), Some(SessionNote::Error));
     assert!(app.error().is_some(), "the red band carries the message");
+}
+
+#[test]
+fn a_confirmed_attach_clears_the_recorded_request() {
+    let mut app = loading_app();
+    app.session_displays.entry(7).or_default();
+    app.display_for(7).attach_failed = true;
+    app.pending_attach_id = Some(7);
+
+    receive(
+        &mut app,
+        DaemonMessage::broadcast(DaemonMessageType::Session {
+            session_id: Some(7),
+            event: SessionEvent::SessionAttached,
+        }),
+    );
+
+    assert_eq!(app.pending_attach_id, None, "the attach landed");
+    assert!(
+        !app.display_for(7).attach_failed,
+        "a confirmed attach supersedes the previous attempt's failure"
+    );
+    assert_eq!(app.attached_session_id, Some(7));
 }
 
 #[test]
@@ -293,6 +347,11 @@ fn re_attaching_clears_a_previous_failure() {
         .expect("attach_to_session succeeds");
 
     assert!(!app.display_for(SESSION).attach_failed);
+    assert_eq!(
+        app.pending_attach_id,
+        Some(SESSION),
+        "the request is on the wire until the daemon confirms it"
+    );
     assert_eq!(app.session_note(), Some(SessionNote::Loading));
 }
 

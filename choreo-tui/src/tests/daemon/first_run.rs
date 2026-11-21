@@ -462,6 +462,56 @@ fn esc_while_a_query_is_in_flight_abandons_the_flow() {
     );
 }
 
+#[test]
+fn esc_while_committing_is_swallowed() {
+    // The commit is already on the wire: Esc can neither take it back nor be
+    // allowed through to the Chat page, where it would cancel the session's
+    // running turn. It does nothing at all — not even a status line.
+    let mut app = test_app();
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    start_flow(&mut app, &tx);
+    answer_models(&mut app, &tx, &rx, vec![model("gpt-4o")], None);
+    press(KeyCode::Enter, &mut app, &tx);
+    handle_daemon_message(
+        DaemonMessage::reply(
+            999,
+            DaemonMessageType::ModelReasoning {
+                capability: levels(&[]),
+                suggested_effort: None,
+            },
+        ),
+        &mut app,
+        &tx,
+    )
+    .expect("handle ModelReasoning");
+    let committing = Some(SetupFlow::Committing {
+        account: "anthropic".to_string(),
+    });
+    assert_eq!(app.setup_flow, committing);
+    let status = app.status().map(str::to_string);
+    let _ = sent(&rx);
+
+    press(KeyCode::Esc, &mut app, &tx);
+
+    assert_eq!(app.setup_flow, committing, "the flow is unchanged");
+    assert!(
+        !sent(&rx)
+            .iter()
+            .any(|m| matches!(m, ClientMessageType::Cancel { .. })),
+        "the session's turn is not cancelled"
+    );
+    assert!(
+        sent(&rx).is_empty(),
+        "committing swallows the key: nothing is sent"
+    );
+    assert_eq!(
+        app.status().map(str::to_string),
+        status,
+        "no status line is written either"
+    );
+}
+
 // ── failure: the flow ends, the session was never touched ────────────
 
 #[test]
@@ -578,10 +628,13 @@ fn a_rejected_commit_ends_the_flow() {
     .expect("handle Failed");
 
     assert_eq!(app.setup_flow, None);
-    assert!(
-        app.error().is_some_and(|e| e.contains("not served")),
-        "got {:?}",
-        app.error()
+    // The line the user reads is the generic dispatch's, with the daemon's own
+    // wording — the flow closes and must not also write a second error.
+    assert_eq!(
+        app.error(),
+        Some(
+            "[daemon] SetSessionChoice failed: model 'claude-3' is not served by account 'anthropic'"
+        ),
     );
 }
 
@@ -622,6 +675,8 @@ fn selecting_an_account_on_the_page_stages_instead_of_switching() {
 
 #[test]
 fn selecting_the_sessions_current_account_is_a_no_op() {
+    // The rule lives in the flow's `start`, so the page never moves when the
+    // choice is refused: re-selecting the account in use is what `Alt+M` is for.
     let mut app = test_app();
     let (tx, rx) = crossbeam_channel::unbounded();
     app.attached_session_id = Some(42);
@@ -642,6 +697,41 @@ fn selecting_the_sessions_current_account_is_a_no_op() {
         app.page,
         Page::AIProviders,
         "the picker is not a way to re-set the same account"
+    );
+}
+
+#[test]
+fn a_second_account_choice_while_one_is_in_flight_is_refused() {
+    // A second staged choice would replace the first, and the superseded
+    // account's `Models` reply (which carries no account) would then open the
+    // picker on ITS list under the new account's name.
+    let mut app = test_app();
+    let (tx, rx) = crossbeam_channel::unbounded();
+
+    start_flow(&mut app, &tx);
+    let first = app.setup_flow.clone();
+    assert!(matches!(first, Some(SetupFlow::LoadingModels { .. })));
+    let _ = sent(&rx);
+
+    app.page = Page::AIProviders;
+    app.ai_providers.selection = Some(0);
+    app.ai_providers.set_accounts(vec![AccountInfo {
+        name: "openai".to_string(),
+        provider: "openai".to_string(),
+        has_credential: true,
+    }]);
+    press(KeyCode::Enter, &mut app, &tx);
+
+    assert_eq!(app.setup_flow, first, "the first choice stays installed");
+    assert!(
+        !sent(&rx)
+            .iter()
+            .any(|m| matches!(m, ClientMessageType::ListModels { .. })),
+        "no second model list is requested"
+    );
+    assert_eq!(
+        app.status(),
+        Some("finish choosing the account's model and reasoning effort first")
     );
 }
 

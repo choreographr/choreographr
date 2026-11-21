@@ -674,9 +674,11 @@ impl TurnEventHandler for App {
     }
 
     fn handle_session_attached(&mut self, session_id: u64) {
-        self.active_session_id = Some(session_id);
-        self.attached_session_id = Some(session_id);
-        self.term_status_dirty = true;
+        // One implementation: the inherent method owns everything an attach
+        // settles (the optimistic rebind, the pending request, the summary fill
+        // and the failure clear), and this trait entry point must not drift
+        // from it.
+        App::handle_session_attached(self, session_id);
     }
 
     fn handle_session_created(

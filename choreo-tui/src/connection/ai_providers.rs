@@ -25,19 +25,15 @@ pub(super) fn handle_ai_providers_event(
 /// account/model/reasoning flow: nothing is written to the session until the
 /// model and its effort are chosen too, so this alone sends no selection.
 ///
-/// An account the session already uses is a no-op — re-selecting it would throw
-/// away the model in use, and `Alt+M` is the way to change the model alone.
+/// The rules that decide whether a selection may start at all — the account the
+/// session already uses, and a choice already in flight — belong to the flow, so
+/// this only names the user's intent and logs it.
 fn select_account(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
     name: String,
 ) {
-    let switching = app.attached_account_slug.as_deref() != Some(name.as_str());
-    tracing::debug!(%name, switching, "selecting account for the active session");
-    if !switching {
-        return;
-    }
-    app.set_page(Page::Chat);
+    tracing::debug!(%name, "selecting account for the active session");
     super::setup_flow::start(app, client_tx, name);
 }
 #[expect(clippy::unnecessary_wraps)]

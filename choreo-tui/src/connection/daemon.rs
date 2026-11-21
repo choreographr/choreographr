@@ -181,16 +181,19 @@ pub(crate) fn handle_daemon_message(
             // say so — record it on the display of the session being attached
             // so the status bar keeps reporting it after the transient error
             // line above is cleared by the next keystroke.  The event carries no
-            // session id, so the optimistic attach's id is the one in question.
+            // session id, so the attach request this client has on the wire is
+            // the one in question; an attach issued without that bookkeeping
+            // falls back to the optimistic attachment.
             //
             // The view deliberately STAYS on the session: detaching would move
             // the user somewhere they did not ask to be, and the red error line
             // plus the status slot already explain what happened.  Re-entering
             // the session from the session list is the only retry.
-            if operation.as_str() == "attach_session"
-                && let Some(session_id) = app.attached_session_id
-            {
-                app.display_for(session_id).attach_failed = true;
+            if operation.as_str() == "attach_session" {
+                let target = app.pending_attach_id.take().or(app.attached_session_id);
+                if let Some(session_id) = target {
+                    app.display_for(session_id).attach_failed = true;
+                }
             }
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback — for the
@@ -667,7 +670,7 @@ pub(crate) fn handle_daemon_message(
                 // refusal where the user is looking. The session is untouched —
                 // nothing has been written yet.
                 if super::setup_flow::is_awaiting_models(app) {
-                    super::setup_flow::fail(app, client_tx, error);
+                    super::setup_flow::fail(app, client_tx, Some(error.as_str()));
                     return Ok(());
                 }
                 tracing::warn!(
@@ -819,12 +822,13 @@ pub(crate) fn handle_daemon_message(
         // A rejected atomic commit: the staged flow's one write did not land, so
         // the flow ends here with the popups closed and the session untouched
         // (no step before it wrote anything). No early return — the generic
-        // dispatch below prints the daemon's own error on the status line.
+        // dispatch below prints the daemon's error on the status line, which is
+        // why the flow's own failure path is told to leave the line alone.
         DaemonMessageType::Failed {
             kind: MessageKind::SetSessionChoice,
-            error,
+            ..
         } => {
-            super::setup_flow::fail(app, client_tx, error);
+            super::setup_flow::fail(app, client_tx, None);
         }
         // The daemon is going away (graceful shutdown) or has evicted this
         // client for lagging. In both cases the writer closes the socket
@@ -1025,7 +1029,7 @@ pub(crate) fn handle_daemon_message(
             // and nothing was committed — the error goes to the status line and
             // the popups close.
             if super::setup_flow::is_staging(app, account) {
-                super::setup_flow::fail(app, client_tx, error);
+                super::setup_flow::fail(app, client_tx, Some(error.as_str()));
                 return Ok(());
             }
             let attached = app.attached_account_slug.as_deref();

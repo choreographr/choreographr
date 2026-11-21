@@ -389,6 +389,18 @@ pub(crate) struct App {
     quit_message: DisplayLine,
     pub(crate) image_job_tx: Option<crossbeam_channel::Sender<ImageJob>>,
     pub(crate) attached_session_id: Option<u64>,
+    /// The session whose `AttachSession` is on the wire, if any — the only
+    /// reliable way to attribute a failure back to the session that caused it.
+    ///
+    /// `SessionEvent::SessionFailed` carries no session id, and the two attach
+    /// paths differ: [`App::attach_to_session`] rebinds
+    /// [`Self::attached_session_id`] optimistically before the reply, while
+    /// [`App::dispatch_pending_attach`] (the one-shot `--attach <SESSION_ID>`)
+    /// deliberately waits for the daemon's `SessionAttached`. Recording the
+    /// requested id here lets a failed attach be marked on the session it was
+    /// about, instead of on whatever happens to be attached when the failure
+    /// lands. Cleared by the confirmed attach it was waiting for.
+    pub(crate) pending_attach_id: Option<u64>,
     /// A `--attach <SESSION_ID>` request named at startup that has not been
     /// dispatched yet. Set once from the CLI in `run_app` and taken exactly
     /// once by [`App::dispatch_pending_attach`], which runs right after the
@@ -626,6 +638,7 @@ impl App {
             image_job_tx: None,
             pending_job_idx: HashMap::new(),
             attached_session_id: None,
+            pending_attach_id: None,
             pending_attach: None,
             attached_account_slug: None,
             attached_status: None,
