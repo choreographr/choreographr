@@ -564,6 +564,13 @@ impl TurnEventHandler for App {
         }
         let display = self.display_for(session_id);
         display.view.turns = merged;
+        // This snapshot is the authoritative transcript for the session, so it
+        // settles the client-side note: the transcript is no longer unknown,
+        // and a late snapshot supersedes an attach failure that was reported
+        // before it (the daemon can answer the attach and the snapshot out of
+        // order relative to our own bookkeeping).
+        display.history_loaded = true;
+        display.attach_failed = false;
         // Content versions must never outlive the turns they fingerprint:
         // drop entries whose turn left the view.  The snapshot merge is a
         // union today (accumulated turns are re-inserted below), so this is

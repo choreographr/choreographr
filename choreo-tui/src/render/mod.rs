@@ -157,7 +157,7 @@ use self::status::KEYS_LOCKED_MARKER;
 // resolving after the split: the markdown renderer imports `format_timestamp`,
 // and the crate suite's `tests/render/` glob-imports the rest.
 pub(crate) use self::format::{format_timestamp, session_detail_tokens_line, status_token_readout};
-pub(crate) use self::status::{format_status, status_display};
+pub(crate) use self::status::{format_status, session_note_display, status_display};
 // `slot_label` is drawn only from within `image` itself; its sole outside
 // caller is the sink test, so the re-export is test-only and does not trip
 // `unused_imports` in the library build.
@@ -283,7 +283,12 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
     // a zero-area fallback rect is harmless to render into.
     let history_area = history_chunks.first().copied().unwrap_or_default();
     // An empty session shows the welcome panel instead of a blank pane, so a
-    // first-time user is told what to do before their first message.
+    // first-time user is told what to do before their first message.  The panel
+    // is gated on the transcript having arrived (`show_welcome`), so a session
+    // whose snapshot is still in flight — or whose attach failed — draws an
+    // empty history area and reports the state in the status bar instead.  Turns
+    // win either way: a `TurnAppended` for the session can arrive before its
+    // snapshot, and the transcript it builds is drawn rather than held back.
     if app.show_welcome() {
         render_welcome(frame, history_area, app);
     } else {
@@ -531,8 +536,16 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(context, Style::default().fg(Color::White)));
         }
-        if let Some(status) = &app.attached_status {
-            let (label, color) = status_display(status);
+        // The status slot prefers the client-side note over the daemon's status:
+        // the note is the durable state that explains why there is no transcript
+        // on screen yet, and it must render even when the daemon has reported no
+        // status at all — which is exactly the failed-attach case.  The daemon's
+        // status is the fallback, so the two never appear together.
+        let slot = app
+            .session_note()
+            .map(session_note_display)
+            .or_else(|| app.attached_status.as_ref().map(status_display));
+        if let Some((label, color)) = slot {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(label, Style::default().fg(color)));
         }

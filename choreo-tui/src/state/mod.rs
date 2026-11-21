@@ -180,6 +180,29 @@ impl ReasoningViewMode {
     }
 }
 
+/// A fact about a session this client knows that the daemon's `SessionStatus`
+/// vocabulary cannot express.
+///
+/// The daemon reports what it is *doing* with a session; it cannot report that
+/// this client has not heard from it yet, or that its last attach attempt
+/// failed.  Those are properties of the client's view of the session, so they
+/// are held per display ([`SessionDisplayState`]) and derived into a note by
+/// [`App::session_note`].
+///
+/// The note is a *display* concern only: it never feeds the OSC 7501
+/// program-status reporting, which publishes the daemon's own view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionNote {
+    /// The session's snapshot has not arrived yet, so its transcript is
+    /// unknown.  This is the state a freshly attached session sits in until
+    /// the daemon's `SessionState` snapshot lands.
+    Loading,
+    /// The last attempt to attach this session failed.  Nothing is loading and
+    /// nothing is running: the session's transcript is unavailable until the
+    /// user re-enters it from the session list.
+    Error,
+}
+
 pub(crate) struct SessionDisplayState {
     pub(crate) view: SessionView,
     pub(crate) visible_turn_ids: Vec<u32>,
@@ -238,7 +261,25 @@ pub(crate) struct SessionDisplayState {
     pub(crate) live_output_tokens: u32,
     pub(crate) progress_dirty: bool,
     pub(crate) status: Option<String>,
+    /// The last turn's failure text (`SessionEvent::Error`), shown with the
+    /// turn.  Distinct from [`Self::attach_failed`], which is a client-side
+    /// fact about a failed attach.
     pub(crate) error: Option<String>,
+    /// Whether this client holds a transcript snapshot for the session — set
+    /// when a `SessionState` snapshot is applied, which is the authoritative
+    /// transcript.  It therefore means "a snapshot has arrived", not "an
+    /// attach finished": the daemon sends `SessionAttached` (which this client
+    /// acts on optimistically) *before* the snapshot, so the window between
+    /// them is exactly the window in which the transcript is unknown.
+    ///
+    /// A display created fresh starts `false`, and a deleted session's display
+    /// is dropped, so its replacement starts `false` again.
+    pub(crate) history_loaded: bool,
+    /// Whether the last attempt to attach this session failed.  Kept on the
+    /// display so it travels with the session: switching away and back cannot
+    /// lose it, and only a new attach (or a snapshot arriving anyway) clears
+    /// it.  See [`SessionNote::Error`].
+    pub(crate) attach_failed: bool,
     pub(crate) selected_model: Option<String>,
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) reasoning_capability: Option<ReasoningCapability>,
@@ -288,6 +329,8 @@ impl Default for SessionDisplayState {
             progress_dirty: false,
             status: None,
             error: None,
+            history_loaded: false,
+            attach_failed: false,
             selected_model: None,
             reasoning_effort: None,
             reasoning_capability: None,
@@ -933,13 +976,45 @@ impl App {
         None
     }
 
+    /// The client-side note for the ATTACHED session, if any.
+    ///
+    /// `Error` wins over `Loading`: a failed attach leaves the transcript
+    /// unknown *and* explains why, and naming the failure is the more
+    /// actionable of the two.  It is read by the status bar's status slot and
+    /// by the idle guards; the welcome-panel decision reads
+    /// `history_loaded` directly (see `show_welcome`).
+    pub(crate) fn session_note(&self) -> Option<SessionNote> {
+        let session_id = self.attached_session_id?;
+        let display = self.session_displays.get(&session_id)?;
+        if display.attach_failed {
+            Some(SessionNote::Error)
+        } else if !display.history_loaded {
+            Some(SessionNote::Loading)
+        } else {
+            None
+        }
+    }
+
     /// Whether the attached session is known to be busy (not idle).  `None`
     /// (no status heard yet) fails open, so a fresh client still reaches the
     /// daemon — the daemon is the authority; this is only a local pre-empt.
     ///
     /// `Sleeping` counts as busy too (see `SessionStatus::is_idle`): its thread
     /// has terminated, so it cannot accept a new turn or a history mutation.
+    ///
+    /// A session in the client-side [`SessionNote::Error`] state is NOT busy,
+    /// whatever the daemon last said about it.  A failed attach left no
+    /// running work behind, and the failure may have landed while the summary's
+    /// last known status was `Sleeping` — which `SessionStatus::is_idle` counts
+    /// as busy.  Without this the idle guard would refuse every prompt with
+    /// "Session is not idle, please wait before prompting." forever, because
+    /// nothing in that state can ever clear the status.  `Loading` is
+    /// deliberately *not* treated as idle: a loading session is genuinely not
+    /// ready, and "please wait" is the right answer for the one frame it lasts.
     fn attached_is_busy(&self) -> bool {
+        if matches!(self.session_note(), Some(SessionNote::Error)) {
+            return false;
+        }
         self.attached_status
             .as_ref()
             .is_some_and(|status| !status.is_idle())

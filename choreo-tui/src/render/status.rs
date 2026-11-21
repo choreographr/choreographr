@@ -1,6 +1,13 @@
 //! The session-status vocabulary: the label and colour for a daemon-reported
-//! [`SessionStatus`], and the persistent keystore-lock marker that leads the
-//! status bar while the daemon's credential store is locked.
+//! [`SessionStatus`], the label and colour for a client-side [`SessionNote`]
+//! (see [`session_note_display`]), and the persistent keystore-lock marker that
+//! leads the status bar while the daemon's credential store is locked.
+//!
+//! The two vocabularies are separate on purpose.  A `SessionStatus` describes
+//! what the daemon is doing with the session; a `SessionNote` describes what
+//! this client knows about its own view of the session (no transcript yet, or
+//! the attach failed).  The status bar's slot prefers the note and falls back
+//! to the daemon's status, so the two never render side by side.
 //!
 //! A tool name inside a status is MCP-supplied arbitrary text, so it is
 //! normalized here rather than at each surface that draws a status: the status
@@ -16,6 +23,7 @@ use choreo_proto::SessionStatus;
 use ratatui::style::Color;
 
 use super::display_text;
+use crate::state::SessionNote;
 
 /// The persistent status-bar banner shown while the daemon's credential
 /// keystore is locked (see `App::keystore_locked`). Small and non-intrusive:
@@ -57,4 +65,22 @@ pub(crate) fn status_display(status: &SessionStatus) -> (String, Color) {
 
 pub(crate) fn format_status(status: &SessionStatus) -> String {
     status_display(status).0
+}
+
+/// The label and colour for a client-side [`SessionNote`] — the state the
+/// daemon's status vocabulary cannot express, shown in the status bar's status
+/// slot in place of (in preference to) the daemon's own status.
+///
+/// `loading` is blue, the same colour as the daemon's `sending` status: the
+/// client is waiting on the daemon, not failing.  `error` is red, matching the
+/// error line above the input box.  Neither is dim: a note that the transcript
+/// is unavailable must read as state, not as an aside.
+///
+/// Kept a pure function of the note (no `App`) so the mapping is testable on
+/// its own and stays part of this module's status vocabulary.
+pub(crate) fn session_note_display(note: SessionNote) -> (String, Color) {
+    match note {
+        SessionNote::Loading => ("loading".into(), Color::Blue),
+        SessionNote::Error => ("error".into(), Color::Red),
+    }
 }

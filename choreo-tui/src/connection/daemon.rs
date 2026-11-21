@@ -176,6 +176,22 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             app.set_error(format!("[daemon] {operation} failed: {error}"));
+            // A failed attach leaves the client-side view of the session without
+            // a transcript, and the daemon's `SessionStatus` vocabulary cannot
+            // say so — record it on the display of the session being attached
+            // so the status bar keeps reporting it after the transient error
+            // line above is cleared by the next keystroke.  The event carries no
+            // session id, so the optimistic attach's id is the one in question.
+            //
+            // The view deliberately STAYS on the session: detaching would move
+            // the user somewhere they did not ask to be, and the red error line
+            // plus the status slot already explain what happened.  Re-entering
+            // the session from the session list is the only retry.
+            if operation.as_str() == "attach_session"
+                && let Some(session_id) = app.attached_session_id
+            {
+                app.display_for(session_id).attach_failed = true;
+            }
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback — for the
             // create flow and for the pin/archive flow (both of which are

@@ -48,14 +48,25 @@ impl App {
     }
 
     /// Whether the chat page should show the welcome panel in place of the
-    /// (empty) history: a session is attached and nothing is in it yet.
+    /// (empty) history: a session is attached, its transcript snapshot has
+    /// arrived, and nothing is in it yet.
+    ///
+    /// The `history_loaded` term is what keeps the panel from standing in for a
+    /// transcript that has not arrived.  Attaching is optimistic (the view
+    /// leaves the session list and primes the status bar before the daemon
+    /// answers), and the transcript only arrives afterwards in the
+    /// `SessionState` snapshot, so an attached session with no turns is either
+    /// genuinely empty or still loading — and the panel's "type a message"
+    /// invitation is wrong for the second case.  The status bar reports the
+    /// loading state; the history area stays empty until the truth arrives.
+    ///
     /// Reads `visible_turn_ids`, so callers must run after the per-frame
     /// `compute_total_height_and_markers` rebuild (as `render_chat` does).
     pub(crate) fn show_welcome(&self) -> bool {
         self.attached_session_id.is_some()
             && self
                 .active_display_ref()
-                .is_some_and(|d| d.visible_turn_ids.is_empty())
+                .is_some_and(|d| d.history_loaded && d.visible_turn_ids.is_empty())
     }
 }
 
@@ -118,10 +129,5 @@ mod tests {
         app.ai_providers
             .set_accounts(vec![account("a", true), account("b", true)]);
         assert!(app.setup_progress().has_keyed_account);
-    }
-
-    #[test]
-    fn no_welcome_without_an_attached_session() {
-        assert!(!App::new().show_welcome());
     }
 }

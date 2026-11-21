@@ -558,10 +558,14 @@ emits to any terminal that honours them), which Rex authors and implements.
 
 ### First conversation
 
-Start `choreo-tui`. An empty session shows a **welcome panel** carrying a single
+Start `choreo-tui`. An **empty** session — one whose transcript has arrived and
+holds no turns yet — shows a **welcome panel** carrying a single
 line: the one thing left to set up and the exact key for it — no AI provider is
 set up yet, an account still needs its API key, or this session has no account —
-and once you are set up it invites your first message. Setting up takes three
+and once you are set up it invites your first message. A session whose transcript
+is still loading shows an empty chat area with `loading` in the status bar, and a
+session whose attach failed shows `error` there (re-enter it from the session
+list to retry). Setting up takes three
 steps:
 
 1. **Add an account** — `Alt+A`, then `n`. Pick a provider (the most common

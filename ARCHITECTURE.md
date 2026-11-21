@@ -3554,7 +3554,9 @@ drawn bar and the Terminal page's "supported (host)" row stay in agreement.
 
 ### Welcome-screen terminal advice
 
-The empty-session welcome panel names a terminal gap only when the profile
+The welcome panel — drawn for a session whose transcript has arrived and is
+empty (see [Client-side session notes](#client-side-session-notes-loading--error))
+— names a terminal gap only when the profile
 settles one as unsupported, and only for a feature the client actually uses:
 copy-on-select (OSC 52), inline images, flicker-free redraws (mode 2026), and
 the disambiguated modified keys (`Shift+Enter` and friends). The reporting
@@ -3594,6 +3596,51 @@ terminal. Both the budget and the height are measured with ratatui's own
 `Paragraph::line_count` (via `state::wrapped_lines_rows`), so the rows charged are
 exactly the rows the drawing paragraph renders; a `div_ceil` approximation could
 round a word-wrapped line short.
+
+### Client-side session notes (loading / error)
+
+Attaching a session is **optimistic**: `attach_to_session` sends `AttachSession`
+and rebinds `attached_session_id` immediately, so the view leaves the session
+list and the status bar primes itself from the summary before the daemon
+answers. The transcript, however, only arrives afterwards — the daemon sends
+`SessionAttached` first and then one `SessionState` snapshot carrying every turn
+(`choreo-daemon/src/server/connection/handlers.rs`). For a session that has to
+be reloaded from the database the gap is long enough to read.
+
+The daemon's `SessionStatus` vocabulary cannot describe that gap (it says what
+the daemon is doing with the session, not what this client knows about its own
+view), so the TUI holds two **client-side flags per session display**
+(`SessionDisplayState`): `history_loaded`, set when a snapshot is applied and
+meaning "we hold this session's transcript", and `attach_failed`, set when a
+`SessionFailed { operation: "attach_session" }` arrives for the session being
+attached and cleared by the next attach attempt or a snapshot. `App::session_note`
+derives them into `SessionNote::Error` (wins), else `SessionNote::Loading` while
+an attached session has no snapshot, else `None`.
+
+Three rules follow from that, and they are the reason the flags exist:
+
+- The **welcome panel is gated on `history_loaded`**. An attached session with
+  zero turns is either genuinely empty or still loading, and the panel's "type a
+  message" invitation is wrong for the second case, so the history area draws
+  nothing (no placeholder, no dim text) until the snapshot settles which one it
+  is. Turns still win: a `TurnAppended` for the session can arrive before its
+  snapshot, and the transcript it builds is drawn rather than held back.
+- The **status bar's status slot prefers the note** (`loading` blue, `error`
+  red) and falls back to the daemon's status, so the note renders even when the
+  daemon has reported no status at all — exactly the failed-attach case.
+- **Error implies idle.** A failed attach left no running work behind, and the
+  summary's last known status may well be `Sleeping`, which `is_idle` counts as
+  busy; without the rule the client-side idle guard would refuse every prompt
+  forever with nothing able to clear it. `Loading` deliberately does *not*
+  imply idle — a loading session is genuinely not ready, and "please wait" is
+  correct for the one frame it lasts.
+
+A failed attach **stays on the page**: the transient error line above the input
+box carries the message, the status slot carries the durable state, and
+re-entering the session from the session list is the only retry (there is no
+retry affordance and no auto-retry). The note never feeds the OSC 7501
+program-status reporting, which publishes the daemon's own view and must not
+learn client-only states.
 
 ### Terminal page
 

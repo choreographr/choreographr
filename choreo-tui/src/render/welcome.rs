@@ -3,6 +3,13 @@
 //! exact key for it, in a single plain sentence per setup state. Once nothing is
 //! left to set up it says so and invites the first message.
 //!
+//! The panel stands in for a transcript that is known to be empty, not for one
+//! that has not arrived: [`crate::state::App::show_welcome`] requires the
+//! session's snapshot to have been applied.  An attach in flight therefore
+//! draws an empty history area with `loading` in the status bar, and a failed
+//! attach draws the same area with `error` there, rather than inviting a
+//! first message into a session whose state is still unknown.
+//!
 //! When the terminal or its host layer costs this client a feature it uses, the
 //! panel also carries the advice derived in `state/terminal_notice.rs`. That
 //! block sits between the sentence and the closing `alt+h` hint, and is

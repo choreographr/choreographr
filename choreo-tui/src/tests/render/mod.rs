@@ -8,7 +8,9 @@
 //! the session-list table as one subject — its columns, the selected-row
 //! highlight, the three scroll/highlight sections and the archived/pin view;
 //! `palette` covers the inline command palette; `tool_rows` pins where a tool
-//! row's text ends relative to the scrollbar column; `sinks` pins that
+//! row's text ends relative to the scrollbar column; `session_note` covers the
+//! status slot's client-side `loading`/`error` note and the welcome panel's gate
+//! on the transcript snapshot; `sinks` pins that
 //! untrusted daemon text is normalized at every widget sink it reaches.
 
 mod format;
@@ -16,6 +18,7 @@ mod model_selector;
 mod palette;
 mod reasoning_dialog;
 mod session_list;
+mod session_note;
 mod sinks;
 mod tool_rows;
 mod wizard;

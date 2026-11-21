@@ -254,6 +254,12 @@ impl App {
             });
         {
             let display = self.display_for(session_id);
+            // A new attach attempt supersedes a previous failure: the failure
+            // state belongs to the *last* attempt, and re-entering the session
+            // from the session list is the only retry there is.  The transcript
+            // flag itself is left alone — a display that already holds a
+            // snapshot keeps rendering it while the re-attach is in flight.
+            display.attach_failed = false;
             // Fill gaps from the (potentially stale) session summary, but never
             // clobber values already accumulated via the all-activity
             // subscription while this session was in the background: the
@@ -489,6 +495,12 @@ impl App {
         self.reset_for_session_switch(session_id);
         self.set_page(Page::Chat);
         self.attached_session_id = Some(session_id);
+        // Clear any failure recorded by a previous attach attempt: this is a
+        // fresh attempt, and the status bar reports it as loading again (the
+        // display's `history_loaded` says whether a transcript is already
+        // held).  Without this the failed-attach state would be sticky across
+        // every re-entry.
+        self.display_for(session_id).attach_failed = false;
         // Refresh the status bar right away from the summary; the daemon's
         // SessionAttached reply re-applies the same (possibly newer) value.
         self.attached_status = self

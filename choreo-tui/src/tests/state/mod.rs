@@ -5,10 +5,12 @@
 //! model, the per-turn reasoning and tool-result collapse state, the session-wide
 //! bulk reasoning mode, image layout, viewport-change classification, streaming,
 //! the streaming response auto-pin, the request lifecycle, the pointer-shape
-//! selection, and the terminal-status records. This parent only declares the
-//! modules; fixtures live in `crate::tests::support`, so a child that needs one
-//! imports it from there.
+//! selection, the client-side attach state (which the welcome panel and the
+//! status note are derived from), and the terminal-status records. This parent
+//! only declares the modules; fixtures live in `crate::tests::support`, so a
+//! child that needs one imports it from there.
 
+mod attach_state;
 mod content_version;
 mod display_line;
 mod find_turn;
