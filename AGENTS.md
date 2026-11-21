@@ -53,7 +53,7 @@ replaced.
 
 ## Documentation
 
-When making changes, ensure [ARCHITECTURE.md](./ARCHITECTURE.md) and [README.md](./README.md) are kept up to date. If a change affects the architectural decisions, module structure, data flow, or any other documented aspect, update the files accordingly.
+Document each change where its scope lives — in-source by default. A change that stays inside one crate is documented in that crate's rustdoc and inline comments and needs **no** `ARCHITECTURE.md` edit. Only a change that crosses a crate boundary updates `ARCHITECTURE.md`, as a concise edit to the existing section; only a change to the user-facing overview updates `README.md`.
 
 ### Rustdoc vs ARCHITECTURE.md
 
@@ -61,6 +61,18 @@ Documentation is split by scope, and each layer is canonical for its own kind of
 
 - **In-source rustdoc** (`//!` module headers + `///` item docs) **owns the per-module API reference** — a module's purpose, its public items' contracts, local invariants, ownership/lifecycle, and portability notes. Anything that changes when exactly one crate changes belongs next to that crate's code.
 - **[ARCHITECTURE.md](./ARCHITECTURE.md) owns the cross-cutting system view** — workspace topology and dependency graphs, the security model, design-decision rationale, the end-to-end data flow, the wire-format/version history, release & packaging, and the sanctioned shared-state exceptions. Anything that would need editing because two or more crates changed belongs in the markdown.
+
+### Keeping ARCHITECTURE.md short
+
+`ARCHITECTURE.md` is the cross-cutting view and is deliberately short. **Do not** add to it:
+
+- a per-feature or per-module section describing how one component works — that is the component's rustdoc, so add it there (the module `//!` header and `///`/`//` comments).
+- module/type/field/variant tables, per-tool descriptions, error-variant lists, or implementation walkthroughs — that is an API reference, which rustdoc owns.
+- a prose restatement of something a source comment already says — the code is the source of truth, and the markdown must not duplicate it.
+
+Before adding a paragraph, ask: *would this need editing because **two or more** crates changed?* If not, it belongs next to the single crate's code. When a change really is cross-cutting, widen or correct the existing section rather than appending a new one, and keep it to what a reader cannot get from the code — the contract, the invariant, and why a boundary sits where it does.
+
+If you find `ARCHITECTURE.md` restating module detail, that is a defect: put the fact into the owning module's rustdoc/comments (verify it is stated there correctly) and delete the markdown copy.
 
 The migration to this split is incremental: a crate is **migrated** once every public item carries docs and its rustdoc is warning-free. Migrated crates carry `#![warn(missing_docs)]` at their crate root (enforced as an error by `clippy-strict`'s `-D warnings`) and are listed in `doc_crates` in the justfile so `doc-check` holds their rustdoc clean. Add a crate to both, in the same change that documents it.
 
@@ -225,7 +237,7 @@ If any step fails, fix the cause and re-run `just pre-commit` from the top — a
 
 ### Documentation (part of the run, before committing)
 
-Update `ARCHITECTURE.md` / `README.md` if the change touches anything they describe, and write the commit message as the release note (see [Release notes via commits](#release-notes-via-commits)).
+Put the documentation where its scope lives (see [Documentation](#documentation)): describe the change in-source (rustdoc + comments) by default, and touch `ARCHITECTURE.md` only when it crosses a crate boundary — a concise update to the existing section, never a new per-feature essay — or `README.md` when it changes the user-facing overview. Then write the commit message as the release note (see [Release notes via commits](#release-notes-via-commits)).
 
 ### Commit
 
