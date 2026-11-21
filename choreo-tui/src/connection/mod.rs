@@ -43,21 +43,19 @@ pub(crate) use terminal_event::handle_terminal_event;
 
 // Test-only imports: the in-file `#[cfg(test)] mod tests` unit tests build
 // `Event`s and messages by hand and `use super::*` to reach the names below,
-// which no non-test code in this module touches after the split (mouse
-// construction, the signal→resume-command mapping, kitty normalisation, and
-// `handle_daemon_message` round-trips are exercised only there). Gated so the
-// lib build stays clippy-clean.
+// which no non-test code in this module touches (mouse construction, the
+// fullscreen/pointer dispatch, and the daemon-message round-trips are
+// exercised only there). Gated so the lib build stays clippy-clean.
+//
+// The signal→resume-command mapping and the kitty-keyboard normalisation now
+// live beside the tests that exercise them (`resume` and `terminal_event`), so
+// this module no longer imports either.
 #[cfg(test)]
 use crate::selection;
 #[cfg(test)]
 use choreo_proto::{DaemonMessage, DaemonMessageType};
 #[cfg(test)]
-use resume::{ResumeCommand, notify_disconnected, signal_to_resume_command};
-#[cfg(test)]
-use terminal_event::{
-    KITTY_KEYBOARD_FLAGS, dispatch_terminal_event, handle_ui_event, normalize_kitty_shift,
-    shift_char,
-};
+use terminal_event::{dispatch_terminal_event, handle_ui_event};
 
 /// Whether `key` is a `Ctrl`/`Alt` *modifier chord*.
 ///
@@ -152,200 +150,10 @@ mod tests {
     use crate::state::{Marker, UiEvent};
     use crate::tests::support::test_app;
     use choreo_proto::Turn;
-    // The crossterm types the page handlers used to pull in through
-    // `super::*` are no longer imported by this module, so the tests name the
-    // ones they construct directly.
-    use crossbeam_channel as channel;
-    use crossterm::event::{Event, KeyCode, KeyboardEnhancementFlags};
-    #[cfg(unix)]
-    use nix::sys::signal::{Signal, raise};
-
-    #[cfg(unix)]
-    #[test]
-    fn sigcont_maps_to_reinit_terminal() {
-        assert!(matches!(
-            signal_to_resume_command(Signal::SIGCONT as i32),
-            Some(ResumeCommand::ReinitTerminal),
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sigtstp_maps_to_prepare_for_suspend() {
-        assert!(matches!(
-            signal_to_resume_command(Signal::SIGTSTP as i32),
-            Some(ResumeCommand::PrepareForSuspend),
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn sigwinch_is_not_a_resume_command() {
-        // SIGWINCH is registered on the self-pipe purely to wake the terminal
-        // thread's mio poll; the actual resize is then reported by crossterm's
-        // `event::poll`/`event::read` drain as `Event::Resize`.  Mapping it to a
-        // ResumeCommand would be wrong — resizing must never trigger a terminal
-        // teardown/reinit.
-        assert!(signal_to_resume_command(Signal::SIGWINCH as i32).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn uninteresting_signal_returns_none() {
-        assert!(signal_to_resume_command(Signal::SIGINT as i32).is_none());
-        assert!(signal_to_resume_command(Signal::SIGTERM as i32).is_none());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn invalid_signal_number_returns_none() {
-        assert!(signal_to_resume_command(9999).is_none());
-    }
-
-    // ── Kitty keyboard protocol ──
-
-    #[test]
-    fn notify_disconnected_detects_dropped_sender() {
-        // The Windows terminal thread's shutdown notify is a sender that is
-        // dropped (never sent on); `try_recv` then reports Disconnected — the
-        // `try_recv().is_ok()` check the old code used would never fire
-        // because no message is ever sent, hanging the thread (and the join
-        // at shutdown) forever. Pin the exact detection contract.
-        let (tx, rx) = channel::unbounded::<()>();
-        assert!(
-            !notify_disconnected(&rx),
-            "a live channel must not read as shut down"
-        );
-        drop(tx);
-        assert!(
-            notify_disconnected(&rx),
-            "a dropped sender must read as shut down"
-        );
-        assert!(
-            notify_disconnected(&rx),
-            "detection must stay latched after disconnect"
-        );
-    }
-
-    #[test]
-    fn kitty_flags_disambiguate_without_report_all_keys() {
-        // A Ctrl+letter editing chord must arrive as a distinct CSI-u key
-        // event (e.g. CSI 109;5 u for Ctrl+M); DISAMBIGUATE_ESCAPE_CODES alone
-        // gives us that because Ctrl+letter is a "disambiguated" key, while
-        // plain text stays as legacy bytes.
-        assert!(KITTY_KEYBOARD_FLAGS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
-        // REPORT_ALL_KEYS_AS_ESCAPE_CODES must stay OFF: it makes IME-composed
-        // text arrive as a `CSI 0;;<codepoints>u` text event, which crossterm
-        // 0.29 mangles into `Char('\0')` (dropping the composed text) — so
-        // Vietnamese/other IME input would type as nothing.
-        assert!(
-            !KITTY_KEYBOARD_FLAGS
-                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
-            "REPORT_ALL_KEYS breaks IME text input (crossterm drops the associated-text field)"
-        );
-    }
-
-    #[test]
-    fn shift_char_maps_us_layout() {
-        assert_eq!(shift_char('a'), 'A');
-        assert_eq!(shift_char('z'), 'Z');
-        assert_eq!(shift_char('1'), '!');
-        assert_eq!(shift_char('0'), ')');
-        assert_eq!(shift_char('-'), '_');
-        assert_eq!(shift_char('='), '+');
-        assert_eq!(shift_char('['), '{');
-        assert_eq!(shift_char(']'), '}');
-        assert_eq!(shift_char('\\'), '|');
-        assert_eq!(shift_char(';'), ':');
-        assert_eq!(shift_char('\''), '"');
-        assert_eq!(shift_char(','), '<');
-        assert_eq!(shift_char('.'), '>');
-        assert_eq!(shift_char('/'), '?');
-        assert_eq!(shift_char('`'), '~');
-        // Non-ASCII and already-shifted chars pass through unchanged.
-        assert_eq!(shift_char('é'), 'é');
-        assert_eq!(shift_char('A'), 'A');
-    }
-
-    #[test]
-    fn normalize_kitty_shift_applies_mapping_and_keeps_shift() {
-        // Shift+A arrives as Char('a') + SHIFT (kitty CSI 97;2 u); the
-        // normaliser must produce the legacy-equivalent glyph Char('A') while
-        // keeping SHIFT, which is a real part of a chord.
-        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::SHIFT,
-        )));
-        assert_eq!(
-            out,
-            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
-        );
-
-        // Shift+1 → '!'.
-        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
-            KeyCode::Char('1'),
-            KeyModifiers::SHIFT,
-        )));
-        assert_eq!(
-            out,
-            Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT))
-        );
-    }
-
-    #[test]
-    fn normalize_kitty_shift_keeps_shift_and_leaves_the_glyph_when_ctrl_held() {
-        // Ctrl+Shift+M arrives as Char('m') + CONTROL + SHIFT (CSI 109;6 u).
-        // Legacy Ctrl+Shift+M was byte 0x0D — identical to Ctrl+M — so there is
-        // no legacy glyph to mirror and the char is left alone; SHIFT survives
-        // so the chord stays distinguishable from Ctrl+M on this terminal.
-        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
-            KeyCode::Char('m'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        )));
-        assert_eq!(
-            out,
-            Event::Key(KeyEvent::new(
-                KeyCode::Char('m'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT
-            ))
-        );
-    }
-
-    #[test]
-    fn normalize_kitty_shift_keeps_alt_and_shift() {
-        // Alt+Shift+A arrives as Char('a') + ALT + SHIFT; legacy sent ESC 'A'
-        // (Char('A') + ALT).  The mapping must apply the glyph and keep BOTH
-        // modifiers, so the chord reads the same as the legacy one.
-        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
-            KeyCode::Char('a'),
-            KeyModifiers::ALT | KeyModifiers::SHIFT,
-        )));
-        assert_eq!(
-            out,
-            Event::Key(KeyEvent::new(
-                KeyCode::Char('A'),
-                KeyModifiers::ALT | KeyModifiers::SHIFT
-            ))
-        );
-    }
-
-    #[test]
-    fn normalize_kitty_shift_leaves_other_events_untouched() {
-        // Non-Char keys (Shift+Enter keeps its modifier — it inserts a
-        // newline in the chat input), unmodified keys, and non-key events
-        // must pass through unchanged.
-        let shift_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
-        assert_eq!(normalize_kitty_shift(shift_enter.clone()), shift_enter);
-
-        let plain = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert_eq!(normalize_kitty_shift(plain.clone()), plain);
-
-        let ctrl_q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
-        assert_eq!(normalize_kitty_shift(ctrl_q.clone()), ctrl_q);
-
-        let paste = Event::Paste("Hi".to_string());
-        assert_eq!(normalize_kitty_shift(paste.clone()), paste);
-    }
+    // Only `Event` is not pulled in through `super::*`; the mouse types the
+    // page handlers import (`MouseEvent`, `MouseButton`, `MouseEventKind`,
+    // `KeyModifiers`) and `handle_terminal_event` come through `super::*`.
+    use crossterm::event::Event;
 
     // ── Marker click logic ──
     //
@@ -1271,58 +1079,5 @@ mod tests {
         app.forget_pointer();
         assert!(!app.mouse_tracking_reassert);
         assert_eq!(app.pointer_hover, None);
-    }
-
-    /// The signal self-pipes are what turn a caught signal back into a resume
-    /// command, so pin the property the whole design rests on: a delivery wakes
-    /// *its own* pipe and no other, which is the only way the identity survives
-    /// (the handler writes one unidentifiable byte).
-    ///
-    /// The handlers run synchronously inside `raise`, so each pipe is already
-    /// readable when it returns — no waiting, no polling.
-    #[cfg(unix)]
-    #[test]
-    fn each_caught_signal_wakes_only_its_own_pipe() {
-        use mio::{Poll, Token};
-
-        let mut signals = resume::Signals::register().expect("register the signal pipes");
-        let mut poll = Poll::new().expect("create poll");
-        signals
-            .register_with(&mut poll)
-            .expect("park the pipes in the poll");
-        let (tx, rx) = channel::unbounded::<ResumeCommand>();
-        let token = |index: usize| Token(resume::SIGNAL_TOKEN_BASE + index);
-
-        // SIGCONT is index 0: it wakes that pipe with the resume command, and
-        // the other pipes have nothing to report.
-        raise(Signal::SIGCONT).expect("raise SIGCONT");
-        signals.on_token(token(0), &mut poll, &tx);
-        assert!(
-            matches!(rx.try_recv(), Ok(ResumeCommand::ReinitTerminal)),
-            "SIGCONT must map to the terminal re-init"
-        );
-        signals.on_token(token(1), &mut poll, &tx);
-        signals.on_token(token(2), &mut poll, &tx);
-        assert!(
-            rx.try_recv().is_err(),
-            "a signal must not be reported by another signal's pipe"
-        );
-
-        // SIGTSTP is index 2: same property, the opposite command.
-        raise(Signal::SIGTSTP).expect("raise SIGTSTP");
-        signals.on_token(token(2), &mut poll, &tx);
-        assert!(
-            matches!(rx.try_recv(), Ok(ResumeCommand::PrepareForSuspend)),
-            "SIGTSTP must map to the suspend preparation"
-        );
-
-        // SIGWINCH is index 1: it wakes its pipe but maps to no command — it
-        // exists only to wake the poll so crossterm emits `Event::Resize`.
-        raise(Signal::SIGWINCH).expect("raise SIGWINCH");
-        signals.on_token(token(1), &mut poll, &tx);
-        assert!(
-            rx.try_recv().is_err(),
-            "SIGWINCH only wakes the poll; it maps to no command"
-        );
     }
 }

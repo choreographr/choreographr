@@ -359,3 +359,126 @@ pub(super) fn handle_resume_command(
     // Windows has no job-control suspend; ResumeCommand is never produced.
     Ok(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn sigcont_maps_to_reinit_terminal() {
+        assert!(matches!(
+            signal_to_resume_command(Signal::SIGCONT as i32),
+            Some(ResumeCommand::ReinitTerminal),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigtstp_maps_to_prepare_for_suspend() {
+        assert!(matches!(
+            signal_to_resume_command(Signal::SIGTSTP as i32),
+            Some(ResumeCommand::PrepareForSuspend),
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sigwinch_is_not_a_resume_command() {
+        // SIGWINCH is registered on the self-pipe purely to wake the terminal
+        // thread's mio poll; the actual resize is then reported by crossterm's
+        // `event::poll`/`event::read` drain as `Event::Resize`.  Mapping it to a
+        // ResumeCommand would be wrong — resizing must never trigger a terminal
+        // teardown/reinit.
+        assert!(signal_to_resume_command(Signal::SIGWINCH as i32).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninteresting_signal_returns_none() {
+        assert!(signal_to_resume_command(Signal::SIGINT as i32).is_none());
+        assert!(signal_to_resume_command(Signal::SIGTERM as i32).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_signal_number_returns_none() {
+        assert!(signal_to_resume_command(9999).is_none());
+    }
+
+    #[test]
+    fn notify_disconnected_detects_dropped_sender() {
+        // The Windows terminal thread's shutdown notify is a sender that is
+        // dropped (never sent on); `try_recv` then reports Disconnected — the
+        // `try_recv().is_ok()` check the old code used would never fire
+        // because no message is ever sent, hanging the thread (and the join
+        // at shutdown) forever. Pin the exact detection contract.
+        let (tx, rx) = channel::unbounded::<()>();
+        assert!(
+            !notify_disconnected(&rx),
+            "a live channel must not read as shut down"
+        );
+        drop(tx);
+        assert!(
+            notify_disconnected(&rx),
+            "a dropped sender must read as shut down"
+        );
+        assert!(
+            notify_disconnected(&rx),
+            "detection must stay latched after disconnect"
+        );
+    }
+
+    /// The signal self-pipes are what turn a caught signal back into a resume
+    /// command, so pin the property the whole design rests on: a delivery wakes
+    /// *its own* pipe and no other, which is the only way the identity survives
+    /// (the handler writes one unidentifiable byte).
+    ///
+    /// The handlers run synchronously inside `raise`, so each pipe is already
+    /// readable when it returns — no waiting, no polling.
+    #[cfg(unix)]
+    #[test]
+    fn each_caught_signal_wakes_only_its_own_pipe() {
+        use mio::{Poll, Token};
+
+        let mut signals = Signals::register().expect("register the signal pipes");
+        let mut poll = Poll::new().expect("create poll");
+        signals
+            .register_with(&mut poll)
+            .expect("park the pipes in the poll");
+        let (tx, rx) = channel::unbounded::<ResumeCommand>();
+        let token = |index: usize| Token(SIGNAL_TOKEN_BASE + index);
+
+        // SIGCONT is index 0: it wakes that pipe with the resume command, and
+        // the other pipes have nothing to report.
+        raise(Signal::SIGCONT).expect("raise SIGCONT");
+        signals.on_token(token(0), &mut poll, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(ResumeCommand::ReinitTerminal)),
+            "SIGCONT must map to the terminal re-init"
+        );
+        signals.on_token(token(1), &mut poll, &tx);
+        signals.on_token(token(2), &mut poll, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "a signal must not be reported by another signal's pipe"
+        );
+
+        // SIGTSTP is index 2: same property, the opposite command.
+        raise(Signal::SIGTSTP).expect("raise SIGTSTP");
+        signals.on_token(token(2), &mut poll, &tx);
+        assert!(
+            matches!(rx.try_recv(), Ok(ResumeCommand::PrepareForSuspend)),
+            "SIGTSTP must map to the suspend preparation"
+        );
+
+        // SIGWINCH is index 1: it wakes its pipe but maps to no command — it
+        // exists only to wake the poll so crossterm emits `Event::Resize`.
+        raise(Signal::SIGWINCH).expect("raise SIGWINCH");
+        signals.on_token(token(1), &mut poll, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "SIGWINCH only wakes the poll; it maps to no command"
+        );
+    }
+}

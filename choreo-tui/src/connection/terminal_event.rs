@@ -591,3 +591,131 @@ pub(super) fn handle_ui_event(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // The kitty tests construct key events directly; `KeyEvent` is not pulled
+    // in by the dispatcher's own imports.
+    use crossterm::event::KeyEvent;
+
+    #[test]
+    fn kitty_flags_disambiguate_without_report_all_keys() {
+        // A Ctrl+letter editing chord must arrive as a distinct CSI-u key
+        // event (e.g. CSI 109;5 u for Ctrl+M); DISAMBIGUATE_ESCAPE_CODES alone
+        // gives us that because Ctrl+letter is a "disambiguated" key, while
+        // plain text stays as legacy bytes.
+        assert!(KITTY_KEYBOARD_FLAGS.contains(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        // REPORT_ALL_KEYS_AS_ESCAPE_CODES must stay OFF: it makes IME-composed
+        // text arrive as a `CSI 0;;<codepoints>u` text event, which crossterm
+        // 0.29 mangles into `Char('\0')` (dropping the composed text) — so
+        // Vietnamese/other IME input would type as nothing.
+        assert!(
+            !KITTY_KEYBOARD_FLAGS
+                .contains(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES),
+            "REPORT_ALL_KEYS breaks IME text input (crossterm drops the associated-text field)"
+        );
+    }
+
+    #[test]
+    fn shift_char_maps_us_layout() {
+        assert_eq!(shift_char('a'), 'A');
+        assert_eq!(shift_char('z'), 'Z');
+        assert_eq!(shift_char('1'), '!');
+        assert_eq!(shift_char('0'), ')');
+        assert_eq!(shift_char('-'), '_');
+        assert_eq!(shift_char('='), '+');
+        assert_eq!(shift_char('['), '{');
+        assert_eq!(shift_char(']'), '}');
+        assert_eq!(shift_char('\\'), '|');
+        assert_eq!(shift_char(';'), ':');
+        assert_eq!(shift_char('\''), '"');
+        assert_eq!(shift_char(','), '<');
+        assert_eq!(shift_char('.'), '>');
+        assert_eq!(shift_char('/'), '?');
+        assert_eq!(shift_char('`'), '~');
+        // Non-ASCII and already-shifted chars pass through unchanged.
+        assert_eq!(shift_char('é'), 'é');
+        assert_eq!(shift_char('A'), 'A');
+    }
+
+    #[test]
+    fn normalize_kitty_shift_applies_mapping_and_keeps_shift() {
+        // Shift+A arrives as Char('a') + SHIFT (kitty CSI 97;2 u); the
+        // normaliser must produce the legacy-equivalent glyph Char('A') while
+        // keeping SHIFT, which is a real part of a chord.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT))
+        );
+
+        // Shift+1 → '!'.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('1'),
+            KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(KeyCode::Char('!'), KeyModifiers::SHIFT))
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_shift_keeps_shift_and_leaves_the_glyph_when_ctrl_held() {
+        // Ctrl+Shift+M arrives as Char('m') + CONTROL + SHIFT (CSI 109;6 u).
+        // Legacy Ctrl+Shift+M was byte 0x0D — identical to Ctrl+M — so there is
+        // no legacy glyph to mirror and the char is left alone; SHIFT survives
+        // so the chord stays distinguishable from Ctrl+M on this terminal.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(
+                KeyCode::Char('m'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ))
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_shift_keeps_alt_and_shift() {
+        // Alt+Shift+A arrives as Char('a') + ALT + SHIFT; legacy sent ESC 'A'
+        // (Char('A') + ALT).  The mapping must apply the glyph and keep BOTH
+        // modifiers, so the chord reads the same as the legacy one.
+        let out = normalize_kitty_shift(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        )));
+        assert_eq!(
+            out,
+            Event::Key(KeyEvent::new(
+                KeyCode::Char('A'),
+                KeyModifiers::ALT | KeyModifiers::SHIFT
+            ))
+        );
+    }
+
+    #[test]
+    fn normalize_kitty_shift_leaves_other_events_untouched() {
+        // Non-Char keys (Shift+Enter keeps its modifier — it inserts a
+        // newline in the chat input), unmodified keys, and non-key events
+        // must pass through unchanged.
+        let shift_enter = Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        assert_eq!(normalize_kitty_shift(shift_enter.clone()), shift_enter);
+
+        let plain = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        assert_eq!(normalize_kitty_shift(plain.clone()), plain);
+
+        let ctrl_q = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert_eq!(normalize_kitty_shift(ctrl_q.clone()), ctrl_q);
+
+        let paste = Event::Paste("Hi".to_string());
+        assert_eq!(normalize_kitty_shift(paste.clone()), paste);
+    }
+}
