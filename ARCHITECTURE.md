@@ -2587,7 +2587,7 @@ gate.
    they can be stored in the database without a global passphrase. The keystore binding is established once (TOFU) via the `BindKeystore` wire path — the only message that can create it; `Unlock` is verify-only. `AddCredential` carries the credential as typed plaintext with no key — the daemon encrypts it to its own binding and requires an already-unlocked keystore.
 
 4. **Sessions, not per-client state** — sessions are independent from client connections. A
-    session has its own model, working directory, and messages. Clients subscribe/unsubscribe from sessions
+   session has its own model, working directory, and messages. Clients subscribe/unsubscribe from sessions
    via the broadcast system. Sessions persist in a redb database and survive daemon restarts.
    Session lifecycle operations (create, attach, list, delete) succeed even when the daemon
    is locked — credentials are only needed to run models. Sessions carry an optional
@@ -2596,278 +2596,125 @@ gate.
    daemon's provider registry when the first RunInput is issued.
 
 5. **Session hierarchy** — sessions can have parent sessions (`parent_session_id`), forming a
-    tree. Child sessions inherit their parent's working directory unless explicitly overridden. The
+   tree. Child sessions inherit their parent's working directory unless explicitly overridden. The
    `spawn_subsession` tool creates autonomous child sessions that run their own tool-calling
    loop and report results back to the parent.
 
-6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions (up to a
-   configurable daemon-wide `max_turns` cap, default 0 (unlimited) rather than pushing that complexity to
-   the client or model. The client just sees `ToolCallStarted`/`ToolCallFinished` events.
+6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions, up to a
+   configurable daemon-wide `max_turns` cap (default 0 = unlimited), rather than pushing that
+   complexity to the client or model. The client just sees `ToolCallStarted`/`ToolCallFinished`
+   events.
 
 7. **Session subscription model** — multiple clients can subscribe to the same session. Events
    are broadcast to all subscribers except the originator, enabling shared session viewing.
 
-8. **SSE streaming** — a custom `SseReader` (not a library) handles `data:` lines and `[DONE]`
-   for OpenAI SSE, giving full control over parsing and buffering behavior. The Anthropic
-   module has its own `AnthropicSseReader` that handles both `event:` and `data:` lines
-   (required by the Anthropic Messages streaming format) and yields `(event_type, data)` pairs.
-   Because the peer is a provider, a gateway, or a proxy, an event is only delimited by a blank
-   line — so the reader caps one event's accumulated bytes (`MAX_SSE_EVENT_BYTES`) rather than
-   letting a peer that never terminates an event grow the buffers without bound, and it resumes
-   its newline scan from the last unscanned offset instead of rescanning the whole buffer on
-   every read (which would make one large event quadratic in its length).
-   The blocking socket read is decoupled onto a dedicated reader thread (`stream.rs`) that
-   forwards parsed events through a bounded crossbeam channel, so the caller can `select!`
-   on the event channel, the cancellation channel, and the deadline timer simultaneously —
-   cancellation and deadline expiry are observed the moment they happen, with no polling; an
-   abort signal stops the reader thread at its next loop boundary once the consumer cancels
-   or drops the stream. A wall-clock deadline (`total_timeout_secs`) backstops each request
-   attempt: the deadline is armed by `retry::AttemptDeadline` *before* the request is sent
-   and re-armed at the start of every retry, so a single attempt's budget spans DNS →
-   connect → headers → body (ureq's `timeout_global` bounds the attempt from DNS through
-   the first body byte, and the SSE consumer enforces the same deadline with an exact
-   timer — the real hard cap, since ureq floors its per-read timeout at ~1 s so sub-second
-   keep-alive trickles could otherwise outlive the deadline). Expiry surfaces as a dedicated
-   `ProviderError::DeadlineExceeded` — non-retryable and distinct from a socket `Io` error.
-   Each retry restarts the deadline, so retries plus their backoff can exceed the configured
-   value in aggregate. A separate body-read **idle timeout** (`request_timeout_secs`) is
-   enforced at the socket level: the connector caps the socket read timeout at that bound,
-   and because a socket timeout resets on every received byte it fires only when the provider
-   sends nothing for that long — so a steadily streaming response is never cut short, however
-   long, while a silent one fails promptly. ureq's own `timeout_recv_body` is NOT used: it is
-   a whole-body total ("the budget is not restarted for each read"), so mapping the idle bound
-   to it would abort any stream longer than the bound even while bytes flow. A read timeout is
-   surfaced as a fatal stream error and logged (`warn!`) with the request's provider slug +
-   model (`SseContext`) so a silent provider is attributable; the wall-clock deadline above
-   remains the backstop for a stream that trickles keep-alive bytes without ever forming an
-   event.
+8. **SSE streaming is hand-written, not a library** — a reader per wire dialect (OpenAI
+   `data:` lines plus `[DONE]`, Anthropic's `event:`/`data:` pairs) keeps parsing and buffering
+   ours. Two properties are contractual rather than incidental: the blocking socket read is
+   **never on the consumer's thread** — it runs on a dedicated reader thread that forwards
+   parsed events over a bounded channel, so events, cancellation, and the deadline are all
+   observable at once with no polling — and a stream is bounded in **three** independent ways
+   (one event's accumulated bytes, a per-attempt wall-clock deadline that fires even on a
+   keep-alive trickle, and a socket-level idle timeout that resets per byte and so never cuts
+   a steadily streaming response short). Losing any of the three is what lets a gateway,
+   a proxy, or a silent provider wedge an inference worker. The reader, the thread, the
+   constants, and ureq's per-timeout quirks live in `choreo-ai-protocols` (`openai/sse`,
+   `stream`, `retry`, `shared`); the cross-cutting contract is that deadline expiry is its own
+   non-retryable `ProviderError::DeadlineExceeded`, distinct from a socket `Io` error.
 
 9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
-    messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
-    (choreo-tui), providing a consistent rendering layer.
+   messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
+   (choreo-tui), providing a consistent rendering layer.
 
-10. **Flexible API format** — both OpenAI Chat Completions and Responses are first-class
-    citizens, selectable per-model via a `RequestFormat` enum (`ChatCompletions` / `Responses`).
-    The dispatch mechanism lives in `ServiceConfig::request_format_for_model()`: it checks
-    the provider catalog's per-model `openai_responses` flag and falls back to `default_request_format`.
-    Every entry point (`completion`, `completion_stream`, `chat_completion_turn`,
-    `chat_completion_turn_streaming`) matches on the resolved format and calls the appropriate
-    request builder. Input/output mapping differs between the two: an assistant turn's tool
-    requests become `function_call` items and their answers `function_call_output` items (the
-    answer names its call by `call_id`, so a history rebuilt from messages — no chained
-    `previous_response_id`, e.g. after a model switch or a restored session — has to replay the
-    calls themselves, not only the outputs), and the `input` is an array of typed items rather
-    than a flat messages list. The Responses body is built from the ONE canonical `messages`
-    history: a chained turn derives its tail (the tool outputs after the last assistant turn)
-    from it and links via `previous_response_id`, while a stateless turn sends the whole list.
-    A tail made up only of tool outputs carries no system item, so the server-side `function_call`
-    and the output answering it stay adjacent and the prompt is not re-sent every tool round; a
-    fresh user turn's tail leads with the rebuilt system prompt.
-    The standard OpenAI Responses API keeps system messages inline as `{role: "system"}` items;
-    the stateless ChatGPT/Codex dialect hoists the system prompt into the top-level
-    `instructions` field, sets `store: false`, ignores `previous_response_id`, and asks for
-    `include: ["reasoning.encrypted_content"]` so captured reasoning items can be replayed
-    into `input` on the next request (`ServiceConfig::responses_stateless`, which
-    reads the overlay's provider-level `responses_stateless` fact; see Reasoning
-    round-trip for why the replay replaces the chain). Chat Completions relies on the full
-    message history.
+10. **Flexible API format** — both OpenAI Chat Completions and the Responses API are
+    first-class, resolved per model (`RequestFormat`, from the catalog's `openai_responses`
+    flag with `default_request_format` as the fallback). The cross-cutting invariant is that
+    there is **one canonical `messages` history**: each adapter lowers it into its own wire
+    shape (a flat typed `input` item array plus `previous_response_id` chaining for Responses,
+    the message list itself for chat), so a history stays sendable across a model switch or a
+    restored session instead of being bound to the format that produced it. Each adapter's
+    event vocabulary, streamed tool-call assembly, stateless dialect, and terminal-event
+    classification are that adapter's own concern — the `choreo-ai-protocols` `openai` module
+    docs own them (`responses`, `sse/responses`, `turn`).
 
-    The streaming terminal events wrap the whole `Response` object under `response`:
-    `response.completed` and `response.incomplete` carry the id/usage there (`sse/responses.rs`'s
-    `response_object` also reads a flattened shape, which some gateways emit), and
-    `response.failed` carries the error object on `response.error`. `incomplete` is a terminal
-    **success**, not a transport failure: `incomplete_details.reason` decides — `content_filter`
-    is the terminal `ContentFiltered` error, while `max_output_tokens` (and any reason this
-    client does not classify) leaves a partial answer reported as a truncated `FinalText`, the
-    same reading chat gives `finish_reason: length`. Reasoning text is streamed as
-    `response.reasoning_summary_text.delta` fragments (the summary is the only reasoning text a
-    Responses model exposes); part boundaries carry no text and are not modelled. An output item
-    of a kind this client does not model deserializes as `ResponseOutputItem::Unknown` and is
-    skipped — counted in a debug line, never logged with its payload — so the surrounding items
-    still produce the turn. The stateless backend is undocumented and unversioned, so a new item
-    kind is data the client does not model, not a malformed answer: failing the response would
-    discard output the provider billed for, and the streaming path already ignores events it does
-    not model.
+    One fact crosses all of them: a tool call's **caller attribution** is carried, never
+    interpreted. The adapter captures it from the response, the daemon persists it on the turn
+    (`AssistantToolCallRecord::caller`, an additive `#[serde(default)]` field), and the rebuilt
+    request copies it back **unchanged** onto the call and the output answering it — the API
+    resumes the right generated program from it. The value is typed in `choreo-proto` (which
+    sits below `choreo-ai-protocols` and cannot name its caller type), and the chat projection
+    strips it, because that wire has no such field.
 
-    **Streamed tool calls are assembled from two events, not one.** A call arrives as a
-    `function_call` **output item** (`response.output_item.added` / `.done`) — the only event
-    that carries the function's `name`, its `call_id`, the provider's `caller` attribution and
-    the item's own copy of the arguments — while `response.function_call_arguments.delta` /
-    `.done` carry the arguments alone and name nothing but that item (`item_id`). Nothing on
-    the argument events names the function, so the accumulator keys a call by its output item
-    (falling back to the call id for a gateway that relays no items), takes the name and
-    identity from the item, appends deltas, and lets `arguments.done` — or the item's complete
-    copy on `output_item.done` — replace the accumulated string.
-
-    The join is **order-independent**: nothing on the wire fixes which half arrives first, so an
-    argument event that names only the call id may open the call before its item does, and the
-    item then folds that slot into the one its own id names instead of minting a second call —
-    otherwise the streamed arguments would be stranded on a slot no event ever names while the
-    call that runs was assembled from the item alone. A gateway that names the function on its
-    arguments event (off-schema, but sent by gateways that relay no items) is read as a
-    **fallback** that only applies while the slot has no name, so an item's name is never
-    overridden. A call the stream mentions without ever naming cannot be run, so a turn left with
-    nothing else fails with `UnidentifiedToolCalls` (metrics label `unidentified_tool_calls`)
-    rather than reporting the empty answer a silently dropped call would look like.
-
-    **Programmatic tool calling (Responses API, gpt-5.6+):** When enabled, the Responses
-    request body includes a `programmatic_tool_calling` tool with `type: "programmatic_tool_calling"`.
-    The model responds with `response.program.code.delta` and `response.program.code.done` events
-    carrying generated JavaScript, plus `response.program_output.done` with execution results.
-    The daemon's `Tool` trait exposes `output_schema()` (JSON Schema describing each tool's
-    return value) and `allowed_callers()` (whether a tool is callable directly by the model,
-    programmatically, or both). These are plumbed through `ChatToolDefinition::function_with_options()`
-    and `ResponsesTool` into the wire format. Per-model auto-enablement is controlled by
-    `ServiceConfig::programmatic_tool_calling_for_model()`; account-level override via
-    `accounts.toml`'s `programmatic_tool_calling` field.
-
-    Every `function_call` such a route produces carries a **caller attribution** —
-    `{"type": "program", "caller_id": <program call id>}` for a call a model-generated
-    program made, or `{"type": "direct"}` for one the model made itself — and the API
-    resumes the correct program from it, so the value has to be copied **unchanged** onto
-    the `function_call_output` that answers the call
-    (<https://developers.openai.com/api/docs/guides/tools-programmatic-tool-calling>).
-    The attribution is carried, never interpreted: the adapter captures it from the
-    response (the item parse when non-streaming, the `function_call` output item's
-    `caller` in the streaming loop), the daemon persists it on the turn as
-    `AssistantToolCallRecord::caller` (a proto-side `ToolCallCaller`, because
-    `choreo-proto` sits below `choreo-ai-protocols` and cannot name its `CallerInfo`),
-    and `assemble_request_messages` re-emits it onto the rebuilt call. The Responses
-    lowering writes it on both replayed item kinds, resolving the output's attribution
-    through an index built over the **full** message history — a chained tool round sends
-    only the outputs, so the assistant message that holds the call (and with it the
-    attribution) is exactly what the tail drops. The chat-completions projection strips
-    it: that wire has no such field, and a history captured under a Responses model may
-    later be sent to a chat route.
-
-11. **Pluggable providers via `InferenceProvider`** — the provider system supports OpenAI-compatible,
-    Anthropic Messages, Google Gemini, and Mistral APIs. Each provider implements the same interface
-    (`chat_completion_turn`, `chat_completion_turn_streaming`, `list_models`) and is constructed
-    from an `AccountConfig` + credential. Accounts are defined in `accounts.toml` with a
-    `provider` field (`"openai"`, `"opencode"`, `"anthropic"`, etc.). The TUI new-account form
-    offers all registered provider options via a shared `PROVIDER_OPTIONS` array. The client
-    implementations, trait, shared types, and catalog live in the `choreo-ai-protocols` crate;
-    the daemon's `InferenceProvider` is the thin dispatch/metrics facade.
+11. **Pluggable providers via `InferenceProvider`** — OpenAI-compatible, Anthropic Messages,
+    Google Gemini, and Mistral each implement the same interface (`chat_completion_turn`,
+    `chat_completion_turn_streaming`, `list_models`) and are constructed from an
+    `AccountConfig` plus a credential; an account is declared in `accounts.toml` by `provider`
+    slug. The trait, the client implementations, the shared types, and the provider catalog all
+    live in `choreo-ai-protocols`, which is what keeps the daemon free of per-protocol
+    knowledge: its `InferenceProvider` is a thin dispatch/metrics facade.
 
 12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
-    where third-party libraries (alloy, subxt, rmcp) require it. These live in the
-    `choreo-blockchain`, `choreo-content`, and `choreo-mcp` crates, each of which holds a global
-    `OnceLock<tokio::runtime::Runtime>` as a sidecar and runs its clients via `block_on()`.
+    where third-party libraries (alloy, subxt, rmcp) require it. Those live in their own crates
+    (`choreo-blockchain`, `choreo-content`, `choreo-mcp`), each holding a global
+    `OnceLock<tokio::runtime::Runtime>` as a sidecar and running its clients via `block_on()`.
     `choreo-mcp` additionally runs one blocking **dispatcher thread per MCP server** that spawns
     its in-flight calls onto that sidecar, so calls to one server run concurrently and can be
     cancelled while the dispatcher keeps serving commands. The daemon links those crates only
-    behind the `blockchain`, `content`, and `mcp` cargo features (the first two off by default;
-    `mcp` is on by default) and calls
-    their synchronous entry points, so tokio is
-    never a direct dependency of the daemon. Every call is additionally bounded by a 30s
-    wall-clock `RPC_TIMEOUT` inside the crate: the daemon's own ~60s tool timeout can only
-    *abandon* the blocked execution thread (a synchronous `block_on` cannot be interrupted),
-    so the crate-level cap is what turns a black-holed RPC endpoint into a clean error
-    instead of a leaked thread. The tools accept an arbitrary `rpc_url`/`ws_url` from the
-    model and open HTTP(S)/WebSocket connections to it — the same trust surface as the
-    `http_request` tool, not a new capability — which is why the whole feature (and the
-    network reach it adds) is off by default. Node-supplied strings (chain names, ENS
-    records, decoded storage/block JSON) are run through a sanitizer that escapes control
-    chars, line/paragraph separators, and Unicode format chars (the same Cf-set policy the
-    daemon's line-oriented tools use) before they enter the tool transcript. This simplifies the mental model (each thread owns
-    its data, no `Send` bounds on shared state, no `Pin<Box<dyn Future>>`), improves stack
-    traces, and avoids the complexity of async cancellation.
+    behind the `blockchain`, `content`, and `mcp` cargo features and calls their synchronous
+    entry points, so tokio is never a direct dependency of the daemon. What each crate must
+    therefore own is the bound the daemon cannot supply: a synchronous `block_on` cannot be
+    interrupted, so the daemon's tool timeout can only *abandon* the execution thread and it is
+    the crate-level cap that turns a black-holed endpoint into a clean error instead of a leaked
+    thread — see `choreo-blockchain`'s `RPC_TIMEOUT` docs. Keeping the daemon thread-only
+    simplifies the mental model (each thread owns its data, no `Send` bounds on shared state, no
+    `Pin<Box<dyn Future>>`), improves stack traces, and avoids the complexity of async
+    cancellation.
 
-13. **Reasoning round-trip as an opaque artifact** — reasoning is not only display text: for
-    Anthropic (thinking blocks + signatures), DeepSeek/Kimi (`reasoning_content`), Gemini
-    (thought signatures), and OpenAI/xAI Responses (opaque reasoning items + `previous_response_id`)
-    it must be sent back on the next request or the tool-call loop fails with a 400. The adapter
-    captures the payload verbatim at the parse boundary into an opaque `ReasoningArtifact`; the
-    daemon stores it on the `Turn` (and persists it), but strips it from client-bound `DaemonMessage`
-    payloads — only the daemon consumes it; the adapter re-emits it verbatim in
-    its own wire format. *Whether* to send is derived, never configured: same-model provenance
-    (`Turn.reasoning_producer` vs current provider+model, so a mid-session model switch drops every
-    old artifact) plus the catalog's `reasoning_passback` policy (`None` / `ToolLoop` / `AllTurns` /
-    `Signature` / `ResponseId`, per-model override else protocol default). `ToolLoop` echoes the
-    tool-involving turns, and on a route whose catalog entry requires the echoed field it echoes
-    every turn instead: DeepSeek asks for all earlier turns' `reasoning_content` once the request
-    carries `tools`, tool-less turns included
-    ([docs](https://api-docs.deepseek.com/guides/thinking_mode)), and GLM treats a missing block as
-    degraded preserved thinking ([docs](https://docs.z.ai/guides/capabilities/thinking-mode)).
-    Display text stays in
-    `Turn.assistant_reasoning`; the artifact bytes are never interpreted by the daemon.
-    *Where* the payload lands on the chat wire is the adapter's decision, from two independent
-    catalog facts — the desired field (`ModelEntry::reasoning_echo`, ingested from the snapshot's
-    `interleaved`) and whether that field must be PRESENT on every assistant message even when
-    empty (`ModelEntry::reasoning_echo_required`). A declared field outranks the field the payload
-    was observed under; a scalar
-    `interleaved` name sets both facts, while the structured `reasoning_details` array is a
-    destination only — a details route with nothing to echo omits the key instead of carrying an
-    unverified empty array.
-    The field may be the structured `reasoning_details` array: its artifact payload is JSON
-    (normalized at capture under the reasoning byte budget), replayed verbatim for OpenRouter's
-    `reasoning.*` entries and rebuilt minimally for bare Kimi-shaped ones. The array is the
-    **only** reasoning field such a message carries — no scalar mirror is invented beside it,
-    because no upstream documents a message carrying both. Replay itself is bounded, per request,
-    over the artifacts of the whole history (newest always kept, older ones while the total stays
-    within the budget), and that budget is the *same number* as the per-turn cap: a larger
-    per-turn cap would have no replay path, so the two differ in behaviour (capture drops the one
-    turn's array, replay drops the oldest) rather than in size — which is why they are one
-    constant, `reasoning_details::MAX_REASONING_BYTES`. The Responses adapter's opaque reasoning
-    items ride the same persisted `ReasoningArtifact` and the same compounding replay path, so
-    they are bounded by that one constant too: capture drops an over-budget item array, and a
-    replay skips an artifact that somehow exceeds it. A corrupt persisted payload is likewise a
-    dropped artifact on both adapters, never a failed request — a hard error there would make
-    every later turn of the session unsendable.
+13. **Reasoning round-trip as an opaque artifact** — reasoning is not only display text. On
+    Anthropic, DeepSeek/Kimi, Gemini, and the OpenAI/xAI Responses routes it must be sent back on
+    the next request or the tool-call loop fails with a 400, so it is carried as a payload the
+    daemon **never interprets**: the adapter captures it verbatim at the parse boundary into an
+    opaque `ReasoningArtifact`, the daemon stores and persists it on the `Turn` but strips it
+    from client-bound `DaemonMessage` payloads, and the adapter re-emits it verbatim in its own
+    wire format. Display text is a separate field (`Turn.assistant_reasoning`), so losing the
+    artifact never blanks the transcript.
+
+    *Whether* to send is **derived, never configured**: same-model provenance
+    (`Turn.reasoning_producer` against the current provider+model, so a mid-session model switch
+    drops every old artifact) plus the catalog's per-model `reasoning_passback` policy, which
+    also decides *where* on the wire a chat route wants it. The variants and the per-route
+    requirements are catalog and adapter detail (`choreo-ai-protocols`'s `catalog/entry` and
+    `openai/reasoning_details`).
+
+    Three consequences are contractual because they cross crate lines. Capture and replay share
+    **one** byte budget (`reasoning_details::MAX_REASONING_BYTES`): a larger per-turn cap would
+    have no replay path, so the two differ in which artifact they drop, never in the number.
+    Replay is bounded **per request over the whole history**, so a long session cannot compound
+    artifacts without limit. And an over-budget, or corrupt, persisted payload is a dropped
+    artifact — never a failed request, which would make every later turn of that session
+    unsendable.
 
     **A reasoning-only turn is output.** The turn result carries the fact that the provider
     produced reasoning, independent of whether any of it could be displayed or replayed: a
-    response whose only output is a reasoning item (or an entry over the replay cap) becomes a
-    `FinalText` with empty content that still carries the round-trip artifact, never an
-    `EmptyResponse` error that discards a payload the provider billed for. Both wire formats
-    reach that verdict through one shared assembler (`openai::turn::assemble_turn`), fed by
-    adapter-specific parts, so the tool-call / truncated-call / empty-response decision tree
-    exists once rather than once per path. That assembler also owns the one place truncated
-    calls are reported: a turn that keeps a runnable call reports the cut-off ones on its
-    `ToolUse`, and a final answer whose calls were all truncated reports them in
-    `FinalTextResult::discarded_tool_calls` — the field the daemon keys its recovery on (see
-    **A turn that yields nothing runnable is recovered, not dispatched**). Dropping them
-    silently would make an unfinished turn indistinguishable from a finished one.
+    response whose only output is a reasoning item becomes a `FinalText` with empty content that
+    still carries the round-trip artifact, never an `EmptyResponse` error that discards a payload
+    the provider billed for. Every turn result also reports **how the provider said it ended**
+    (`FinishOutcome`, whose `Absent` is a first-class verdict rather than a fallback), read from
+    each adapter's own wire vocabulary. Both wire formats reach those verdicts through one shared
+    assembler (`openai::turn::assemble_turn`), so the tool-call / truncated-call / empty-response
+    decision tree exists once; that is where truncated calls are reported (a runnable turn keeps
+    them on its `ToolUse`, a final answer reports them in `FinalTextResult::discarded_tool_calls`),
+    and dropping them silently would make an unfinished turn indistinguishable from a finished one.
 
-    **Every turn result reports how the provider said it ended.** `FinishOutcome`
-    (`Length` / `Stop` / `Filtered` / `Other` / `Absent`) is read from each adapter's own
-    wire vocabulary — chat's `finish_reason`, Responses' `incomplete` details,
-    `Anthropic`'s `stop_reason`, Gemini's `finishReason` — by one mapping function per
-    adapter that both its streaming and non-streaming paths call, so the two cannot
-    disagree. `Absent` is a first-class verdict, not a fallback: a stream that ends without
-    naming a reason is reported as exactly that, because both the transcript note and the
-    discard metric must distinguish "the provider hit its output cap" from "we do not
-    know". The `Anthropic` streaming path additionally validates its accumulated
-    `input_json_delta` arguments through the same whole-or-nothing rule as the OpenAI
-    adapters — it is the one non-OpenAI route whose arguments arrive as raw text, so a
-    truncated call there could otherwise reach dispatch unparsed. That argument *text*
-    comes from the deltas alone: the block-start `input` object is only a fallback,
-    because the wire sends it as an empty object, so concatenating the two would produce
-    bytes that are not JSON.
-
-    **A tool call is reported, not adjudicated.** Every adapter passes the provider's
-    function name through verbatim, so a nameless or provider-invalid `tool_use` / `functionCall`
-    block reaches the daemon as-is rather than being dropped, repaired or errored on inside the
-    adapter — the Anthropic and Google paths hand-roll their own turn assembly and would
-    otherwise need the rule a third and fourth time. Whether such a reply is runnable is decided
-    once, in the daemon's agent loop (see **A turn that yields nothing runnable is recovered, not
-    dispatched** under **Session architecture**), which is the single convergence point for all
-    four wire formats; replay repair of an already-recorded call is likewise the daemon's job (see
-    **The request copy is repaired, never the transcript**), on the request copy only.
-
-    **A tool result is named and grouped as Gemini requires.** The Gemini adapter resolves each
-    tool result's wire name from the assistant message that declared the call it answers (matched
-    by call id, never copied onto the result, so the two cannot drift), because the API matches a
-    `functionResponse` against its `functionCall` by **name**, not id. A call turn's whole response
-    set is emitted together in **one** user content — the content after a `functionCall` turn must
-    carry exactly one `functionResponse` per call, so results are never split across contents — and
-    a result that answers no declared call is **dropped** rather than sent nameless. Because the wire
-    carries no call id to match on, the adapter mints one per `functionCall` part, and the id
-    carries the call's position **among that reply's tool calls** (`fc_<name>_<position>`, name
-    folded to `[A-Za-z0-9_-]`): parallel function calling lets one reply name the same function
-    twice, and a name-only id would collapse both results onto one transcript record in the
-    daemon's id-keyed bookkeeping. The position is deterministic for a given reply, so a replayed
-    turn mints the ids it recorded under.
+    **A tool call is reported, not adjudicated.** Every adapter passes the provider's function
+    name through verbatim, and each one is responsible only for its own wire's shape — Gemini's
+    name-matched `functionResponse` grouping and minted positional call ids, Anthropic's
+    whole-or-nothing `input_json_delta` validation, the responses adapter's streamed-call
+    assembly. Whether such a reply is runnable is decided once, in the daemon's agent loop (see
+    **A turn that yields nothing runnable is recovered, not dispatched**), which is the single
+    convergence point for all four wire formats; replay repair of an already-recorded call is
+    likewise the daemon's job (see **The request copy is repaired, never the transcript**), on
+    the request copy only.
 
 ---
 
@@ -2920,134 +2767,20 @@ rustdoc (`choreo-proto`).
 > `env!("CARGO_BIN_EXE_...")`) must live in the crate that owns the binary
 > (choreo-tui / choreo-im / choreo-acp each own theirs; the root package owns
 > only the daemon binary).
->
-> **Shared daemon-test harness.** `choreo-daemon/tests/common/mod.rs` provides
-> the scaffolding for end-to-end daemon tests that run the real
-> `run_server` (Unix socket + TCP/Noise) and drive it with the real client
-> library: `test_db()`, `test_daemon_state()`, and `SpawnedDaemon` (spawns
-> the server on a temp socket/ACL/free port, waits for both listeners, and
-> SIGINT-shuts it down on drop). Test files opt in with `mod common;`.
-> The daemon<->client tests (`tests/it/daemon_client_unix.rs`,
-> `tests/it/daemon_client_noise.rs`) build on it.
 
-These end-to-end tests close the previous coverage gap: the daemon's TCP/Noise
-listener (`handshake_responder` + ACL + `tcp_client_thread`) and the real client
-connection paths (`run_daemon_connection` / `run_daemon_tcp_connection`) had no
-integration coverage before — only the transport primitives were exercised in
-isolation. `daemon_client_unix.rs` covers Ping/Pong and ListSessions/CreateSession
-round trips, CreateSession+Attach ordering (`SessionAttached` before
-`SessionState`), the SIGINT `ShuttingDown` notification, and two concurrent
-clients with client-disconnect cleanup; `daemon_client_noise.rs` covers the same
-round trips over the encrypted channel plus cross-transport shared state (Noise +
-Unix clients on one daemon), ACL rejection of an unknown client key,
-wrong-server-public-key failure, and `ShuttingDown` through the encrypted channel
-(previously Unix-only); summary broadcasts are an explicit opt-in on both
-transports — `noise_subscribe_receives_session_broadcasts` pins that an
-unsubscribed Noise client receives no broadcasts while a subscribed one does.
-A 1 MiB `AddCredential` round trip (`noise_large_message_through_daemon`)
-proves >64 KiB messages survive the full daemon path through the transport's
-fragmentation. `noise_large_message_daemon_to_client` covers the reverse
-direction: a ListSessions reply large enough to fragment travels intact from
-the daemon's writer thread to the client. The extended `noise_integration.rs` data-plane tests push
-the transport itself: typed `ClientMessage`/`DaemonMessage` round trips through
-the Noise transport state, payloads at and beyond snow's 65535-byte ciphertext
-cap — the 65518-byte single-fragment boundary plus multi-fragment reassembly
-(65519 bytes = 2 fragments, 1 MiB = 17 fragments, and a post-fragment echo
-proving nonces stay in sync) — malformed-handshake rejection, and a new
-unit test (`transport_state_rejects_tampered_ciphertext`) proving GCM
-authentication rejects a single flipped ciphertext byte, an
-oversized-fragment-prefix rejection test (`noise_rejects_oversized_fragment_prefix`)
-pins the length-prefix validation, and a tampered-prefix rejection test
-(`noise_rejects_tampered_length_prefix`) proves a one-bit prefix flip on the
-wire is rejected loudly — never silently truncated — because the reassembly
-decision comes from the authenticated continuation byte, not the prefix. A regression test
-(`noise_concurrent_bidirectional_large_messages`) pins the transport lock
-scope: both endpoints send 1 MiB concurrently under tiny socket buffers, and
-the sends must complete because `send_message` holds the `TransportState`
-lock only per-chunk during encryption and never across the blocking socket
-writes — the old lock-across-`write_all` code deadlocked this scenario
-(neither side's reader could acquire the lock to drain the socket).
+**End-to-end harness.** `choreo-daemon/tests/it/common/mod.rs` is the shared
+scaffolding for tests that run the real `run_server` (Unix socket + TCP/Noise)
+and drive it with the real client library; its module docs own the details
+(`test_db`, `test_daemon_state`, `SpawnedDaemon`'s temp socket/ACL/port and
+SIGINT shutdown). Test modules opt in with `use crate::common;`.
 
-**Test infrastructure:** Most tests use `UnixStream::pair()` for socket-less daemon↔client
-communication, and mock HTTP servers for API simulation; the end-to-end transport
-tests above instead bind real sockets (a temp Unix-socket path and an ephemeral
-TCP port via `SpawnedDaemon`). `SpawnedDaemon` has `run_server` bind
-`127.0.0.1:0` itself and report the address it actually bound, so the harness
-connects to this process's own listener: pre-binding a `:0` probe, reading its
-port, and dropping it for `run_server` to re-bind would leave a window where
-another test process steals that port, and the readiness `TcpStream::connect`
-would then succeed against the thief's listener — handing back a daemon whose own
-accept loop never started.
-
-**One integration-test binary per crate.** A crate's integration suite lives in
-a single `tests/it/main.rs` target (one module per former `tests/foo.rs`).
-Cargo builds each `tests/*.rs` file into its own test binary that statically
-links the whole library, so `choreo-daemon`'s 33-file suite meant 33 relinks and
-33 clippy re-checks on every change to the library or any of its dependencies;
-folding them into one target collapses that fan-out to a single compile + link.
-This is invisible at runtime: cargo-nextest spawns the test binary once per test
-(`--exact <name>`), so process-per-test isolation is unchanged. The one caveat
-is the libtest fallback (`cargo test -- --ignored`), which now runs a crate's
-whole integration suite in one process — the sanctioned runner is nextest (the
-integration suite is `#[ignore]` precisely so `test-libtest` never touches it),
-so this only narrows an already-discouraged path.
-
-**Test runner:** The recommended runner is cargo-nextest, configured in
-`.config/nextest.toml` (`fail-fast = false`; 120s `slow-timeout` that kills hung
-tests). Cargo aliases `test-fast` (unit tests), `test-integration` (the
-`#[ignore]` suite), and `test-all` (both) invoke it with `--workspace`
-(`test-all` additionally passes `--exclude choreo-gui` — the GUI's Blitz/wgpu
-stack is too heavy for the gate, matching its `default-members` exclusion; its
-tests run via `just test-gui`); plain
-`cargo test` / `cargo test -- --ignored` still work via libtest. Nextest runs
-every test in its own process — a large wall-time win for this 20-crate
-workspace, since libtest serializes test binaries and threads their tests
-within one process. Global *process-local* state needs no special handling
-under nextest's process-per-test model — e.g. the keystore test-config-root
-override in `choreo-transport` is thread-local and marked `#[serial]` only
-because libtest runs tests as threads within one process; each nextest test
-process gets its own copy. Fixed network ports are *not* isolated by
-process-per-test, however: two test processes binding the same address conflict
-just as two threads would, and `#[serial]` cannot serialize across processes —
-prefer ephemeral ports (`TcpListener::bind("127.0.0.1:0")`) so tests never
-contend for a fixed address. The `SpawnedDaemon` harness takes this to its
-race-free conclusion: it lets `run_server` bind the ephemeral port itself and
-reports the bound address back, so there is no probe-drop window for another
-process to grab the port between the probe and the real bind.
-
-**Coverage:** the `coverage` cargo alias runs exactly the `test-all` selection
-under cargo-llvm-cov (`just coverage` for a per-file table, `just coverage-lcov`
-for an lcov file plus a per-crate summary from `scripts/coverage-summary.sh`).
-The `.github/workflows/coverage.yml` job runs `coverage-lcov` on every push and
-pull request that touches Rust sources, manifests, or the test configuration;
-it publishes the per-crate table on the run's summary page and the `lcov.info`
-artifact, and enforces no floor. Two tooling constraints shape it. First,
-cargo-llvm-cov must be ≥ 0.9.1: on the pinned nightly, test binaries land in
-the build-dir layout (`target/…/debug/build/<crate>/<hash>/out/`), which older
-releases do not scan — they report only the final binaries' share of the
-workspace (about a third) with no error, so `_require-llvm-cov` refuses them.
-Second, the report must come from the same invocation that ran the tests: a
-separate `cargo llvm-cov report` step has the same blind spot even on 0.9.1,
-which is why the per-crate summary is derived from the lcov file rather than
-from a second report pass. Coverage counts inline `#[cfg(test)]` modules
-inside source files (only crate-level `tests/` directories are excluded), so
-the figure slightly overstates production-code coverage.
-
-**GUI tests in CI:** because `test-all` and `coverage` exclude `choreo-gui`, a
-separate `.github/workflows/gui-tests.yml` job runs `just test-gui` on every
-push and pull request that touches the GUI or a workspace crate it builds on.
-It installs the system libraries the Blitz/winit stack links at build time
-(fontconfig, libwayland-client) and is the only CI run that compiles and
-executes the GUI's tests.
-
-Run all tests:
-```bash
-cargo test-all            # nextest: unit + integration, parallel
-cargo test-fast           # nextest: unit tests only
-cargo test-integration    # nextest: integration tests only
-cargo test                # libtest unit tests
-cargo test -- --ignored   # libtest integration tests
-```
+**The conventions live elsewhere.** The unit/integration split, the
+no-time-based-waits rule, and the one-integration-binary-per-crate layout are
+the test-authoring contract (AGENTS.md → Test Discipline); the nextest profile
+and the cargo aliases carry their own rationales (`.config/nextest.toml`,
+`.cargo/config.toml`), the commands are listed in the README, and each CI job's
+scope is documented in its workflow file. What is left here is the layout of
+this workspace's suites, above.
 
 ---
 

@@ -11,6 +11,10 @@
 # coverage CI workflow (.github/workflows/coverage.yml) appends the table to the
 # job summary; locally it is just printed.
 #
+# The figure counts inline `#[cfg(test)]` modules inside source files, because
+# only crate-level `tests/` directories are excluded, so it slightly overstates
+# production-code coverage.
+#
 # Usage:
 #   scripts/coverage-summary.sh target/coverage/lcov.info
 #
