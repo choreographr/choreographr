@@ -138,65 +138,17 @@ Choreographr (workspace)
 
 (`choreo-markdown` is consumed by `choreo-client-core` and `choreo-tui`; it is omitted from the graph for brevity.)
 
-`choreo-sanitize` is a leaf crate (no workspace deps) consumed by
-`choreo-daemon`, `choreo-tui`, `choreo-client-core`, `choreo-blockchain`, and
-`choreo-mcp` —
-it owns the Unicode "spoofing" predicates, the shared tool-output byte
-budget / `...[truncated]` marker, and the canonical code-injection environment
-set stripped from every spawned child, so every sanitizer and streaming cap in
-the workspace agrees on the same policy and budget and the shell tool and MCP
-stdio child strip the same variables.
-
-`choreo-image` is a leaf crate (only `image` + `heifer` + `heifer-isobmff` +
-`moxcms` + `resvg` + `thiserror` + `tracing`) consumed by
-`choreo-daemon` and `choreo-tui` — it owns the single decode path for raster
-formats (with EXIF orientation baked in) and the HEIC/HEIF decode (with `heifer`,
-which applies the container's own orientation transforms), so the model path and
-the UI path cannot drift apart. It is split by decoder, not by caller: `raster`
-owns the `image`-crate decode and probe, `heic` owns the `heifer` decode and its
-container-geometry probe, and `svg` owns the `usvg`/`resvg` parse-and-rasterize
-path, and the modules own their colour conversion
-separately because their decoders expose it differently. A raster's embedded ICC
-profile is converted with the pure-Rust `moxcms` engine — an RGB profile on an
-RGB buffer, at the buffer's own depth, skipped for a source that is already sRGB
-(detected from its primaries and transfer curves, since an sRGB tag is the common
-case and converting it to itself would cost a full extra pass and buffer for no
-change). A HEIC's colour is converted inside `heifer`'s decode, from the
-container's embedded profile or, when it carries none, its `nclx` description or
-the HEVC VUI — so the crate must not re-apply a profile to a HEIC buffer, and a
-colour space `heifer` cannot convert (HDR's PQ/HLG) keeps the coded samples
-rather than failing the image.
-
-HEIC/HEIF memory is bounded inside the decoder: `heifer` enforces its own
-`max_pixels` against the picture it is about to allocate, so a container whose
-declared geometry disagrees with its coded picture cannot defeat the budget, and
-a declared-geometry pre-check rejects a hostile file before any decoding work
-starts. A caller that needs only the pixel dimensions (the daemon's
-`display_image` probe) uses the same crate's header-only probe — the `image`-crate
-header for rasters, the ISOBMFF container boxes for HEIC — which enforces the
-identical decompression-bomb bound without decoding or colour-managing a single
-pixel, and reports the extent the decode would actually produce (the raster probe
-applies the EXIF quarter turn, the HEIC probe replays the container's own
-crop/rotate). That HEIC replay is arithmetic duplicated from `heifer`, so it is
-pinned by a test that encodes containers through `heifer`'s own encoder and
-asserts the probe's prediction equals the decoded extent — a drift becomes a test
-failure instead of a silently wrong size.
-
-SVG is the one image format the crate treats as *code*: `svg::parse` runs `usvg`,
-which resolves `<use>`/`xlink:href` chains, CSS, gradients, patterns, clip paths,
-masks and filters before any pixel exists. That resolution walks references an
-author controls, so the parse policy lives in this one module rather than at each
-call site: a nesting depth cap (`MAX_SVG_DEPTH`, 256 against `usvg`'s 1024
-default) bound to input the workspace does not control, and one process-wide
-`usvg::Options` whose system font database is scanned once per process instead of
-once per image — a per-image scan would put a filesystem walk in the vision and
-display paths. `svg::render` then allocates the target pixmap and hands back
-**straight** (non-premultiplied) RGBA: `tiny-skia` stores premultiplied alpha, so
-the demultiply happens at this boundary, and a translucent fill reaches the model
-and the terminal at the colour the document specifies rather than darkened. Only
-*how much* of the tree to draw stays with the caller, because the daemon renders
-an optional crop region at native resolution while the TUI renders a whole frame
-scaled to fit its cell.
+Two leaf crates exist so that a policy with many consumers has exactly one home:
+`choreo-sanitize` (consumed by `choreo-daemon`, `choreo-mcp`, `choreo-tui`,
+`choreo-blockchain`, and `choreo-client-core`) holds the Unicode "spoofing"
+predicates, the tool-output byte budget with its `...[truncated]` marker, and the
+code-injection environment set stripped from every spawned child, so every
+sanitizer, streaming cap and spawned child agrees; `choreo-image` (consumed by
+`choreo-daemon` and `choreo-tui`) holds the single decode path for rasters,
+HEIC/HEIF and SVG under one decompression-bomb budget, so the model path and the
+UI path cannot drift apart on a colour fix or a bomb guard. Their rustdoc owns
+the per-format detail (`cargo doc -p choreo-sanitize` / `-p choreo-image`,
+`just doc`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ---
 
@@ -514,11 +466,9 @@ into a dedicated type only for requester-relative intent
 hoists the origin session off the event: events do NOT carry a `session_id`, so
 every event has an origin by construction (`Some(id)` for session-scoped
 broadcasts; `None` for the connection-level replies the daemon synthesizes with
-no session, e.g. "no session attached" failures) — it can never be forgotten,
-mismatched, or duplicated; the wire nests the event inside the envelope, so the
-origin is present on the wire too. The daemon's payload enum is deliberately not
-`#[non_exhaustive]`: the variant set IS the wire contract, so every consumer
-match enumerates it fully.
+no session, e.g. "no session attached" failures). The daemon's payload enum is
+deliberately not `#[non_exhaustive]`: the variant set IS the wire contract, so
+every consumer match enumerates it fully.
 
 **Wire format:**
 
@@ -531,16 +481,12 @@ match enumerates it fully.
 
 - Protocol version: `9` (v9 = live MCP config reload: the new `ClientMessage::McpReload` request and its `DaemonMessage::McpReloaded`/`McpReloadFailed` replies, so a running daemon can pick up `mcp.json` edits (added/removed/changed servers) without a restart; v8 = per-session `pinned`/`archived` flags: the new `ClientMessage::SetSessionPinned`/`SetSessionArchived` requests, the daemon-GENERATED broadcast `SessionEvent::SessionFlagsChanged` (rides `DaemonState::broadcast()`, so a client learns of a flag change via the broadcast rather than a targeted reply), and the `SessionSummary::pinned`/`archived_at` fields they surface. v7 = the create-session reply is split from the create-session broadcast: `SessionEvent::SessionCreatedForRequester` is the direct reply to the creating connection and is the ONLY create event a frontend may auto-attach to, while `SessionEvent::SessionCreated` is notification-only (broadcast to every subscriber) and must never move a client's view — fixing a client hijacking its own view when ANOTHER client created a session. Delete/status lifecycle messages are unaffected: `SessionDeleted` was already broadcast-only with the requester already knowing the id it deleted; v6 = displayed-image bytes are no longer shipped in session-scoped snapshots (`SessionState`/`TurnAppended`/`TurnsRedone`) — they carry only `ImageMetadata` — and are instead fetched on demand via the new `ClientMessage::GetImage` ⇄ `DaemonMessage::Image` pair, keyed by `(session_id, turn_id, image_index)` and served from the durable `session_attachments` store; v5 = the two-state `Locked`/`Unlocked` status *broadcasts* were replaced by `DaemonMessage::Keystore { state: KeystoreState }` (`Unbound`/`Locked`/`Unlocked`), pushed at subscribe time and on every transition so a first-run client learns it must BIND; `Locked`/`Unlocked` remain targeted operation replies. v4 = the 29 session-scoped events were moved into `SessionEvent` and now ride the `DaemonMessage::Session { session_id: Option<u64>, event }` envelope; v3 had removed `TurnFinalized` — the final-turn snapshot rides `TurnAppended` — and added `Evicted`, a best-effort lag-eviction advisory; mixed-version peers fail fast at the version gate). The v4 shape was amended in place before the first release — the `session_id: 0` sentinel became `Option<u64>` (`None` for connection-level replies) — so the wire version stayed `4` with no bump at that point. The MCP trust-query request/reply variants (`ClientMessage::McpTrust`/`McpUntrust`/`McpTrustList`, `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were added to v9 the same way, before any release carried v9; the policy is that variants may be added to the **current, unreleased** wire version without a bump, because mixed-version peers do not exist until a release ships and the version gate fails fast on a mismatch either way. A bump is required only once a version has shipped in a release. Under the same pre-release policy, the v6 `GetImage`/`Image` pair was reshaped for v9 before any release carried v9: its positional `image_index: u32` became a tagged `key: ImageKey` (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol now serves both displayed images and tool-result vision images from the shared `session_attachments` store. Under the same pre-release policy, the v9 frame was amended in place to the uniform correlation envelope: `ClientMessage` = `{ id: u64, inner: ClientMessageType }`, `DaemonMessage` = `{ id: Option<u64>, inner: DaemonMessageType }` (a broadcast is `id: None`; a reply stamps the request's id), the payload enums were renamed `ClientMessageType`/`DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and widened to `u64`, and the `MessageKind` tag plus the `Accepted`/`Failed` acknowledgement replies were added. No bump — no release has shipped v9. Under the same pre-release policy, the v9 streaming axis was made daemon-owned: the session thread assigns a run's `stream_id` (a per-session, monotonic counter) when it accepts a `RunInput`/`ContinueGeneration` and reports it on the acceptance `Started` reply/broadcast, so those requests no longer carry a client-chosen `stream_id` (the client learns it from `Started`, which also fixes the cross-client collision where two clients fanned one session could each claim the same id); the `CANCEL_ALL` sentinel (`stream_id = 0`) remains for a pre-`Started` cancel. Under the same pre-release policy, the `SessionStatus` streaming phase was split in v9: the single `Inference` state became `Sending`/`Waiting`/`Reasoning`/`Responding`, so a status bar can tell the request dispatch from the provider's time-to-first-token wait from reasoning from answer streaming. The `Waiting` boundary is anchored on client-side request-upload completion (the last byte of the request body handed to the transport), not on the provider's response headers: a buffering gateway (e.g. opencode.ai behind Cloudflare) withholds the response head until the model begins generating, so anchoring on the headers would collapse `Waiting` into `Sending` for those providers. The upload hook fires once per attempt, so a retried turn reports `Waiting` for the failed attempt too, before `Retrying`. Under the same pre-release policy, `ClientMessage::AddCredential` was reshaped in v9 to carry a typed plaintext `ServiceCredential` (`{ service, credential }`) instead of a client-encrypted `encrypted_payload` plus an `unlock_key`: no key rides the wire, the daemon encrypts the credential to its own binding public key, and the add path requires an already-unlocked keystore (no implicit unlock). Also under the same pre-release policy, v9 gained the `DaemonMessage::ModelsUpdated { account, models }` broadcast, emitted when a background model-list fetch finishes so an already-open model picker refreshes in place; a cold picker now paints instantly from a locally cached or catalog-seeded list and this broadcast supersedes that seed when the live fetch lands, instead of blocking on a slow `/v1/models` round-trip. Under the same pre-release policy, v9 gained the `DaemonMessage::ModelsUnavailable { account, error }` broadcast — the counterpart of `ModelsUpdated`, emitted when that background fetch FAILS, so a picker waiting on it shows the provider's error instead of waiting forever — and `DaemonMessage::Models` with `provisional: true` and an empty `models` list became the way the daemon reports "nothing is cached or seedable for this account and a fetch is running". Those two pushes are what end a client's wait: a client keeps no retry timer for an answer the daemon promises to send. Under the same pre-release policy, v9 gained the atomic account/model/effort choice: `ClientMessage::SetSessionChoice { account, model, effort }` commits all three to the attached session in ONE write, so an account is never observable bound to a model its provider does not serve. The two queries that let a client *suggest* a choice first ride the same version: `ListModels` gained `account: Option<String>` (`Some(name)` asks about a candidate account the session is not bound to yet), `DaemonMessage::Models`/`ModelsUpdated` now carry `Vec<ModelInfo>` (each id with its supported reasoning levels) plus, on `Models`, a `suggested_model` to pre-highlight while the choice is pending, and the new `ClientMessage::ModelReasoning { account, model }` ⇄ `DaemonMessage::ModelReasoning { capability, suggested_effort }` pair answers a candidate model's levels and the effort to pre-select for it.
 - Max frame size: 64 MiB
-- Lag-eviction byte gauge: `DaemonMessage::approx_wire_size` / `Turn::approx_size` (in `choreo-proto/src/size.rs`) — a deliberate over-estimate used by the daemon's lag accounting, pinned by `types::tests::approx_wire_size_never_underestimates_encoded_payload` (see the daemon's `broadcast` module docs for the lag accounting)
 
 Payloads are MessagePack in **named mode** (`rmp_serde::to_vec_named`): structs
 serialize as maps with field names and enum variants by variant name, so the
 format is self-describing, compact, and broadly supported across languages
 (future mobile/web/third-party clients). The `(protocol_version, message)` tuple
-still encodes as a MessagePack array of 2 even in named mode. Decoding runs
-through an explicit `Deserializer` over a `Cursor` so the trailing-bytes check
-can use the cursor position as a remainder probe (rmp-serde 1.3.1 has no
-`from_slice_ref`).
+still encodes as a MessagePack array of 2 even in named mode.
 
 **Codec rule.** MessagePack (named) carries anything that crosses a language
 boundary: the client↔daemon wire and the values in `sessions`/`session_turns`.
@@ -1592,12 +1538,13 @@ file protections are, in three layers:
    bind-then-chmod window is harmless because the parent directory already
    blocks every other user from reaching the path; a failed chmod is logged
    (`warn!`), never fatal, for the same reason.
-3. **A Linux peer-uid check.** Before reading a single message on a local
+3. **A Linux/Android peer-uid check.** Before reading a single message on a local
    connection, `connection::client_thread` asks the kernel for the peer's
    credentials (`SO_PEERCRED`) and rejects the connection — unregistering its
    writer channel, exactly like a failed TCP handshake — unless the peer's uid
-   equals the daemon's effective uid. Platforms without a cheap peer-credential
-   call rely on layers 1–2 alone.
+   equals the daemon's effective uid; a socket whose credentials cannot be read
+   is treated as foreign. Platforms without a cheap peer-credential call rely on
+   layers 1–2 alone.
 
 The temp-dir fallback is per-uid
 (`temp_dir()/choreographr-<uid>/choreographr.sock`), not a bare
@@ -1713,29 +1660,26 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   own stored binding before persisting it (one key per keystore).
 - The unlock key is sent over the channel (by `Unlock`/`BindKeystore`); zeroized after use
   by the daemon
-- A credential is one of `ApiKey`, `X`, `Substrate`, or `OAuth`. The `OAuth` variant
-  carries the durable grant (the refresh token, the client registration, the
-  identity claim extracted from the id_token, and — for a provider grant — the
-  token endpoint and refresh body encoding resolved at login, so a runtime refresh
-  does not depend on the catalog profile; never the raw JWT), discriminated by
-  `OAuthKind` (`Provider` or `Mcp`). The ephemeral access token is not part of
-  that durable shape, with one deliberate exception: an MCP grant whose
-  authorization server issued **no refresh token** persists its long-lived access
-  token, because with nothing to refresh it is the only usable credential — absent
-  it the variant carries no access token. Every variant
+- A credential is one of `ApiKey`, `X`, `Substrate`, or `OAuth` (`choreo-shared`'s
+  `ServiceCredential`). The `OAuth` variant holds only the durable grant — never the
+  raw `id_token` — with one deliberate exception: an MCP grant whose authorization
+  server issued **no refresh token** persists its long-lived access token, because
+  with nothing to refresh it is the only usable credential. Every variant
   participates in `#[zeroize(drop)]` and redacts every secret field in both `Display`
-  and `Debug`
+  and `Debug`, so a credential can be logged without leaking.
 - `/lock` destroys all in-memory credentials, returning to locked state
 - **The locked state is authoritative and broadcast.** `DaemonState` keeps a single
-  `locked: bool` (starts `true`; `false` after a successful Unlock or BindKeystore
-  — the shared `unlock_tail` is the one place it is cleared; `true`
-  again on `/lock`, which clears in-memory credentials/providers). On a REAL
+  `locked: bool` flag beside `keystore_bound` (starts `true`; `false` after a
+  successful Unlock or BindKeystore — the shared `unlock_tail` is the one place it
+  is cleared; `true` again on `/lock`, which clears in-memory
+  credentials/providers), and the pair derives the authoritative
+  `DaemonMessage::Keystore { state }` (`Unbound`/`Locked`/`Unlocked`). On a REAL
   lock-state transition the daemon broadcasts the current state to ALL activity
-  subscribers (`DaemonMessage::Unlocked` / `DaemonMessage::Locked` — the existing
-  flat variants, no wire change) via `broadcast_lock_state`, and a
-  freshly-connecting activity subscriber is sent the CURRENT state immediately
-  (alongside the send-on-subscribe `CatalogUpdated`), so a client that connects to
-  an already-locked daemon learns so without waiting for a transition. The acting
+  subscribers (`broadcast_keystore_state`), and a freshly-connecting activity
+  subscriber is sent the CURRENT state immediately (the same
+  `current_keystore_message` construction, alongside the send-on-subscribe
+  `CatalogUpdated`), so a client that connects to an already-locked daemon learns
+  so without waiting for a transition. The acting
   client additionally keeps its targeted per-action reply (an
   `Unlocked`/`Locked`/`LockedError`) — enqueued through the request's
   `ReplyTarget` (carried on `Unlock`/`BindKeystore`/`SaveCredential`) so it is
@@ -1748,94 +1692,18 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   when RunInput is called, the session thread resolves the InferenceProvider from the daemon's
   provider registry. If no credential is available for the session's account, a clear error is
   returned telling the user to add a key.
-- **Model lists are warmed in the background, never on unlock.** Unlock (and credential/account
-  mutations) resolve providers in-memory only — no network I/O touches the daemon command loop.
-  Instead, the daemon spawns a detached prefetch thread whenever a session joins an account:
-  on CreateSession, AttachSession (both branches — already-active and loaded-from-db), and when
-  `UpdateMetadata` changes a session's account. The thread calls `list_models()` and reports
-  back via the `DaemonCommand::ModelPrefetchResult` command so the command loop — the single
-  writer of `model_cache` — records the result; a per-account `model_prefetch_in_flight` guard
-  deduplicates bursts of joins and is released even on fetch failure. The shared
-  `MODEL_CACHE_TTL` (5 min) governs both prefetch freshness and the on-demand path in
-  `handle_list_models`, which NEVER fetches on the command loop: a fresh, non-empty cache
-  answers immediately; a stale/missing cache triggers the same background prefetch (no-op
-  while one is in flight, so an open picker cannot double-fetch) and answers with the best
-  list it already has — the stale entry, else the local catalog's curated ids for the
-  account's provider (an instant first paint, so the picker never blocks on a slow
-  `/v1/models`), and then an EMPTY list flagged `provisional` — "nothing to paint,
-  a fetch is running" (or, when no fetch could even be started because the account has
-  no buildable provider, a genuine error: a waiting state must always have a fetch behind it
-  that will end it). Both stand-ins are flagged `provisional` on the wire, so a
-  picker can say the list is not (yet) the account's verified one; an empty
-  provisional list is a waiting state the picker renders as a waiting row, never
-  "no models", and both the prefetch gate (`should_prefetch_models`) and the
-  on-demand path treat an
-  EMPTY cache entry as absent (`fresh_model_list`), so an empty entry never suppresses a
-  fetch. Every list the daemon
-  serves is ordered case-insensitively by id at the point it enters the daemon (a fetched
-  result and the catalog seed, `sort_model_ids`), so the cache, the `Models` reply,
-  the `/model` listing and the broadcasts below cannot disagree. When a fetch lands the loop caches
-  the result unconditionally (the insert is what refreshes the TTL) and broadcasts
-  `DaemonMessage::ModelsUpdated { account, models }` on the ACTIVITY bus UNLESS the entry was
-  already a fresh, non-empty list identical to the result; a stale or absent entry is always
-  re-announced even when the ids match, so an open picker's `provisional` label clears once
-  the live fetch confirms it. The broadcast lets an already-open picker replace its list in
-  place without moving the row under the cursor. A fetch that FAILS broadcasts
-  `DaemonMessage::ModelsUnavailable { account, error }` on the same bus, keyed by the same
-  account, so a picker showing the empty provisional "fetching" row ends with the provider's
-  error inline rather than a wait that cannot end; these two pushes are the only events that
-  end it, and no client polls or holds a timer for the answer. A panic inside the fetch
-  thread is caught (`catch_unwind`) and reported as a normal failure so the in-flight guard
-  can never leak, and a result arriving for an account whose provider was removed or rebuilt
-  mid-flight is discarded instead of cached.
-- Every model list the daemon serves carries each id's reasoning levels
-  (`ModelInfo { id, reasoning_levels }`, a pure catalog lookup via
-  `model_reasoning_capability`) and, on the `Models` reply, a `suggested_model`: the session's
-  current model when the list serves it, else the provider catalog's `default_model` when the
-  list serves that, else the first id (`suggest_model`). Membership is always case-insensitive
-  (`match_model_id`) because the daemon sorts ids case-insensitively while keeping the
-  provider's casing, so an exact `==` would call a differently-cased id unsupported — the SAME
-  rule `ValidateModel` uses, so a model the picker suggests can never be rejected. `ListModels`
-  accepts an optional account, so the first-run flow can inspect a *candidate* account before
-  binding it; a candidate's reply carries `selected_model: None`, since the session's own model
-  says nothing about another account's list. The companion `ModelReasoning` query answers a
-  candidate model's levels plus the effort to pre-select (`suggest_effort`: the session's
-  current effort when the model supports it, else the middle supported level
-  `ReasoningCapability::middle`) with no provider instance and no network round-trip.
-  The first-run flow then commits the whole choice atomically with `SetSessionChoice`, which
-  binds the account, its model and the model's effort to the session in ONE write
-  (`SessionAccountSet` → `ModelSelected` → `ReasoningEffortSet` → `ContextWindowResolved` are
-  broadcast after the single persist), so no client can observe or persist an account paired
-  with a model its provider does not serve. A rejected choice leaves the session untouched and
-  answers only the requester. The GUI and the typed `/model`/`/reasoning` commands keep using
-  `SetSessionAccount`/`SetModel`/`SetReasoningEffort` individually.
-- The TUI binds an account through that atomic choice, staged rather than commit-first
-  (`state/setup_flow.rs`, driven from `connection/setup_flow.rs`). Choosing an account — Enter
-  on an `Alt+A` row, or the daemon confirming a credential for a session that has none — starts
-  a five-phase machine: `LoadingModels { account }` → `ChoosingModel { account, models }` →
-  `LoadingReasoning { account, model }` → `ChoosingReasoning { account, model, capability }` →
-  `Committing { account }`, where the first two hops are `ListModels`/`ModelReasoning` queries
-  about a *candidate* account and the only write is the terminal `SetSessionChoice`. Nothing is
-  therefore written until the account, the model and the effort are all known: Esc in the
-  picker or the effort dialog drops the flow, sends nothing and returns to the accounts page,
-  and a disconnect or session switch drops it silently, so no session can be left holding an
-  account without a model or a model without an effort. Esc in the two in-flight phases drops
-  it the same way; while `Committing` the write is already on the wire, so bare Esc is
-  swallowed there instead of falling through to the Chat page's cancel-the-turn binding. A
-  model whose level set is empty skips the dialog and commits `"off"`; every failure
-  (`ModelsFailed`, `ModelsUnavailable`, a rejected `SetSessionChoice`) ends the flow — the first
-  two with the daemon's error on the status line, the last relying on the generic dispatch that
-  prints `[daemon] SetSessionChoice failed: …` for the same message. Only one flow exists at a
-  time: a second account choice (Enter on the accounts page while one is in flight) is refused
-  with a status line and leaves the first installed, because a `Models` reply carries no
-  account name and would otherwise paint the superseded account's models under the new one's
-  name. The machine is a pure transition function of `(phase, event)` — the driver sends the
-  messages and opens the popups — so every rule is unit-tested without a daemon;
-  `Models`/`ModelReasoning` replies are routed to it by the phase that awaits them, and the
-  effort dialog (`state/reasoning_dialog.rs` + `render/reasoning_dialog.rs`) shows the choice
-  instead of applying one silently. Both entry points share their guards in `start`:
-  re-selecting the account a session already uses is a no-op, and the mid-session paths
-  (`Alt+M`, `Alt+R`, `/model`, `/reasoning`) still use the individual commands.
+- **Model lists are warmed in the background, never on unlock.** Unlock and
+  credential/account mutations resolve providers in memory only — a model-list
+  fetch never runs on the daemon command loop. A detached, dedup-guarded prefetch
+  fills the model cache (whose single writer is the command loop), and `ListModels`
+  always answers from what it has — the cached list, the catalog's curated ids, or
+  an empty `provisional` list — while the fetch's landing ends the client's wait
+  with a pushed `ModelsUpdated`/`ModelsUnavailable` rather than a poll. The
+  account/model/effort choice is committed atomically by `SetSessionChoice`, so no
+  client or stored session can observe an account bound to a model its provider
+  does not serve. The cache TTL, the provisional stand-ins and the typed
+  `/model`/`/reasoning` paths are documented in-source (`choreo-daemon`'s
+  `daemon::models` module; `choreo-tui`'s `state/setup_flow`).
 - There is no global "default account". Each session carries its own `account_name: Option<String>`
   field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
   This avoids a global mutable fallback and lets different sessions use different accounts.
@@ -1944,47 +1812,41 @@ command loop's only MCP job is to install a finished result and swap the tool ca
 worker thread that posts a `DaemonCommand` back.
 
 - **Startup.** `DaemonState::open` only loads `mcp.json` and queues the daemon-tier
-  `shared` servers; the socket is bound and the first client served immediately. The
-  daemon core drains the queue and starts a background connect per server once the
-  command channel and OAuth runtime exist; each connect posts a
-  `DaemonCommand::McpConnected` that the loop installs and rebuilds the cached
-  catalogue from. A request already on a turn keeps its previous registry snapshot; the
-  next turn sees the server's tools. The per-server connect budget is generous (60 s)
-  precisely because it is off the critical path.
-- **Unlock.** The daemon starts LOCKED and runs those startup connects while an OAuth
-  grant is still encrypted, so such a server 401s; the unlock tail schedules a resync
-  of every `mcp:`-keyed server, but only AFTER the acting client's `Unlocked` reply and
-  the lock-state broadcast are enqueued, and on background workers — so an unlock never
-  blocks the reply or the loop. A resync requested while a connect is already in flight
-  is coalesced: a failed in-flight connect retries once with the now-live credentials.
-- **Session overlays.** A session's project / per-session servers are planned cheaply
-  (pool-only), pushed as a partial overlay, then connected on a worker that posts one
-  `DaemonCommand::McpSessionConnected` **per entry as it settles** — so a fast server's
-  tools land without waiting for a slow sibling's handshake. The result is installed
-  only when the session's resolve generation still matches (which advances only when
-  the resolve RELEASES the session's connections, i.e. a project-root or trust change)
-  and the entry is still wanted; a re-resolve that reuses the connections keeps the
-  generation and skips entries a worker is already connecting, so one entry never gets
-  two simultaneous handshakes. `/mcp reload` likewise drops changed servers and defers
-  their reconnects, and a manual `/mcp reconnect` of a daemon-tier *shared* server parks
-  its reply on the connect rather than blocking the loop. A project or per-session
-  server's manual reconnect still rebuilds in place (bounded, user-initiated), because
-  its connections are per session, not pool-wide: routing it through the daemon-tier
-  connect would pool a second, shared connection whose tools duplicate the session's
-  private ones. The same rule governs the post-unlock and post-sign-in bring-up: a
-  shared server reconnects on a worker, while a `shared = false` server has its stale
-  per-session slots dropped so the holding sessions re-resolve and reconnect them.
+  `shared` servers, so the socket is bound and the first client served immediately;
+  the daemon core drains that queue into one background connect per server once the
+  command channel and OAuth runtime exist. The per-server connect budget is generous
+  (60 s) precisely because it is off the critical path, and a request already on a
+  turn keeps its previous registry snapshot — the next turn sees the server's tools.
+- **Unlock.** Those startup connects run while the daemon is still LOCKED and an
+  OAuth grant is still encrypted, so such a server 401s; the unlock tail schedules a
+  resync of every `mcp:`-keyed server on background workers, and only AFTER the
+  acting client's `Unlocked` reply and the lock-state broadcast are enqueued, so an
+  unlock never delays the reply.
+- **Session overlays and reconnect.** A session's project / per-session servers are
+  planned pool-only, pushed as a partial overlay, then connected on a worker that
+  posts one result **per entry as it settles**, so a fast server's tools land
+  without waiting for a slow sibling's handshake. A superseded result is discarded
+  rather than resurrecting a stale connection, and a re-resolve that reuses the
+  connections keeps its resolve generation. A daemon-tier *shared* server always
+  connects on a worker (a manual `/mcp reconnect` parks its reply on that connect,
+  and `/mcp reload` defers the changed servers' reconnects); only a project or
+  per-session server is rebuilt in place, because a daemon-tier connect would pool a
+  second, shared connection whose tools duplicate the session's private ones.
+
+The mechanics behind each of those phases — the install/generation check, the reply
+parking, the coalescing of a resync that arrives during a connect — are documented
+in-source (`choreo-daemon`'s `daemon::mcp_commands` with its `reconnect` and
+`overlay` children, and `choreo-mcp`'s `session` module), held complete by the
+`#![warn(missing_docs)]` + `doc-check` gate.
 
 Two values inside the `rmcp` engine are sanctioned shared-state exceptions (see
-AGENTS.md). The live `RunningService` handle sits in a
-`tokio::sync::Mutex<Option<..>>` (the **eighth** exception) — a
-connection-lifecycle handle closed exactly once and never touched per message,
-holding the lock only across the bounded `close_with_timeout` on shutdown. The
-`ClientHandler`'s notification rate limiter carries a shared
-`Arc<std::sync::Mutex<LimiterState>>` (the **ninth** exception) because `rmcp`
-delivers notifications on more than one task; the lock guards a handful of
-integers and is never held across an `await`.
-
+AGENTS.md, exceptions **8** and **9**): the live `RunningService` handle in a
+`tokio::sync::Mutex<Option<..>>` — a connection-lifecycle handle closed exactly
+once and never touched per message, the lock held only across the bounded
+`close_with_timeout` on shutdown — and the `ClientHandler`'s notification rate
+limiter in an `Arc<std::sync::Mutex<LimiterState>>`, because `rmcp` delivers
+notifications on more than one task; that lock guards a handful of integers and is
+never held across an `await`.
 
 ---
 

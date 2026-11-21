@@ -46,13 +46,37 @@ use zeroize::Zeroizing;
 /// `McpTrustList` and `DaemonMessage::McpTrustUpdated`/`McpTrustList`) were
 /// added to 9 this way, before any release carried 9. Under the same policy the
 /// `SessionStatus` streaming phase was split in 9: the single `Inference` state
-/// became `Sending`/`Thinking`/`Responding`, so a client can tell the pre-token
-/// connection wait from reasoning from answer streaming. Also under the same
-/// policy, `ClientMessage::AddCredential` was reshaped in 9 to carry a typed
-/// plaintext `ServiceCredential` (`service` + `credential`) instead of a
-/// client-encrypted `encrypted_payload` plus an `unlock_key`: no key rides the
-/// wire, the daemon encrypts the credential to its own binding public key, and
-/// the add path requires an already-unlocked keystore (no implicit unlock).
+/// became `Sending`/`Waiting`/`Reasoning`/`Responding`, so a client can tell the
+/// request dispatch from the provider's time-to-first-token wait from reasoning
+/// from answer streaming. The `Waiting` boundary is anchored on client-side
+/// request-upload completion rather than the provider's response headers, because
+/// a buffering gateway can withhold the response head until the model begins
+/// generating (see [`crate::SessionStatus::Waiting`]).
+///
+/// Also under the same policy, 9's frame was amended in place to the uniform
+/// correlation envelope: `ClientMessage` = `{ id, inner }` and `DaemonMessage` =
+/// `{ id: Option<u64>, inner }` (a broadcast is `id: None`, a reply stamps the
+/// request's id), the payload enums were renamed `ClientMessageType`/
+/// `DaemonMessageType`, the streaming `request_id` was renamed `stream_id` and
+/// widened to `u64`, and the payload-free `MessageKind` tag plus the
+/// `Accepted`/`Failed` acknowledgement replies were added. Under the same policy
+/// the streaming axis became daemon-owned: the session thread assigns a run's
+/// `stream_id` when it accepts a `RunInput`/`ContinueGeneration` and reports it
+/// on the acceptance `Started` reply/broadcast, so those requests carry no
+/// client-chosen id (`CANCEL_ALL`, `stream_id = 0`, remains for a pre-`Started`
+/// cancel). Under the same policy the 6 `GetImage`/`Image` pair was reshaped:
+/// its positional `image_index: u32` became a tagged `key: ImageKey`
+/// (`Displayed { index }` or `ToolResult { call_id }`), so one fetch protocol
+/// serves both displayed images and tool-result vision images from the shared
+/// attachment store.
+///
+/// Also under the same policy, `ClientMessage::AddCredential` was reshaped in 9
+/// to carry a typed plaintext `ServiceCredential` (`service` + `credential`)
+/// instead of a client-encrypted `encrypted_payload` plus an `unlock_key`: no key
+/// rides the wire, the daemon encrypts the credential to its own binding public
+/// key, and the add path requires an already-unlocked keystore (no implicit
+/// unlock).
+///
 /// Also under the same policy, 9 gained the provider OAuth login surface: the
 /// `ClientMessage::ListOAuthProviders` request and its
 /// `DaemonMessage::OAuthProviders(Vec<OAuthProviderDescriptor>)` reply, so a
