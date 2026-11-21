@@ -140,12 +140,17 @@ fn tmux_notice(version: Option<Version>) -> TerminalNotice {
 
 /// The macOS Option-as-Meta advice, carrying the setting for the detected
 /// terminal (see `terminal_advice::option_key_setting`).
+///
+/// The headline states the conditional rather than an absolute. A layout that
+/// already maps Option to Meta, and any combination that composes to no
+/// printable character, deliver the chord with nothing configured — so the block
+/// would be wrong to say the shortcuts never arrive.
 fn macos_option_notice(setting: &'static str) -> TerminalNotice {
     TerminalNotice {
-        headline: "Option+key shortcuts never arrive on macOS".to_string(),
+        headline: "Option+key types a character unless the terminal sends Meta".to_string(),
         lines: vec![
-            "macOS composes a character for Option+key before the app sees it, so `alt+` \
-             shortcuts only arrive once the terminal sends Option as Meta."
+            "macOS composes Option+key into a character before the app sees it; a combination \
+             with no printable result always arrives as Meta."
                 .to_string(),
             setting.to_string(),
         ],
@@ -343,11 +348,11 @@ mod tests {
     fn each_macos_terminal_gets_its_own_option_setting_and_no_other() {
         let settings = [
             (TerminalKind::Ghostty, "macos-option-as-alt = true"),
-            (TerminalKind::Kitty, "macos_option_as_alt left"),
+            (TerminalKind::Kitty, "macos_option_as_alt both"),
             (TerminalKind::Alacritty, "option_as_alt = \"Both\""),
             (
                 TerminalKind::WezTerm,
-                "send_composed_key_when_left_alt_is_pressed = false",
+                "send_composed_key_when_right_alt_is_pressed = false",
             ),
             (TerminalKind::ItTerm, "Left/Right Option Key = Esc+"),
             (TerminalKind::AppleTerminal, "Use Option as Meta key"),
@@ -367,6 +372,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_option_headline_states_the_conditional_not_an_absolute() {
+        // Option+key reaches the app as Meta with nothing configured when the
+        // layout already maps Option to Meta, so the block must not claim the
+        // shortcuts never arrive; it names the condition instead.
+        let notice = terminal_notice(&profile(
+            TerminalKind::Ghostty,
+            Platform::MacOs,
+            Host::Direct,
+        ))
+        .expect("macOS carries the Option advice");
+        assert!(notice.headline.contains("unless the terminal sends Meta"));
+        assert!(!all_text(&notice).contains("never arrive"));
     }
 
     #[test]

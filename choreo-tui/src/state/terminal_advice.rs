@@ -223,11 +223,13 @@ pub(crate) fn tmux_lines(version: Option<Version>) -> Vec<&'static str> {
 /// The macOS Option-as-Meta setting for the detected terminal, or `None` where
 /// that advice does not apply.
 ///
-/// Option+key composes a character on macOS before any application sees it, so
-/// an `alt+` shortcut never arrives unless the terminal is told to send Option
-/// as Meta. The advice is about the emulator's own key handling, which a
-/// multiplexer passes through but a workspace manager's pane does not: under a
-/// hosted layer the outer terminal cannot be named, so it is withheld there.
+/// Option+key composes a character on macOS before any application sees it, so a
+/// chord reaches the app as Meta only when the terminal is told to send Option as
+/// one — a combination that composes to no printable character arrives as Alt
+/// regardless, and a layout whose Option already maps to Meta needs nothing. The
+/// advice is about the emulator's own key handling, which a multiplexer passes
+/// through but a workspace manager's pane does not: under a hosted layer the
+/// outer terminal cannot be named, so it is withheld there.
 pub(crate) fn option_key_setting(profile: &TerminalProfile) -> Option<&'static str> {
     match profile.host {
         Host::Hosted(_) => None,
@@ -251,14 +253,22 @@ fn macos_option_setting(kind: TerminalKind) -> &'static str {
              U.S. Standard and U.S. International layouts already default to on)"
         }
         TerminalKind::Kitty => {
-            "kitty: set `macos_option_as_alt left` in ~/.config/kitty/kitty.conf"
+            // `macos_option_as_alt` takes `no | yes | left | right | both`, and
+            // `left` maps only the left Option key. The client's chords are on
+            // whichever Option key the user reaches for, so the advice is the
+            // whole-keyboard setting.
+            "kitty: set `macos_option_as_alt both` in ~/.config/kitty/kitty.conf"
         }
         TerminalKind::Alacritty => {
             "Alacritty: set `option_as_alt = \"Both\"` under [window] in \
              ~/.config/alacritty/alacritty.toml"
         }
         TerminalKind::WezTerm => {
-            "WezTerm: set `send_composed_key_when_left_alt_is_pressed = false` in ~/.wezterm.lua"
+            // WezTerm already sends the LEFT Option key as Alt (its composition
+            // flag defaults to false); it is the RIGHT key that composes by
+            // default, so that is the flag worth naming.
+            "WezTerm: set `send_composed_key_when_right_alt_is_pressed = false` in \
+             ~/.wezterm.lua (the right Option key composes by default)"
         }
         TerminalKind::ItTerm => "iTerm2: Profiles → Keys → Left/Right Option Key = Esc+",
         TerminalKind::AppleTerminal => "Terminal.app: Profiles → Keyboard → Use Option as Meta key",

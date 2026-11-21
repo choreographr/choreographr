@@ -487,16 +487,18 @@ Android offers no recommendation: the terminal is the app you already chose.
 
 #### macOS: Option as Alt
 
-macOS composes a character for `Option+key` before any application sees it, so
-`alt+` shortcuts do not arrive at all until the terminal is told to send Option
-as Meta. The setting, per terminal:
+macOS composes a character for `Option+key` before any application sees it, so a
+chord reaches the app as Meta only once the terminal is told to send Option as
+one. Two cases need no setting: a layout that already maps Option to Meta (the
+U.S. Standard and U.S. International layouts do), and any combination that
+composes to no printable character. The setting, per terminal:
 
 | Terminal | Setting |
 |---|---|
 | Ghostty | `macos-option-as-alt = true` in `~/.config/ghostty/config` (the U.S. Standard and U.S. International layouts already default to on) |
-| kitty | `macos_option_as_alt left` in `~/.config/kitty/kitty.conf` |
+| kitty | `macos_option_as_alt both` in `~/.config/kitty/kitty.conf` |
 | Alacritty | `[window] option_as_alt = "Both"` in `~/.config/alacritty/alacritty.toml` |
-| WezTerm | `send_composed_key_when_left_alt_is_pressed = false` in `~/.wezterm.lua` |
+| WezTerm | `send_composed_key_when_right_alt_is_pressed = false` in `~/.wezterm.lua` (the right Option key composes by default; the left one already sends Alt) |
 | iTerm2 | Profiles → Keys → Left/Right Option Key = **Esc+** |
 | Terminal.app | Profiles → Keyboard → **Use Option as Meta key** |
 

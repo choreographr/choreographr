@@ -242,7 +242,8 @@ fn fix_lines(profile: &TerminalProfile) -> Vec<Line<'static>> {
     let mut any = false;
     if let Some(setting) = option_key_setting(profile) {
         lines.push(Line::from(Span::styled(
-            "Option as Alt (macOS) — macOS composes Option+key before the app sees it:",
+            "Option as Alt (macOS) — macOS composes Option+key into a character unless the \
+             terminal sends Meta:",
             dim_style(),
         )));
         lines.push(Line::from(Span::styled(
@@ -555,7 +556,7 @@ mod tests {
     #[test]
     fn the_macos_fix_names_the_detected_terminals_own_setting() {
         let out = text(&profile(TerminalKind::Kitty, Platform::MacOs, Host::Direct));
-        assert!(out.contains("macos_option_as_alt left"));
+        assert!(out.contains("macos_option_as_alt both"));
 
         // Nothing to configure on a Linux direct session with no tmux.
         let linux = text(&profile(
