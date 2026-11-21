@@ -15,21 +15,22 @@ use ratatui::widgets::StatefulWidget;
 /// is supported via the `scrollbar_dragging` field on `App`.
 ///
 /// User-text markers (green indicator dots on the track) are rendered
-/// from a pre-computed viewport-sized slot bitmap passed via
-/// [`with_marker_slots`].
+/// from a pre-computed viewport-sized slot bitmap borrowed via
+/// [`with_marker_slots`], so a frame copies nothing.
 /// Markers are drawn on the track *beneath* the thumb, so a marker that
 /// lands under the thumb is hidden rather than obscuring it — the thumb is
 /// the position indicator and must stay visible at all times.
 #[derive(Debug, Clone)]
-pub(crate) struct SmoothScrollbar {
+pub(crate) struct SmoothScrollbar<'a> {
     thumb_fg: Option<Color>,
     track_bg: Option<Color>,
     marker_fg: Option<Color>,
     /// Occupancy bitmap indexed by virtual slot: `true` where a user-text
     /// marker sits.  `true` at slot `s` draws a marker half-cell there.  The
-    /// renderer supplies a cached, viewport-sized bitmap (O(vh)) so a frame
-    /// never rebuilds a set from every marker.
-    marker_slots: Vec<bool>,
+    /// renderer lends its cached, viewport-sized bitmap (O(vh)) by reference so
+    /// a frame never rebuilds a set from every marker and never copies the
+    /// bitmap either.
+    marker_slots: &'a [bool],
 }
 
 /// State for [`SmoothScrollbar`].
@@ -43,16 +44,21 @@ pub(crate) struct SmoothScrollbarState {
     viewport_content_length: usize,
 }
 
-impl SmoothScrollbar {
-    pub(crate) fn new() -> Self {
+impl SmoothScrollbar<'static> {
+    /// A scrollbar with no marker bitmap.  The `'static` lifetime lets the
+    /// builder start from an empty slice and adopt the renderer's borrowed
+    /// bitmap later via [`Self::with_marker_slots`].
+    pub(crate) const fn new() -> Self {
         Self {
             thumb_fg: None,
             track_bg: None,
             marker_fg: None,
-            marker_slots: Vec::new(),
+            marker_slots: &[],
         }
     }
+}
 
+impl SmoothScrollbar<'_> {
     /// Set the foreground color for the thumb (including half-block
     /// characters where visible).
     pub(crate) const fn thumb_fg(mut self, color: Color) -> Self {
@@ -75,12 +81,20 @@ impl SmoothScrollbar {
 
     /// Attach a pre-computed occupancy bitmap of the virtual slots where
     /// user-text markers should appear on the track (index = virtual slot,
-    /// `true` = marker).  The caller caches this per display so a frame never
-    /// rebuilds a set from every marker.
-    pub(crate) fn with_marker_slots(mut self, slots: &[bool]) -> Self {
-        self.marker_slots.clear();
-        self.marker_slots.extend_from_slice(slots);
-        self
+    /// `true` = marker).  The caller caches this per display and lends it by
+    /// reference, so a frame neither rebuilds a set from every marker nor
+    /// copies the bitmap.
+    ///
+    /// The fields are rebuilt one by one rather than via functional record
+    /// update: the returned scrollbar borrows `slots`, so its lifetime differs
+    /// from `self`'s and a struct-update expression cannot express that.
+    pub(crate) fn with_marker_slots(self, slots: &[bool]) -> SmoothScrollbar<'_> {
+        SmoothScrollbar {
+            thumb_fg: self.thumb_fg,
+            track_bg: self.track_bg,
+            marker_fg: self.marker_fg,
+            marker_slots: slots,
+        }
     }
 }
 
@@ -118,7 +132,7 @@ enum Half {
     Empty,
 }
 
-impl StatefulWidget for SmoothScrollbar {
+impl StatefulWidget for SmoothScrollbar<'_> {
     type State = SmoothScrollbarState;
 
     fn render(self, area: Rect, buf: &mut Buffer, state: &mut Self::State) {

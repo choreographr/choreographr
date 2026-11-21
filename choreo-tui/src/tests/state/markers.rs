@@ -1,5 +1,6 @@
 //! User-text turn marker computation (content line and virtual slot).
 
+use crate::state::SessionDisplayState;
 use crate::tests::support::{insert_turn, test_app};
 use choreo_proto::Turn;
 
@@ -145,5 +146,126 @@ fn marker_virtual_slot_proportional_to_position() {
     assert!(
         display.markers[2].virtual_slot < virtual_track,
         "last marker slot should be less than virtual_track={virtual_track}"
+    );
+}
+
+/// The stored marker slot and the scrollbar occupancy bitmap must never
+/// disagree, even after the total height grows without a marker rebuild.
+///
+/// This is the invariant the scrollbar click handler depends on: it tests each
+/// marker's stored `virtual_slot` against the clicked half-slots, so that slot
+/// has to be the one the draw-time bitmap placed the marker at — otherwise a
+/// click on a visible marker misses and falls through to a track jump. The
+/// streaming fast path grows the total (`height_prefix`) while skipping
+/// `rebuild_markers` for the last visible turn, so the two must stay consistent
+/// through both the no-rebuild and the catch-up-rebuild frames.
+#[test]
+fn marker_slots_stay_in_sync_after_total_height_drift() {
+    let mut app = test_app();
+    app.history_viewport.width = 80;
+    app.history_viewport.height = 20;
+    let viewport = app.history_viewport;
+    let virtual_track = 2 * viewport.height as usize;
+
+    insert_turn(&mut app, 0, "a", "first answer");
+    insert_turn(&mut app, 1, "b", "second answer");
+    insert_turn(&mut app, 2, "c", "third answer");
+    app.rebuild_height_prefix();
+
+    // Settle the bitmap the renderer would draw from this frame.
+    app.active_display().unwrap().ensure_marker_slots(&viewport);
+    let total_old = app.total_history_height();
+    let drawn: Vec<usize> = {
+        let display = app.active_display_ref().unwrap();
+        display.markers.iter().map(|m| m.virtual_slot).collect()
+    };
+    assert_eq!(drawn.len(), 3, "one marker per user-text turn");
+
+    // Simulate the streaming fast path for the last visible turn: the height
+    // model grows, but `rebuild_markers` is skipped (nothing marks the bitmap
+    // dirty), so the total moves while the stored slots keep the old
+    // denominator.
+    let delta = total_old;
+    {
+        let display = app.active_display().unwrap();
+        let last = display.turn_heights.len() - 1;
+        display.turn_heights[last] += delta;
+        for prefix in &mut display.height_prefix[last..] {
+            *prefix += delta;
+        }
+    }
+    let total_new = app.total_history_height();
+    assert!(total_new > total_old, "the drift grew the total");
+
+    // No rebuild is due, so the frame reuses the bitmap: the stored slots did
+    // not move and every marker's bit is still set where it is stored. A click
+    // at the drawn row therefore still finds its marker.
+    app.active_display().unwrap().ensure_marker_slots(&viewport);
+    {
+        let display = app.active_display_ref().unwrap();
+        let slots_now: Vec<usize> = display.markers.iter().map(|m| m.virtual_slot).collect();
+        assert_eq!(
+            slots_now, drawn,
+            "stored slots must stay put when no bitmap rebuild is due"
+        );
+        for marker in &display.markers {
+            assert!(
+                display
+                    .marker_slots
+                    .get(marker.virtual_slot)
+                    .copied()
+                    .unwrap_or(false),
+                "bitmap must be set at the stored slot {}",
+                marker.virtual_slot
+            );
+        }
+    }
+
+    // A rebuild is now due (structural change or track change). Every marker is
+    // recomputed from its content line against the *current* total, the stored
+    // slot is written back in the same pass that sets the bitmap bit, so the two
+    // agree again — now at the new scale.
+    {
+        let display = app.active_display().unwrap();
+        display.marker_slots_dirty = true;
+        display.ensure_marker_slots(&viewport);
+    }
+    let display = app.active_display_ref().unwrap();
+    for marker in &display.markers {
+        let expected =
+            SessionDisplayState::marker_slot(marker.content_line, virtual_track, total_new);
+        assert_eq!(
+            marker.virtual_slot, expected,
+            "stored slot must be recomputed against the current total={total_new}"
+        );
+        assert!(
+            display
+                .marker_slots
+                .get(marker.virtual_slot)
+                .copied()
+                .unwrap_or(false),
+            "bitmap must be set at the freshly stored slot {}",
+            marker.virtual_slot
+        );
+    }
+    // No bitmap bit may sit outside a stored slot: the bitmap is derived from
+    // exactly these markers, so a stale bit would be a phantom marker.
+    for (slot, &set) in display.marker_slots.iter().enumerate() {
+        if set {
+            assert!(
+                display.markers.iter().any(|m| m.virtual_slot == slot),
+                "bitmap bit {slot} does not correspond to any marker's stored slot"
+            );
+        }
+    }
+    // The drift really did rescale at least one marker (a marker with content
+    // on line 0 legitimately stays at slot 0).
+    assert!(
+        display
+            .markers
+            .iter()
+            .zip(&drawn)
+            .any(|(m, &old)| m.virtual_slot != old),
+        "the catch-up rebuild should rescale the slots against the grown total"
     );
 }

@@ -1,10 +1,11 @@
 //! The chat history pane: the visible window of turns and their text blocks.
 //!
-//! The pane is drawn bottom-up. Turns are walked from newest to oldest and
-//! [`clipped_area`] consumes the scroll offset from *that* end, so a turn that
-//! starts below the viewport is skipped before any of its content is touched
-//! and the loop stops as soon as the viewport is full. Every block — an image
-//! block, a turn's text — reserves its rows the same way, which is why the
+//! The pane draws only the visible window. The height prefix-sum already says
+//! which visible turn the viewport starts in, so the renderer seeks that
+//! bottommost *visible* turn and walks upward from there, stopping as soon as the
+//! viewport is full — a turn below the window is never touched. [`clipped_area`]
+//! consumes the scroll offset relative to that window's bottom edge. Every block —
+//! an image block, a turn's text — reserves its rows the same way, which is why the
 //! caller must render images before text: images sit *below* their turn's text
 //! on screen, and the shared `y` cursor is what keeps the two in order.
 //!

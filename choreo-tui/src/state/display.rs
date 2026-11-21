@@ -108,9 +108,12 @@ pub(crate) struct SessionDisplayState {
     /// rebuilding a `Vec` + `HashSet` from every marker each frame (O(markers));
     /// it is rebuilt lazily when the marker set changes
     /// ([`Self::marker_slots_dirty`]) or the viewport height changes the virtual
-    /// track (see `ensure_marker_slots`).
+    /// track (see `ensure_marker_slots`).  A rebuild also writes each marker's
+    /// slot back into its `virtual_slot` field, so the stored slots and this
+    /// bitmap always agree.
     pub(crate) marker_slots: Vec<bool>,
-    /// Whether [`Self::marker_slots`] must be rebuilt from [`Self::markers`].
+    /// Whether [`Self::marker_slots`] must be rebuilt from [`Self::markers`]
+    /// (which also re-derives every marker's `virtual_slot` in the same pass).
     pub(crate) marker_slots_dirty: bool,
     pub(crate) streaming_turn_index: Option<usize>,
     pub(crate) streaming_dirty: bool,

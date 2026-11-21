@@ -49,10 +49,12 @@ pub(crate) enum ViewportChange {
     Rewrap,
     /// Only the height changed — a real vertical resize, or the chrome (the
     /// status/error line, the input box) growing or shrinking.
-    /// Nothing re-wraps, so the caches and the selection stay valid, but the
-    /// heights must be recomputed because the image-block height the height
-    /// prefix reserves derives from the viewport height.  That recompute is a
-    /// cache-hit rebuild, so it is cheap enough to run for every chrome change.
+    /// Nothing re-wraps, so the caches and the selection stay valid.  Turn
+    /// heights read the viewport height only through the image-block reserve,
+    /// so a session with no image-bearing turn keeps its whole height model and
+    /// only the scrollbar's marker slots rescale lazily to the new track; a
+    /// session with an image-bearing turn (`any_image_turns`) marks the model
+    /// dirty so the next cache-hit rebuild recomputes the reserve.
     HeightsOnly,
 }
 
@@ -60,12 +62,14 @@ pub(crate) enum ViewportChange {
 ///
 /// Pure (no terminal access) so the policy — and its full case matrix — is
 /// unit-testable.  Only the rendered WIDTH decides a re-wrap: nothing about
-/// wrapping reads the height.  Any height change recomputes the height model,
-/// because the image-block height the prefix reserves derives from the viewport
-/// height — and that recompute is a cache-hit rebuild (no re-render), so it is
-/// cheap enough to run even when a status line merely appears or disappears.
-/// See [`App::update_viewport_from_terminal_size`] for why wiping the render
-/// cache on a chrome height change was the bug.
+/// wrapping reads the height.  A height change re-wraps nothing and is not
+/// itself a reason to rebuild the height model — turn heights depend on the
+/// viewport height only through the image-block reserve.  So a text-only
+/// session's height model stays valid and only the scrollbar's marker slots
+/// rescale; a session with an image-bearing turn (`any_image_turns`) marks the
+/// model dirty so the next cache-hit rebuild recomputes the reserve.  The
+/// [`ViewportChange`] variants carry that split, and the caller (with the
+/// display in hand) decides which case its session is in.
 pub(crate) fn classify_viewport_change(
     old_width: u16,
     new_width: u16,
@@ -272,11 +276,16 @@ pub(crate) fn cached_or_compute_lines(
 }
 
 /// A transcript marker projected onto the scrollbar: the content line it sits
-/// on, and the virtual scrollbar slot (of the scrollbar's own resolution) that
-/// line maps to.
+/// on, and the virtual scrollbar slot that line is currently mapped to.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Marker {
     pub content_line: usize,
+    /// The virtual slot this marker currently occupies in the cached
+    /// [`SessionDisplayState::marker_slots`] bitmap — the slot it is drawn at.
+    /// [`SessionDisplayState::ensure_marker_slots`] writes it in the same pass
+    /// that sets the bitmap bit, so the stored slot and the bitmap agree by
+    /// construction; the scrollbar click handler tests this field against the
+    /// clicked half-slots, so a click hits exactly what was drawn.
     pub virtual_slot: usize,
 }
 
@@ -429,14 +438,12 @@ impl App {
         // selection's column anchors go.  A height change — a real vertical
         // resize, OR the chrome (the status/error line, the input box) growing
         // or shrinking — re-wraps nothing, so the caches and the selection
-        // survive; only the HEIGHTS are recomputed, because the image-block
-        // height the prefix reserves derives from the viewport
-        // height.  The old code cleared every session's render cache on any
-        // height change, which forced a full O(session) re-render the instant
-        // any status line was set or cleared (the input delay a large session
-        // showed right after a copy and on the next keystroke); the height
-        // recompute is now a cache-hit rebuild, so it is cheap enough to run for
-        // every chrome change.
+        // survive.  Turn heights read the viewport height only through the
+        // image-block reserve (`image_block_height`), so a text-only session's
+        // height model stays valid and only the scrollbar's marker slots rescale
+        // to the new virtual track (lazily, in `ensure_marker_slots`); a session
+        // with an image-bearing turn marks the model dirty so the next
+        // cache-hit rebuild recomputes the reserve.
         match classify_viewport_change(old_width, new_width, old_height, new_height) {
             ViewportChange::Rewrap => {
                 // The width changed, so every line re-wraps: the width-keyed
@@ -692,7 +699,6 @@ impl SessionDisplayState {
         self.turn_heights.clear();
         self.any_image_turns = false;
         let mut total = 0usize;
-        let virtual_track = Self::virtual_track_slots(viewport);
         let fallback_img_height = Self::image_block_height(viewport) as usize;
         let turn_count = self.view.turns.len();
         tracing::trace!(turn_count, "rebuild_height_prefix");
@@ -700,7 +706,6 @@ impl SessionDisplayState {
         let visible_count = self.view.turns.iter().filter(|(_, t)| !t.undone).count();
         self.render_cache.resize(visible_count, None);
 
-        let mut user_text_start_lines: Vec<usize> = Vec::with_capacity(turn_count);
         let mut visible_idx = 0usize;
         for (&turn_id, turn) in &self.view.turns {
             if turn.undone {
@@ -799,31 +804,22 @@ impl SessionDisplayState {
             });
             let turn_height = text_height + total_img_height;
             self.turn_heights.push(turn_height);
-            if turn.user_text.is_some() {
-                user_text_start_lines.push(total);
-            }
             total += turn_height;
             self.height_prefix.push(total);
             self.visible_turn_ids.push(turn_id);
             visible_idx += 1;
         }
-        let final_total = total.max(1);
+        // Derive the markers from the freshly filled `visible_turn_ids` /
+        // `turn_heights` (the one source of the marker set) now that the total
+        // height is known.
+        self.rebuild_markers(viewport);
+        let final_total = self.total_history_height().max(1);
         tracing::trace!(
-            marker_count = user_text_start_lines.len(),
+            marker_count = self.markers.len(),
             final_total,
             "computed markers"
         );
-        self.markers.reserve(user_text_start_lines.len());
-        for &start_line in &user_text_start_lines {
-            let slot = start_line * virtual_track / final_total;
-            self.markers.push(Marker {
-                content_line: start_line,
-                virtual_slot: slot,
-            });
-        }
         self.markers_dirty = false;
-        // The marker set changed, so the renderer's slot bitmap is stale.
-        self.marker_slots_dirty = true;
     }
 
     pub(crate) fn mark_streaming_changed(&mut self) {
@@ -1019,6 +1015,12 @@ impl SessionDisplayState {
         // streaming fast path.
         self.maybe_pin_response_top(viewport);
 
+        // Settle the scrollbar's cached occupancy bitmap here, in the height
+        // model's single settle point, so the scrollbar draw only borrows it.
+        // A no-op unless the marker set or the virtual track changed, and it
+        // keeps every marker's stored slot in lockstep with the bitmap it draws.
+        self.ensure_marker_slots(viewport);
+
         self.total_history_height().max(1)
     }
 
@@ -1068,7 +1070,7 @@ impl SessionDisplayState {
             if let Some(turn) = self.view.turns.get(&turn_id)
                 && turn.user_text.is_some()
             {
-                let slot = accum * virtual_track / total;
+                let slot = Self::marker_slot(accum, virtual_track, total);
                 self.markers.push(Marker {
                     content_line: accum,
                     virtual_slot: slot,
@@ -1080,40 +1082,46 @@ impl SessionDisplayState {
         self.marker_slots_dirty = true;
     }
 
+    /// Map a content line to its virtual scrollbar slot: the line scaled into
+    /// the 2-per-row virtual track against the current total height.  Every
+    /// place that computes a marker slot goes through here, so the marker set,
+    /// the cached occupancy bitmap and the click handler share one mapping.
+    pub(crate) fn marker_slot(content_line: usize, virtual_track: usize, total: usize) -> usize {
+        content_line * virtual_track / total.max(1)
+    }
+
     /// Ensure the scrollbar's marker-slot bitmap matches the current markers and
     /// viewport: a viewport-sized `true`-per-occupied-slot array the renderer
     /// draws from in O(vh).
     ///
-    /// Rebuilt (from each marker's *content line*, so a viewport-height change
-    /// rescales correctly against the new virtual track) only when the marker
-    /// set changed ([`Self::marker_slots_dirty`]) or the viewport height altered
-    /// the track length; every other frame — including every scrolling frame
-    /// and every streaming chunk — reuses it, which is what keeps the scrollbar
-    /// draw O(vh) instead of O(markers).
+    /// Rebuilt only when the marker set changed ([`Self::marker_slots_dirty`])
+    /// or the viewport height altered the track length; every other frame —
+    /// including every scrolling frame and every streaming chunk — reuses it,
+    /// which is what keeps the scrollbar draw O(vh) instead of O(markers).
+    ///
+    /// Each marker's slot is recomputed from its *content line* against the
+    /// current total and track and written back into [`Marker::virtual_slot`] in
+    /// the same pass that sets the bitmap bit, so the stored slot is always the
+    /// slot the bitmap drew — even after a track change or a streaming response
+    /// that drifted the total without rebuilding the marker set.
     pub(crate) fn ensure_marker_slots(&mut self, viewport: &HistoryViewport) {
         let virtual_track = Self::virtual_track_slots(viewport);
         if !self.marker_slots_dirty && self.marker_slots.len() == virtual_track {
             return;
         }
         let total = self.total_history_height().max(1);
-        // The bitmap length records the track it was built for.  When the track
-        // is unchanged, each marker's stored `virtual_slot` is the slot for the
-        // current total (both were written together by the marker rebuild); when
-        // the viewport height changed the track, the stored slots are for the
-        // old scale, so rescale from the marker's content line instead.
-        let track_unchanged = self.marker_slots.len() == virtual_track;
-        let mut slots = vec![false; virtual_track];
-        for marker in &self.markers {
-            let slot = if track_unchanged {
-                marker.virtual_slot
-            } else {
-                marker.content_line * virtual_track / total
-            };
-            if let Some(bit) = slots.get_mut(slot) {
+        // Reuse the buffer: a rebuild happens once per structural change (or
+        // track change), not per frame, so resizing in place avoids handing the
+        // allocator a fresh viewport-sized `Vec` each time.
+        self.marker_slots.resize(virtual_track, false);
+        self.marker_slots.fill(false);
+        for marker in &mut self.markers {
+            let slot = Self::marker_slot(marker.content_line, virtual_track, total);
+            marker.virtual_slot = slot;
+            if let Some(bit) = self.marker_slots.get_mut(slot) {
                 *bit = true;
             }
         }
-        self.marker_slots = slots;
         self.marker_slots_dirty = false;
     }
 

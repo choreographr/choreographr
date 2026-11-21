@@ -179,7 +179,7 @@ pub(crate) fn mouse_in_scrollbar_column(
     column == vp_width && row < vp_height
 }
 
-fn vertical_scrollbar() -> SmoothScrollbar {
+fn vertical_scrollbar() -> SmoothScrollbar<'static> {
     SmoothScrollbar::new()
         .thumb_fg(Color::DarkGray)
         .track_bg(BG_SHADE)
@@ -304,17 +304,14 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
             .saturating_sub(app.effective_scroll());
         // Draw markers from the display's cached viewport-sized occupancy
         // bitmap (O(vh)) rather than rebuilding a Vec + HashSet from every
-        // marker each frame (O(markers)).  `ensure_marker_slots` only rebuilds
-        // when the marker set or the viewport height changed.
-        let viewport = app.history_viewport;
-        let marker_slots = if let Some(d) = app.active_display() {
-            d.ensure_marker_slots(&viewport);
-            d.marker_slots.clone()
-        } else {
-            Vec::new()
-        };
+        // marker each frame (O(markers)).  The bitmap is settled by
+        // `compute_total_height_and_markers` above, so this only borrows it —
+        // no clone, no second allocation.
+        let marker_slots: &[bool] = app
+            .active_display_ref()
+            .map_or(&[], |d| d.marker_slots.as_slice());
         frame.render_stateful_widget(
-            vertical_scrollbar().with_marker_slots(&marker_slots),
+            vertical_scrollbar().with_marker_slots(marker_slots),
             history_chunks.get(1).copied().unwrap_or_default(), // always present (2-chunk split); safe fallback
             &mut SmoothScrollbarState::new(total_height)
                 .position(position)
