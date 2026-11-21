@@ -44,7 +44,8 @@ pub(crate) struct StreamingResponseCache {
 // `HistoryViewport` is a 4-byte Copy struct; every call site already holds a
 // reference (App-level wrappers, tests), so taking it by value would churn
 // signatures across the crate for no measurable gain.  Same rationale as the
-// main `impl SessionDisplayState` block in `state/mod.rs`.
+// `impl SessionDisplayState` blocks that carry the height model and the scroll
+// position in the `history` module.
 #[expect(clippy::trivially_copy_pass_by_ref)]
 impl SessionDisplayState {
     /// Re-render the in-flight turn through the incremental response cache and

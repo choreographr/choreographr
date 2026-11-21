@@ -15,7 +15,7 @@
 //! together only made every edit touch a file four subjects were queueing on.
 //! The model-selector popup lives in the sibling `state/model_selector.rs`, the
 //! session-manager list/detail state in `state/session_manager.rs`, and the
-//! history marker (`Marker`) in `state/history.rs`, beside the height model it
+//! history marker (`Marker`) in `state/history/`, beside the height model it
 //! indexes.
 //!
 //! Everything here is re-exported from `state` (`pub(crate) use pages::*`), so

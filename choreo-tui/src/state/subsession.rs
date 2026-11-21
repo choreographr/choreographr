@@ -31,7 +31,7 @@ use crossbeam_channel::Sender;
 /// The tool whose call makes the TUI auto-enter the sub-session it spawns.
 ///
 /// Kept as a constant so the in-flight tracker in `state/turn.rs`, the reporting
-/// path in `connection/daemon.rs`, and the navigation gate here cannot drift on
+/// path in `connection/daemon/`, and the navigation gate here cannot drift on
 /// the tool's wire name.
 pub(crate) const SPAWN_SUBSESSION_TOOL: &str = "spawn_subsession";
 

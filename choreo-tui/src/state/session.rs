@@ -365,7 +365,7 @@ impl App {
         }
     }
 
-    // Call sites in `connection/daemon.rs` pass `&Option<String>`; changing
+    // Call sites in `connection/daemon/` pass `&Option<String>`; changing
     // the signature would touch files outside this one.
     #[expect(clippy::ref_option)]
     pub(crate) fn handle_session_working_dir_set(
@@ -774,7 +774,7 @@ impl App {
 /// A blind overwrite would regress the status bar's `↑in ↓out` readout until
 /// the next `TokenUsageUpdate` — i.e. until the turn ends — while a `None`
 /// snapshot must never wipe an accumulated total.
-// Call sites in `connection/daemon.rs` pass `&Option<TokenUsage>`;
+// Call sites in `connection/daemon/` pass `&Option<TokenUsage>`;
 // changing the signature would touch files outside this one.
 #[expect(clippy::ref_option)]
 pub(crate) fn merge_token_usage(
