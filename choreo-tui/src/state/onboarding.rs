@@ -1,35 +1,21 @@
 //! First-run setup guidance: the App-side glue over the shared setup rules
 //! in `choreo_client_core::onboarding` — reading the checklist state off the
-//! attached session, arming the follow-through that walks a freshly created
-//! account straight into the session and the model picker, and pre-filling
-//! the new-account wizard's name — plus the terminal advice the welcome panel
-//! shows when the detected terminal or its host layer costs this client a
-//! feature it actually uses.
+//! attached session and pre-filling the new-account wizard's name — plus the
+//! terminal advice the welcome panel shows when the detected terminal or its
+//! host layer costs this client a feature it actually uses.
 //!
 //! Everything here is pure state derivation over `App` (no I/O, no channels),
 //! so the rules are unit-testable without a daemon. The render side lives in
-//! `render/welcome.rs`; the message-handling side (auto-selecting the account
-//! once its credential is confirmed) lives in `connection/daemon.rs`.
+//! `render/welcome.rs`; the message-handling side (what happens once the daemon
+//! confirms a credential) lives in `connection/setup_flow.rs`.
 //!
 //! The welcome panel's terminal advice lives in `state/terminal_notice.rs`, so
 //! this module stays purely about first-run setup.
 
 use super::App;
-use choreo_client_core::{SetupFollow, SetupProgress, suggest_account_name};
+use choreo_client_core::{SetupProgress, suggest_account_name};
 
 impl App {
-    /// Arm the follow-through for `account` when its key is being saved and
-    /// the attached session has no account yet. A session that already has
-    /// an account keeps it: adding a second key must not silently switch
-    /// what an in-use session talks to.
-    pub(crate) fn arm_setup_follow(&mut self, account: &str) {
-        self.setup_follow = SetupFollow::arm(
-            account,
-            self.attached_session_id.is_some(),
-            self.attached_account_slug.is_some(),
-        );
-    }
-
     /// Pick the wizard's highlighted provider (advancing to the name step)
     /// and pre-fill the account name with a suggestion, so the common case
     /// is a single Enter. The field stays editable for anyone who wants a
@@ -132,26 +118,6 @@ mod tests {
         app.ai_providers
             .set_accounts(vec![account("a", true), account("b", true)]);
         assert!(app.setup_progress().has_keyed_account);
-    }
-
-    #[test]
-    fn follow_is_armed_only_for_a_session_without_an_account() {
-        let mut app = App::new();
-        // No attached session: nothing to select the account into.
-        app.arm_setup_follow("anthropic");
-        assert_eq!(app.setup_follow, None);
-
-        app.attached_session_id = Some(1);
-        app.arm_setup_follow("anthropic");
-        assert_eq!(
-            app.setup_follow,
-            Some(SetupFollow::AwaitCredential("anthropic".to_string()))
-        );
-
-        // A session already using an account keeps it.
-        app.attached_account_slug = Some("openai".to_string());
-        app.arm_setup_follow("anthropic");
-        assert_eq!(app.setup_follow, None);
     }
 
     #[test]

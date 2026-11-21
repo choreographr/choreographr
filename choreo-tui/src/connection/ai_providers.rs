@@ -21,19 +21,24 @@ pub(super) fn handle_ai_providers_event(
     }
 }
 
+/// Select `name` as the account for the active session by starting the staged
+/// account/model/reasoning flow: nothing is written to the session until the
+/// model and its effort are chosen too, so this alone sends no selection.
+///
+/// An account the session already uses is a no-op — re-selecting it would throw
+/// away the model in use, and `Alt+M` is the way to change the model alone.
 fn select_account(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
     name: String,
 ) {
     let switching = app.attached_account_slug.as_deref() != Some(name.as_str());
-    if switching {
-        app.mandatory_model_selection = true;
-    }
     tracing::debug!(%name, switching, "selecting account for the active session");
-    app.pending
-        .send(client_tx, ClientMessageType::SetSessionAccount { name });
+    if !switching {
+        return;
+    }
     app.set_page(Page::Chat);
+    super::setup_flow::start(app, client_tx, name);
 }
 #[expect(clippy::unnecessary_wraps)]
 fn handle_ai_providers_list_key(
@@ -229,10 +234,9 @@ pub(super) fn handle_credential_modal_event(
             ) {
                 Ok(msg) => {
                     tracing::info!(account_name, "credential sent to daemon");
-                    // On a session with no account yet, carry the user on to
-                    // selecting this account and a model once the daemon
-                    // confirms the key (see `SetupFollow`).
-                    app.arm_setup_follow(&account_name);
+                    // On a session with no account yet, carry the user on to the
+                    // staged account/model/reasoning choice once the daemon
+                    // confirms the key (see `connection/setup_flow.rs`).
                     app.pending.send(client_tx, msg);
                     app.set_status(format!(
                         "[daemon] credential stored for account: {account_name}"

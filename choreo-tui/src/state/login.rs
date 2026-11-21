@@ -362,20 +362,20 @@ impl App {
             Some(LoginOutcome::Done { service, message }) => {
                 self.pending.send(client_tx, *message);
                 // Mirror the API-key add: a first-run session with no account
-                // follows through to select this account, then open the model
-                // picker, once the daemon confirms `CredentialAdded` — which an
-                // OAuth `AddCredential` emits exactly like an API-key one. An
-                // MCP sign-in's service is a credential key (`mcp:<slug>|…`),
-                // not an account, so it takes no follow-through: the daemon
-                // brings the server up itself once the grant is stored, and its
-                // tools land under the `mcp/<slug>` group.
+                // follows through once the daemon confirms `CredentialAdded` —
+                // which an OAuth `AddCredential` emits exactly like an API-key
+                // one — into the staged account/model/reasoning flow (see
+                // `connection/setup_flow.rs`). An MCP sign-in's service is a
+                // credential key (`mcp:<slug>|…`), not an account, so it takes
+                // no follow-through: the daemon brings the server up itself
+                // once the grant is stored, and its tools land under the
+                // `mcp/<slug>` group.
                 if service.starts_with("mcp:") {
                     let slug = target.unwrap_or(service);
                     self.set_status(format!(
                         "signed in MCP server {slug}; connecting — its tools appear under the mcp/{slug} group"
                     ));
                 } else {
-                    self.arm_setup_follow(&service);
                     self.set_status(format!("signed in {service}; storing credential…"));
                 }
                 self.set_login_modal(None);

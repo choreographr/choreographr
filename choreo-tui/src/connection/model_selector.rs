@@ -6,12 +6,17 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind
 /// Handle events while the model selector overlay is open (Chat page).
 ///
 /// Up/Down move the highlight, Enter selects the highlighted model and
-/// closes (sending `SetModel`), Esc dismisses without changing anything,
-/// PgUp/PgDn page the highlight, and every other key feeds the filter box.
-/// The mouse scroll wheel navigates like the arrows (pin-at-middle); a
-/// left-click on a list row selects it exactly like Enter, and a left-click
-/// on the filter row positions the input cursor.  Quit is handled via Alt+Q
-/// at the terminal-event level.
+/// closes, Esc dismisses without changing anything, PgUp/PgDn page the
+/// highlight, and every other key feeds the filter box.  The mouse scroll wheel
+/// navigates like the arrows (pin-at-middle); a left-click on a list row selects
+/// it exactly like Enter, and a left-click on the filter row positions the
+/// input cursor.  Quit is handled via Alt+Q at the terminal-event level.
+///
+/// Inside the staged account flow the same keys mean something different: the
+/// picker is choosing the model for an account that is not bound yet, so Enter
+/// (or a row click) only *stages* it — the session is written once, at the end
+/// of the flow, by `SetSessionChoice` — and Esc abandons the whole flow rather
+/// than just the popup.
 #[expect(clippy::unnecessary_wraps)]
 pub(super) fn handle_model_selector_event(
     event: &Event,
@@ -23,20 +28,28 @@ pub(super) fn handle_model_selector_event(
             if key.kind != KeyEventKind::Press {
                 return Ok(());
             }
-            // Esc dismisses the overlay without changing the model.
+            // Esc dismisses the overlay without changing the model. Inside the
+            // flow, dismissing the popup is the flow's own cancel: it closes
+            // what it opened, sends nothing and returns to the accounts page.
             if key.code == KeyCode::Esc {
+                if super::setup_flow::owns_model_picker(app) {
+                    super::setup_flow::cancel(app, client_tx);
+                    return Ok(());
+                }
                 tracing::debug!("[choreo-tui] model selector dismissed");
                 app.model_selector.close();
-                if app.mandatory_model_selection {
-                    app.set_page(crate::state::Page::AIProviders);
-                    app.pending.send(client_tx, ClientMessageType::ListAccounts);
-                }
                 return Ok(());
             }
             // Enter selects the highlighted model (if any) and closes.  An
             // empty filtered list (e.g. a filter with no matches) simply
             // closes.
             if key.code == KeyCode::Enter {
+                if super::setup_flow::owns_model_picker(app) {
+                    if let Some(model) = app.model_selector.highlighted() {
+                        super::setup_flow::model_chosen(app, client_tx, model);
+                    }
+                    return Ok(());
+                }
                 if let Some(model) = app.model_selector.submit() {
                     tracing::info!(%model, "model selector: selecting model");
                     app.pending
@@ -65,7 +78,7 @@ pub(super) fn handle_model_selector_event(
             // provider picker: wheel scrolls the highlight (1 row per notch,
             // same pin-at-middle behavior as the arrows), a click on a
             // visible list row selects it (like Enter), a click on the filter
-            // row positions the cursor, and clicks anywhere else (dimmed
+            // row positions the input cursor, and clicks anywhere else (dimmed
             // area, outside the popup) are no-ops.
             match mouse.kind {
                 MouseEventKind::ScrollDown => app.model_selector.move_down(),
@@ -108,6 +121,12 @@ pub(super) fn handle_model_selector_event(
                         // the clicked row and select it, exactly like
                         // Enter.
                         app.model_selector.focused = idx;
+                        if super::setup_flow::owns_model_picker(app) {
+                            if let Some(model) = app.model_selector.highlighted() {
+                                super::setup_flow::model_chosen(app, client_tx, model);
+                            }
+                            return Ok(());
+                        }
                         if let Some(model) = app.model_selector.submit() {
                             tracing::info!(%model, "model selector: selecting model");
                             app.pending

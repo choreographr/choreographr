@@ -100,10 +100,10 @@ fn cancel_login_when_none_is_open_is_a_noop() {
 }
 
 #[test]
-fn mcp_login_done_reports_the_slug_and_skips_setup_follow() {
+fn mcp_login_done_reports_the_slug_and_skips_setup() {
     let mut app = test_app();
-    // An attached session with no account: the PROVIDER branch would arm the
-    // first-run follow-through here, so its absence proves the MCP branch ran.
+    // An attached session with no account: the PROVIDER branch would start the
+    // staged setup flow here, so its absence proves the MCP branch ran.
     app.attached_session_id = Some(1);
     app.attached_account_slug = None;
     // The modal's `provider` is the human-facing slug; its `service` (the
@@ -141,14 +141,14 @@ fn mcp_login_done_reports_the_slug_and_skips_setup_follow() {
         !status.contains("abc123"),
         "key leaked into status: {status}"
     );
-    // The modal is closed and no first-run follow-through is armed (the daemon
+    // The modal is closed and no staged setup flow was started (the daemon
     // brings the server up itself once the grant is stored).
     assert!(app.login.is_none());
-    assert!(app.setup_follow.is_none());
+    assert!(app.setup_flow.is_none());
 }
 
 #[test]
-fn provider_login_done_arms_setup_follow_and_reports_the_account() {
+fn provider_login_done_reports_the_account_and_waits_for_the_daemon() {
     let mut app = test_app();
     app.attached_session_id = Some(1);
     app.attached_account_slug = None;
@@ -174,9 +174,10 @@ fn provider_login_done_arms_setup_follow_and_reports_the_account() {
         sent.inner,
         ClientMessageType::AddCredential { .. }
     ));
-    // The provider path arms the first-run follow-through and names the
-    // account (not a slug/tool group).
-    assert!(app.setup_follow.is_some());
+    // The provider path names the account (not a slug/tool group) and leaves
+    // the staged setup flow to the daemon's `CredentialAdded` confirmation: the
+    // flow must not start from a key that has not been accepted yet.
+    assert!(app.setup_flow.is_none());
     assert_eq!(app.status(), Some("signed in work; storing credential…"));
     assert!(app.login.is_none());
 }

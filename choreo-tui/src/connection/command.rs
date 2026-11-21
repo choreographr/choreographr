@@ -77,6 +77,15 @@ pub(super) fn open_model_selector(
     app: &mut App,
     client_tx: &crossbeam_channel::Sender<ClientMessage>,
 ) -> Result<(), ClientError> {
+    // A staged account choice owns the picker while it is in flight: it is
+    // choosing the model for an account the session is not bound to yet, so a
+    // second, independent list request would race it and could paint the
+    // attached account's models over the staged ones.
+    if app.setup_flow.is_some() {
+        tracing::debug!("[choreo-tui] model selector is busy with the staged account choice");
+        app.set_status("finish choosing the account's model and reasoning effort first");
+        return Ok(());
+    }
     // The model list is fetched through the session's account, so without
     // one the daemon can only answer with a credential error naming an empty
     // account. Say what is actually missing and how to fix it instead — with the

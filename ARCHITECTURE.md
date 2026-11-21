@@ -2026,6 +2026,26 @@ startup              connect→unbound?        /unlock [key]            AddCrede
   with a model its provider does not serve. A rejected choice leaves the session untouched and
   answers only the requester. The GUI and the typed `/model`/`/reasoning` commands keep using
   `SetSessionAccount`/`SetModel`/`SetReasoningEffort` individually.
+- The TUI binds an account through that atomic choice, staged rather than commit-first
+  (`state/setup_flow.rs`, driven from `connection/setup_flow.rs`). Choosing an account — Enter
+  on an `Alt+A` row, or the daemon confirming a credential for a session that has none — starts
+  a five-phase machine: `LoadingModels { account }` → `ChoosingModel { account, models }` →
+  `LoadingReasoning { account, model }` → `ChoosingReasoning { account, model, capability }` →
+  `Committing { account }`, where the first two hops are `ListModels`/`ModelReasoning` queries
+  about a *candidate* account and the only write is the terminal `SetSessionChoice`. Nothing is
+  therefore written until the account, the model and the effort are all known: Esc in the
+  picker or the effort dialog drops the flow, sends nothing and returns to the accounts page,
+  and a disconnect or session switch drops it silently, so no session can be left holding an
+  account without a model or a model without an effort. A model whose level set is empty skips
+  the dialog and commits `"off"`; every failure (`ModelsFailed`, `ModelsUnavailable`, a
+  rejected `SetSessionChoice`) ends the flow with the daemon's error on the status line. The
+  machine is a pure transition function of `(phase, event)` — the driver sends the messages and
+  opens the popups — so every rule is unit-tested without a daemon; `Models`/`ModelReasoning`
+  replies are routed to it by the phase that awaits them, and the effort dialog
+  (`state/reasoning_dialog.rs` + `render/reasoning_dialog.rs`) shows the choice instead of
+  applying one silently. Re-selecting the account a session already uses is a no-op, and the
+  mid-session paths (`Alt+M`, `Alt+R`, `/model`, `/reasoning`) still use the individual
+  commands.
 - There is no global "default account". Each session carries its own `account_name: Option<String>`
   field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
   This avoids a global mutable fallback and lets different sessions use different accounts.
@@ -3542,7 +3562,9 @@ extras — the OSC 9;4 progress bar, OSC 7501 program status, OSC 22 pointer
 shape — are silent when unsupported, so their absence never warrants advice.
 
 `state::terminal_notice::terminal_notice` (in `state/terminal_notice.rs`, split
-from the first-run setup glue that stays in `state/onboarding.rs`) is a **pure
+from the first-run setup glue that stays in `state/onboarding.rs`, whose
+message-handling half is the staged account flow's driver in
+`connection/setup_flow.rs`) is a **pure
 function over `&TerminalProfile`** (the same shape as the capability table), so
 every rule of the advice matrix is unit-tested from synthetic profiles: a `Direct` terminal with an asserted gap
 gets a headline naming that gap plus the terminals recommended for its platform

@@ -2,7 +2,8 @@
 //! follow the banner sections the monolithic file was already divided into.
 //!
 //! `format` holds the pure formatters (status line, token readouts and
-//! timestamp); `model_selector` covers the model-selection popup; `wizard`
+//! timestamp); `model_selector` covers the model-selection popup;
+//! `reasoning_dialog` covers the staged flow's effort dialog; `wizard`
 //! covers the account wizard and the credential modal; `session_list` covers
 //! the session-list table as one subject — its columns, the selected-row
 //! highlight, the three scroll/highlight sections and the archived/pin view;
@@ -13,6 +14,7 @@
 mod format;
 mod model_selector;
 mod palette;
+mod reasoning_dialog;
 mod session_list;
 mod sinks;
 mod tool_rows;

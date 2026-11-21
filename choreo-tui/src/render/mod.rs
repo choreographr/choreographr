@@ -8,8 +8,8 @@
 //! - [`status`] — the session-status vocabulary and the keystore-lock marker
 //! - [`format`] — timestamps and the cumulative-token readouts
 //! - the page submodules (`welcome`, `session_manager`, `ai_providers`,
-//!   `model_selector`, `command_palette`, `login`), each owning one screen or
-//!   overlay
+//!   `model_selector`, `reasoning_dialog`, `command_palette`, `login`), each
+//!   owning one screen or overlay
 //!
 //! What stays here is exactly the frame-level plumbing: the sink normalizer
 //! ([`display_text`]/[`display_text_owned`]), the [`BG_SHADE`] the history
@@ -112,6 +112,7 @@ mod image;
 mod login;
 mod model_selector;
 mod popup;
+mod reasoning_dialog;
 mod session_manager;
 mod status;
 mod style;
@@ -143,6 +144,7 @@ use self::command_palette::render_command_palette;
 use self::help::render_help;
 use self::login::render_login_modal;
 use self::model_selector::render_model_selector;
+use self::reasoning_dialog::render_reasoning_dialog;
 use self::session_manager::render_session_manager;
 use self::terminal_help::render_terminal_help;
 use self::welcome::render_welcome;
@@ -207,6 +209,13 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     // The model selector overlay draws on top of the Chat page content.
     if app.model_selector.is_open() {
         render_model_selector(frame, app);
+    }
+
+    // The staged account choice's reasoning dialog draws over the Chat page
+    // like the picker it follows (the two are never open together: the picker
+    // closes as the model is taken).
+    if app.reasoning_dialog.is_open() {
+        render_reasoning_dialog(frame, app);
     }
 
     // The inline command palette floats above the command input box on the

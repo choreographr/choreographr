@@ -3,17 +3,18 @@
 //! render model (height prefix-sum, markers, scroll, viewport, render cache),
 //! the streaming response auto-pin, the provider catalog, text-input machinery,
 //! page states, picker geometry, displayed-image fetch plumbing, the turn-event
-//! handlers, the model selector, the pointer-shape selection, and the session
-//! lifecycle live in sibling modules (`history`, `pin`, `providers`, `input`,
-//! `pages`, `pointer`, `model_selector`, `layout`, `images`, `turn`, `session`)
-//! and are re-exported here so the rest of the crate keeps referring to
-//! `crate::state::*` unchanged.
+//! handlers, the model selector, the staged account/model/reasoning flow and the
+//! reasoning dialog, the pointer-shape selection, and the session lifecycle live
+//! in sibling modules (`history`, `pin`, `providers`, `input`, `pages`,
+//! `pointer`, `model_selector`, `setup_flow`, `reasoning_dialog`, `layout`,
+//! `images`, `turn`, `session`) and are re-exported here so the rest of the
+//! crate keeps referring to `crate::state::*` unchanged.
 
 use crate::RenderedImage;
 use crate::image_worker::{ImageId, ImageJob};
 use crate::selection::TextSelection;
 use crate::terminal;
-use choreo_client_core::{PendingReplies, SessionView, SetupFollow};
+use choreo_client_core::{PendingReplies, SessionView};
 use choreo_proto::{ReasoningCapability, SessionStatus, TokenUsage, socket_path};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use std::collections::{HashMap, HashSet};
@@ -35,8 +36,10 @@ mod pages;
 mod pin;
 mod pointer;
 mod providers;
+mod reasoning_dialog;
 mod session;
 mod session_manager;
+mod setup_flow;
 mod streaming;
 mod subsession;
 mod terminal_advice;
@@ -72,8 +75,10 @@ pub(crate) use terminal_notice::{TerminalNotice, terminal_notice};
 // `pointer` declares only inherent `App` methods, so there is nothing to
 // re-export: its `mod` declaration above is the whole wiring.
 pub(crate) use providers::*;
+pub(crate) use reasoning_dialog::ReasoningDialogState;
 pub(crate) use session::*;
 pub(crate) use session_manager::*;
+pub(crate) use setup_flow::*;
 pub(crate) use streaming::StreamingResponseCache;
 pub(crate) use subsession::*;
 // The terminal advice tables are read by the welcome notice derivation
@@ -521,13 +526,14 @@ pub(crate) struct App {
     /// the socket path so tests (which bypass `run_app`) still have a valid
     /// value.
     pub(crate) connection_addr: String,
-    /// First-run follow-through in flight: the account whose API key was just
-    /// saved, to be selected for the attached session once the daemon
-    /// confirms the key, and then the model picker opened once the selection
-    /// lands. `None` outside that chain (see [`SetupFollow`]).
-    pub(crate) setup_follow: Option<SetupFollow>,
-    /// A switched account must complete model selection before chat resumes.
-    pub(crate) mandatory_model_selection: bool,
+    /// The staged account/model/reasoning choice in flight, if any. Nothing is
+    /// committed to the session until its last step, so an abandoned flow
+    /// leaves the session untouched (see [`SetupFlow`]). `None` outside it.
+    pub(crate) setup_flow: Option<SetupFlow>,
+    /// The reasoning-effort dialog the staged flow opens once a model is chosen
+    /// (see [`ReasoningDialogState`]). Closed whenever no flow is staging an
+    /// effort.
+    pub(crate) reasoning_dialog: ReasoningDialogState,
     /// The active OAuth login modal, when a `/login` flow is running. Holds the
     /// worker session; dropped (which cancels) when the flow ends or the user
     /// cancels.
@@ -640,8 +646,8 @@ impl App {
             session_displays: HashMap::new(),
             active_session_id: None,
             connection_addr: socket_path(),
-            setup_follow: None,
-            mandatory_model_selection: false,
+            setup_flow: None,
+            reasoning_dialog: ReasoningDialogState::new(),
             login: None,
             oauth_providers: Vec::new(),
             oauth_providers_fetched: false,
@@ -908,9 +914,6 @@ impl App {
     /// See [`Self::attached_is_busy`] for the idle signal every client-side
     /// guard shares.
     pub(crate) fn new_turn_rejection(&self) -> Option<&'static str> {
-        if self.mandatory_model_selection {
-            return Some("choose a model for the selected account before prompting.");
-        }
         // Idle guard: a new turn can only begin from an idle (`Inactive`)
         // session.  See `SessionStatus::is_idle` for why `Sleeping` counts as
         // busy too.  `None` (no status known yet) fails open.

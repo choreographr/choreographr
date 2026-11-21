@@ -6,11 +6,13 @@ use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEve
 // `connection.rs` is navigable; the entry points (`run_app`,
 // `handle_terminal_event`, `handle_ui_event`) dispatch into them via the
 // siblings below. Alongside the per-page handlers the split also carves out
-// three support siblings: `resume` (suspend/resume signal coordination plus
+// four support siblings: `resume` (suspend/resume signal coordination plus
 // the shutdown-notify probe), `terminal_event` (crossterm-event normalisation
-// and routing — kitty flags, paste, fullscreen, `UiEvent`), and `ui_loop`
-// (`run_app` and the `select!` event loop). The re-exports below keep the
-// existing `connection::*` paths resolving, and the per-page handlers are
+// and routing — kitty flags, paste, fullscreen, `UiEvent`), `setup_flow` (the
+// I/O driver for the staged account/model/reasoning choice, whose decision
+// core lives in `state/setup_flow.rs`), and `ui_loop` (`run_app` and the
+// `select!` event loop). The re-exports below keep the existing
+// `connection::*` paths resolving, and the per-page handlers are
 // `pub(super)` — visible to this module only — because nothing outside the
 // connection glue calls them.
 mod ai_providers;
@@ -20,6 +22,7 @@ mod daemon;
 mod model_selector;
 mod resume;
 mod session_manager;
+mod setup_flow;
 mod terminal_event;
 mod ui_loop;
 

@@ -33,15 +33,26 @@ fn ai_providers_enter_selects_account_and_returns_to_chat() {
     )
     .expect("handle enter");
 
-    // The view returns to the chat page and the highlighted account is sent
-    // as the account for the active (attached) session.
+    // The view returns to the chat page and the highlighted account is staged
+    // as the candidate for the active (attached) session: the flow asks for its
+    // models and writes nothing to the session yet.
     assert_eq!(app.page, Page::Chat);
+    assert_eq!(
+        app.setup_flow,
+        Some(SetupFlow::LoadingModels {
+            account: "personal-account".to_string()
+        })
+    );
     let msg = rx.recv().expect("sent message");
     assert_eq!(
         msg.inner,
-        ClientMessageType::SetSessionAccount {
-            name: "personal-account".to_string(),
+        ClientMessageType::ListModels {
+            account: Some("personal-account".to_string()),
         }
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "selecting an account sends nothing else"
     );
 }
 
@@ -110,11 +121,17 @@ fn ai_providers_list_click_selects_account_and_returns_to_chat() {
         Page::Chat,
         "clicking an account is equivalent to selecting it and pressing Enter"
     );
+    assert_eq!(
+        app.setup_flow,
+        Some(SetupFlow::LoadingModels {
+            account: "personal-account".to_string()
+        })
+    );
     let msg = rx.recv().expect("sent message");
     assert_eq!(
         msg.inner,
-        ClientMessageType::SetSessionAccount {
-            name: "personal-account".to_string(),
+        ClientMessageType::ListModels {
+            account: Some("personal-account".to_string()),
         }
     );
 }

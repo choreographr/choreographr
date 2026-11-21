@@ -306,6 +306,20 @@ impl ModelSelectorState {
         picker_window(self.scroll, self.focused, filtered.len(), height)
     }
 
+    /// Move the highlight onto `model` when the painted list contains it, so a
+    /// caller holding a suggestion can open the picker on that row.
+    ///
+    /// Focus only: unlike [`Self::apply_models`] it never marks the row active
+    /// — the `●` marker is the daemon's selection, and a staged choice has none
+    /// yet.
+    pub(crate) fn highlight(&mut self, model: &str) {
+        if let Some(idx) = self.filtered().iter().position(|id| *id == model) {
+            self.focused = idx;
+            self.scroll = idx;
+        }
+        self.clamp_focus();
+    }
+
     /// The highlighted model ID, if the filtered list is non-empty.
     pub(crate) fn highlighted(&self) -> Option<String> {
         self.filtered()

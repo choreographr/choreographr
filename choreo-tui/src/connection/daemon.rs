@@ -1,7 +1,6 @@
 use super::route_session_update;
 use crate::state::{App, Page, ProviderInfo, SPAWN_SUBSESSION_TOOL, merge_token_usage};
 use crate::terminal::progress;
-use choreo_client_core::SetupFollow;
 use choreo_client_core::{
     AutoBindAttempt, ClientError, Pending, PendingContext, attempt_keystore_auto_bind,
     dispatch_daemon_message, record_unlock_key,
@@ -177,12 +176,6 @@ pub(crate) fn handle_daemon_message(
             ..
         } => {
             app.set_error(format!("[daemon] {operation} failed: {error}"));
-            // A rejected account selection ends the first-run follow-through:
-            // the model picker will never open, and leaving the chain armed
-            // would only mis-fire on a later, unrelated `SessionAccountSet`.
-            if operation == "set_account" {
-                app.setup_follow = None;
-            }
             // If we're on the Session Manager page, also show the error
             // right on that page so the user has immediate feedback — for the
             // create flow and for the pin/archive flow (both of which are
@@ -243,21 +236,11 @@ pub(crate) fn handle_daemon_message(
             // per-daemon here; refresh the account list so the page reflects
             // the new credential's `has_credential` state.
             app.pending.send(client_tx, ClientMessageType::ListAccounts);
-            // First-run follow-through, first stage: the key for the account
-            // the user just set up is confirmed, and the attached session has
-            // no account yet — select it and return to the chat, so the user
-            // is not left to discover `/account <name>` on their own.
-            if app.setup_follow == Some(SetupFollow::AwaitCredential(service.clone())) {
-                tracing::info!(%service, "setup: selecting the new account for the session");
-                app.pending.send(
-                    client_tx,
-                    ClientMessageType::SetSessionAccount {
-                        name: service.clone(),
-                    },
-                );
-                app.setup_follow = Some(SetupFollow::AwaitAccountSet(service.clone()));
-                app.set_page(Page::Chat);
-            }
+            // First-run guidance: a key the daemon just confirmed for an
+            // accountless attached session starts the staged
+            // account/model/reasoning choice, so the user is not left to
+            // discover `/account <name>` on their own.
+            super::setup_flow::start_after_credential(app, client_tx, service.clone());
         }
         DaemonMessageType::CredentialRemoved { service } => {
             app.set_status(format!("[daemon] credential removed: {service}"));
@@ -401,9 +384,6 @@ pub(crate) fn handle_daemon_message(
             let reported = *session_id;
             if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.handle_model_selected(session_id, model, reasoning_capability.clone());
-                if app.attached_session_id == Some(session_id) {
-                    app.mandatory_model_selection = false;
-                }
             }) {
                 // Background session: the per-session display was already
                 // updated above; stop here so the generic dispatch's
@@ -444,9 +424,6 @@ pub(crate) fn handle_daemon_message(
                     "suppressing status feedback for background session's model selection failure",
                 );
                 return Ok(());
-            }
-            if app.mandatory_model_selection && *session_id == app.attached_session_id {
-                super::command::open_model_selector(app, client_tx)?;
             }
             // Attached session (or a targeted/connection-level reply): fall
             // through so the generic dispatch writes the `[daemon] failed
@@ -532,12 +509,6 @@ pub(crate) fn handle_daemon_message(
             let reported = *session_id;
             if !route_session_update(app, reported, message.id, |app, session_id| {
                 app.handle_session_account_set(session_id, account);
-                if app.attached_session_id == Some(session_id) && app.mandatory_model_selection {
-                    let display = app.display_for(session_id);
-                    display.selected_model = None;
-                    display.reasoning_effort = None;
-                    display.context_window = None;
-                }
             }) {
                 // Background session: the per-session display was already
                 // updated above; stop here so the generic dispatch's
@@ -550,18 +521,12 @@ pub(crate) fn handle_daemon_message(
                 );
                 return Ok(());
             }
-            // First-run follow-through, second stage: the account picked up
-            // from a just-saved key is now on the attached session, so open
-            // the model picker — the last step before the user can chat.
-            if *session_id == app.attached_session_id && app.mandatory_model_selection {
-                super::command::open_model_selector(app, client_tx)?;
-            }
-            if *session_id == app.attached_session_id
-                && app.setup_follow == Some(SetupFollow::AwaitAccountSet(account.clone()))
-            {
-                tracing::info!(%account, "setup: account selected, opening the model picker");
-                app.setup_follow = None;
-                super::command::open_model_selector(app, client_tx)?;
+            // The staged flow's own commit lands as this broadcast: it closes
+            // the popups and clears the flow (guarded on the account it
+            // staged). An account set by anything else leaves a flow in flight
+            // alone.
+            if *session_id == app.attached_session_id {
+                super::setup_flow::on_account_set(app, client_tx, account);
             }
             // Attached session (or a targeted/connection-level reply): fall
             // through so the user's own `/account` command still prints
@@ -614,7 +579,7 @@ pub(crate) fn handle_daemon_message(
         DaemonMessageType::Models {
             models,
             selected_model,
-            suggested_model: _,
+            suggested_model,
             provisional,
         } => {
             // A `Models` reply that resolved a pending `ListModels` slot is the
@@ -624,6 +589,25 @@ pub(crate) fn handle_daemon_message(
             // the request id replaces the old "is the selector open?" guess:
             // the requester is known structurally.
             if is_list_models_reply(resolved.as_ref()) {
+                // While the staged flow awaits its list, the reply is the
+                // flow's: the account it names is a candidate the session is
+                // not bound to, so the popup is opened from the flow's staged
+                // list rather than from the attached session's selection.
+                if super::setup_flow::is_awaiting_models(app) {
+                    tracing::debug!(
+                        count = models.len(),
+                        provisional,
+                        "staged setup: received the candidate account's model list"
+                    );
+                    super::setup_flow::on_models(
+                        app,
+                        client_tx,
+                        models.clone(),
+                        suggested_model.clone(),
+                        *provisional,
+                    );
+                    return Ok(());
+                }
                 // Prefer the daemon's reported selection, falling back to the
                 // display's cached model when it is absent.
                 let selected = selected_model.clone().or_else(|| {
@@ -644,8 +628,32 @@ pub(crate) fn handle_daemon_message(
             // dispatch_daemon_message so `/model` keeps printing the list into
             // the chat history.
         }
+        DaemonMessageType::ModelReasoning {
+            capability,
+            suggested_effort,
+        } => {
+            // The staged flow is the only requester of this query, so a reply
+            // arriving while it awaits one is its own; anything else has no
+            // surface to land on. No early return: the generic dispatch below
+            // has no text for this reply either, it just logs its kind.
+            if super::setup_flow::is_awaiting_reasoning(app) {
+                super::setup_flow::on_reasoned(
+                    app,
+                    client_tx,
+                    capability.clone(),
+                    suggested_effort.clone(),
+                );
+            }
+        }
         DaemonMessageType::ModelsFailed { error } => {
             if is_list_models_reply(resolved.as_ref()) {
+                // The flow's own request was refused: end it and surface the
+                // refusal where the user is looking. The session is untouched —
+                // nothing has been written yet.
+                if super::setup_flow::is_awaiting_models(app) {
+                    super::setup_flow::fail(app, client_tx, error);
+                    return Ok(());
+                }
                 tracing::warn!(
                     error_len = error.len(),
                     "model selector: failed to list models"
@@ -792,6 +800,16 @@ pub(crate) fn handle_daemon_message(
             return Ok(());
         }
         // ── Connection-level termination ─────────────────────────────
+        // A rejected atomic commit: the staged flow's one write did not land, so
+        // the flow ends here with the popups closed and the session untouched
+        // (no step before it wrote anything). No early return — the generic
+        // dispatch below prints the daemon's own error on the status line.
+        DaemonMessageType::Failed {
+            kind: MessageKind::SetSessionChoice,
+            error,
+        } => {
+            super::setup_flow::fail(app, client_tx, error);
+        }
         // The daemon is going away (graceful shutdown) or has evicted this
         // client for lagging. In both cases the writer closes the socket
         // right after the message, so the TUI must stop and tell the user
@@ -864,9 +882,6 @@ pub(crate) fn handle_daemon_message(
         // in-flight key, leave the store alone.
         DaemonMessageType::CredentialAddFailed { .. } => {
             discard_rejected_unlock_key(app, &mut resolved);
-            // A rejected key ends the first-run follow-through: selecting an
-            // account the daemon cannot use would only add a second error.
-            app.setup_follow = None;
         }
         // Verify-only operation against a daemon whose keystore has NO
         // binding yet (either the subscribe-time lock-state push or the reply
@@ -972,24 +987,14 @@ pub(crate) fn handle_daemon_message(
             return Ok(());
         }
         DaemonMessageType::ModelsUpdated { account, models } => {
-            // A background model-list fetch finished. If the picker is open
-            // for the attached session's account, swap its list in place:
-            // this replaces the instant catalog seed (or the empty "fetching…"
-            // waiting row) with the live list, so newly-available models appear
-            // without the user reopening the picker. Ignore other accounts —
-            // the picker is scoped to the attached session only.
-            let attached = app.attached_account_slug.as_deref();
-            if app.model_selector.is_open() && attached == Some(account.as_str()) {
-                tracing::debug!(
-                    count = models.len(),
-                    "model selector: list refreshed by background fetch"
-                );
-                // `refresh_models`, NOT `apply_models`: this replaces a list the
-                // user may already be navigating, so it keeps the highlighted
-                // row's model (and the scroll window) instead of re-deriving the
-                // cursor from the active model. It also ends the waiting row.
-                app.model_selector.refresh_models(models.clone());
-            }
+            // A background model-list fetch finished. Whichever surface is
+            // showing that account's list swaps it in place — the staged flow's
+            // picker (and the list the flow holds, so a model the live fetch
+            // added is choosable at once) or the standalone `Alt+M` picker. This
+            // replaces the instant catalog seed (or the empty "fetching…" waiting
+            // row) with the live list, without the user reopening anything.
+            // Another account's list is none of either surface's business.
+            super::setup_flow::on_models_updated(app, client_tx, account, models.clone());
             // Never falls through to the generic dispatch (nothing to render).
             return Ok(());
         }
@@ -997,9 +1002,16 @@ pub(crate) fn handle_daemon_message(
             // The fetch that an empty provisional `Models` reply announced can
             // fail. Announcing it here is what ends the waiting row: the picker
             // shows the provider's error inline (`apply_error`) instead of a
-            // "fetching…" row that could never end. Same account guard as
-            // `ModelsUpdated` — the picker is scoped to the attached session,
-            // and another account's failed fetch is none of its business.
+            // "fetching…" row that could never end.
+            //
+            // Inside the staged flow it ends the flow instead: the candidate
+            // account's list never arrived, so there is nothing to choose from
+            // and nothing was committed — the error goes to the status line and
+            // the popups close.
+            if super::setup_flow::is_staging(app, account) {
+                super::setup_flow::fail(app, client_tx, error);
+                return Ok(());
+            }
             let attached = app.attached_account_slug.as_deref();
             if app.model_selector.is_open() && attached == Some(account.as_str()) {
                 tracing::warn!(

@@ -47,6 +47,21 @@ impl PopupSize {
         max_w: 100,
         max_h: 40,
     };
+
+    /// The sizing of a small no-filter dialog (the staged flow's reasoning
+    /// dialog): a narrow box. Only its width is used — a dialog's height comes
+    /// from its content ([`dialog_layout`]), because a three-row ladder drawn
+    /// as a fixed fraction of the screen would be mostly empty box.
+    pub(crate) const DIALOG: PopupSize = PopupSize {
+        w_num: 2,
+        w_den: 5,
+        h_num: 1,
+        h_den: 3,
+        min_w: 28,
+        min_h: 4,
+        max_w: 56,
+        max_h: 12,
+    };
 }
 
 /// Compute a centered popup rect for a modal overlay from a [`PopupSize`].
@@ -161,6 +176,52 @@ pub(crate) fn selector_list_layout(area: Rect) -> SelectorLayout {
         filter_row: chunks.first().copied().unwrap_or_default(),
         body: chunks.get(1).copied().unwrap_or_default(),
         footer: chunks.get(2).copied().unwrap_or_default(),
+    }
+}
+
+/// The two vertical bands of a small dialog: the content row band and the
+/// footer hint row, inside a bordered, content-sized popup.
+///
+/// Deliberately not a [`SelectorLayout`]: those popups are list *pickers* with a
+/// filter row, and a three-to-five row effort ladder has nothing to filter.
+/// Forcing the third band on it would spend a row on an empty filter and put a
+/// cursor where nothing is typed.
+pub(crate) struct DialogLayout {
+    pub(crate) popup: Rect,
+    pub(crate) body: Rect,
+    pub(crate) footer: Rect,
+}
+
+/// Compute a small dialog's geometry over `area` (the terminal frame): a
+/// centered box as wide as [`PopupSize::DIALOG`] says, but only `body_rows`
+/// content rows plus a border and a footer tall — clamped to what the terminal
+/// can actually show.  The renderer draws into exactly these bands, so a
+/// content-sized dialog can never claim rows it does not draw.
+pub(crate) fn dialog_layout(area: Rect, body_rows: u16) -> DialogLayout {
+    let sized = centered_popup(area, PopupSize::DIALOG);
+    // `body_rows + 2` borders + 1 footer row, never taller than the screen
+    // allows (the `.max(3)` keeps room for the borders and the footer when the
+    // terminal is tiny).
+    let height = body_rows
+        .saturating_add(3)
+        .min(area.height.saturating_sub(2).max(3));
+    let popup = Rect {
+        x: sized.x,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width: sized.width.min(area.width).max(1),
+        height,
+    };
+    // The bordered block shrinks the inner area by one cell on every side,
+    // exactly like the renderer's `Block::borders(Borders::ALL).inner(popup)`.
+    let inner = Block::default().borders(Borders::ALL).inner(popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    DialogLayout {
+        popup,
+        body: chunks.first().copied().unwrap_or_default(),
+        footer: chunks.get(1).copied().unwrap_or_default(),
     }
 }
 
@@ -836,5 +897,53 @@ mod tests {
             ),
             None
         );
+    }
+
+    // ── dialog_layout (small no-filter modal) ────────────────────────────
+
+    #[test]
+    fn dialog_layout_sizes_the_box_to_its_content() {
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let layout = dialog_layout(area, 4);
+        // Four content rows + two borders + the footer row.
+        assert_eq!(layout.popup.height, 7);
+        assert_eq!(
+            layout.body.height, 4,
+            "the body band is exactly the content rows"
+        );
+        assert_eq!(layout.footer.height, 1);
+        // Both bands sit inside the bordered box and inside the screen.
+        for band in [layout.body, layout.footer] {
+            assert!(band.x > layout.popup.x);
+            assert!(band.x + band.width < layout.popup.x + layout.popup.width);
+            assert!(band.y > layout.popup.y);
+            assert!(band.y + band.height < layout.popup.y + layout.popup.height);
+        }
+        // Centered vertically (integer division, so a 7-row box on 40 rows
+        // sits at row 16 with one row more below than above).
+        assert_eq!(layout.popup.y, (area.height - layout.popup.height) / 2);
+    }
+
+    #[test]
+    fn dialog_layout_cannot_outgrow_a_tiny_terminal() {
+        // A ladder longer than the screen, on a screen too small for it: the
+        // box clamps to the area (never taller than `height - 2`) and the bands
+        // stay inside it, so nothing is drawn off-screen.
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 8,
+        };
+        let layout = dialog_layout(area, 20);
+        assert_eq!(layout.popup.height, 6);
+        assert_eq!(layout.popup.width, 26, "never wider than the screen allows");
+        assert!(layout.body.height >= 1);
+        assert_eq!(layout.footer.height, 1);
     }
 }

@@ -10,7 +10,7 @@
 //! modules this dispatches to; the UI loop itself lives in the sibling
 //! `ui_loop` module.
 
-use crate::state::{AccountWizardStep, App, Page, UiEvent};
+use crate::state::{AccountWizardStep, App, Page, SetupFlow, UiEvent};
 use choreo_client_core::ClientError;
 use choreo_proto::ClientMessage;
 use crossterm::event::{
@@ -261,6 +261,14 @@ pub(crate) fn handle_terminal_event(
         }
         return Ok(());
     }
+    // The staged flow's reasoning dialog is the last step of the account
+    // choice: it swallows every key (Up/Down/Enter) while it is open, and Esc
+    // abandons the whole flow — see `connection/setup_flow.rs`.  Alt+Q is
+    // handled above so the user can always quit while it is open.
+    if app.reasoning_dialog.is_open() {
+        super::setup_flow::handle_dialog_event(&event, app, client_tx);
+        return Ok(());
+    }
     // The model selector overlay (Chat page) also takes priority over page
     // content, mirroring the fullscreen guard above.  Alt+Q is handled
     // before this point so the user can always quit while it is open.
@@ -356,6 +364,22 @@ pub(crate) fn handle_terminal_event(
     }
     if app.ai_providers.polkadot_import.is_open() {
         handle_polkadot_import_event(&event, app, client_tx);
+        return Ok(());
+    }
+    // Esc anywhere else in the staged choice abandons it too. While a query is
+    // in flight no popup is up yet, so the key would otherwise fall through to
+    // the page underneath (where a bare Esc on the Chat page cancels the
+    // session's turn). Only the two waiting phases are covered: once the choice
+    // is being committed the write is already on the wire and there is nothing
+    // to take back.
+    if matches!(
+        app.setup_flow,
+        Some(SetupFlow::LoadingModels { .. } | SetupFlow::LoadingReasoning { .. })
+    ) && let Event::Key(key) = &event
+        && key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Esc
+    {
+        super::setup_flow::cancel(app, client_tx);
         return Ok(());
     }
     match app.page {
@@ -535,6 +559,10 @@ pub(super) fn handle_ui_event(
         }
         UiEvent::ReaderClosed => {
             app.should_quit = true;
+            // A staged account choice is waiting on a daemon that just went
+            // away; nothing of it was committed, so drop it rather than leave a
+            // popup or a phase behind.
+            super::setup_flow::abandon(app);
             // If the daemon already told us why (ShuttingDown / Evicted),
             // keep that message; a bare EOF means the daemon went away
             // without an advisory (crash, restart, or the socket closed).
