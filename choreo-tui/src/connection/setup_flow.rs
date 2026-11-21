@@ -170,8 +170,9 @@ pub(super) fn start(
         return;
     }
     tracing::info!(%account, "staged setup: staging an account choice");
-    // The key was saved from the accounts page; the choice that follows is the
-    // chat's setup, so show the chat the popups overlay.
+    // The choice opens the picker and then the effort dialog, which are drawn
+    // over the Chat page, so bring the chat up whichever page the choice was
+    // started from (the accounts page, or the credential reply's follow-through).
     app.set_page(Page::Chat);
     apply(app, client_tx, SetupFlow::begin(account));
 }
