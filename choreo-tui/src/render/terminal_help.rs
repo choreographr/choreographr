@@ -16,11 +16,11 @@
 use super::popup::render_reference_popup;
 use super::style::{dim_style, heading_style};
 use crate::state::{
-    PopupSize, gap_phrases, hosted_pane_sentence, join_phrases, option_key_setting,
-    recommendations, screen_sentence, tmux_lines,
+    PopupSize, alt_chord_label, gap_phrases, hosted_pane_sentence, join_phrases,
+    option_key_setting, recommendations, screen_sentence, tmux_lines,
 };
 use crate::terminal::profile::{
-    Capabilities, Host, Mux, NativeImages, TerminalKind, TerminalProfile,
+    Capabilities, Host, Mux, NativeImages, Platform, TerminalKind, TerminalProfile,
 };
 use ratatui::{
     Frame,
@@ -317,8 +317,12 @@ pub(super) fn terminal_page_lines(profile: &TerminalProfile) -> Vec<Line<'static
     }
     lines.extend(fix_lines(profile));
     lines.push(Line::default());
+    // The chord is spelled for this platform, like every other user-facing one.
     lines.push(Line::from(Span::styled(
-        "Esc or Alt+T to close",
+        format!(
+            "Esc or {} to close",
+            alt_chord_label(Platform::current(), "T")
+        ),
         dim_style(),
     )));
     lines
@@ -596,7 +600,11 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         });
-        assert_eq!(last.as_deref(), Some("Esc or Alt+T to close"));
+        let expected = format!(
+            "Esc or {} to close",
+            alt_chord_label(Platform::current(), "T")
+        );
+        assert_eq!(last.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

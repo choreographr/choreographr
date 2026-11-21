@@ -713,10 +713,12 @@ impl App {
         self.quit_message.get()
     }
 
-    /// The key that opens the model selector — `Alt+M` on every terminal now
-    /// that commands live on `Alt+` chords.  Used by hint and status strings.
-    pub(crate) fn model_selector_label() -> &'static str {
-        "Alt+M"
+    /// The chord that opens the model selector, spelled for this platform —
+    /// `Alt+M` on a keyboard that carries an Alt key, `⌥M` on a Mac, where the
+    /// key is Option.  Used by hint and status strings, so it delegates to
+    /// [`alt_chord_label`] rather than carrying a spelling of its own.
+    pub(crate) fn model_selector_label() -> String {
+        alt_chord_label(crate::terminal::profile::Platform::current(), "M")
     }
 
     pub(crate) fn display_for(&mut self, session_id: u64) -> &mut SessionDisplayState {

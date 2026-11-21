@@ -12,7 +12,8 @@
 //! accounts page, cycle or list reasoning effort) live alongside the daemon
 //! sends so a shortcut and its typed spelling always share one implementation.
 
-use crate::state::{App, Page};
+use crate::state::{App, Page, alt_chord_label};
+use crate::terminal::profile::Platform;
 use crate::{Command, parse_input_line};
 use choreo_client_core::{
     ClientError, McpCommand, PendingContext, build_add_credential_message, command_echo,
@@ -78,12 +79,14 @@ pub(super) fn open_model_selector(
 ) -> Result<(), ClientError> {
     // The model list is fetched through the session's account, so without
     // one the daemon can only answer with a credential error naming an empty
-    // account. Say what is actually missing and how to fix it instead.
+    // account. Say what is actually missing and how to fix it instead — with the
+    // account chord spelled the way this platform's keyboard spells it.
     if app.attached_session_id.is_some() && app.attached_account_slug.is_none() {
         tracing::debug!("[choreo-tui] model selector needs an account first");
-        app.set_error(
-            "choose an account first — press alt+a to add one or pick one with Enter".to_string(),
-        );
+        app.set_error(format!(
+            "choose an account first — press {} to add one or pick one with Enter",
+            alt_chord_label(Platform::current(), "A")
+        ));
         return Ok(());
     }
     tracing::debug!("[choreo-tui] opening model selector");

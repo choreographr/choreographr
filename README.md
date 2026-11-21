@@ -502,6 +502,10 @@ composes to no printable character. The setting, per terminal:
 | iTerm2 | Profiles → Keys → Left/Right Option Key = **Esc+** |
 | Terminal.app | Profiles → Keyboard → **Use Option as Meta key** |
 
+The client spells that modifier the way the keyboard labels it, so on macOS
+every chord it prints carries the Option glyph — the model selector is `⌥M`,
+not `Alt+M` — while every other platform keeps `Alt+`.
+
 #### tmux and other multiplexers
 
 Under tmux, two settings let the client's features reach the pane. Put them in

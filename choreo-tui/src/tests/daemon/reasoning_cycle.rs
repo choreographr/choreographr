@@ -1,4 +1,5 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
+use crate::state::App;
 use crate::tests::support::{make_session_full, test_app};
 use choreo_proto::{
     ClientMessageType, DaemonMessage, DaemonMessageType, ReasoningCapability, SessionEvent,
@@ -158,10 +159,11 @@ fn ctrl_r_no_model_selected_shows_message() {
     )
     .expect("handle alt+r");
 
-    assert_eq!(
-        app.status(),
-        Some("no model selected — pick one with Alt+M")
+    let expected = format!(
+        "no model selected — pick one with {}",
+        App::model_selector_label()
     );
+    assert_eq!(app.status(), Some(expected.as_str()));
     // Effort should remain unchanged (still None) and nothing is sent to
     // the daemon (no cycling, so no SetReasoningEffort).
     assert!(app.display_for(0).reasoning_effort.is_none());

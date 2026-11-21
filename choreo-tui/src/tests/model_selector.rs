@@ -69,9 +69,14 @@ fn ctrl_m_does_not_open_selector() {
 }
 
 #[test]
-fn model_selector_label_is_alt_m() {
-    // `Alt+M` works on every terminal.
-    assert_eq!(App::model_selector_label(), "Alt+M");
+fn model_selector_label_is_spelled_for_this_platform() {
+    // `Alt+M` on a keyboard with an Alt key, `⌥M` on a Mac: the spelling comes
+    // from the shared chord helper, so this pins the wiring rather than a
+    // particular platform's glyph (`state::keymap` table-tests both).
+    assert_eq!(
+        App::model_selector_label(),
+        crate::state::alt_chord_label(crate::terminal::profile::Platform::current(), "M")
+    );
 }
 
 #[test]

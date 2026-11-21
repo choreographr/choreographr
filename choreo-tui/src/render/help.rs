@@ -177,7 +177,8 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         });
-        assert_eq!(last.as_deref(), Some("Esc or Alt+H to close"));
+        let expected = format!("Esc or {} to close", shortcut("help"));
+        assert_eq!(last.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

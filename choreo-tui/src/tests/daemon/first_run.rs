@@ -1,5 +1,6 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
+use crate::terminal::profile::Platform;
 use crate::tests::support::test_app;
 use choreo_client_core::SetupFollow;
 use choreo_proto::{ClientMessageType, DaemonMessage, DaemonMessageType, SessionEvent};
@@ -182,7 +183,11 @@ fn model_picker_without_an_account_explains_what_is_missing() {
     .expect("handle Alt+M");
 
     assert!(!app.model_selector.is_open());
-    assert!(app.error().is_some_and(|e| e.contains("alt+a")));
+    let account_chord = alt_chord_label(Platform::current(), "A");
+    assert!(
+        app.error().is_some_and(|e| e.contains(&account_chord)),
+        "the message names the accounts chord this platform spells"
+    );
     assert!(
         !sent(&rx)
             .iter()

@@ -27,8 +27,16 @@
 //! and its typed `/command` spelling can never drift.  `quit` is listed for
 //! DISPLAY only (it stays the global pre-dispatch special case in
 //! `connection/mod.rs`, so it quits from any page or open modal).
+//!
+//! **A label is spelled for the platform.**  The modifier a macOS keyboard
+//! labels Option (`⌥`) is the same one every other platform labels Alt, so
+//! [`alt_chord_label`] decides that spelling once and every user-facing chord —
+//! the table's labels, the hint strings, the model selector's name — renders
+//! through it.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+use crate::terminal::profile::Platform;
 
 /// A single logical key within a [`Chord`].
 ///
@@ -89,19 +97,42 @@ impl Chord {
     }
 
     /// Human-facing label, e.g. `"Alt+Enter"`, `"Alt+Shift+R"`.
-    fn label(self) -> String {
+    ///
+    /// The `Alt` segment goes through [`alt_chord_label`], so a macOS surface
+    /// reads `⌥` where every other platform reads `Alt`.  Rendering just the
+    /// prefix and appending the rest keeps a modifier combination intact: a
+    /// `Ctrl`+`Alt` chord reads `Ctrl+⌥M` on macOS and `Ctrl+Alt+M` elsewhere,
+    /// in one fixed modifier order.
+    fn label(self, platform: Platform) -> String {
         let mut label = String::new();
         if self.ctrl {
             label.push_str("Ctrl+");
         }
         if self.alt {
-            label.push_str("Alt+");
+            // An empty key renders the bare modifier: `Alt+` or `⌥`.
+            label.push_str(&alt_chord_label(platform, ""));
         }
         if self.shift {
             label.push_str("Shift+");
         }
         label.push_str(&key_label(self.key));
         label
+    }
+}
+
+/// Render one `Alt+<key>` chord for `platform`: macOS spells the modifier
+/// with the glyph its keyboards carry, every other platform spells it "Alt".
+///
+/// Every command lives on an `Alt+<key>` chord, but a Mac keyboard has no key
+/// labelled "alt" — the key is Option, printed `⌥` — so a macOS user reading
+/// "Alt+M" has to translate a label their keyboard does not carry.  This is the
+/// one place that spelling is decided: the chord labels, the hint strings, and
+/// the model-selector name all route through it, so the client cannot print two
+/// spellings of the same key.
+pub(crate) fn alt_chord_label(platform: Platform, key: &str) -> String {
+    match platform {
+        Platform::MacOs => format!("⌥{key}"),
+        Platform::Linux | Platform::Windows | Platform::Android => format!("Alt+{key}"),
     }
 }
 
@@ -196,13 +227,13 @@ pub(crate) fn binding_for(event: &KeyEvent) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// The display label for a command's shortcut.  `None` when the command has no
-/// shortcut.
+/// The display label for a command's shortcut, spelled for this platform (see
+/// [`alt_chord_label`]).  `None` when the command has no shortcut.
 pub(crate) fn shortcut_label_for(name: &str) -> Option<String> {
     SHORTCUTS
         .iter()
         .find(|(_, n)| *n == name)
-        .map(|(chord, _)| chord.label())
+        .map(|(chord, _)| chord.label(Platform::current()))
 }
 
 #[cfg(test)]
@@ -236,11 +267,16 @@ mod tests {
     /// The label the Help page and palette render for the shifted chord.
     #[test]
     fn shifted_chord_label_reads_as_alt_shift() {
+        let expected = format!("{}Shift+R", alt_chord_label(Platform::current(), ""));
         assert_eq!(
             shortcut_label_for("reasoning-toggle").as_deref(),
-            Some("Alt+Shift+R")
+            Some(expected.as_str())
         );
-        assert_eq!(shortcut_label_for("reasoning").as_deref(), Some("Alt+R"));
+        let expected = alt_chord_label(Platform::current(), "R");
+        assert_eq!(
+            shortcut_label_for("reasoning").as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]
@@ -302,13 +338,70 @@ mod tests {
 
     #[test]
     fn shortcut_labels_render_the_alt_chords() {
-        assert_eq!(shortcut_label_for("model").as_deref(), Some("Alt+M"));
-        assert_eq!(shortcut_label_for("continue").as_deref(), Some("Alt+Enter"));
-        assert_eq!(shortcut_label_for("undo").as_deref(), Some("Alt+↑"));
-        assert_eq!(shortcut_label_for("redo").as_deref(), Some("Alt+↓"));
-        assert_eq!(shortcut_label_for("quit").as_deref(), Some("Alt+Q"));
-        assert_eq!(shortcut_label_for("terminal").as_deref(), Some("Alt+T"));
-        assert_eq!(shortcut_label_for("help").as_deref(), Some("Alt+H"));
+        // The modifier is spelled for this host, so the expectation is built
+        // through the same helper the labels use: the table's key is what these
+        // assertions pin, the spelling is the platform's (see
+        // `alt_chord_labels_spell_the_modifier_for_the_platform`).
+        let alt = |key: &str| alt_chord_label(Platform::current(), key);
+        assert_eq!(
+            shortcut_label_for("model").as_deref(),
+            Some(alt("M").as_str())
+        );
+        assert_eq!(
+            shortcut_label_for("continue").as_deref(),
+            Some(alt("Enter").as_str())
+        );
+        assert_eq!(
+            shortcut_label_for("undo").as_deref(),
+            Some(alt("↑").as_str())
+        );
+        assert_eq!(
+            shortcut_label_for("redo").as_deref(),
+            Some(alt("↓").as_str())
+        );
+        assert_eq!(
+            shortcut_label_for("quit").as_deref(),
+            Some(alt("Q").as_str())
+        );
+        assert_eq!(
+            shortcut_label_for("terminal").as_deref(),
+            Some(alt("T").as_str())
+        );
+        assert_eq!(
+            shortcut_label_for("help").as_deref(),
+            Some(alt("H").as_str())
+        );
         assert_eq!(shortcut_label_for("nope"), None);
+    }
+
+    /// The modifier's spelling is the platform's, decided in one place: macOS
+    /// reads the glyph its keyboards carry, every other platform reads "Alt".
+    #[test]
+    fn alt_chord_labels_spell_the_modifier_for_the_platform() {
+        // (platform, bare alt chord, Ctrl+Alt chord, Alt+Shift chord)
+        let cases = [
+            (Platform::MacOs, "⌥M", "Ctrl+⌥M", "⌥Shift+R"),
+            (Platform::Linux, "Alt+M", "Ctrl+Alt+M", "Alt+Shift+R"),
+        ];
+        for (platform, alt_m, ctrl_alt_m, alt_shift_r) in cases {
+            assert_eq!(alt_chord_label(platform, "M"), alt_m, "{platform}");
+            assert_eq!(
+                Chord::alt(Key::Char('m')).label(platform),
+                alt_m,
+                "{platform}"
+            );
+            // A combination keeps one modifier order, with the Alt segment
+            // spelled as the platform spells it.
+            let ctrl_alt = Chord {
+                ctrl: true,
+                ..Chord::alt(Key::Char('m'))
+            };
+            assert_eq!(ctrl_alt.label(platform), ctrl_alt_m, "{platform}");
+            assert_eq!(
+                Chord::alt_shift(Key::Char('r')).label(platform),
+                alt_shift_r,
+                "{platform}"
+            );
+        }
     }
 }
