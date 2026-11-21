@@ -13,7 +13,6 @@
 //! sends so a shortcut and its typed spelling always share one implementation.
 
 use crate::state::{App, Page, alt_chord_label};
-use crate::terminal::profile::Platform;
 use crate::{Command, parse_input_line};
 use choreo_client_core::{
     ClientError, McpCommand, PendingContext, build_add_credential_message, command_echo,
@@ -89,12 +88,12 @@ pub(super) fn open_model_selector(
     // The model list is fetched through the session's account, so without
     // one the daemon can only answer with a credential error naming an empty
     // account. Say what is actually missing and how to fix it instead — with the
-    // account chord spelled the way this platform's keyboard spells it.
+    // account chord spelled the way this client's detected platform spells it.
     if app.attached_session_id.is_some() && app.attached_account_slug.is_none() {
         tracing::debug!("[choreo-tui] model selector needs an account first");
         app.set_error(format!(
             "choose an account first — press {} to add one or pick one with Enter",
-            alt_chord_label(Platform::current(), "A")
+            alt_chord_label(app.platform(), "A")
         ));
         return Ok(());
     }
@@ -213,7 +212,7 @@ fn cycle_reasoning(
         None => {
             app.set_status(format!(
                 "no model selected — pick one with {}",
-                App::model_selector_label()
+                app.model_selector_label()
             ));
             tracing::warn!(
                 session_id = ?app.attached_session_id,
@@ -256,7 +255,7 @@ fn reasoning_list(app: &mut App) {
         None => {
             app.set_status(format!(
                 "no model selected — pick one with {}",
-                App::model_selector_label()
+                app.model_selector_label()
             ));
         }
     }

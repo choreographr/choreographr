@@ -50,3 +50,24 @@ fn render_reasoning_dialog_survives_an_empty_ladder() {
     assert!(content.contains("Reasoning Effort"));
     assert!(content.contains("No effort levels"));
 }
+
+#[test]
+fn render_reasoning_dialog_with_an_empty_ladder_draws_no_rows() {
+    use crate::tests::support::test_app;
+
+    // The empty-ladder branch is one explanatory line and nothing else: no
+    // focus marker, no suggestion marker, and no footer hint advertising a
+    // selection there is nothing to select.
+    let mut app = test_app();
+    app.reasoning_dialog.open(Vec::new(), None);
+    let content = drawn_cells(&mut app, 80, 24);
+    assert!(
+        !content.contains('>'),
+        "no row is marked as focused:\n{content}"
+    );
+    assert!(!content.contains("(suggested)"), "nothing to suggest");
+    assert!(
+        !content.contains("enter select"),
+        "no footer hint for a ladder that is not drawn"
+    );
+}

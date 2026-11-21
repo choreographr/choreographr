@@ -23,6 +23,7 @@
 use super::popup::render_reference_popup;
 use super::style::{dim_style, heading_style};
 use crate::state::{App, PopupSize, shortcut_label_for};
+use crate::terminal::profile::Platform;
 use ratatui::{
     Frame,
     style::{Color, Style},
@@ -43,8 +44,11 @@ fn key_style() -> Style {
 /// The display label for a command from the shortcut table — the same string the
 /// command palette shows — or the command name itself if it has no binding (a
 /// programming miss, but it keeps the page rendering rather than panicking).
-fn shortcut(command: &str) -> String {
-    shortcut_label_for(command).unwrap_or_else(|| command.to_string())
+///
+/// `platform` is the client's detected one (`App::platform`), threaded down so
+/// the labels and the page's chord spelling come from one runtime source.
+fn shortcut(command: &str, platform: Platform) -> String {
+    shortcut_label_for(command, platform).unwrap_or_else(|| command.to_string())
 }
 
 /// One shortcut row: the chord (key-styled, padded so the descriptions align),
@@ -56,20 +60,25 @@ fn row(label: &str, desc: &str) -> Line<'static> {
     ])
 }
 
-/// Build the page's lines.
+/// Build the page's lines for `platform`, which decides how the `Alt` modifier
+/// is spelled in every chord the page prints.
 ///
 /// Sections, top to bottom: turn control, navigate & settings, editing, and the
 /// slash-command affordance, followed by the closing key hint. Every command
 /// chord is looked up from the shortcut table, so this page and dispatch cannot
 /// disagree about which key runs which command.
-pub(super) fn help_lines() -> Vec<Line<'static>> {
+pub(super) fn help_lines(platform: Platform) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
 
     lines.push(Line::from(Span::styled("turn control", heading_style())));
     lines.push(row("Esc", "stop the running request"));
-    lines.push(row(&shortcut("continue"), "continue the session"));
+    lines.push(row(&shortcut("continue", platform), "continue the session"));
     lines.push(row(
-        &format!("{} / {}", shortcut("undo"), shortcut("redo")),
+        &format!(
+            "{} / {}",
+            shortcut("undo", platform),
+            shortcut("redo", platform)
+        ),
         "undo / redo",
     ));
     lines.push(Line::default());
@@ -78,17 +87,23 @@ pub(super) fn help_lines() -> Vec<Line<'static>> {
         "navigate & settings",
         heading_style(),
     )));
-    lines.push(row(&shortcut("model"), "choose the model"));
-    lines.push(row(&shortcut("reasoning"), "cycle the reasoning effort"));
+    lines.push(row(&shortcut("model", platform), "choose the model"));
     lines.push(row(
-        &shortcut("reasoning-toggle"),
+        &shortcut("reasoning", platform),
+        "cycle the reasoning effort",
+    ));
+    lines.push(row(
+        &shortcut("reasoning-toggle", platform),
         "expand / collapse every reasoning section",
     ));
-    lines.push(row(&shortcut("terminal"), "terminal capabilities page"));
-    lines.push(row(&shortcut("account"), "accounts"));
-    lines.push(row(&shortcut("session"), "sessions"));
-    lines.push(row(&shortcut("help"), "show this help"));
-    lines.push(row(&shortcut("quit"), "quit"));
+    lines.push(row(
+        &shortcut("terminal", platform),
+        "terminal capabilities page",
+    ));
+    lines.push(row(&shortcut("account", platform), "accounts"));
+    lines.push(row(&shortcut("session", platform), "sessions"));
+    lines.push(row(&shortcut("help", platform), "show this help"));
+    lines.push(row(&shortcut("quit", platform), "quit"));
     lines.push(Line::default());
 
     lines.push(Line::from(Span::styled("editing", heading_style())));
@@ -113,7 +128,7 @@ pub(super) fn help_lines() -> Vec<Line<'static>> {
     ]));
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
-        format!("Esc or {} to close", shortcut("help")),
+        format!("Esc or {} to close", shortcut("help", platform)),
         dim_style(),
     )));
 
@@ -127,7 +142,7 @@ pub(super) fn render_help(frame: &mut Frame<'_>, app: &mut App) {
         frame,
         "Help",
         PopupSize::LIST,
-        help_lines(),
+        help_lines(app.platform()),
         &mut app.help_modal_scroll,
     );
 }
@@ -136,10 +151,18 @@ pub(super) fn render_help(frame: &mut Frame<'_>, app: &mut App) {
 mod tests {
     use super::*;
     use crate::render::lines_as_text;
+    use crate::tests::support::test_app;
+
+    /// The platform these tests render for: the app's own detected one, the same
+    /// accessor `render_help` passes, so the expectations are never a hardcoded
+    /// `Alt+`/`⌥` spelling.
+    fn platform() -> Platform {
+        test_app().platform()
+    }
 
     /// Every line of the page, newline-joined, for substring assertions.
     fn text() -> String {
-        lines_as_text(&help_lines())
+        lines_as_text(&help_lines(platform()))
     }
 
     #[test]
@@ -160,7 +183,7 @@ mod tests {
             "help",
             "quit",
         ] {
-            let label = shortcut(command);
+            let label = shortcut(command, platform());
             assert!(
                 out.contains(&label),
                 "the help page is missing {command:?}'s chord {label:?}:\n{out}"
@@ -170,14 +193,14 @@ mod tests {
 
     #[test]
     fn the_help_page_ends_with_the_closing_hint() {
-        let lines = help_lines();
+        let lines = help_lines(platform());
         let last = lines.last().map(|line| {
             line.spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         });
-        let expected = format!("Esc or {} to close", shortcut("help"));
+        let expected = format!("Esc or {} to close", shortcut("help", platform()));
         assert_eq!(last.as_deref(), Some(expected.as_str()));
     }
 
@@ -199,7 +222,7 @@ mod tests {
         // the single note line's first span is the bare two-space indent, and
         // headings/closing hint are single-span lines. So a first span wider
         // than the fixed column means a label overflowed it.
-        for line in help_lines() {
+        for line in help_lines(platform()) {
             if let [first, _] = line.spans.as_slice() {
                 let label_field = first.content.as_ref();
                 if label_field.len() > 2 {

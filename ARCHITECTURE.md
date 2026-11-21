@@ -3383,6 +3383,16 @@ A chord matches only its **exact** modifier set: `Alt+Shift+R` (flip the bulk
 reasoning visibility) and `Alt+R` (cycle the reasoning effort) are different
 commands, and no chord aliases its sibling.
 
+**A printed chord is spelled for the detected platform.** The modifier a
+non-Mac keyboard labels Alt is the one a Mac keyboard labels Option (`⌥`), so a
+single helper (`alt_chord_label`) decides that spelling for the whole client —
+the table's labels, the hint strings, the Help page, the command palette and the
+model-selector name — and no surface carries a spelling of its own. Its platform
+comes from the launch-time `TerminalProfile` (`App::platform()`), not from the
+compile target: the profile is the compile target refined by what the client
+actually launched in (a Termux userland reports Android), so every printed chord
+agrees with the platform the Terminal page shows.
+
 Both terminal encodings can express that difference, by different means, and the
 lowering reconciles them in one place. A kitty-protocol terminal reports
 `shift+alt+key` as a CSI-u event with SHIFT in the modifier field

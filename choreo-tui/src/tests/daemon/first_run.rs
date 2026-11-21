@@ -1,6 +1,5 @@
 use crate::connection::{handle_daemon_message, handle_terminal_event};
 use crate::state::*;
-use crate::terminal::profile::Platform;
 use crate::tests::support::test_app;
 use choreo_proto::{
     AccountInfo, ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, MessageKind,
@@ -823,5 +822,4 @@ fn a_flow_hides_the_accounts_chord_for_a_second_picker() {
         app.status(),
         Some("finish choosing the account's model and reasoning effort first")
     );
-    let _ = Platform::current();
 }

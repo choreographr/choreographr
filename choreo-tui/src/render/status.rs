@@ -77,10 +77,12 @@ pub(crate) fn format_status(status: &SessionStatus) -> String {
 /// is unavailable must read as state, not as an aside.
 ///
 /// Kept a pure function of the note (no `App`) so the mapping is testable on
-/// its own and stays part of this module's status vocabulary.
-pub(crate) fn session_note_display(note: SessionNote) -> (String, Color) {
+/// its own and stays part of this module's status vocabulary.  The label is
+/// borrowed from a fixed pair of literals, so the caller builds a span from it
+/// without allocating.
+pub(crate) fn session_note_display(note: SessionNote) -> (&'static str, Color) {
     match note {
-        SessionNote::Loading => ("loading".into(), Color::Blue),
-        SessionNote::Error => ("error".into(), Color::Red),
+        SessionNote::Loading => ("loading", Color::Blue),
+        SessionNote::Error => ("error", Color::Red),
     }
 }

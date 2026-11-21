@@ -395,5 +395,5 @@ pub(super) fn abandon(app: &mut App) {
         return;
     }
     tracing::debug!("staged setup: abandoned (its session or connection went away)");
-    app.abandon_setup_flow();
+    app.clear_setup_flow();
 }

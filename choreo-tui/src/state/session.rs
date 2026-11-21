@@ -52,7 +52,7 @@ impl App {
         // A staged account choice belongs to the session being left: nothing of
         // it was committed, so it is dropped (with the popups it opened) rather
         // than carried onto a different session's account.
-        self.abandon_setup_flow();
+        self.clear_setup_flow();
         // A command line belongs to the session the user was editing; it must
         // never become the newly-attached session's draft.  Discarding it clears
         // the buffer before any draft hand-off happens elsewhere.

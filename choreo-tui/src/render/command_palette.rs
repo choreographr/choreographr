@@ -9,6 +9,7 @@
 //! overlaps the help/status rows above them, erased with `Clear`.
 use crate::markdown_render::display_width;
 use crate::state::{App, picker_window, shortcut_label_for};
+use crate::terminal::profile::Platform;
 use choreo_client_core::CommandMatch;
 use ratatui::{
     Frame,
@@ -84,8 +85,16 @@ pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App, input
     let focused = app.command_palette_focused();
 
     let mut lines: Vec<Line> = Vec::with_capacity(height);
+    // The labels are spelled for this client's detected platform, read once for
+    // the whole palette.
+    let platform = app.platform();
     for (i, command_match) in matches.iter().enumerate().skip(scroll).take(count) {
-        lines.push(palette_row(command_match, i == focused, rect.width));
+        lines.push(palette_row(
+            command_match,
+            i == focused,
+            rect.width,
+            platform,
+        ));
     }
     if truncated {
         let hidden = len - (scroll + count);
@@ -100,11 +109,16 @@ pub(super) fn render_command_palette(frame: &mut Frame<'_>, app: &mut App, input
 
 /// Build one palette row: `"{marker}/{name}  {summary}"` with the matched
 /// prefix characters emphasized, plus a right-aligned dim shortcut label when
-/// the command has one.
+/// the command has one — spelled for `platform`.
 ///
 /// `marker` is `>` on the focused row (else a space), matching the picker
 /// popups' highlight convention.
-fn palette_row(command_match: &CommandMatch, focused: bool, width: u16) -> Line<'static> {
+fn palette_row(
+    command_match: &CommandMatch,
+    focused: bool,
+    width: u16,
+    platform: Platform,
+) -> Line<'static> {
     // Focused rows read Yellow+BOLD (the picker-popup convention); other rows
     // are White.  Matched prefix characters are emphasized brighter (Cyan+BOLD)
     // so the leading characters the query matched stand out from the rest of
@@ -143,7 +157,7 @@ fn palette_row(command_match: &CommandMatch, focused: bool, width: u16) -> Line<
     // content width is measured from the same text the spans emit so the label
     // lands flush right (and is simply omitted when the row is too narrow).
     let content = format!("{marker}/{name}  {}", command_match.spec.summary);
-    if let Some(label) = shortcut_label_for(name) {
+    if let Some(label) = shortcut_label_for(name, platform) {
         let used = display_width(&content);
         let label_width = display_width(&label);
         if (width as usize) > used + label_width + 1 {

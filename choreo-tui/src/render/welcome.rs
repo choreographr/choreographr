@@ -224,7 +224,9 @@ pub(super) fn render_welcome(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let lines = welcome_lines(
         app.setup_progress(),
         !app.ai_providers.accounts.is_empty(),
-        Platform::current(),
+        // The detected platform, so the panel's chords match the platform the
+        // Terminal page prints rather than the compile target.
+        app.platform(),
         app.terminal_advice(),
         width,
         area.height,

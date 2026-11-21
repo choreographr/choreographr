@@ -541,11 +541,17 @@ fn render_chat(frame: &mut Frame<'_>, app: &mut App) -> Rect {
         // on screen yet, and it must render even when the daemon has reported no
         // status at all — which is exactly the failed-attach case.  The daemon's
         // status is the fallback, so the two never appear together.
-        let slot = app
-            .session_note()
-            .map(session_note_display)
-            .or_else(|| app.attached_status.as_ref().map(status_display));
-        if let Some((label, color)) = slot {
+        //
+        // The two labels are built separately rather than into one `Option`
+        // tuple: the note's labels are fixed literals (drawn without an
+        // allocation), while a daemon status may interpolate a tool name or a
+        // retry count and so arrives owned.
+        let note_slot = app.session_note().map(session_note_display);
+        let status_slot = app.attached_status.as_ref().map(status_display);
+        if let Some((label, color)) = note_slot {
+            spans.push(Span::raw(" | "));
+            spans.push(Span::styled(label, Style::default().fg(color)));
+        } else if let Some((label, color)) = status_slot {
             spans.push(Span::raw(" | "));
             spans.push(Span::styled(label, Style::default().fg(color)));
         }

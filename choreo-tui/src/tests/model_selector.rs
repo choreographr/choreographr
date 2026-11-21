@@ -72,10 +72,13 @@ fn ctrl_m_does_not_open_selector() {
 fn model_selector_label_is_spelled_for_this_platform() {
     // `Alt+M` on a keyboard with an Alt key, `⌥M` on a Mac: the spelling comes
     // from the shared chord helper, so this pins the wiring rather than a
-    // particular platform's glyph (`state::keymap` table-tests both).
+    // particular platform's glyph (`state::keymap` table-tests both).  The
+    // expectation is built from the same accessor the label itself reads — the
+    // app's detected platform — not the compile target.
+    let app = test_app();
     assert_eq!(
-        App::model_selector_label(),
-        crate::state::alt_chord_label(crate::terminal::profile::Platform::current(), "M")
+        app.model_selector_label(),
+        crate::state::alt_chord_label(app.platform(), "M")
     );
 }
 

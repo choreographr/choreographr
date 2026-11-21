@@ -47,21 +47,66 @@ impl PopupSize {
         max_w: 100,
         max_h: 40,
     };
+}
 
-    /// The sizing of a small no-filter dialog (the staged flow's reasoning
-    /// dialog): a narrow box. Only its width is used — a dialog's height comes
-    /// from its content ([`dialog_layout`]), because a three-row ladder drawn
-    /// as a fixed fraction of the screen would be mostly empty box.
-    pub(crate) const DIALOG: PopupSize = PopupSize {
-        w_num: 2,
-        w_den: 5,
-        h_num: 1,
-        h_den: 3,
-        min_w: 28,
-        min_h: 4,
-        max_w: 56,
-        max_h: 12,
+/// The width of a small no-filter dialog (the staged flow's reasoning dialog):
+/// a fraction of the terminal width, floored at `min` and capped at `max`.
+///
+/// Deliberately width-only. A dialog's height comes from its content (see
+/// [`dialog_layout`]) — a three-row ladder drawn as a fixed fraction of the
+/// screen would be mostly empty box — so a height field here would be a value
+/// no caller reads.
+pub(crate) struct DialogWidth {
+    pub(crate) num: u16,
+    pub(crate) den: u16,
+    pub(crate) min: u16,
+    pub(crate) max: u16,
+}
+
+impl DialogWidth {
+    /// A narrow box: ~40% of the width, never below 28 columns and never wider
+    /// than 56, so the ladder stays a dialog rather than a list popup.
+    pub(crate) const DIALOG: DialogWidth = DialogWidth {
+        num: 2,
+        den: 5,
+        min: 28,
+        max: 56,
     };
+
+    /// This dialog's width on a terminal `area_width` columns wide, clipped off
+    /// the screen edges by the same 4-column slack [`clamped_extent`] applies to
+    /// every popup.
+    fn width(&self, area_width: u16) -> u16 {
+        clamped_extent(
+            area_width,
+            u32::from(self.num),
+            u32::from(self.den),
+            self.min,
+            self.max,
+            4,
+        )
+    }
+}
+
+/// One popup dimension from a terminal `extent`: the fraction `num/den` of it,
+/// floored at `min`, capped at `max`, then narrowed by `slack` columns/rows so
+/// the popup never touches the screen edges, and never below one cell.
+///
+/// `extent.saturating_sub(slack)` is panic-free on a tiny terminal, and the
+/// `.max(1)` keeps the clamp's bounds from inverting (clamp panics when its min
+/// exceeds its max) — the arithmetic that lets every overlay share one sizing
+/// rule without a panic path.
+fn clamped_extent(extent: u16, num: u32, den: u32, min: u16, max: u16, slack: u16) -> u16 {
+    // u16 → u32 widening is lossless and the divided fraction always fits back
+    // in u16 here because it is subsequently clamped to `max` (a u16) before any
+    // other use.
+    #[expect(clippy::cast_possible_truncation)] // clamped to a u16 max below
+    {
+        ((u32::from(extent) * num / den) as u16)
+            .clamp(min, max)
+            .min(extent.saturating_sub(slack))
+            .max(1)
+    }
 }
 
 /// Compute a centered popup rect for a modal overlay from a [`PopupSize`].
@@ -74,25 +119,23 @@ impl PopupSize {
 // used by the render-layer call sites; a small owned struct is intentional.
 #[expect(clippy::needless_pass_by_value)] // keep the shared call-site signature
 pub(crate) fn centered_popup(area: Rect, size: PopupSize) -> Rect {
-    // u16 → u32 widening is lossless and the divided fraction always fits
-    // back in u16 here because it is subsequently clamped to `max_w`/`max_h`
-    // (both u16) before any other use.
-    #[expect(clippy::cast_possible_truncation)] // clamped to u16 maxes below
-    {
-        let width = ((u32::from(area.width) * size.w_num / size.w_den) as u16)
-            .clamp(size.min_w, size.max_w)
-            .min(area.width.saturating_sub(4))
-            .max(1);
-        let height = ((u32::from(area.height) * size.h_num / size.h_den) as u16)
-            .clamp(size.min_h, size.max_h)
-            .min(area.height.saturating_sub(2))
-            .max(1);
-        Rect {
-            x: area.x + (area.width.saturating_sub(width)) / 2,
-            y: area.y + (area.height.saturating_sub(height)) / 2,
-            width,
-            height,
-        }
+    // The 4-column / 2-row slack is what keeps the box off the screen edges.
+    let width = clamped_extent(
+        area.width, size.w_num, size.w_den, size.min_w, size.max_w, 4,
+    );
+    let height = clamped_extent(
+        area.height,
+        size.h_num,
+        size.h_den,
+        size.min_h,
+        size.max_h,
+        2,
+    );
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
     }
 }
 
@@ -193,12 +236,12 @@ pub(crate) struct DialogLayout {
 }
 
 /// Compute a small dialog's geometry over `area` (the terminal frame): a
-/// centered box as wide as [`PopupSize::DIALOG`] says, but only `body_rows`
-/// content rows plus a border and a footer tall — clamped to what the terminal
-/// can actually show.  The renderer draws into exactly these bands, so a
-/// content-sized dialog can never claim rows it does not draw.
+/// centered box as wide as [`DialogWidth::DIALOG`] asks for, but only
+/// `body_rows` content rows plus a border and a footer tall — clamped to what
+/// the terminal can actually show.  The renderer draws into exactly these
+/// bands, so a content-sized dialog can never claim rows it does not draw.
 pub(crate) fn dialog_layout(area: Rect, body_rows: u16) -> DialogLayout {
-    let sized = centered_popup(area, PopupSize::DIALOG);
+    let width = DialogWidth::DIALOG.width(area.width);
     // `body_rows + 2` borders + 1 footer row, never taller than the screen
     // allows (the `.max(3)` keeps room for the borders and the footer when the
     // terminal is tiny).
@@ -206,9 +249,9 @@ pub(crate) fn dialog_layout(area: Rect, body_rows: u16) -> DialogLayout {
         .saturating_add(3)
         .min(area.height.saturating_sub(2).max(3));
     let popup = Rect {
-        x: sized.x,
+        x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
-        width: sized.width.min(area.width).max(1),
+        width: width.min(area.width).max(1),
         height,
     };
     // The bordered block shrinks the inner area by one cell on every side,

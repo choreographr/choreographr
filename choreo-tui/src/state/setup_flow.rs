@@ -11,11 +11,16 @@
 //! This module is the **decision core**: [`SetupFlow`] holds the phase and the
 //! facts staged so far, [`SetupEvent`] is everything that can move it (a user
 //! key or a daemon message), and a transition returns the next phase plus the
-//! [`SetupStep`]s the caller must perform. Nothing here sends, opens or closes
-//! anything, and nothing here waits: no timers, no polling, no I/O — the
-//! driver in `connection/setup_flow.rs` performs the steps. That split is what
-//! makes every rule below a total function of `(phase, event)` and unit-testable
-//! without a daemon.
+//! [`SetupStep`]s the caller must perform. The machine itself performs no I/O —
+//! no sends, no timers, no polling, no waiting — the driver in
+//! `connection/setup_flow.rs` performs every step. That split is what makes every
+//! rule below a total function of `(phase, event)` and unit-testable without a
+//! daemon.
+//!
+//! The one `App` helper here ([`App::clear_setup_flow`]) is state-only too: it
+//! drops the staged flow and closes the popups that flow opened, because those
+//! are part of the staged state. It decides nothing about *when* to do so — that
+//! is the driver's `abandon`.
 
 use super::App;
 use choreo_proto::{ModelInfo, ReasoningCapability};
@@ -25,12 +30,12 @@ pub(crate) const OFF_EFFORT: &str = "off";
 
 impl App {
     /// Drop the staged flow and the popups it opened, without navigating and
-    /// without reporting anything. This is the state half of `abandon`: the
-    /// driver in `connection/setup_flow.rs` decides *when* a flow's context has
-    /// gone (the connection closed, the session changed, the client restarted),
-    /// and this is what is left to do about it — nothing was committed, so
-    /// nothing is half-done.
-    pub(crate) fn abandon_setup_flow(&mut self) {
+    /// without reporting anything. This is the state half of the driver's
+    /// `abandon`: the driver decides *when* a flow's context has gone (the
+    /// connection closed, the session changed, the client restarted), and this
+    /// is what is left to do about it — nothing was committed, so nothing is
+    /// half-done.
+    pub(crate) fn clear_setup_flow(&mut self) {
         self.setup_flow = None;
         self.model_selector.close();
         self.reasoning_dialog.close();
@@ -766,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn abandoning_from_every_phase_closes_the_popups_and_stays_put() {
+    fn clearing_from_every_phase_closes_the_popups_and_stays_put() {
         // A vanished context (connection closed, session switched, client
         // restarted) is a state wipe, not a transition: nothing was committed,
         // so the flow is simply dropped with the popups it opened.
@@ -775,7 +780,7 @@ mod tests {
             app.setup_flow = Some(phase);
             app.model_selector.open();
             app.reasoning_dialog.open(vec!["off".to_string()], None);
-            app.abandon_setup_flow();
+            app.clear_setup_flow();
             assert_eq!(app.setup_flow, None);
             assert!(!app.model_selector.is_open());
             assert!(!app.reasoning_dialog.is_open());

@@ -227,13 +227,17 @@ pub(crate) fn binding_for(event: &KeyEvent) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// The display label for a command's shortcut, spelled for this platform (see
+/// The display label for a command's shortcut, spelled for `platform` (see
 /// [`alt_chord_label`]).  `None` when the command has no shortcut.
-pub(crate) fn shortcut_label_for(name: &str) -> Option<String> {
+///
+/// The platform is a parameter rather than a lookup so this module decides no
+/// spelling source of its own: the caller passes the client's detected platform
+/// (`App::platform`), which is the one every user-facing chord is spelled for.
+pub(crate) fn shortcut_label_for(name: &str, platform: Platform) -> Option<String> {
     SHORTCUTS
         .iter()
         .find(|(_, n)| *n == name)
-        .map(|(chord, _)| chord.label(Platform::current()))
+        .map(|(chord, _)| chord.label(platform))
 }
 
 #[cfg(test)]
@@ -264,19 +268,24 @@ mod tests {
         assert_eq!(binding_for(&alt_shift('m')), None);
     }
 
-    /// The label the Help page and palette render for the shifted chord.
+    /// The label the Help page and palette render for the shifted chord — for
+    /// both platform spellings of the modifier.
     #[test]
     fn shifted_chord_label_reads_as_alt_shift() {
-        let expected = format!("{}Shift+R", alt_chord_label(Platform::current(), ""));
-        assert_eq!(
-            shortcut_label_for("reasoning-toggle").as_deref(),
-            Some(expected.as_str())
-        );
-        let expected = alt_chord_label(Platform::current(), "R");
-        assert_eq!(
-            shortcut_label_for("reasoning").as_deref(),
-            Some(expected.as_str())
-        );
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let expected = format!("{}Shift+R", alt_chord_label(platform, ""));
+            assert_eq!(
+                shortcut_label_for("reasoning-toggle", platform).as_deref(),
+                Some(expected.as_str()),
+                "{platform}"
+            );
+            let expected = alt_chord_label(platform, "R");
+            assert_eq!(
+                shortcut_label_for("reasoning", platform).as_deref(),
+                Some(expected.as_str()),
+                "{platform}"
+            );
+        }
     }
 
     #[test]
@@ -338,40 +347,42 @@ mod tests {
 
     #[test]
     fn shortcut_labels_render_the_alt_chords() {
-        // The modifier is spelled for this host, so the expectation is built
-        // through the same helper the labels use: the table's key is what these
-        // assertions pin, the spelling is the platform's (see
+        // The modifier is spelled for the platform passed in, so the expectation
+        // is built through the same helper the labels use: the table's key is
+        // what these assertions pin, the spelling is the platform's (see
         // `alt_chord_labels_spell_the_modifier_for_the_platform`).
-        let alt = |key: &str| alt_chord_label(Platform::current(), key);
-        assert_eq!(
-            shortcut_label_for("model").as_deref(),
-            Some(alt("M").as_str())
-        );
-        assert_eq!(
-            shortcut_label_for("continue").as_deref(),
-            Some(alt("Enter").as_str())
-        );
-        assert_eq!(
-            shortcut_label_for("undo").as_deref(),
-            Some(alt("↑").as_str())
-        );
-        assert_eq!(
-            shortcut_label_for("redo").as_deref(),
-            Some(alt("↓").as_str())
-        );
-        assert_eq!(
-            shortcut_label_for("quit").as_deref(),
-            Some(alt("Q").as_str())
-        );
-        assert_eq!(
-            shortcut_label_for("terminal").as_deref(),
-            Some(alt("T").as_str())
-        );
-        assert_eq!(
-            shortcut_label_for("help").as_deref(),
-            Some(alt("H").as_str())
-        );
-        assert_eq!(shortcut_label_for("nope"), None);
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let alt = |key: &str| alt_chord_label(platform, key);
+            assert_eq!(
+                shortcut_label_for("model", platform).as_deref(),
+                Some(alt("M").as_str())
+            );
+            assert_eq!(
+                shortcut_label_for("continue", platform).as_deref(),
+                Some(alt("Enter").as_str())
+            );
+            assert_eq!(
+                shortcut_label_for("undo", platform).as_deref(),
+                Some(alt("↑").as_str())
+            );
+            assert_eq!(
+                shortcut_label_for("redo", platform).as_deref(),
+                Some(alt("↓").as_str())
+            );
+            assert_eq!(
+                shortcut_label_for("quit", platform).as_deref(),
+                Some(alt("Q").as_str())
+            );
+            assert_eq!(
+                shortcut_label_for("terminal", platform).as_deref(),
+                Some(alt("T").as_str())
+            );
+            assert_eq!(
+                shortcut_label_for("help", platform).as_deref(),
+                Some(alt("H").as_str())
+            );
+            assert_eq!(shortcut_label_for("nope", platform), None);
+        }
     }
 
     /// The modifier's spelling is the platform's, decided in one place: macOS

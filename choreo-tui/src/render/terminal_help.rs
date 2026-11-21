@@ -20,7 +20,7 @@ use crate::state::{
     option_key_setting, recommendations, screen_sentence, tmux_lines,
 };
 use crate::terminal::profile::{
-    Capabilities, Host, Mux, NativeImages, Platform, TerminalKind, TerminalProfile,
+    Capabilities, Host, Mux, NativeImages, TerminalKind, TerminalProfile,
 };
 use ratatui::{
     Frame,
@@ -317,12 +317,10 @@ pub(super) fn terminal_page_lines(profile: &TerminalProfile) -> Vec<Line<'static
     }
     lines.extend(fix_lines(profile));
     lines.push(Line::default());
-    // The chord is spelled for this platform, like every other user-facing one.
+    // The chord is spelled for the detected platform (`profile.platform`), like
+    // every other user-facing one.
     lines.push(Line::from(Span::styled(
-        format!(
-            "Esc or {} to close",
-            alt_chord_label(Platform::current(), "T")
-        ),
+        format!("Esc or {} to close", alt_chord_label(profile.platform, "T")),
         dim_style(),
     )));
     lines
@@ -589,21 +587,16 @@ mod tests {
 
     #[test]
     fn the_page_always_ends_with_the_closing_hint() {
-        let lines = terminal_page_lines(&profile(
-            TerminalKind::Unknown,
-            Platform::Linux,
-            Host::Direct,
-        ));
+        let profile = profile(TerminalKind::Unknown, Platform::Linux, Host::Direct);
+        let lines = terminal_page_lines(&profile);
         let last = lines.last().map(|line| {
             line.spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect::<String>()
         });
-        let expected = format!(
-            "Esc or {} to close",
-            alt_chord_label(Platform::current(), "T")
-        );
+        // The expectation is built from the same profile field the page reads.
+        let expected = format!("Esc or {} to close", alt_chord_label(profile.platform, "T"));
         assert_eq!(last.as_deref(), Some(expected.as_str()));
     }
 

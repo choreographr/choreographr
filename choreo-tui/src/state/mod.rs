@@ -775,12 +775,26 @@ impl App {
         self.quit_message.get()
     }
 
+    /// The platform every user-facing chord is spelled for: this client's
+    /// **detected** one (the profile's), not the compile target
+    /// `Platform::current` reports.
+    ///
+    /// The two differ on exactly one axis that the user can see: a Termux
+    /// userland reports Android, so the profile is the compile target refined by
+    /// what this client actually launched in.  Reading the spelling source from
+    /// the profile means a chord, a hint and the model-selector name all agree
+    /// with the platform the Terminal page prints, and leaves one runtime source
+    /// for every spelling ([`alt_chord_label`]).
+    pub(crate) fn platform(&self) -> crate::terminal::profile::Platform {
+        self.terminal.platform
+    }
+
     /// The chord that opens the model selector, spelled for this platform —
     /// `Alt+M` on a keyboard that carries an Alt key, `⌥M` on a Mac, where the
     /// key is Option.  Used by hint and status strings, so it delegates to
     /// [`alt_chord_label`] rather than carrying a spelling of its own.
-    pub(crate) fn model_selector_label() -> String {
-        alt_chord_label(crate::terminal::profile::Platform::current(), "M")
+    pub(crate) fn model_selector_label(&self) -> String {
+        alt_chord_label(self.platform(), "M")
     }
 
     pub(crate) fn display_for(&mut self, session_id: u64) -> &mut SessionDisplayState {

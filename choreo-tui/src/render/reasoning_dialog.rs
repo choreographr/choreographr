@@ -38,6 +38,11 @@ pub(super) fn render_reasoning_dialog(frame: &mut Frame<'_>, app: &mut App) {
     frame.render_widget(block, layout.popup);
 
     if app.reasoning_dialog.levels.is_empty() {
+        // Defensive: the staged flow never opens this dialog with an empty
+        // ladder — a model reporting no effort levels commits `"off"` instead
+        // (`state/setup_flow.rs`) — but `ReasoningDialogState::open` is
+        // reachable with one, and an unexplained empty box is worse than a line
+        // that says why nothing is listed.
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 " No effort levels reported for this model.",
@@ -49,9 +54,10 @@ pub(super) fn render_reasoning_dialog(frame: &mut Frame<'_>, app: &mut App) {
     }
 
     let focused = app.reasoning_dialog.focused;
-    let levels = app.reasoning_dialog.levels.clone();
-    let mut lines: Vec<Line> = Vec::with_capacity(levels.len());
-    for (i, level) in levels.iter().enumerate() {
+    // Iterate the ladder in place: the row loop only reads it (`is_suggested`
+    // borrows immutably), so a per-frame clone of every level would buy nothing.
+    let mut lines: Vec<Line> = Vec::with_capacity(app.reasoning_dialog.levels.len());
+    for (i, level) in app.reasoning_dialog.levels.iter().enumerate() {
         let is_focused = i == focused;
         // `>` marks the row Enter will commit. The suggestion is marked in
         // words, not with a second glyph, so "why is this row highlighted?" is
