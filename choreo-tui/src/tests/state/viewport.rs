@@ -98,15 +98,17 @@ fn width_change_clears_content_dirty() {
 }
 
 #[test]
-fn height_only_change_recomputes_heights_without_wiping_cache() {
+fn height_only_change_without_images_skips_the_height_rebuild() {
     // A height-only change — a real vertical resize, or the chrome
-    // (status/error line, input box) growing or shrinking —
-    // re-wraps nothing, so it must NOT wipe the render cache: doing that
-    // forced a full O(session) re-render, the input delay a large session
-    // showed right after a copy set the status and on the next keystroke
-    // that cleared it.  It DOES mark the heights dirty, because the
-    // image-block height the prefix reserves derives from the viewport
-    // height; that rebuild is a cache hit.
+    // (status/error line, input box) growing or shrinking — re-wraps nothing, so
+    // it must NOT wipe the render cache (doing that forced a full O(session)
+    // re-render, the input delay a large session showed after a copy set the
+    // status and on the next keystroke that cleared it).  Turn heights depend on
+    // the viewport height ONLY through the image-block reserve, so a session
+    // with no image-bearing turn needs no height rebuild at all: the height
+    // model stays valid and only the scrollbar's marker slots rescale (deferred
+    // to the next draw).  This keeps a chrome-height change off the O(turns)
+    // rebuild path for every text-only session.
     let mut app = test_app();
 
     app.history_viewport.width = 79;
@@ -119,6 +121,7 @@ fn height_only_change_recomputes_heights_without_wiping_cache() {
         let display = app.active_display().unwrap();
         display.content_dirty = true;
         display.markers_dirty = false;
+        display.any_image_turns = false;
         display.render_cache = vec![Some(dummy_cache_entry())];
     }
 
@@ -126,8 +129,12 @@ fn height_only_change_recomputes_heights_without_wiping_cache() {
 
     let display = app.active_display_ref().unwrap();
     assert!(
-        display.markers_dirty,
-        "a height change must recompute the heights (image blocks depend on the viewport height)"
+        !display.markers_dirty,
+        "no image turns: heights are unchanged, so no height rebuild is needed"
+    );
+    assert!(
+        display.marker_slots_dirty,
+        "the scrollbar's marker slots still rescale to the new virtual track"
     );
     assert!(
         display.render_cache.iter().all(Option::is_some),
@@ -136,5 +143,39 @@ fn height_only_change_recomputes_heights_without_wiping_cache() {
     assert!(
         display.content_dirty,
         "content_dirty must be untouched by a height-only change"
+    );
+}
+
+#[test]
+fn height_only_change_with_images_recomputes_heights() {
+    // When a turn DOES reserve an image block, its height derives from the
+    // viewport height, so a height change must recompute the height model (a
+    // cache-hit rebuild — the render cache is still preserved).
+    let mut app = test_app();
+
+    app.history_viewport.width = 79;
+    app.history_viewport.height = 20;
+
+    app.last_terminal_size = Some((80, 30));
+    app.terminal_resized = false;
+
+    {
+        let display = app.active_display().unwrap();
+        display.content_dirty = true;
+        display.markers_dirty = false;
+        display.any_image_turns = true;
+        display.render_cache = vec![Some(dummy_cache_entry())];
+    }
+
+    app.update_viewport_from_terminal_size();
+
+    let display = app.active_display_ref().unwrap();
+    assert!(
+        display.markers_dirty,
+        "an image-bearing turn's height depends on the viewport height, so rebuild"
+    );
+    assert!(
+        display.render_cache.iter().all(Option::is_some),
+        "the rebuild is a cache hit; the render cache is preserved"
     );
 }

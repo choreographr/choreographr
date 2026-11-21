@@ -94,8 +94,24 @@ pub(crate) struct SessionDisplayState {
     pub(crate) visible_turn_ids: Vec<u32>,
     pub(crate) turn_heights: Vec<usize>,
     pub(crate) height_prefix: Vec<usize>,
+    /// Whether any visible turn currently reserves an image block.  Only
+    /// image-bearing turns' heights depend on the viewport height
+    /// (`image_block_height`), so a chrome-height change can skip the whole
+    /// height rebuild when this is `false`.  Maintained by the height-model
+    /// rebuild and the streaming fast path.
+    pub(crate) any_image_turns: bool,
     pub(crate) markers: Vec<Marker>,
     pub(crate) markers_dirty: bool,
+    /// Viewport-sized occupancy bitmap of the scrollbar marker slots, derived
+    /// from [`Self::markers`] against the current total height and virtual
+    /// track.  The renderer draws the scrollbar from this (O(vh)) instead of
+    /// rebuilding a `Vec` + `HashSet` from every marker each frame (O(markers));
+    /// it is rebuilt lazily when the marker set changes
+    /// ([`Self::marker_slots_dirty`]) or the viewport height changes the virtual
+    /// track (see `ensure_marker_slots`).
+    pub(crate) marker_slots: Vec<bool>,
+    /// Whether [`Self::marker_slots`] must be rebuilt from [`Self::markers`].
+    pub(crate) marker_slots_dirty: bool,
     pub(crate) streaming_turn_index: Option<usize>,
     pub(crate) streaming_dirty: bool,
     pub(crate) content_dirty: bool,
@@ -194,8 +210,11 @@ impl Default for SessionDisplayState {
             visible_turn_ids: Vec::new(),
             turn_heights: Vec::new(),
             height_prefix: Vec::new(),
+            any_image_turns: false,
             markers: Vec::new(),
             markers_dirty: true,
+            marker_slots: Vec::new(),
+            marker_slots_dirty: true,
             streaming_turn_index: None,
             streaming_dirty: false,
             content_dirty: false,

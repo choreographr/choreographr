@@ -40,17 +40,25 @@ pub(super) fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     app.ensure_cache_synced();
 
-    let mut rows_remaining = area.height as usize;
-    let mut y = area.y + area.height;
-    let mut rows_to_skip = app.effective_scroll();
-
-    // Clone visible turn IDs upfront to avoid borrow conflicts when
-    // accessing display state via app.display_for inside the loop.
     let Some(session_id) = app.active_session_id else {
         return;
     };
-    let visible_turn_ids: Vec<u32> = app.display_for(session_id).visible_turn_ids.clone();
-    let len = visible_turn_ids.len();
+
+    // Locate only the turns that intersect the viewport from the height
+    // prefix-sum: an O(log n) seek to the first/last visible turn, so the draw
+    // below touches O(vh) turns regardless of how many sit above or below the
+    // viewport.  A linear newest→oldest scan had to walk every turn below the
+    // viewport to consume the scroll offset, which made scrolling O(turns).
+    let Some((first, last, initial_skip)) = visible_turn_window(app) else {
+        return;
+    };
+
+    let mut rows_remaining = area.height as usize;
+    let mut y = area.y + area.height;
+    // Rows of the bottommost visible turn that fall below the viewport bottom,
+    // consumed by `clipped_area` as it draws that turn partially (its images
+    // first, then its text, matching the per-turn draw order).
+    let mut rows_to_skip = initial_skip;
 
     // Build the whole-selection table highlight ONCE per frame, before the
     // visible-turn loop: it scans the selection's content lines (viewport-
@@ -59,20 +67,24 @@ pub(super) fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // is active.
     let table_highlight = selection::table_highlight(app);
 
-    // Iterate visible turns from newest to oldest.  clipped_area consumes
-    // rows_to_skip from the bottom (newest end) so that turns fully below
-    // the viewport are skipped before any content is rendered.
-    for raw_i in 0..len {
-        let i = len - 1 - raw_i;
-        // `i < len == visible_turn_ids.len()`, so the lookup is always in
-        // bounds; `.get()` keeps it total.
-        let Some(turn_id) = visible_turn_ids.get(i).copied() else {
-            continue;
-        };
-
+    // Draw the visible window bottom-up: the bottommost visible turn first
+    // (clipped by `initial_skip`), then each turn above it, stopping once the
+    // viewport is full.  Starting at the bottommost *visible* turn means no
+    // turns below the viewport are ever walked.
+    for i in (first..=last).rev() {
         if rows_remaining == 0 {
             break;
         }
+
+        // `i < visible_turn_ids.len()`, so the lookup is in bounds; `.get()`
+        // keeps it total.  Read through an immutable borrow that ends before
+        // the mutable render-cache borrow below (no whole-list clone needed).
+        let Some(turn_id) = app
+            .active_display_ref()
+            .and_then(|d| d.visible_turn_ids.get(i).copied())
+        else {
+            continue;
+        };
 
         // Get cached lines (Arc clone is O(1)), the pre-computed height,
         // cumulative visual-row offsets for O(log n) row→line lookups, the
@@ -227,6 +239,51 @@ pub(super) fn render_history(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
+/// The contiguous window of visible turns that intersect the viewport, derived
+/// from the height prefix-sum: `(first, last, initial_skip)`.
+///
+/// `first..=last` are the turn indices to draw; `initial_skip` is how many rows
+/// of the bottommost (`last`) turn fall below the viewport bottom and must be
+/// consumed before drawing it.  Pure prefix-sum math — `partition_point` seeks
+/// in O(log n), and no turn is visited — so the renderer never walks the turns
+/// above or below the viewport.  `None` when there is nothing to draw yet.
+fn visible_turn_window(app: &App) -> Option<(usize, usize, usize)> {
+    let display = app.active_display_ref()?;
+    // `height_prefix[i]` is the cumulative content-row end (exclusive) of turn
+    // `i`, so it is also the total when non-empty.
+    let prefix = &display.height_prefix;
+    let total = *prefix.last()?;
+    if total == 0 {
+        return None;
+    }
+
+    let vh = app.history_viewport.height as usize;
+    // The scroll offset is a distance from the bottom; clamp defensively even
+    // though `effective_scroll` already clamps against the content height.
+    let scroll = app.effective_scroll().min(total);
+    // Content row just past the viewport bottom (at least 1 so indices stay in
+    // range on a degenerate empty viewport).
+    let content_bottom = (total - scroll).max(1);
+    let content_top = content_bottom.saturating_sub(vh);
+
+    // The turn containing the last visible row (`content_bottom - 1`) is the
+    // first whose cumulative end reaches `content_bottom`.
+    let last = prefix
+        .partition_point(|&end| end < content_bottom)
+        .min(prefix.len() - 1);
+    // The turn containing the top visible row (`content_top`) is the first
+    // whose cumulative end exceeds `content_top`.
+    let first = prefix.partition_point(|&end| end <= content_top).min(last);
+    // Rows of the bottommost visible turn that sit below the viewport bottom.
+    let initial_skip = prefix
+        .get(last)
+        .copied()
+        .unwrap_or(content_bottom)
+        .saturating_sub(content_bottom);
+
+    Some((first, last, initial_skip))
+}
+
 /// Reserve `full_height` rows of the pane for one block and return the part of
 /// it that is actually on screen, advancing the bottom-up draw cursor.
 ///
@@ -293,4 +350,128 @@ fn render_text_block(
         Paragraph::new(lines).style(paragraph_style).scroll((0, 0)),
         rect,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::visible_turn_window;
+    use crate::tests::support::{insert_turn, test_app};
+    use ratatui::layout::Rect;
+
+    /// A session of `turns` two-block turns with a viewport tall enough to show
+    /// only a few of them, so the visible window is a strict subset.
+    fn app_with_turns(turns: u32) -> crate::state::App {
+        let mut app = test_app();
+        app.history_viewport.width = 40;
+        app.history_viewport.height = 10;
+        for i in 0..turns {
+            insert_turn(
+                &mut app,
+                i,
+                &format!("UU{i:02} question"),
+                &format!("AA{i:02} answer"),
+            );
+        }
+        app.rebuild_height_prefix();
+        app
+    }
+
+    #[test]
+    fn window_at_bottom_ends_on_newest_turn() {
+        let app = app_with_turns(40);
+        let (first, last, skip) = visible_turn_window(&app).expect("window");
+        assert_eq!(last, 39, "bottom-pinned window must reach the newest turn");
+        assert_eq!(
+            skip, 0,
+            "the bottommost turn is fully visible at the bottom"
+        );
+        assert!(
+            last - first < app.history_viewport.height as usize,
+            "the drawn window must not exceed the viewport in turns",
+        );
+    }
+
+    #[test]
+    fn window_at_top_starts_at_first_turn() {
+        let mut app = app_with_turns(40);
+        let max = app.max_scroll_offset();
+        app.scroll_to(max);
+        let (first, last, _skip) = visible_turn_window(&app).expect("window");
+        assert_eq!(first, 0, "scrolled to the top, the window starts at turn 0");
+        assert!(
+            last < 39,
+            "the newest turn is off-screen when scrolled to the top"
+        );
+        assert!(last - first < app.history_viewport.height as usize);
+    }
+
+    #[test]
+    fn window_size_is_bounded_by_viewport_not_turn_count() {
+        // The whole point of the seek: the window must not grow with the
+        // transcript.  A 10x longer session draws the same bounded window.
+        let small = app_with_turns(20);
+        let large = app_with_turns(200);
+        let vh = small.history_viewport.height as usize;
+        let (f1, l1, _) = visible_turn_window(&small).expect("small");
+        let (f2, l2, _) = visible_turn_window(&large).expect("large");
+        assert!(l1 - f1 < vh);
+        assert!(l2 - f2 < vh);
+    }
+
+    /// Draw a whole frame and return its cells row-major (mirrors the shared
+    /// `tests/render` harness), syncing the history viewport to the frame's
+    /// layout first so the window math and the drawn area agree.
+    fn drawn(app: &mut crate::state::App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let [history, _, _, _] = app.chat_page_layout(40, 12);
+        app.history_viewport.update(Rect {
+            x: 0,
+            y: 0,
+            width: history.width.saturating_sub(1),
+            height: history.height,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).expect("backend");
+        terminal
+            .draw(|frame| crate::render::render(frame, app))
+            .expect("render a frame");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
+    }
+
+    #[test]
+    fn deep_scroll_renders_the_window_not_the_whole_transcript() {
+        let mut app = app_with_turns(40);
+
+        // At the bottom the newest turn is drawn and the oldest is not.
+        app.scroll_to(0);
+        let bottom = drawn(&mut app);
+        assert!(
+            bottom.contains("UU39"),
+            "newest turn must be visible at the bottom"
+        );
+        assert!(
+            !bottom.contains("UU00"),
+            "oldest turn must be off-screen at the bottom"
+        );
+
+        // Scrolled to the top, the oldest turn is drawn and the newest is not.
+        let max = app.max_scroll_offset();
+        app.scroll_to(max);
+        let top = drawn(&mut app);
+        assert!(
+            top.contains("UU00"),
+            "oldest turn must be visible at the top"
+        );
+        assert!(
+            !top.contains("UU39"),
+            "newest turn must be off-screen at the top"
+        );
+    }
 }

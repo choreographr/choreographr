@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -17,7 +15,8 @@ use ratatui::widgets::StatefulWidget;
 /// is supported via the `scrollbar_dragging` field on `App`.
 ///
 /// User-text markers (green indicator dots on the track) are rendered
-/// from pre-computed virtual-slot positions passed via [`with_markers`].
+/// from a pre-computed viewport-sized slot bitmap passed via
+/// [`with_marker_slots`].
 /// Markers are drawn on the track *beneath* the thumb, so a marker that
 /// lands under the thumb is hidden rather than obscuring it — the thumb is
 /// the position indicator and must stay visible at all times.
@@ -26,10 +25,11 @@ pub(crate) struct SmoothScrollbar {
     thumb_fg: Option<Color>,
     track_bg: Option<Color>,
     marker_fg: Option<Color>,
-    /// Pre-computed virtual-slot positions where user-text markers
-    /// appear on the track.  Computed at render time from content-line
-    /// positions and the virtual-track scale.
-    markers: HashSet<usize>,
+    /// Occupancy bitmap indexed by virtual slot: `true` where a user-text
+    /// marker sits.  `true` at slot `s` draws a marker half-cell there.  The
+    /// renderer supplies a cached, viewport-sized bitmap (O(vh)) so a frame
+    /// never rebuilds a set from every marker.
+    marker_slots: Vec<bool>,
 }
 
 /// State for [`SmoothScrollbar`].
@@ -49,7 +49,7 @@ impl SmoothScrollbar {
             thumb_fg: None,
             track_bg: None,
             marker_fg: None,
-            markers: HashSet::new(),
+            marker_slots: Vec::new(),
         }
     }
 
@@ -73,11 +73,13 @@ impl SmoothScrollbar {
         self
     }
 
-    /// Attach pre-computed virtual-slot positions where user-text
-    /// markers should appear on the track.
-    pub(crate) fn with_markers(mut self, markers: &[usize]) -> Self {
-        self.markers.clear();
-        self.markers.extend(markers.iter().copied());
+    /// Attach a pre-computed occupancy bitmap of the virtual slots where
+    /// user-text markers should appear on the track (index = virtual slot,
+    /// `true` = marker).  The caller caches this per display so a frame never
+    /// rebuilds a set from every marker.
+    pub(crate) fn with_marker_slots(mut self, slots: &[bool]) -> Self {
+        self.marker_slots.clear();
+        self.marker_slots.extend_from_slice(slots);
         self
     }
 }
@@ -184,14 +186,14 @@ impl StatefulWidget for SmoothScrollbar {
             // the same cell.
             let top_half = if top_in_thumb {
                 Half::Thumb
-            } else if self.markers.contains(&top_slot) {
+            } else if self.marker_slots.get(top_slot).copied().unwrap_or(false) {
                 Half::Marker
             } else {
                 Half::Empty
             };
             let bot_half = if bot_in_thumb {
                 Half::Thumb
-            } else if self.markers.contains(&bot_slot) {
+            } else if self.marker_slots.get(bot_slot).copied().unwrap_or(false) {
                 Half::Marker
             } else {
                 Half::Empty
@@ -369,7 +371,9 @@ mod tests {
     // ── Marker tests ─────────────────────────────────────────────
 
     /// Like `render_to_symbols` but with markers and `marker_fg` set.
-    /// Markers are pre-computed virtual-slot positions.
+    /// `marker_slots` are virtual-slot indices; they are expanded into the
+    /// occupancy bitmap the scrollbar now consumes (index = slot, `true` =
+    /// marker) sized to the 2-per-row virtual track the renderer would build.
     fn render_to_symbols_with_markers(
         height: u16,
         content_length: usize,
@@ -378,11 +382,18 @@ mod tests {
         marker_slots: &[usize],
     ) -> Vec<String> {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, height));
+        let virtual_track = 2 * height as usize;
+        let mut bitmap = vec![false; virtual_track];
+        for &slot in marker_slots {
+            if let Some(bit) = bitmap.get_mut(slot) {
+                *bit = true;
+            }
+        }
         let scrollbar = SmoothScrollbar::new()
             .thumb_fg(Color::Gray)
             .track_bg(Color::DarkGray)
             .marker_fg(Color::Green)
-            .with_markers(marker_slots);
+            .with_marker_slots(&bitmap);
         let mut state = SmoothScrollbarState::new(content_length)
             .position(position)
             .viewport_content_length(viewport_content_length);
@@ -451,11 +462,13 @@ mod tests {
     #[test]
     fn marker_uses_green_fg_color() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 5));
+        let mut slots = vec![false; 10];
+        slots[6] = true;
         let scrollbar = SmoothScrollbar::new()
             .thumb_fg(Color::Gray)
             .track_bg(Color::DarkGray)
             .marker_fg(Color::Green)
-            .with_markers(&[6]);
+            .with_marker_slots(&slots);
         // Position=0, content=10, viewport=3 → thumb covers rows 0-1.
         // Marker at line 6 → virtual slot 6 → row 3 top half.
         let mut state = SmoothScrollbarState::new(10)
@@ -477,11 +490,13 @@ mod tests {
         // cell's foreground) and the marker the lower half (its background),
         // so the thumb stays visible above the marker.
         let mut buf = Buffer::empty(Rect::new(0, 0, 1, 5));
+        let mut slots = vec![false; 10];
+        slots[1] = true;
         let scrollbar = SmoothScrollbar::new()
             .thumb_fg(Color::Gray)
             .track_bg(Color::DarkGray)
             .marker_fg(Color::Green)
-            .with_markers(&[1]);
+            .with_marker_slots(&slots);
         let mut state = SmoothScrollbarState::new(10)
             .position(0)
             .viewport_content_length(1);

@@ -459,12 +459,26 @@ impl App {
                 }
             }
             ViewportChange::HeightsOnly => {
-                // A real vertical resize: nothing re-wraps, so the caches and
-                // the selection stay valid, but the image-block height the
-                // prefix reserves derives from the viewport height, so recompute
-                // the heights (a cache-hit rebuild — no re-render).
+                // Nothing re-wraps.  The only turn-height input that reads the
+                // viewport height is the image-block reserve
+                // (`image_block_height`), so a turn's height changes only when
+                // that reserve changes AND the turn actually has an image.
+                // Otherwise the height prefix, turn heights and render caches
+                // are all still valid — only the scrollbar's marker slots
+                // rescale to the new virtual track, which `ensure_marker_slots`
+                // does lazily at the next draw (O(markers), no height rebuild).
+                // This keeps a chrome-height change — a status line appearing on
+                // the first keystroke, the input box wrapping onto a new line —
+                // off the O(turns) full-rebuild path for text-only sessions.
+                let old_img = (old_height / 2).max(1);
+                let new_img = (new_height / 2).max(1);
+                let img_height_changed = old_img != new_img;
                 for display in self.session_displays.values_mut() {
-                    display.markers_dirty = true;
+                    if img_height_changed && display.any_image_turns {
+                        display.markers_dirty = true;
+                    } else {
+                        display.marker_slots_dirty = true;
+                    }
                 }
             }
             ViewportChange::None => {}
@@ -676,6 +690,7 @@ impl SessionDisplayState {
         self.markers.clear();
         self.turn_layouts.clear();
         self.turn_heights.clear();
+        self.any_image_turns = false;
         let mut total = 0usize;
         let virtual_track = Self::virtual_track_slots(viewport);
         let fallback_img_height = Self::image_block_height(viewport) as usize;
@@ -759,7 +774,11 @@ impl SessionDisplayState {
             // (the height path uses `turn_image_count`, the render loop
             // `turn_image_slots`, and both walk the same source order), so a
             // click's `image_ranges` index maps onto that slot list exactly.
-            for _ in 0..turn_image_count(turn) {
+            let img_count = turn_image_count(turn);
+            if img_count > 0 {
+                self.any_image_turns = true;
+            }
+            for _ in 0..img_count {
                 let start = text_height + total_img_height;
                 image_ranges.push((start, start + fallback_img_height));
                 total_img_height += fallback_img_height;
@@ -803,6 +822,8 @@ impl SessionDisplayState {
             });
         }
         self.markers_dirty = false;
+        // The marker set changed, so the renderer's slot bitmap is stale.
+        self.marker_slots_dirty = true;
     }
 
     pub(crate) fn mark_streaming_changed(&mut self) {
@@ -1055,6 +1076,45 @@ impl SessionDisplayState {
             }
             accum += turn_height;
         }
+        // The marker set changed, so the renderer's slot bitmap is stale.
+        self.marker_slots_dirty = true;
+    }
+
+    /// Ensure the scrollbar's marker-slot bitmap matches the current markers and
+    /// viewport: a viewport-sized `true`-per-occupied-slot array the renderer
+    /// draws from in O(vh).
+    ///
+    /// Rebuilt (from each marker's *content line*, so a viewport-height change
+    /// rescales correctly against the new virtual track) only when the marker
+    /// set changed ([`Self::marker_slots_dirty`]) or the viewport height altered
+    /// the track length; every other frame — including every scrolling frame
+    /// and every streaming chunk — reuses it, which is what keeps the scrollbar
+    /// draw O(vh) instead of O(markers).
+    pub(crate) fn ensure_marker_slots(&mut self, viewport: &HistoryViewport) {
+        let virtual_track = Self::virtual_track_slots(viewport);
+        if !self.marker_slots_dirty && self.marker_slots.len() == virtual_track {
+            return;
+        }
+        let total = self.total_history_height().max(1);
+        // The bitmap length records the track it was built for.  When the track
+        // is unchanged, each marker's stored `virtual_slot` is the slot for the
+        // current total (both were written together by the marker rebuild); when
+        // the viewport height changed the track, the stored slots are for the
+        // old scale, so rescale from the marker's content line instead.
+        let track_unchanged = self.marker_slots.len() == virtual_track;
+        let mut slots = vec![false; virtual_track];
+        for marker in &self.markers {
+            let slot = if track_unchanged {
+                marker.virtual_slot
+            } else {
+                marker.content_line * virtual_track / total
+            };
+            if let Some(bit) = slots.get_mut(slot) {
+                *bit = true;
+            }
+        }
+        self.marker_slots = slots;
+        self.marker_slots_dirty = false;
     }
 
     pub(crate) fn max_scroll_offset(&self, viewport: &HistoryViewport) -> usize {

@@ -251,10 +251,19 @@ pub(super) fn handle_chat_event(
                     let top_slot = 2 * mouse.row as usize;
                     let bot_slot = top_slot + 1;
 
+                    // Derive each marker's slot from its content line against
+                    // the CURRENT total and virtual track (the same mapping the
+                    // draw-time bitmap uses), rather than trusting the stored
+                    // `virtual_slot`, which is only refreshed on a full marker
+                    // rebuild and can lag a chrome-height change that skipped
+                    // one.
+                    let virtual_track = 2 * app.history_viewport.height as usize;
+                    let total = app.total_history_height().max(1);
                     let marker_hit = app.active_display_ref().and_then(|d| {
-                        d.markers
-                            .iter()
-                            .find(|m| m.virtual_slot == top_slot || m.virtual_slot == bot_slot)
+                        d.markers.iter().find(|m| {
+                            let slot = m.content_line * virtual_track / total;
+                            slot == top_slot || slot == bot_slot
+                        })
                     });
 
                     if let Some(marker) = marker_hit {

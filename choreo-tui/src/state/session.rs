@@ -98,6 +98,7 @@ impl App {
         display.streaming_response = None;
         display.streaming_dirty = false;
         display.markers_dirty = true;
+        display.marker_slots_dirty = true;
         display.content_dirty = false;
         display.status = None;
         display.error = None;

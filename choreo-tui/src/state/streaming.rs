@@ -21,7 +21,7 @@
 
 use super::{
     HistoryViewport, RenderCacheKey, RenderedCache, RenderedTurn, SessionDisplayState,
-    semantic_line_row_range, semantic_line_row_start,
+    semantic_line_row_range, semantic_line_row_start, turn_image_count,
 };
 use crate::markdown_render::{
     IncrementalMarkdown, compute_visual_offsets, lines_height, reasoning_expanded_default,
@@ -223,6 +223,12 @@ impl SessionDisplayState {
 
             let full_img_height = Self::image_block_height(viewport) as usize;
             let img_count = turn.displayed_images.len();
+            // Track that this session holds an image-bearing turn, so a later
+            // chrome-height change knows it must re-reserve image block heights
+            // (see the `HeightsOnly` branch in `update_viewport_from_terminal_size`).
+            if turn_image_count(turn) > 0 {
+                self.any_image_turns = true;
+            }
             let turn_height = text_height + img_count * full_img_height;
 
             // `turn_idx` was bounds-checked against `visible_turn_ids` above,
@@ -247,7 +253,18 @@ impl SessionDisplayState {
                 if !at_bottom {
                     self.history_scroll.scroll = self.history_scroll.scroll.saturating_add(delta);
                 }
-                self.rebuild_markers(viewport);
+                // Rescale the scrollbar markers only when content streams from a
+                // turn that is *not* the last visible one: growth above a later
+                // turn shifts that turn's marker content line.  When the
+                // streaming turn is the last visible turn (the common case) no
+                // marker's content line moves, so recomputing every marker — an
+                // O(turns) walk — is skipped; the markers' scrollbar slots drift
+                // by a fraction of the grown total until the next structural
+                // rebuild, which corrects them.  This keeps the per-chunk path
+                // O(1) in the number of turns.
+                if turn_idx + 1 < self.visible_turn_ids.len() {
+                    self.rebuild_markers(viewport);
+                }
             } else if old_height > turn_height {
                 return self.rebuild_height_prefix_preserving_scroll(viewport);
             }
