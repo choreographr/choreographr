@@ -501,6 +501,13 @@ pub(crate) fn run_app(mode: ConnectionMode, attach: Option<u64>) -> io::Result<(
         .send(&client_tx, ClientMessageType::ListSessions);
     app.pending
         .send(&client_tx, ClientMessageType::ListAccounts);
+    // Subscribe to the daemon's all-activity bus exactly once, here in the
+    // startup sequence, and never re-subscribe: the daemon's fan-out is
+    // lossless and drops a subscriber only when its receiver is gone, so every
+    // background session's events keep arriving for the life of this
+    // connection. A re-subscribe would be redundant; a *silent* drop on the
+    // daemon side would leave the TUI blind to background sessions until it
+    // happened to attach to one (see `choreo-daemon`'s `broadcast` module).
     app.pending
         .send(&client_tx, ClientMessageType::SubscribeAllActivity);
     // Emit the initial window title now that the alternate screen is active

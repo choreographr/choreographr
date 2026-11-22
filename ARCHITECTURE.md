@@ -941,157 +941,85 @@ image blocks) rather than embedded in the response struct.
 
 ### Tool output sanitization and bounding
 
-Tool output is defended in three layers — at the **source** (the tool that produces
-the bytes), at the **transcript** (what the model sees on the next call), and at the
-**sink** (the terminal that renders it). One Unicode policy and one byte budget sit
-behind all three, so the layers cannot drift: `choreo-sanitize` owns the spoofing
-predicates (`is_unsafe_unicode` / `is_non_joiner_format_char`), the 128 KiB
-`MAX_TOOL_OUTPUT_BYTES` budget with its `...[truncated]` marker, the incremental
-`ByteBudget` a streaming path is charged against, and the shared child-env injection
-list. Its consumers are the daemon's line sanitizers and transcript choke point, the
-TUI's terminal render filter, `choreo-blockchain`'s node-output sanitizer,
-`choreo-client-core`'s live accumulation, and `choreo-mcp`'s stdio children — so a
-character class is defined once, not re-implemented per layer.
+Tool output is defended in three layers at once — at the **source** (the tool
+that produces the bytes), at the **transcript** (what the model sees on the next
+call), and at the **sink** (the terminal that renders it) — and all three sit on
+one Unicode policy and one byte budget so they cannot drift. `choreo-sanitize`
+owns those shared primitives; each layer's per-tool application, including the
+ordering rule that keeps a critical tail alive through the transcript's
+post-sanitize re-cap, is documented where it lives (`choreo-daemon`'s
+`tools/sanitize.rs` and its transcript choke point, `choreo-tui`'s
+`text_filter`).
 
-- **Source.** The line-oriented tools escape C0/C1 controls, U+2028/U+2029, and the
-  non-joiner format class as they render a listing or a content body, so one entry
-  stays one line and a hostile name or line cannot inject terminal escapes.
-- **Transcript.** The single point where every tool result is recorded escapes
-  *only* the Cf spoofing class, preserving ESC/ANSI, newlines, and tabs so shell/VM
-  colors survive into the model's history.
-- **Sink.** `choreo-tui`'s terminal-safety filter keeps complete SGR colour
-  sequences and escapes everything else. That is what makes the raw shell/VM
-  streams safe to draw at all, including for the tools that never sanitize at the
-  source.
-
-Each layer's per-tool application is documented where it lives (`tools/sanitize.rs`,
-`choreo-tui`'s `text_filter`), including the ordering rule the budget depends on:
-escaping *expands* text, so a body capped as raw bytes can exceed the budget once a
-Cf character becomes `\u{202e}`. The transcript choke point therefore re-caps after
-sanitizing, and a tool that appends a critical tail (the VM exit footer, the shell
-`Exit code:` line, the PDF untrusted-content delimiter) sanitizes before capping via
-`finish_tool_output_sanitized`, whose output is plain ASCII — which makes the choke
-point's re-sanitize and re-cap no-ops, so the tail cannot be cut off.
-
-**Content is capped; delivery is bounded separately.** `ByteBudget` caps a single
-tool's content at the source and the clients cap their own live accumulation at the
-same shared budget with the same marker, so the streamed view and the authoritative
-recorded result agree. Delivery is a different bound: the lossless delivery design
-separately bounds the per-client in-flight bytes that trigger lag-eviction (see the
-`choreo-daemon` `broadcast` module docs). They do not collide — content is capped at
-the source, delivery per client queue.
+**Content is capped; delivery is bounded separately.** The byte budget caps one
+tool's content at the source and in every client's live accumulation, while the
+lossless delivery design separately bounds the per-client in-flight bytes that
+trigger lag-eviction (see the `choreo-daemon` `broadcast` module docs). The two
+do not collide — content is capped at the source, delivery per client queue.
 
 ### PDF tools
 
-`pdf_classify` and `pdf_to_markdown` give the agent native PDF ingestion by
-wrapping `pdf-inspector` (Firecrawl) — a pure-Rust, extraction-only PDF parser
-built on `lopdf`. The parser has no JavaScript engine, never renders pages, and
-never executes embedded files, `/Launch` actions, or external references, so the
-classic PDF malware *execution* vectors are excluded by construction. The tool
-layout and per-tool contracts are documented in-source (see `tools/pdf/`).
-
-> **Dependency — security.** `pdf-inspector` 1.x ships `lopdf >= 0.42`, whose
-> MAX_NESTING_DEPTH cap fixes RUSTSEC-2026-0187: a ~21 KB crafted PDF with
-> ~10,000-deep nested objects aborted the process via stack overflow — a SIGABRT
-> that `catch_unwind` **cannot** intercept. The regression guard
-> `nested_array_poc_does_not_abort_process` in `tests/it/pdf_tool_integration.rs`
-> still covers it: with `lopdf >= 0.42` the PoC yields a clean parse error or a
-> graceful `SCANNED` classification (exit 0) instead of SIGABRT. The dependency
-> sits behind `choreo-daemon`'s `pdf` feature, which is in `default` so every
-> desktop consumer keeps the tools; the iOS embedded-daemon build opts out because
-> pdf-inspector's build script links a C dylib the Linux validation shim cannot
-> produce. There is no `[patch.crates-io]` redirect — `choreo-daemon/Cargo.toml`
-> carries the full rationale.
-
-Extracted markdown is **untrusted data end-to-end**: `pdf_to_markdown` frames it in
-an explicit `UNTRUSTED content extracted from PDF…` block whose closing delimiter is
-reserved *inside* the shared byte budget (so a truncated extraction still closes its
-frame) and whose literals are redacted from the extracted text (so a hostile PDF
-cannot close the frame early and have the rest read as trusted output). Both tools
-parse only validated bytes — the path resolved, a regular-file check, a 50 MiB size
-cap, and the `%PDF-` magic header, all checked against the same open handle so a
-file swapped or grown between check and read cannot slip past. The individual gates,
-the post-decompress budget, and the page-range checks are documented in-source
-(`tools/pdf/`), as is the containment story: `lopdf` panics on malformed input are
-caught by the request worker's `catch_unwind` boundary (see the worker thread
-discussion above), while OS-level sandboxing (Landlock/seccomp/Seatbelt) for
-extension-process parsing is a planned follow-up.
+`pdf_classify` and `pdf_to_markdown` wrap `pdf-inspector` (Firecrawl), a
+pure-Rust, extraction-only parser built on `lopdf`: with no JavaScript engine
+and no page rendering, the classic PDF malware *execution* vectors are excluded
+by construction. Input gating, the untrusted content framing, and the
+containment story are documented in-source (`tools/pdf/`). The dependency's
+RUSTSEC-2026-0187 fix (`lopdf >= 0.42`'s nesting cap, with the regression guard
+`nested_array_poc_does_not_abort_process` still in
+`tests/it/pdf_tool_integration.rs`), the `pdf` feature's placement in `default`,
+and the iOS embedded build's opt-out are explained in
+`choreo-daemon/Cargo.toml`.
 
 ### Postcard binary encoding
 
-Tools communicate with the RISC-V sandbox via a `postcard`-encoded binary protocol:
-
-- **Arguments:** Encoded as `postcard::to_allocvec(&args)` where `args: Self::Args`
-- **Return value:** Encoded as `postcard::to_allocvec(&Result::<Result<R, E>, ToolError>::Ok(Ok(ret)))`
-  — a nested postcard `Result` where:
-  - `Ok(Ok(ret))` — tool succeeded, `ret: R` (serialized return value)
-  - `Ok(Err(e))` — tool failed, `e: E` (structured, per-tool error type)
-  - `Err(e)` — infrastructure failure, `e: ToolError`
-  The outer layer captures infrastructure failures (arg deserialisation); the inner
-  layer captures tool-defined errors.  This allows VM guests to pattern-match on
-  specific error variants (e.g. `DbError::NotFound`, `HttpError::InvalidUrl`).
-- **Tool call frame (VM → host):** `[tool_name: postcard String][args: postcard-encoded Args]`
-
-### Available tools
-
-Each tool's contract — its arguments, return shape, and output behaviour, and its
-feature/binary gating — is documented in-source (see `choreo-daemon`'s tool modules,
-`cargo doc -p choreo-daemon` / `just doc`), held complete by the `#![warn(missing_docs)]` +
-`doc-check` gate. The registry lists the shipped tools (see the `tools` module and its `ToolRegistry` docs).
+Tools reach the RISC-V sandbox over a `postcard` binary protocol. The frame
+shapes, the args encoding, and the nested `Result<Result<R, E>, ToolError>`
+return encoding — the outer layer for infrastructure failures (arg
+deserialisation), the inner for the tool's own error type, so a guest can
+pattern-match its variants — are documented in-source (`choreo-daemon`'s `tools`
+module and `tools/vm.rs`).
 
 ### Tool groups
 
-Tools are organized into groups to reduce context overhead. Each tool declares its group
-via `fn group() -> &'static str` on the `Tool` trait. The group catalog — each group's name,
-its model-facing description, and its cargo-feature gating — is documented in-source (see
-`choreo-daemon`'s `tools` module, `cargo doc -p choreo-daemon` / `just doc`), held complete by
-the `#![warn(missing_docs)]` + `doc-check` gate; the default active set (`core`, `git`, and
-`shell`) travels with the session-config default in `choreo-daemon`'s `sessions` module.
+Tools are grouped to reduce context overhead, and each declares its group via
+`Tool::group`. The group catalog — each group's name, its model-facing
+description, and its cargo-feature gating — is in-source (`choreo-daemon`'s
+`tools` module), as is the default active set (`core`, `git`, `shell`) with the
+session-config default in `sessions`. The system prompt lists every group and
+its description; the model activates and deactivates them with
+`load_tools`/`unload_tools`, and **core** cannot be unloaded.
 
-The system prompt lists all groups and their descriptions. The model uses `load_tools` to
-activate additional groups and `unload_tools` to deactivate them. **core** cannot be unloaded.
-
-Groups affect only tool **availability** in the API `tools` array — they are a discovery
-mechanism, not access control. The RISC-V VM (`run_riscv`) always has access to all registered
-tools regardless of group state.
+Groups affect only tool **availability** in the API `tools` array — they are a
+discovery mechanism, not access control. The RISC-V VM (`run_riscv`) reaches
+every registered tool regardless of group state.
 
 ### Concurrent tool dispatch
 
-Each response's tool calls are partitioned into a **serial
-(session-config)** phase — `load_tools`, `unload_tools`, `set_working_dir`, and
-the other session-config mutators — and a **concurrent** phase holding every
-remaining tool (shell, filesystem, VM, HTTP, Git, `spawn_subsession`, …) whose
-execution is independent of session state. The typed `PendingConfigChange`
-capture, the `is_session_config_tool` predicate, and the Phase-3 worker-copy
-mirror that carries successful session-config mutations onto the request
-worker's config copy live in `requests/config_tools.rs`.
+Each response's tool calls are partitioned into a **serial (session-config)**
+phase — `load_tools`, `unload_tools`, and `set_working_dir` — and a
+**concurrent** phase holding every remaining tool (shell, filesystem, VM, HTTP,
+Git, `spawn_subsession`, …) whose execution is independent of session state. The
+typed `PendingConfigChange` capture, the `is_session_config_tool` predicate, and
+the Phase-3 worker-copy mirror that carries successful mutations onto the
+request worker's config copy live in `requests/config_tools.rs`; the dispatch
+and execution machinery — thread topology, per-tool timeout resolution, the wait
+loops, the streaming forwarder, and per-tool result recording — lives in
+`requests/tool_execution.rs`.
 
-The dispatch and execution machinery — channel wiring, per-tool timeout
-resolution, the wait loops, the streaming forwarder, and per-tool result
-recording — lives in-source: `requests/tool_execution.rs`'s module docs own the
-thread topology (execution, forwarding, and wait-loop thread per concurrent tool)
-and the per-tool timeout budgets.
-
-Cancellation is fully event-driven: every wait blocks on a
-`crossbeam_channel::select_biased!` between its result channel, the request's
-cancel channel, and (where a timeout applies) an exact `after(remaining)` timer
-— there are no `recv_timeout` poll loops — and every wait biases the cancel arm
-first, so a queued cancel is selected deterministically and a cancel that lands
-mid-block is more likely to beat a simultaneously-ready result. When a cancel
-wins a race, an already-completed result is still drained (non-blocking) rather
-than discarded, so the tool's real output is recorded while the request still
-stops (sticky `cancelled` flag). A cancel observed by the concurrent collector
-sends every still-running wait-loop a per-tool kill and keeps draining until all
-batch handles have arrived, so each unfinished call records a deterministic
-`"tool '<name>' cancelled"` outcome; the placeholder sweep
-(`mark_unexecuted_tool_results`) remains a safety net for wait-loops that die
-before delivering. Tool results are always rendered in the model's original call
-order — placeholders are seeded in call order and filled **in place by
-`call_id`** as each tool streams or finishes, and because the provider request
-is rebuilt from the session turn (which carries the results in that same call
-order) there is no separate accumulator to re-sort.
-A tool thread that panics is caught and reported as a `ToolOutput` with
-`is_error: true` instead of crashing the daemon.
+Three properties hold across both phases however the races fall. Cancellation is
+fully event-driven (every wait is a `select_biased!` that lists the cancel arm
+first, over the result channel, the cancel channel, and an exact
+`after(remaining)` timer — never a poll loop), and a cancel that wins a race
+still **drains** an already-completed result rather than discarding it, so the
+transcript keeps the tool's real output while the request still stops on the
+sticky flag. A cancel observed by the concurrent collector sends every
+still-running wait-loop a per-tool kill and keeps draining until all batch
+handles have arrived, so each unfinished call records a deterministic outcome
+and the placeholder sweep (`mark_unexecuted_tool_results`) stays only a safety
+net for a wait-loop that dies before delivering. Tool results are always
+rendered in the model's original call order — placeholders are seeded in call
+order and filled **in place by `call_id`** — and a tool thread that panics is
+caught and reported as an error `ToolOutput` instead of crashing the daemon.
 
 Both phases share a `ToolContext.cancelled` flag with the running tool so a tool
 that consults it can stop early — the one sanctioned shared-state exception to
@@ -1099,18 +1027,16 @@ the repo's channel-only thread-communication rule (see AGENTS.md).
 
 ### spawn_subsession
 
-`spawn_subsession` is a core-group `Tool` implementation that runs in the
-concurrent dispatch path: it asks the daemon command loop for a child session
-(parent recorded as `parent_session_id`; working directory, model, and tool groups
-inherited), drives the child's own agent loop to completion under the daemon-wide
-`max_turns` cap, and returns the child's assistant text. Its contract is documented
-in-source (`choreo-daemon`'s `tools/subsession.rs`).
-
-The daemon tracks the parent→child relationship (`DaemonState::children`) so a
-parent's cancellation, exit, or deletion also stops its children — see the daemon's
-`cancel_children_of` and cascade-deletion docs. The TUI's navigation round trip
-(entering the child a spawn created, and switching back when it finishes) is
-documented in `choreo-tui`'s `state/subsession.rs`.
+`spawn_subsession` is a core-group tool on the concurrent dispatch path: it asks
+the daemon command loop for a child session (`parent_session_id` recorded;
+working directory, model, and tool groups inherited), drives the child's own
+agent loop to completion under the daemon-wide `max_turns` cap, and returns the
+child's assistant text. Its contract is in-source (`choreo-daemon`'s
+`tools/subsession.rs`). The daemon tracks the parent→child relationship
+(`DaemonState::children`) so a parent's cancellation, exit, or deletion also
+stops its children — see `cancel_children_of` and the cascade-deletion docs —
+and the TUI's navigation round trip is documented in `choreo-tui`'s
+`state/subsession.rs`.
 
 ### `run_riscv` — RISC-V sandboxed code execution
 
@@ -1169,18 +1095,18 @@ Security model.
 
 ### Turn durability
 
-Each `Turn` is written to disk when the **agent-loop iteration that produced it**
-completes, not when the request does — one request is not one turn: a tool loop may
-iterate without limit (unbounded when `max_turns` is 0) for tens of minutes, so the
-request is far too coarse a durability unit. The iteration boundary is the first
-moment a turn is complete (assistant message plus one recorded result per call), and
-it precedes the next provider round-trip, so a checkpoint there bounds the crash
-window to the single turn in flight. The worker builds its turns on a private
-`SessionState` clone, and the session thread's merge at `RequestFinished` stays the
-authoritative final write; the checkpoint itself, that merge's `persisted_turns`
-re-write skip, and the swallow-and-retry handling of a failed checkpoint are
-documented in-source (`choreo-daemon`'s `requests/tool_execution.rs`,
-`sessions/state.rs`, and `sessions/handlers/inference.rs`).
+Each `Turn` is written when the **agent-loop iteration that produced it**
+completes, not when the request does: a request is not one turn, and its tool
+loop can iterate unbounded for tens of minutes, so the request is far too coarse
+a durability unit. The iteration boundary is the first moment a turn is complete
+(assistant message plus one recorded result per call) and it precedes the next
+provider round-trip, so a checkpoint there bounds the crash window to the single
+turn in flight. The worker builds its turns on a private `SessionState` clone
+and the session thread's merge at `RequestFinished` stays the authoritative
+final write; the checkpoint itself, that merge's `persisted_turns` re-write
+skip, and the swallow-and-retry handling of a failed checkpoint are documented
+in-source (`choreo-daemon`'s `requests/tool_execution.rs`, `sessions/state.rs`,
+and `sessions/handlers/inference.rs`).
 
 Three invariants hold around that boundary:
 
@@ -1191,7 +1117,7 @@ Three invariants hold around that boundary:
   turn's `TurnAppended` arrives.
 - **A committed turn is durable.** `redb` write transactions default to
   `Durability::Immediate` and the daemon never lowers it, so a committed turn has
-  been fsynced — a crash loses only what was never committed.
+  been fsynced (see the `db` module docs).
 - **Every request ending persists.** Completion, inference failure, and
   cancellation all finalize the turn and route the worker's snapshot through
   `RequestFinished`, so a graceful shutdown (which cancels in-flight requests)
@@ -1199,33 +1125,30 @@ Three invariants hold around that boundary:
   would have written.
 
 **Crash-recovery skew.** Durability covers the turn rows, not every field of the
-worker's `SessionState`. The fields the worker owns — `last_response_id` (the
-provider's continuation-chain head) and `accumulated_usage` (the billing total) —
-change on that private clone and merge only at `RequestFinished`, so after a
-mid-request crash the on-disk turns can be newer than they are; config a tool
-changes through the session's own commands (model, title, working directory, tool
-groups) is persisted when the command is applied, so only the worker-owned fields
-lag. On restart the session is rebuilt from the turn rows: `next_turn_id` comes from
-the maximum turn id (never the record's advisory `turn_count`), the billing total
-and the context-size readout are re-derived from the per-turn usage those rows carry,
-and the stale `last_response_id` is restored only when its producing provider+model
-still matches — a `ResponseId` provider then continues from that older head with the
-checkpointed turns re-sent as new input. This is the accepted cost of turn-level
+worker's `SessionState`: the worker-owned fields (`last_response_id`, the
+continuation-chain head, and `accumulated_usage`, the billing total) change on
+that private clone and merge only at `RequestFinished`, so after a mid-request
+crash the on-disk turns can be newer than they are — config a tool changes
+through the session's own commands is persisted when the command is applied, so
+only the worker-owned fields lag. On restart the session is rebuilt from the
+turn rows: `next_turn_id` comes from the maximum turn id (never the record's
+advisory `turn_count`), the billing total and context-size readout are
+re-derived from the per-turn usage those rows carry, and the stale
+`last_response_id` is restored only when its producing provider+model still
+matches — a `ResponseId` provider then continues from that older head with the
+checkpointed turns re-sent as new input. That is the accepted cost of turn-level
 durability: the conversation itself is never lost.
 
 ### Schema versioning & migrations
 
 The `meta` table holds the persisted schema version, and the daemon runs the
-migration chain immediately after opening the database on every startup. The policy:
-an **additive** change (a `#[serde(default)]` field, a lazily created table) needs no
-migration, while a **breaking** change (codec swap, key-type change, table
-split/merge, semantic change) gets a numbered migration and a `SCHEMA_VERSION` bump.
-The contract every entry must satisfy — a chain contiguous over
-`1..SCHEMA_VERSION`, one write transaction per step, idempotent under re-run, old
-record shapes decoded through frozen local copies — plus the pre-migration
-`bak-v{from}` backup and the downgrade / redb `UpgradeRequired` refusals are
-documented in-source (see `choreo-daemon`'s `db` module, `cargo doc -p choreo-daemon`
-/ `just doc`).
+migration chain immediately after opening the database on every startup. The
+policy — an **additive** change needs no migration, a **breaking** one gets a
+numbered migration and a `SCHEMA_VERSION` bump — and the contract every entry
+must satisfy (a chain contiguous over `1..SCHEMA_VERSION`, one write transaction
+per step, idempotent under re-run, old record shapes decoded through frozen
+local copies), with the pre-migration `bak-v{from}` backup and the downgrade
+refusal, are documented in-source (`choreo-daemon`'s `db` module).
 
 ### Undo/Redo
 
@@ -1259,10 +1182,10 @@ loop can force-close a wedged session's provider sockets from the thread that
 decided the cancel: `shutdown(fd, SHUT_RDWR)` is the only way to un-block a
 worker blocked in a provider `read()`, and the registry's lock is held only for
 a handful of fd syscalls. The daemon's live-connection counter (the **third**
-exception, `server/lifecycle.rs`'s `Arc<AtomicUsize>` released by the RAII
-`ConnectionSlot`) enforces `MAX_CONCURRENT_CONNECTIONS` atomically across the
-two accept paths — a bound no channel can express without a dedicated
-accounting thread.
+exception, released by the RAII `ConnectionSlot`) enforces
+`MAX_CONCURRENT_CONNECTIONS` atomically across every accept path — a bound no
+channel can express without a dedicated accounting thread. Both rationales live
+on the types (`DaemonState::session_registries`, `server/lifecycle.rs`).
 
 ---
 
@@ -1393,117 +1316,37 @@ id derives it from the highest id already allocated (never from a turn count).
 
 ### Broadcast fan-out (lossless delivery, lag eviction)
 
-The all-activity subscription is **sticky**: the daemon's activity broadcast
-(`handle_broadcast_activity`) never drops a message for a subscriber —
-only a disconnected receiver is removed.  This matters because the TUI
-registers for all activity exactly once at startup and never re-subscribes:
-evicting it would permanently blind it to every background session, so
-switching into a streaming session would show a blank turn until the next
-chunk arrived over the (just attached) per-session path instead of the
-accumulated content.
+All three subscriber fan-outs — the all-activity broadcast, the summary
+broadcast, and the per-session broadcast — share ONE policy through
+`crate::broadcast::SubscriberSink`, so they cannot drift: every subscriber's
+writer channel is unbounded (an enqueue can never be full), so the daemon never
+drops a broadcast message and a slow subscriber can never stall the
+single-threaded command loop or a session thread; delivery is guaranteed,
+in-order, and exactly-once for every connected non-evicted client. Memory is
+bounded by LAG-BASED EVICTION instead of drops — the crossing message is still
+enqueued, and the outcome only tells the caller to evict the lagging client. The
+policy, `LagLimits`, the soft-threshold rationale, the counter-balance invariant
+with its one bounded exit-window exception, and the solicited-`Image` carve-out
+are `choreo-daemon`'s `broadcast` module docs.
 
-All three subscriber fan-outs — the all-activity broadcast
-(`handle_broadcast_activity`), the summary broadcast (`DaemonState::broadcast`),
-and the per-session `broadcast()` in sessions.rs — share ONE lossless
-policy via `crate::broadcast::SubscriberSink`.  Each subscriber's writer
-channel is UNBOUNDED, so an enqueue can never be `Full`: the daemon never
-drops a broadcast message, and a slow subscriber can never stall the
-daemon's single-threaded command loop or a session thread (unbounded
-`send` never blocks).  Delivery is guaranteed, in-order (FIFO), and
-exactly-once for every connected non-evicted client.
+Two facts cross layer lines. **Eviction needs no daemon-held socket handle**:
+each connection's writer gets a socket write timeout, so a wedged client cannot
+stall its writer forever — the write fails, the writer shuts the socket down
+itself, and the reader's blocking read unblocks into the normal teardown (see
+the `choreo-daemon` `server` module docs). And **evictions are not silent**:
+each one increments the `choreo_evictions_total` counter served on `/metrics`,
+so a permanently wedged subscriber stays observable.
 
-Memory is bounded by LAG-BASED EVICTION instead of drops.  Each
-`SubscriberSink` carries an in-flight byte counter (an `Arc<AtomicUsize>`
-shared between the producers that increment it on enqueue and the
-connection's writer thread that decrements it on dequeue — sanctioned
-exception #6, see AGENTS.md); `SubscriberSink::enqueue` reports
-`EnqueueOutcome::{Delivered, Disconnected, ClientOverLag, GlobalOverBudget}`
-based on [`LagLimits`] (`per_client_cap` 64 MiB, daemon-wide `global_budget`
-512 MiB — injectable in tests).  The crossing message is STILL enqueued
-(lossless); the outcome only tells the caller to evict the lagging client
-(`DaemonCommand::EvictClient`) or the largest-backlog client
-(`EvictLargestLagging`).  `handle_evict_client` drops the client's single `clients` entry (which holds
-its writer sink, its summary/activity flags, and its session memberships),
-tells its sessions to drop it (`RemoveSubscriber`), and enqueues a best-effort
-`Evicted` advisory before dropping the sink.
-
-The thresholds are SOFT bounds: a race can overshoot the cap by at most
-one message's bytes before the eviction command lands — an exact hard
-cutoff would require a blocking or dropping send, which is exactly what
-this design eliminates.
-
-The byte counters stay BALANCED on every path, to within one bounded race.
-The writer thread decrements on each dequeue; when it stops early (send
-error, or the `Evicted`/`ShuttingDown` stop) it drains whatever is still
-queued and decrements that too, so an abandoned backlog can never stay
-frozen in the daemon-wide total and permanently exhaust the global budget.
-Every enqueue path (`enqueue`, `send_unchecked`, the connection's
-`send_to_writer` — all through the shared `send_accounted` core)
-self-corrects both counters when the send fails on a dead receiver (writer
-thread already gone), and the `Evicted`/`ShuttingDown` advisories are
-accounted like any other message. The one residual race is a straggler
-enqueued in the microsecond window between the writer's exit drain and its
-receiver being dropped: that `send` SUCCEEDS (the receiver is still alive),
-the message is never dequeued, and its bytes stay in the daemon-wide
-counter forever. The leak is bounded to at most one message's bytes per
-teardown event (a producer that sends after the receiver is gone
-self-corrects), so it is accepted and documented as the invariant's one
-bounded exception.
-
-Eviction needs no daemon-held socket handle: each connection's writer gets
-a socket write timeout (`DaemonState::writer_write_timeout`, default 5 s `WRITER_WRITE_TIMEOUT`), so a wedged client
-(zero receive window) cannot stall its writer forever — the write fails,
-the writer shuts the socket down itself (notify-before-EOF on the graceful
-path), and the reader's blocking read unblocks into the normal
-`cleanup_client` teardown (see the `choreo-daemon` `server` module docs).
-
-Evictions are not lost silently: every one increments the
-`choreo_evictions_total` Prometheus counter served on `/metrics`, so a
-permanently wedged subscriber — one whose backlog keeps crossing the cap —
-remains observable.  The old `choreo_broadcast_dropped_total` counter (and
-the drop-on-full policy it measured) is gone: the daemon no longer drops
-broadcast messages.
-
-Each connection is identified by a process-unique `ClientId`, minted from a
-process-wide monotonic `AtomicU32` counter (`broadcast::ClientId::next`) — the
-tenth sanctioned shared-state exception (see AGENTS.md): a lock-free tick that
-carries no protocol data and never crosses the wire, chosen over a random id
-so connection ids read as small sequential numbers in logs.  The daemon's
-consolidated `DaemonState::clients` map is keyed by it — one entry per client
-holding its writer sink, its subscription flags, and its session memberships.
-
-The one process-global override shared with tests is `choreo-shared`'s
-`paths::TEST_LOG_DIR` (a `static RwLock<Option<PathBuf>>`) — the eleventh
-sanctioned shared-state exception (see AGENTS.md).  Integration tests must keep
-the suite's log directory out of the developer's real `$XDG_STATE_HOME`, but
-that directory is resolved from many threads (the daemon command loop and each
-per-server MCP thread), so a thread-local override would let a worker leak its
-log there; a process-global override is shared instead.  It carries no protocol
-data and is a no-op in production (nothing sets it outside tests), and
-nextest's process-per-test keeps one override per process isolated.
-
-The tools' per-file mutation locks (the daemon's
-`tools::file_locks::FILE_LOCKS`, a `LazyLock<FileLocks>` wrapping a
-`Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>`) are the twelfth sanctioned
-shared-state exception (see AGENTS.md).  Each turn's non-config tool calls run
-on their own threads (`requests.rs`, "Phase 2: All remaining tools
-(concurrent)"), so two mutations of the same file in one batch — the
-read-modify-write in `edit_file`, a `write_file` racing an `edit_file`, a
-`delete_files` racing either — would otherwise both read the original and
-silently lose one update; the per-path lock serializes them while mutations of
-different files stay parallel.
-The key is the target's canonical path — canonicalizing the parent directory
-and re-appending the file name when the target does not exist yet, so a create
-racing an edit of the now-existing file agrees on one key even through a
-symlinked or `..`-bearing parent, and two symlinks to one target share a lock.
-The registry reserves each path's handle under the map lock (brief, never
-across the mutation), holds each per-path mutex only for the mutation itself,
-and prunes unreferenced entries from a RAII guard's `Drop` — so a mutation that
-panics still releases its entry.  It carries no protocol data.  Only the three
-`fs` mutation tools take it, and the key is a *single* path: deleting a
-directory does not serialize against a write of a file inside it, and a tool
-that writes an arbitrary path outside `tools::fs` (e.g. `retrieve_webpage`'s
-`output_path`) is not covered.
+Four sanctioned shared-state exceptions (see AGENTS.md) sit behind this design;
+each is a single-purpose lock-free counter or registry whose rationale lives on
+its own type docs: the delivery-lag byte counters
+(`SubscriberSink.bytes_in_flight` plus the daemon-wide `global_lag`, the
+**sixth**), the process-unique `ClientId` minted from a monotonic `AtomicU32`
+(the **tenth** — written there in `broadcast`'s `ClientId` docs),
+`choreo-shared`'s `paths::TEST_LOG_DIR` test override (the **eleventh** — on its
+own docs), and the per-file mutation locks (`tools::file_locks::FILE_LOCKS`, the
+**twelfth** — whose module docs also state the single-path key's two deliberate
+gaps).
 
 ---
 
@@ -1528,145 +1371,143 @@ gate.
 
 ## Design decisions
 
-1. **Unix sockets, not HTTP for client↔daemon** — keeps everything local, avoids port conflicts,
-   leverages OS-level access control.
+1. **Unix sockets, not HTTP for client↔daemon** — keeps everything local, avoids
+   port conflicts, leverages OS-level access control.
 
-2. **Binary protocol (MessagePack, named mode), not JSON** — self-describing, compact, typed,
-   versioned. Length-prefixed framing avoids parsing ambiguities. Version field allows protocol
-   evolution.
+2. **Binary protocol (MessagePack, named mode), not JSON** — self-describing,
+   compact, and typed, over a length-prefixed frame (so framing is unambiguous)
+   whose version gate rejects a mixed-version peer at decode rather than letting
+   it misread a payload.
 
-3. **Lock/Unlock security** — the daemon starts without credentials in memory. The unlock key travels
-   only over authenticated transport and is zeroized after use. Credentials are encrypted per-credential so
-   they can be stored in the database without a global passphrase. The keystore binding is established once (TOFU) via the `BindKeystore` wire path — the only message that can create it; `Unlock` is verify-only. `AddCredential` carries the credential as typed plaintext with no key — the daemon encrypts it to its own binding and requires an already-unlocked keystore.
+3. **Lock/Unlock security** — the daemon starts with no credentials in memory,
+   and each credential is encrypted to the daemon's own binding before it is
+   stored, so no global passphrase exists to lose; the unlock key rides only
+   authenticated transport and is zeroized after use. Two wire contracts hold
+   that together: `BindKeystore` is the ONLY path that can create a binding
+   (TOFU, once), so `Unlock` must stay verify-only, and `AddCredential` carries
+   typed plaintext with no key, so the daemon encrypts it itself and requires an
+   already-unlocked keystore. The flow, its reply-before-broadcast ordering
+   invariant, and the multi-client provisioning consequences are under
+   **Lock/Unlock flow** above.
 
-4. **Sessions, not per-client state** — sessions are independent from client connections. A
-   session has its own model, working directory, and messages. Clients subscribe/unsubscribe from sessions
-   via the broadcast system. Sessions persist in a redb database and survive daemon restarts.
-   Session lifecycle operations (create, attach, list, delete) succeed even when the daemon
-   is locked — credentials are only needed to run models. Sessions carry an optional
-   `account_name` field that determines which provider credential to use at request time;
-   there is no global "default account" fallback. The provider is resolved lazily from the
-   daemon's provider registry when the first RunInput is issued.
+4. **Sessions, not per-client state** — a session owns its model, working
+   directory, and messages, and is independent of the connections watching it;
+   clients subscribe/unsubscribe from sessions via the broadcast system.
+   Sessions persist in redb and survive a restart, and every lifecycle operation
+   (create, attach, list, delete) works while the daemon is locked — credentials
+   are only needed to run a model. A session carries an optional `account_name`
+   that decides which credential a request uses, so there is no global "default
+   account" fallback, and the provider is resolved lazily from the daemon's
+   provider registry rather than pinned at creation.
 
-5. **Session hierarchy** — sessions can have parent sessions (`parent_session_id`), forming a
-   tree. Child sessions inherit their parent's working directory unless explicitly overridden. The
-   `spawn_subsession` tool creates autonomous child sessions that run their own tool-calling
-   loop and report results back to the parent.
+5. **Session hierarchy** — sessions can have parent sessions
+   (`parent_session_id`), forming a tree. Child sessions inherit their parent's
+   working directory unless explicitly overridden. The `spawn_subsession` tool
+   creates autonomous child sessions that run their own tool-calling loop and
+   report results back to the parent.
 
-6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool interactions, up to a
-   configurable daemon-wide `max_turns` cap (default 0 = unlimited), rather than pushing that
-   complexity to the client or model. The client just sees `ToolCallStarted`/`ToolCallFinished`
-   events.
+6. **Tool-call loop in the daemon** — the daemon drives multi-turn tool
+   interactions, up to a configurable daemon-wide `max_turns` cap (default 0 =
+   unlimited), rather than pushing that complexity to the client or model. The
+   client just sees `ToolCallStarted`/`ToolCallFinished` events.
 
-7. **Session subscription model** — multiple clients can subscribe to the same session. Events
-   are broadcast to all subscribers except the originator, enabling shared session viewing.
+7. **Session subscription model** — multiple clients can subscribe to the same
+   session, and every session event fans out to all of them as a broadcast
+   (`id: None`) rather than back to the requester alone; that is what makes
+   shared session viewing work. Only a request's terminal reply is targeted at
+   one client.
 
-8. **SSE streaming is hand-written, not a library** — a reader per wire dialect (OpenAI
-   `data:` lines plus `[DONE]`, Anthropic's `event:`/`data:` pairs) keeps parsing and buffering
-   ours. Two properties are contractual rather than incidental: the blocking socket read is
-   **never on the consumer's thread** — it runs on a dedicated reader thread that forwards
-   parsed events over a bounded channel, so events, cancellation, and the deadline are all
-   observable at once with no polling — and a stream is bounded in **three** independent ways
-   (one event's accumulated bytes, a per-attempt wall-clock deadline that fires even on a
-   keep-alive trickle, and a socket-level idle timeout that resets per byte and so never cuts
-   a steadily streaming response short). Losing any of the three is what lets a gateway,
-   a proxy, or a silent provider wedge an inference worker. The reader, the thread, the
-   constants, and ureq's per-timeout quirks live in `choreo-ai-protocols` (`openai/sse`,
-   `stream`, `retry`, `shared`); the cross-cutting contract is that deadline expiry is its own
-   non-retryable `ProviderError::DeadlineExceeded`, distinct from a socket `Io` error.
+8. **SSE streaming is hand-written, not a library** — a reader per wire dialect
+   (OpenAI `data:` lines plus `[DONE]`, Anthropic's `event:`/`data:` pairs)
+   keeps parsing and buffering ours. Three properties are contractual rather
+   than incidental: the blocking socket read is **never on the consumer's
+   thread**, so events, cancellation, and the deadline are all observable at
+   once with no polling; a stream is bounded in **three** independent ways — one
+   event's accumulated bytes, a per-attempt wall-clock deadline that fires even
+   on a keep-alive trickle, and a socket-level idle timeout that resets per byte
+   and so never cuts a steadily streaming response short; and deadline expiry is
+   its own non-retryable error, distinct from a socket `Io` failure. Losing any
+   of the three is what lets a gateway, a proxy, or a silent provider wedge an
+   inference worker. The readers, the reader thread, the constants, and ureq's
+   per-timeout quirks are `choreo-ai-protocols` rustdoc (`openai/sse`, `stream`,
+   `retry`, `shared`).
 
-9. **Markdown as the intermediate format** — all text (tool output, assistant text, error
-   messages) is treated as markdown and rendered as HTML (desktop) or shaped to terminal output
-   (choreo-tui), providing a consistent rendering layer.
+9. **Markdown as the intermediate format** — all text (tool output, assistant
+   text, error messages) is treated as markdown and rendered as HTML (desktop)
+   or shaped to terminal output (choreo-tui), providing a consistent rendering
+   layer.
 
-10. **Flexible API format** — both OpenAI Chat Completions and the Responses API are
-    first-class, resolved per model (`RequestFormat`, from the catalog's `openai_responses`
-    flag with `default_request_format` as the fallback). The cross-cutting invariant is that
-    there is **one canonical `messages` history**: each adapter lowers it into its own wire
-    shape (a flat typed `input` item array plus `previous_response_id` chaining for Responses,
-    the message list itself for chat), so a history stays sendable across a model switch or a
-    restored session instead of being bound to the format that produced it. Each adapter's
-    event vocabulary, streamed tool-call assembly, stateless dialect, and terminal-event
-    classification are that adapter's own concern — the `choreo-ai-protocols` `openai` module
-    docs own them (`responses`, `sse/responses`, `turn`).
+10. **Flexible API format** — both OpenAI Chat Completions and the Responses API
+    are first-class, resolved per model (`RequestFormat`, from the catalog's
+    `openai_responses` flag with `default_request_format` as the fallback). The
+    cross-cutting invariant is that there is **one canonical `messages`
+    history** that each adapter lowers into its own wire shape, so a history
+    stays sendable across a model switch or a restored session instead of being
+    bound to the format that produced it. Each adapter's event vocabulary,
+    streamed tool-call assembly, stateless dialect, and terminal-event
+    classification are that adapter's own concern (the `choreo-ai-protocols`
+    `openai` module docs own them).
 
-    One fact crosses all of them: a tool call's **caller attribution** is carried, never
-    interpreted. The adapter captures it from the response, the daemon persists it on the turn
-    (`AssistantToolCallRecord::caller`, an additive `#[serde(default)]` field), and the rebuilt
-    request copies it back **unchanged** onto the call and the output answering it — the API
-    resumes the right generated program from it. The value is typed in `choreo-proto` (which
-    sits below `choreo-ai-protocols` and cannot name its caller type), and the chat projection
-    strips it, because that wire has no such field.
+    One fact crosses all of them: a tool call's **caller attribution** is
+    carried, never interpreted — captured by the adapter, persisted on the turn,
+    copied back **unchanged** onto the call and the output answering it by the
+    rebuilt request, and stripped by the chat projection, whose wire has no such
+    field. The value is typed in `choreo-proto`, which sits below
+    `choreo-ai-protocols` and so cannot name the adapter's caller type.
 
-11. **Pluggable providers via `InferenceProvider`** — OpenAI-compatible, Anthropic Messages,
-    Google Gemini, and Mistral each implement the same interface (`chat_completion_turn`,
-    `chat_completion_turn_streaming`, `list_models`) and are constructed from an
-    `AccountConfig` plus a credential; an account is declared in `accounts.toml` by `provider`
-    slug. The trait, the client implementations, the shared types, and the provider catalog all
-    live in `choreo-ai-protocols`, which is what keeps the daemon free of per-protocol
+11. **Pluggable providers** — every protocol client (OpenAI-compatible,
+    Anthropic Messages, Google Gemini, Mistral) implements one `ProviderClient`
+    trait and is built from an account's `provider` slug plus a credential. The
+    trait, the clients, the shared types, and the provider catalog all live in
+    `choreo-ai-protocols`, which is what keeps the daemon free of per-protocol
     knowledge: its `InferenceProvider` is a thin dispatch/metrics facade.
 
-12. **OS threads with sidecar async runtime** — the daemon avoids async Rust everywhere except
-    where third-party libraries (alloy, subxt, rmcp) require it. Those live in their own crates
-    (`choreo-blockchain`, `choreo-content`, `choreo-mcp`), each holding a global
-    `OnceLock<tokio::runtime::Runtime>` as a sidecar and running its clients via `block_on()`.
-    `choreo-mcp` additionally runs one blocking **dispatcher thread per MCP server** that spawns
-    its in-flight calls onto that sidecar, so calls to one server run concurrently and can be
-    cancelled while the dispatcher keeps serving commands. The daemon links those crates only
-    behind the `blockchain`, `content`, and `mcp` cargo features and calls their synchronous
-    entry points, so tokio is never a direct dependency of the daemon. What each crate must
-    therefore own is the bound the daemon cannot supply: a synchronous `block_on` cannot be
-    interrupted, so the daemon's tool timeout can only *abandon* the execution thread and it is
-    the crate-level cap that turns a black-holed endpoint into a clean error instead of a leaked
-    thread — see `choreo-blockchain`'s `RPC_TIMEOUT` docs. Keeping the daemon thread-only
-    simplifies the mental model (each thread owns its data, no `Send` bounds on shared state, no
-    `Pin<Box<dyn Future>>`), improves stack traces, and avoids the complexity of async
-    cancellation.
+12. **OS threads with sidecar async runtime** — the daemon avoids async Rust
+    everywhere except where third-party libraries (alloy, subxt, rmcp) require
+    it, and those live in their own crates (`choreo-blockchain`,
+    `choreo-content`, `choreo-mcp`), each holding a global
+    `OnceLock<tokio::runtime::Runtime>` as a sidecar and running its clients via
+    `block_on()`. The daemon links those crates only behind the `blockchain`,
+    `content`, and `mcp` cargo features and calls their synchronous entry
+    points, so tokio is never a direct dependency of the daemon. What each crate
+    must therefore own is the bound the daemon cannot supply: a synchronous
+    `block_on` cannot be interrupted, so the daemon's tool timeout can only
+    *abandon* the execution thread and it is the crate-level cap that turns a
+    black-holed endpoint into a clean error instead of a leaked thread (see
+    `choreo-blockchain`'s `RPC_TIMEOUT` docs). Keeping the daemon thread-only
+    simplifies the mental model (each thread owns its data, no `Send` bounds on
+    shared state, no `Pin<Box<dyn Future>>`), improves stack traces, and avoids
+    the complexity of async cancellation.
 
-13. **Reasoning round-trip as an opaque artifact** — reasoning is not only display text. On
-    Anthropic, DeepSeek/Kimi, Gemini, and the OpenAI/xAI Responses routes it must be sent back on
-    the next request or the tool-call loop fails with a 400, so it is carried as a payload the
-    daemon **never interprets**: the adapter captures it verbatim at the parse boundary into an
-    opaque `ReasoningArtifact`, the daemon stores and persists it on the `Turn` but strips it
-    from client-bound `DaemonMessage` payloads, and the adapter re-emits it verbatim in its own
-    wire format. Display text is a separate field (`Turn.assistant_reasoning`), so losing the
-    artifact never blanks the transcript.
+13. **Reasoning round-trip as an opaque artifact** — reasoning is not only
+    display text: on Anthropic, DeepSeek/Kimi, Gemini, and the OpenAI/xAI
+    Responses routes it must be sent back on the next request or the tool-call
+    loop fails with a 400, so it is carried as a payload the daemon **never
+    interprets**. Display text is a separate field (`Turn.assistant_reasoning`),
+    so losing the artifact never blanks the transcript, and *whether* to send is
+    derived (same-model provenance plus the catalog's `reasoning_passback`
+    policy), never configured. **Reasoning round-trip** above holds the four-way
+    custody split; the remaining rules are the owning modules' rustdoc.
 
-    *Whether* to send is **derived, never configured**: same-model provenance
-    (`Turn.reasoning_producer` against the current provider+model, so a mid-session model switch
-    drops every old artifact) plus the catalog's per-model `reasoning_passback` policy, which
-    also decides *where* on the wire a chat route wants it. The variants and the per-route
-    requirements are catalog and adapter detail (`choreo-ai-protocols`'s `catalog/entry` and
-    `openai/reasoning_details`).
+    Two consequences are contractual because they cross crate lines. Capture and
+    replay share **one** byte budget (`reasoning_details::MAX_REASONING_BYTES`):
+    a larger per-turn cap would have no replay path, so the two differ in which
+    artifact they drop, never in the number. And replay is bounded **per request
+    over the whole history**, so a long session cannot compound artifacts
+    without limit.
 
-    Three consequences are contractual because they cross crate lines. Capture and replay share
-    **one** byte budget (`reasoning_details::MAX_REASONING_BYTES`): a larger per-turn cap would
-    have no replay path, so the two differ in which artifact they drop, never in the number.
-    Replay is bounded **per request over the whole history**, so a long session cannot compound
-    artifacts without limit. And an over-budget, or corrupt, persisted payload is a dropped
-    artifact — never a failed request, which would make every later turn of that session
-    unsendable.
-
-    **A reasoning-only turn is output.** The turn result carries the fact that the provider
-    produced reasoning, independent of whether any of it could be displayed or replayed: a
-    response whose only output is a reasoning item becomes a `FinalText` with empty content that
-    still carries the round-trip artifact, never an `EmptyResponse` error that discards a payload
-    the provider billed for. Every turn result also reports **how the provider said it ended**
-    (`FinishOutcome`, whose `Absent` is a first-class verdict rather than a fallback), read from
-    each adapter's own wire vocabulary. Both wire formats reach those verdicts through one shared
-    assembler (`openai::turn::assemble_turn`), so the tool-call / truncated-call / empty-response
-    decision tree exists once; that is where truncated calls are reported (a runnable turn keeps
-    them on its `ToolUse`, a final answer reports them in `FinalTextResult::discarded_tool_calls`),
-    and dropping them silently would make an unfinished turn indistinguishable from a finished one.
-
-    **A tool call is reported, not adjudicated.** Every adapter passes the provider's function
-    name through verbatim, and each one is responsible only for its own wire's shape — Gemini's
-    name-matched `functionResponse` grouping and minted positional call ids, Anthropic's
-    whole-or-nothing `input_json_delta` validation, the responses adapter's streamed-call
-    assembly. Whether such a reply is runnable is decided once, in the daemon's agent loop
-    (`choreo-daemon`'s `requests::recovery`), which is the single convergence point for all four
-    wire formats; replay repair of an already-recorded call is likewise the daemon's job
-    (`choreo-daemon`'s `wire` module), on the request copy only.
+    **A reasoning-only turn is output**, and every turn reports **how the
+    provider said it ended** (`FinishOutcome`, whose `Absent` is a first-class
+    verdict rather than a fallback): both wire formats reach those verdicts
+    through one shared assembler (`openai::turn::assemble_turn`), so the
+    tool-call / truncated-call / empty-response decision tree exists once and a
+    truncated call is reported rather than dropped — dropping it silently would
+    make an unfinished turn indistinguishable from a finished one. **A tool call
+    is reported, not adjudicated**: each adapter is responsible only for its own
+    wire's shape, and whether a reply is runnable is decided once, in the
+    daemon's agent loop (`requests::recovery`), with replay repair of an
+    already-recorded call in the daemon's `wire` module, on the request copy
+    only.
 
 ---
 
