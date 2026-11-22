@@ -6,7 +6,7 @@
 # that dep back at an older compatible release. The workspace `rust-version`
 # therefore becomes a *release-time claim*, not a resolver constraint: before
 # publishing, sync it to the resolved tree's true floor (see RELEASE.md Phase
-# 2 and the "Build and run" section of ARCHITECTURE.md).
+# 2 and the `[workspace.package]` MSRV comment in the root `Cargo.toml`).
 [resolver]
 incompatible-rust-versions = "allow"
 

@@ -125,7 +125,7 @@ impl Acl {
 /// there is a STRICT single writer — the daemon command loop, via
 /// [`SharedAcl::reload`] on `DaemonCommand::AclReload` events. Every change
 /// REQUEST travels by channel; only the atomic store mutates the ACL. The
-/// rationale lives in ARCHITECTURE.md's `server/acl.rs` row.
+/// rationale is AGENTS.md's exception #4.
 ///
 /// Holding the path here (rather than passing it to a reload handler)
 /// guarantees the watcher, the initial load, and every reload all target

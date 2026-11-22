@@ -255,6 +255,9 @@ mod tests {
             );
         }
         // The one-time slug migration: renamed slugs present, old slugs gone.
+        // There is deliberately no runtime alias resolution — an old slug (in
+        // an account, a keystore service name, or a saved display preference)
+        // is renamed as data, never mapped back at lookup time.
         for slug in [
             "fireworks-ai",
             "togetherai",

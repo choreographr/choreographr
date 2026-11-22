@@ -88,7 +88,8 @@ avif = ["image/avif-native"]
 # declares, so `cargo binstall choreo-tui` resolves the same asset URL and
 # extracts just `choreo-tui`. The `{ version }` template renders THIS crate's
 # version — workspace versions are inherited (`version.workspace = true`), so
-# it always matches the release version. See ARCHITECTURE.md's binstall note.
+# it always matches the release version. The root package's identical block
+# records the template notes.
 [package.metadata.binstall]
 pkg-url = "https://github.com/choreographr/choreographr/releases/download/v{ version }/choreographr-{ version }-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"

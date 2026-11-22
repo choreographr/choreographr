@@ -1,8 +1,8 @@
 //! Native PDF tools: classification (`pdf_classify`) and Markdown extraction
 //! (`pdf_to_markdown`).
 //!
-//! Layout follows the workspace convention of **one tool per `.rs` file**
-//! (see ARCHITECTURE.md "Module layout"): `classify.rs` holds `PdfClassify`,
+//! Layout follows the workspace convention of **one tool per `.rs` file**:
+//! `classify.rs` holds `PdfClassify`,
 //! `markdown.rs` holds `PdfToMarkdown`, and the shared input-gating /
 //! output-hygiene helpers live here in `mod.rs` (mirroring `tools/fs/`,
 //! `tools/x/`, `tools/admin/`).

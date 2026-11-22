@@ -7,8 +7,7 @@
 //! communicates with it only by sending a [`DaemonCommand`] over the single
 //! `daemon_tx` crossbeam channel, so all daemon state is mutated through
 //! [`DaemonState::handle_command`] with no shared-mutable-state lock. This is
-//! the workspace's actor model (AGENTS.md "Thread Communication"); see
-//! ARCHITECTURE.md's `daemon.rs` row for the module's role in the system.
+//! the workspace's actor model (AGENTS.md "Thread Communication").
 //!
 //! Replies travel back per-request over a channel the sender placed in the
 //! command (a one-shot `std::sync::mpsc` or a crossbeam sender), never through
