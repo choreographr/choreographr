@@ -58,8 +58,9 @@
 //!   payload survived. Collapsing the three is what once let an over-cap payload
 //!   blank the transcript and read as an empty response.
 //!
-//! The end-to-end story (catalog facts, request budget, wire destination) lives
-//! in `ARCHITECTURE.md` → *Reasoning round-trip*; this header states only what a
+//! The end-to-end story — which crate decides *how* to send, *whether* to send,
+//! and *which wire key* carries the payload — is the cross-crate view in
+//! `ARCHITECTURE.md` → *Reasoning round-trip*; this header states only what a
 //! reader of these two modules must hold true.
 
 mod capture;

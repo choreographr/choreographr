@@ -143,6 +143,13 @@ pub(super) fn zstd_compress(bytes: &[u8]) -> Vec<u8> {
 /// single-purpose bookkeeping that carries no protocol data; the lock recovery
 /// follows AGENTS.md's poisoned-lock rule, with a lost entry an acceptable
 /// failure mode for a downgrade hint.
+///
+/// A `415` is the only status that lands here because it is the spec-correct
+/// signal for an unsupported request coding. A provider (or a gateway in front
+/// of one) that answers `400` instead never downgrades — `400` is also the
+/// status for a genuinely malformed request that re-sending uncompressed cannot
+/// fix — so such an offering keeps failing until its overlay entry drops
+/// `request_compression`.
 static COMPRESSION_DOWNGRADED: LazyLock<RwLock<HashSet<String>>> =
     LazyLock::new(|| RwLock::new(HashSet::new()));
 

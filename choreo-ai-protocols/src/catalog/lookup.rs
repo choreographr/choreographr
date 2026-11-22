@@ -18,8 +18,10 @@
 //! another provider (context window, output ceiling) — resolve through
 //! [`with_portable_model_fact`] instead, so an offering can inherit them from an
 //! explicitly declared canonical identity. Everything a *route* decides (wire
-//! protocol, request format, reasoning echo/passback, modality gates) stays
-//! exact-match only.
+//! protocol, request format, endpoint, auth, the max-tokens field, reasoning
+//! echo/passback, modality gates) stays exact-match only: canonical identity is
+//! never inferred from a matching model string, a stripped provider prefix, a
+//! date suffix, or any other similarity.
 
 use tracing::trace;
 
