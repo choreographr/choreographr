@@ -1,10 +1,13 @@
-//! X25519 ECDH + HKDF + AES-256-GCM envelope for credentials in transit.
+//! X25519 ECDH + HKDF + AES-256-GCM envelope for credential blobs.
 //!
-//! [`encrypt_with_public_key`] and [`decrypt_with_private_key`] are the
-//! daemon↔client credential-transfer primitives: a fresh ephemeral X25519
-//! keypair is generated per message, ECDH with the recipient's static key
-//! feeds HKDF-SHA256 (with a per-message random salt and nonce), and the
-//! payload is sealed with AES-256-GCM.
+//! [`encrypt_with_public_key`] and [`decrypt_with_private_key`] seal a
+//! serialized [`ServiceCredential`](crate::ServiceCredential) to a recipient's
+//! static X25519 key: a fresh ephemeral keypair is generated per message, ECDH
+//! with the recipient's static key feeds HKDF-SHA256 (with a per-message random
+//! salt and nonce), and the payload is sealed with AES-256-GCM. Both sides of
+//! the keystore use it: the daemon encrypts each credential to its own stored
+//! binding before persisting the blob, so the at-rest form is readable only by
+//! an unlock that presents the binding's private key.
 
 use crate::error::KeystoreError;
 

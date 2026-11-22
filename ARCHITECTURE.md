@@ -371,65 +371,45 @@ foreign reader will ever touch the bytes.
 ## Enrollment & transport trust
 
 The TCP enrollment model is a deliberate ASYMMETRY — the SSH `known_hosts`
-pattern, not symmetric TOFU. It exists so that the first-contact window (the
-only moment a MITM could strike) can never observe the daemon's keystore
-unlock key, which clients send inside `Unlock`. Every key arrives over a channel the
-operator already trusts, or is confirmed by a human comparing fingerprints:
+pattern, not symmetric TOFU: a client's transport key is provisioned into the
+daemon's ACL by the operator out of band, while the server's key is learned
+in-band on first contact, confirmed by a human, then pinned. The asymmetry
+exists so the first-contact window (the only moment a MITM could strike) can
+never observe the daemon's keystore unlock key, which clients send inside
+`Unlock`.
 
-- **Client keys → daemon: out of band, always.** A client's transport public
-  key is never learned from the wire for authorization purposes. It is
-  provisioned into `authorized_clients.toml` by the operator via one of three
-  equivalent paths (manual file edit, `/acl add` from a LOCAL connection,
-  `choreographr acl-add` CLI) — all converging on the same file and the same
-  advisory-file-lock discipline, with the hot-reload chain making every path
-  effective without a daemon restart. The ACL parse-compare reload policy
-  means a torn editor save never un-authorizes live clients. When the ACL
-  lives in the config directory (the production layout) it is watched by the
-  same unified config transport as the overlay and accounts; an ACL resolved
-  elsewhere (the `--base-dir` layout keeps it at the base root) gets its own
-  watcher, so ACL hot-reload never depends on where the overlay happens to
-  live.
-- **Server key → client: learned in-band on FIRST contact only, confirmed by
-  a human, then pinned.** With no pin for the address, the client runs the
-  Noise XX handshake (`PREAMBLE_XX`), which reveals the server's static key;
-  the client renders its fingerprint (base64 clustered into 4-char groups —
-  bijective with the 32-byte key) and requires confirmation against the value
-  the daemon operator read out during the enrollment conversation (interactive
-  y/N before the TUI starts, or `--trust-fingerprint` for headless clients).
-  Only then is the key pinned to `known_servers.toml` and any protocol traffic
-  — `Unlock` in particular — allowed to flow. Every later connection uses
-  Noise IK (`PREAMBLE_IK`) against the pin; a changed server key fails LOUDLY
-  with the pinned fingerprint and re-pair guidance, never a silent re-prompt.
-- **Why not symmetric OOB, and why not blind TOFU:** blind TOFU would let a
-  first-contact MITM harvest an `Unlock` (the daemon keystore's unlock key) —
-  strictly worse than a phished SSH password. The XX + fingerprint flow keeps
-  the single out-of-band artifact to one fingerprint readout while
-  eliminating the client-side file handling of a symmetric exchange. The
-  daemon-as-client future reuses exactly this shape: one keypair per daemon
-  serving both roles, enrollment operator-driven, headless confirmation via
-  the fingerprint flag.
-- **Decision rule:** a new peer is always provisioned by an operator who can
-  touch a trusted machine — never by the network. Any future feature that
-  seems to require in-band trust bootstrapping is a sign of trying to automate
-  operator trust; revisit the XX confirm UX before weakening the gate.
+The trust gate that makes that hold: with no pin for an address the client runs
+Noise XX, and the revealed server key is confirmed against the fingerprint the
+daemon operator read out during enrollment BEFORE a single protocol message
+flows — a refusal closes the connection with no `Unlock` sent. Only a confirmed
+key is pinned, and every later connection uses Noise IK against the pin, where a
+changed server key fails loudly with re-pair guidance rather than silently
+re-prompting. Blind TOFU is rejected because it would let a first-contact MITM
+harvest an `Unlock` (strictly worse than a phished SSH password), and a
+symmetric out-of-band exchange would add client-side file handling for no
+security gain. The daemon-as-client future reuses this shape: one keypair per
+daemon serving both roles, enrollment operator-driven, headless confirmation via
+the fingerprint flag.
 
-The Noise transport's shared state is the workspace's **second** sanctioned
-shared-state exception (see AGENTS.md). `NoiseStream` clones one
-`Arc<Mutex<TransportState>>` and one `Arc<AtomicBool>` single-writer guard
-across its `try_clone` reader/writer halves, which must interleave
-encrypt/decrypt against the same snow `TransportState` — so the state is shared,
-not channeled. The lock is held only per chunk, never across blocking socket
-I/O (that scope is what prevents the bidirectional large-message deadlock), and
-the guard is a single-bit flag in the spirit of the cooperative-cancellation
-flag; the full rationale is in `choreo-transport`'s `noise` module docs.
+**Decision rule:** a new peer is always provisioned by an operator who can
+touch a trusted machine — never by the network. Any future feature that
+seems to require in-band trust bootstrapping is a sign of trying to automate
+operator trust; revisit the XX confirm UX before weakening the gate.
 
-The plaintext side of the transport is zeroized. `choreo-proto`'s
-`encode_payload`/`encode_frame` return a `zeroize::Zeroizing<Vec<u8>>`, and
-`choreo-transport` holds that buffer until the Noise encryption call returns
-(and clears its reused per-fragment plaintext staging buffer after each send),
-so an encoded frame — which may carry a secret such as a credential riding
-`AddCredential`, or the unlock key — is wiped from memory on drop instead of
-lingering in freed or reused buffers.
+Every mechanism behind that model — the three ACL provisioning paths and their
+shared advisory-lock write discipline, the parse-compare reload policy that
+keeps a torn editor save from un-authorizing live clients, the watcher
+placement, the fingerprint rendering, and the pin/unlock-key store's own
+hardening — is documented in-source (`choreo-daemon`'s `server/acl`,
+`choreo-transport`'s `key`, `choreo-client-core`'s `known_servers` and
+`connection`, `choreo-tui`'s `lib`).
+
+The plaintext side of the transport is zeroized end to end: an encoded frame —
+which may carry a secret such as a credential riding `AddCredential`, or the
+unlock key — is a `Zeroizing` buffer in `choreo-proto` that `choreo-transport`
+holds until the encryption call returns, and the transport's reused per-fragment
+staging buffer is cleared after every send. Both halves are documented at their
+sites (`frame` and `noise`).
 
 ## Provider Architecture
 
@@ -798,288 +778,128 @@ Noise handshake, so any peer that reaches it is trusted exactly as the daemon
 owner is — it can read session transcripts, retrieve plaintext credentials
 while the keystore is unlocked (`GetCredential`), run tools, and enroll other
 clients (`/acl add`, which is refused on the TCP/Noise listener). Transport
-authentication therefore cannot be what protects it; the operating system's
-file protections are, in three layers:
+authentication cannot be what protects it; the operating system's file
+protections are, in three layers: an owner-only (`0700`) parent directory, a
+`0600` socket file narrowed immediately after `bind(2)`, and a Linux/Android
+`SO_PEERCRED` peer-uid check that rejects a foreign uid (and a socket whose
+credentials cannot be read) before a single message is read. A directory owned
+by another user is refused outright — never merely warned about — because that
+user could enumerate or swap the socket path; a *pre-existing shared* parent
+(`$XDG_RUNTIME_DIR`, the platform temp dir) is never re-moded, since narrowing
+it would be destructive.
 
-1. **An owner-only directory.** The socket's parent is created mode `0700`
-   (`choreo_shared::perm::ensure_private_dir`) whenever the daemon itself
-   creates it — a `--base-dir`'s `{base}/run`, or the temp-dir fallback's
-   per-uid directory. The mode is applied through an `O_NOFOLLOW` directory
-   descriptor (a planted symlink is refused, and the owner check and `fchmod`
-   act on one inode). A directory owned by another user is **refused outright**
-   — the daemon refuses to serve the trusted domain there, because that user
-   could enumerate or swap the socket path. A pre-existing parent is never
-   re-moded: `$XDG_RUNTIME_DIR` and the platform temp dir are shared with every
-   other process and user, and narrowing them would be destructive.
-2. **A `0600` socket file.** `bind(2)` creates the socket with the process umask,
-   so the daemon narrows it to owner-only immediately afterwards. The short
-   bind-then-chmod window is harmless because the parent directory already
-   blocks every other user from reaching the path; a failed chmod is logged
-   (`warn!`), never fatal, for the same reason.
-3. **A Linux/Android peer-uid check.** Before reading a single message on a local
-   connection, `connection::client_thread` asks the kernel for the peer's
-   credentials (`SO_PEERCRED`) and rejects the connection — unregistering its
-   writer channel, exactly like a failed TCP handshake — unless the peer's uid
-   equals the daemon's effective uid; a socket whose credentials cannot be read
-   is treated as foreign. Platforms without a cheap peer-credential call rely on
-   layers 1–2 alone.
-
-The temp-dir fallback is per-uid
-(`temp_dir()/choreographr-<uid>/choreographr.sock`), not a bare
-`temp_dir()/choreographr.sock`: the shared temp dir is world-searchable, so the
-socket needs a directory of its own to be private in, and the uid in the name
-keeps two users on one host from colliding. `choreo_shared::paths::default_socket_path`
-is the single definition of the path — `choreo-proto` delegates to it — so the
-daemon and every client resolve the same one.
+Each layer's rationale, the bind-then-chmod window, the per-uid temp-dir
+fallback (and why the path has one definition in
+`choreo_shared::paths::default_socket_path`, delegated to by `choreo-proto`),
+and the shared `choreo_shared::perm` policy behind the modes are documented
+in-source (`choreo_shared`'s `perm`/`paths`, `choreo-daemon`'s
+`server/lifecycle` and `server/connection`).
 
 ### On-disk state database
 
 The `redb` store (`state.redb`, plus every `state.redb.bak-v*` pre-migration
 snapshot) holds plaintext conversation history, tool output — which routinely
 carries secrets — and image attachments, so it is protected by the filesystem
-independently of the keystore's AES-GCM credential blobs:
+**independently of the keystore's AES-GCM credential blobs**, which are the only
+encrypted-at-rest records in the suite. The same shared policy applies: the
+*immediate* parent through `ensure_private_dir` (`0700`, foreign owner refused
+fatally), the file itself forced to `0600` on every open path and after every
+backup copy (a typical `redb` create honours the umask and lands `0644`). A
+shared ancestor is never narrowed, and any tightening failure other than a
+foreign-owned directory only warns — losing the daemon over a permission quirk
+is worse than a visible log line.
 
-1. **An owner-only data directory.** `open_db_at` creates the database's
-   *immediate* parent through `choreo_shared::perm::ensure_private_dir` —
-   `0700`, and a directory owned by another user is refused (fatal). A shared
-   ancestor (the platform temp dir, the data root such as `~/.local/share`) is
-   never re-moded: narrowing it would lock out every other program and user, so
-   a `CHOREOGRAPHR_DB_PATH` that points straight at one leaves its mode alone.
-2. **A `0600` database file, re-applied on every open.** `redb::Database::create`
-   honours the umask, so a typical desktop create lands `0644`; the mode is
-   therefore forced on every open path (fresh create, interrupted-create
-   recreate, and ordinary open), which also tightens a file left at the old
-   default by an earlier install. Backups inherit the same treatment after their
-   copy.
-
-The file-mode tightening is **best-effort**: an unusual embedder path or a
-filesystem without POSIX modes logs a `warn!` and the daemon starts anyway —
-losing the daemon over a permission quirk is worse than a visible log line, and
-the remaining control (the other layer, or the file's own mode) still bounds
-access. A **foreign-owned** directory is the one exception: it is refused
-outright, never merely warned about, because another user in the parent could
-enumerate or swap the store's files.
+The per-path decision (which directories are shared roots, the open/create/
+recreate call sites, the backup copies) is documented in-source
+(`choreo-daemon`'s `db` module).
 
 ### Lock/Unlock flow
 
 Each daemon's credential keystore is governed by a keypair whose private half (the
 **unlock key**) is held client-side, one per daemon, in the client's
 `known_servers.toml`. The daemon stores only the public half as a **binding**, and
-it starts **locked** with no credentials in memory. The binding is created by
-exactly ONE wire path, `ClientMessage::BindKeystore` (TOFU): on an unbound
-keystore it ADOPTS the presented key (loud `KEYSTORE BOUND` log), runs the shared
-unlock tail, and replies the targeted `DaemonMessage::Bound` — bind implies
-unlock; on an already-bound keystore it verifies only (a mismatch is the usual
-wrong-key rejection, never an overwrite). `Unlock` is strictly VERIFY-ONLY:
-against an unbound keystore it answers the targeted
-`DaemonMessage::KeystoreUnbound` (deliberately distinct from `LockedError`,
-which means "bound but wrong key") and never adopts anything. Binding keys are
-ALWAYS freshly generated by the client's CSPRNG at bind time (auto-bind — there
-is no `/bind-key` command); pre-held keys (stored known_servers key or the
-legacy raw `identity.pk` file) verify existing bindings and never create new
-ones. Binding is TOFU-once — rotation is not implemented.
+it starts **locked** with no credentials in memory. The contract between the two
+halves is deliberately narrow: `ClientMessage::BindKeystore` is the ONLY path
+that can create a binding — it ADOPTS the presented key on an unbound keystore
+(TOFU, loud `KEYSTORE BOUND` log) and merely verifies it on a bound one — while
+`Unlock` is strictly VERIFY-ONLY, answering `KeystoreUnbound` (deliberately
+distinct from the bound-but-wrong-key `LockedError`) rather than ever adopting.
+Binding is TOFU-once: no rotation is implemented, and re-binding a daemon whose
+DB was reset is what the next connect's auto-bind does.
 
-`known_servers.toml` holds those per-daemon **private** unlock keys, so the file
-is treated as secret. Both the read and the write are hardened through the
-shared `choreo_shared::perm` policy: the file is opened `O_NOFOLLOW` (a planted
-symlink is refused rather than followed), verified to be a regular file owned by
-the current euid, `0600` is re-applied through the open descriptor on every
-write (so one that pre-existed with looser permissions is tightened), and the
-parent config directory is best-effort tightened to `0700`. Hardening the LOAD
-as well as the write matters because a `pubkey` pin is what steers the next
-Noise IK handshake — a file a local attacker could author would let them
-impersonate the daemon and capture credentials — so a refused or unreadable
-store loads as EMPTY (re-confirmed first contact), never as the attacker's
-contents. The rewrite stays in-place under the advisory file lock (no
-temp+rename) so concurrent TUI pinning serializes on one inode.
+`AddCredential` carries the credential as a TYPED plaintext value and no key at
+all, and requires an already-unlocked keystore (a locked daemon refuses it rather
+than unlocking implicitly); the daemon encrypts each credential to its own
+binding before persisting, so provisioning and refresh rotation share one
+blob-write path that never needs the private key. Because the client records a
+per-daemon unlock key only after a targeted confirmation (except the auto-bind
+key, which must be recorded pre-send), one ordering guarantee crosses both
+halves: **the targeted reply to `Unlock`/`BindKeystore` reaches the acting
+client's writer queue before the lock-state transition broadcast**, so the
+broadcast can never overtake it.
 
-A client sends `ClientMessage::Unlock { private_key }` (resolved verify-only as
-its stored per-daemon unlock key, else the legacy raw `identity.pk` file —
-copied into the store on first use; a caller-supplied base64 key from
-`/unlock <key>` is decoded WRITE-FREE — recording happens only on the daemon's
-targeted confirmation). `AddCredential` carries the credential as a TYPED
-plaintext value and no key at all (`AddCredential { service, credential }`):
-the client neither resolves nor transmits an unlock key, and the daemon
-ENCRYPTS the credential to its own binding public key before persisting it. The
-add path requires an already-UNLOCKED keystore — a locked daemon rejects it with
-`CredentialAddFailed` ("unlock the keystore first") and does NOT change lock
-state (there is no implicit unlock). The
-client records an unlock key per-daemon only after the daemon's targeted
-confirmation (`Unlocked` / `Bound`) — except the auto-bind key, which is
-recorded PRE-SEND (mandatory: an unbound daemon adopts whatever key arrives
-first, so even a lost confirmation leaves the recorded key matching the
-binding). Nothing is ever auto-deleted; `KnownServers::remove(addr)` re-pair is
-the only removal path.
+**Multi-client provisioning** follows from those rules: the first client to
+reach a fresh (unbound) daemon auto-binds it with a freshly minted key, and any
+other client stays locked until that key is shared out of band (added to its
+`known_servers.toml`, or supplied with `/unlock <base64-key>`).
 
-**ORDERING INVARIANT:** the targeted reply to Unlock/BindKeystore is enqueued by
-the daemon command loop into the acting client's writer sink BEFORE any
-lock-state transition broadcast — both travel the same per-client FIFO writer
-queue, so the broadcast can never overtake the reply. (AddCredential also
-enqueues its targeted `CredentialAdded`/`CredentialAddFailed` reply on this
-thread, though the handler never produces a lock-state broadcast.) Client
-key-recording correctness keys on this (implemented via `DaemonCommand`
-carrying the client's `SubscriberSink`; pinned by the integration test
-`unix_targeted_reply_precedes_lock_state_broadcast`).
-
-```
-startup              connect→unbound?        /unlock [key]            AddCredential{service, credential}
-   │                       │                       │                          │
-   │  locked               │  AUTO-BIND (once per  │ verify-only resolve      │ requires an UNLOCKED
-   │  (no credentials)     │  connection): mint    │ unlock key; unbound →    │ keystore (locked →
-   │                       │  fresh key, record    │ KeystoreUnbound →        │ CredentialAddFailed, no
-   │                       │  PRE-SEND, BindKeystore│ auto-bind; match →      │ state change); encrypt
-   │                       │  → Bound (implies     │ decrypt all credential   │ the credential to the
-   │                       │  unlock)              │ blobs, load accounts     │ binding pubkey, persist
-   ▼                       ▼                       ▼                          ▼ (no lock-state change)
-```
-
-- Credentials are encrypted per-credential with ECDH (X25519) + HKDF + AES-256-GCM, keyed
-  to the daemon's binding public key; the daemon ENCRYPTS each incoming credential to its
-  own stored binding before persisting it (one key per keystore).
-- The unlock key is sent over the channel (by `Unlock`/`BindKeystore`); zeroized after use
-  by the daemon
-- A credential is one of `ApiKey`, `X`, `Substrate`, or `OAuth` (`choreo-shared`'s
-  `ServiceCredential`). The `OAuth` variant holds only the durable grant — never the
-  raw `id_token` — with one deliberate exception: an MCP grant whose authorization
-  server issued **no refresh token** persists its long-lived access token, because
-  with nothing to refresh it is the only usable credential. Every variant
-  participates in `#[zeroize(drop)]` and redacts every secret field in both `Display`
-  and `Debug`, so a credential can be logged without leaking.
-- `/lock` destroys all in-memory credentials, returning to locked state
-- **The locked state is authoritative and broadcast.** `DaemonState` keeps a single
-  `locked: bool` flag beside `keystore_bound` (starts `true`; `false` after a
-  successful Unlock or BindKeystore — the shared `unlock_tail` is the one place it
-  is cleared; `true` again on `/lock`, which clears in-memory
-  credentials/providers), and the pair derives the authoritative
-  `DaemonMessage::Keystore { state }` (`Unbound`/`Locked`/`Unlocked`). On a REAL
-  lock-state transition the daemon broadcasts the current state to ALL activity
-  subscribers (`broadcast_keystore_state`), and a freshly-connecting activity
-  subscriber is sent the CURRENT state immediately (the same
-  `current_keystore_message` construction, alongside the send-on-subscribe
-  `CatalogUpdated`), so a client that connects to an already-locked daemon learns
-  so without waiting for a transition. The acting
-  client additionally keeps its targeted per-action reply (an
-  `Unlocked`/`Locked`/`LockedError`) — enqueued through the request's
-  `ReplyTarget` (carried on `Unlock`/`BindKeystore`/`SaveCredential`) so it is
-  id-stamped like every other reply; receiving the broadcast too is idempotent.
-  This is what makes client B's unlock re-latch client A's banner.
-- `LockedError` is sent if any client attempts a request that requires credentials while locked
-- **Multi-client provisioning:** the first client to connect to a fresh (unbound) daemon auto-binds it with a minted key; other clients get `LockedError` until the key is shared out-of-band (add `unlock_key` to their `known_servers.toml`, or `/unlock <base64-key>`). A daemon DB reset invalidates its binding; the next connect auto-binds a fresh key (the stale stored key is replaced by the new bind's pre-send record).
-- Session lifecycle operations (CreateSession, AttachSession, ListSessions, etc.) succeed even
-  when locked — credentials are only needed at RunInput time. Provider resolution is lazy:
-  when RunInput is called, the session thread resolves the InferenceProvider from the daemon's
-  provider registry. If no credential is available for the session's account, a clear error is
-  returned telling the user to add a key.
-- **Model lists are warmed in the background, never on unlock.** Unlock and
-  credential/account mutations resolve providers in memory only — a model-list
-  fetch never runs on the daemon command loop. A detached, dedup-guarded prefetch
-  fills the model cache (whose single writer is the command loop), and `ListModels`
-  always answers from what it has — the cached list, the catalog's curated ids, or
-  an empty `provisional` list — while the fetch's landing ends the client's wait
-  with a pushed `ModelsUpdated`/`ModelsUnavailable` rather than a poll. The
-  account/model/effort choice is committed atomically by `SetSessionChoice`, so no
-  client or stored session can observe an account bound to a model its provider
-  does not serve. The cache TTL, the provisional stand-ins and the typed
-  `/model`/`/reasoning` paths are documented in-source (`choreo-daemon`'s
-  `daemon::models` module; `choreo-tui`'s `state/setup_flow`).
-- There is no global "default account". Each session carries its own `account_name: Option<String>`
-  field. When RunInput is issued, the daemon resolves the provider from the session's own account name.
-  This avoids a global mutable fallback and lets different sessions use different accounts.
+The per-side mechanics — the `unlock_tail`/`finish_unlock` ordering that leaves a
+failed unlock's plaintext unpublished, the broadcast-to-all-subscribers and
+send-on-subscribe `Keystore { state }` pushes, the write-free `/unlock` key path
+and pre-send bind record, the `known_servers.toml` hardening, and the lazily
+rebuilt per-session providers — are documented in-source (`choreo-daemon`'s
+`daemon/keystore` and `daemon/subscriber_handlers`, `choreo-client-core`'s
+`credentials` and `known_servers`, `choreo-keystore`'s `crypto`).
 
 ### Dependency supply chain
 
-The workspace ships Rust that must trust its third-party dependencies, so the dependency
-graph is treated as part of the security surface. On 2026-08-20 `arrayref` — a transitive
-dependency here via `tiny-skia` → `usvg`/`resvg` (SVG rendering in the daemon and TUI) and
-`blake2b_simd` → `subxt` (blockchain feature, off by default) — was republished as `0.3.10`
-from a compromised maintainer account with a dependency on payload-downloading crates
-(RUSTSEC-2026-0260); the malicious versions were deleted from crates.io ~1.5–2h later.
-Four layered controls make a repeat fail loudly instead of landing silently:
+The workspace ships Rust that must trust its third-party dependencies, so the
+dependency graph is part of the security surface: the 2026-08-20 `arrayref`
+republishing made that concrete. Four layered controls make a repeat fail loudly
+instead of landing silently, and three repository files carry them:
 
-1. **Committed `Cargo.lock`** — every locked package carries its checksum, so builds resolve
-exactly what the lockfile pins. `just test-all`, `just clippy`, and `scripts/release.sh`
-(the release build path, incl. the musl cross-build) pass `--locked`, making the committed
-lockfile authoritative: a silent regeneration fails the command rather than silently
-re-resolving against the live registry.
-2. **`deny.toml`** (`cargo-deny`) — hard bans on every version from the 2026-08-20 attack
-(`arrayref =0.3.10`, `internment =0.8.7`, `append-only-vec =0.1.9`, plus the six deleted
-payload crates by name: `proc-macro1`, `proc-macro-en`, `aovine`, `arone`, `aronenao`,
-`tinymember`), RustSec advisory checking (vulnerabilities and "malicious" advisories
-fail by default in cargo-deny 0.20; unmaintained only for direct deps; the one
-upstream-blocked vulnerability — RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5 via
-`sp-core`/`alloy` on `elliptic-curve` 0.13) — is a documented, reachability-
-justified `ignore` in `deny.toml` until those stacks reach `crypto-bigint` 0.7),
-and a crates.io-only source
-restriction (all 1261 locked packages currently resolve from the crates.io index).
-3. **`scripts/check-supply-chain.sh`** — a first scan of the local `~/.cargo/registry` cache
-for the DELETED malicious `.crate` files (neither cargo-deny nor cargo-audit inspects idle
-cache files; this is the Rust Security Response Team's own remediation `find`, run fresh on
-every gate), then the cargo-deny policy check, with a `cargo-audit` + literal lockfile-scan
-fallback when cargo-deny isn't installed.
-4. **RustSec advisory database** — the RUSTSEC-2026-0259..0266 series covering the attack is
-in the DB both tools fetch, so re-introducing any attacker crate fails the gate even without
-the explicit bans in `deny.toml`.
+- **`Cargo.lock` + `--locked`** — a silent re-resolution against the live
+  registry fails the command instead of succeeding quietly.
+- **`deny.toml`** (`cargo-deny`) — the attacker's versions banned by name, a
+  crates.io-only source restriction, and advisory scoping (the one accepted
+  vulnerability is a documented, reachability-justified `ignore`).
+- **`scripts/check-supply-chain.sh`** — the cache scan for the DELETED `.crate`
+  files that no graph tool can see anymore, then the policy check, with a
+  `cargo-audit` + literal lockfile-scan fallback.
+- **The shared RustSec advisory database** — both tools read it, so
+  re-introducing an attacker crate fails the gate even without an explicit ban.
 
-The strongest remaining option — bit-for-bit reproducible builds from a checked-in
-dependency snapshot via `cargo vendor` + a `[source]` replacement in `.cargo/config.toml` —
-is intentionally not enabled (repository size).
+This file states no version numbers of its own: `deny.toml` and the script are
+the authoritative ban list, and their headers carry the incident rationale. The
+strongest remaining option — bit-for-bit reproducible builds from a checked-in
+dependency snapshot via `cargo vendor` + a `[source]` replacement — is
+intentionally not enabled (repository size).
 
-The MCP path's heaviest third-party dependency is **`rmcp` 3.8** (the official Model
-Context Protocol Rust SDK, Apache-2.0), linked by default now that the `mcp` feature
-ships on. It is pinned (a deliberate upgrade, not an auto-follow of `3.x` churn),
-declared with `default-features = false` so only the needed transports compile, and
-resolves from crates.io like every other package — so the four layers above cover it
-exactly as they cover the rest of the tree. Its HTTP transport shares one compiled
-`reqwest` 0.13 build with `alloy` and `choreo-mcp` (the whole tree now resolves a single
-`reqwest` 0.13 major: the GUI's `blitz-net` → `dioxus-native` path moved onto it with the
-dioxus 0.8 / blitz 0.3 line; `deny.toml` keeps `multiple-versions = "warn"` so any future
-divergence is reported rather than silently duplicated).
+The MCP path's heaviest third-party dependency, `rmcp`, is pinned and limited to
+the transports it needs (`default-features = false`), and the whole tree
+resolves a single `reqwest` major — both declared in the workspace `Cargo.toml`,
+with `deny.toml` keeping `multiple-versions = "warn"` so a future divergence is
+reported rather than silently duplicated.
 
 ### MCP client trust boundary
 
 The MCP client treats every server as untrusted and every server-supplied string as
-data, never as instructions or configuration:
+data, never as instructions or configuration. The boundary is enforced at four
+sites, each documented where it lives: schema bounding and catalogue caps in
+`choreo-mcp`'s `protocol`, header/transport discipline and capability honesty in
+its `engine`, process safety and environment hygiene in its `stdio` (with the
+injection-variable list shared with the shell tool through `choreo-sanitize`'s
+`child_env`), and least privilege in the daemon, where `ToolPolicy::Mobile`
+registers no shell, sandbox, or MCP group at all.
 
-- **Untrusted inputs.** Tool/resource descriptions, `title`, `icons`, `instructions`,
-  and resource text are rendered to the model as data only (the wrapper prefixes each
-  tool description with `[MCP <slug>] `) and are never executed or used to drive a
-  security decision.
-- **Schema safety.** Tool schemas are bounded before use: a schema over 256 KiB, deeper
-  than 32 nesting levels, or not an object drops that tool while the rest of the
-  catalogue is kept (per the spec's "exclude the offending tool" rule). A server's
-  catalogue is capped at 1024 tools. No network `$ref` dereferencing is performed.
-- **Header discipline.** Only `Mcp-Method` / `Mcp-Name` / `Mcp-Param-*` are generated
-  (by `rmcp`, from the request body); user-configured `headers` are validated up front,
-  reserved transport headers are rejected, and config values never become header names.
-  Config-file secrets are never logged unredacted.
-- **Process safety.** A stdio server is spawned as an explicit executable plus args
-  (never a shell string) in its own process group, with a byte-capped read path (an
-  over-8-MiB frame drops the connection) and kill escalation on shutdown: a graceful
-  close awaits `kill()`, and a dropped transport sends a synchronous process-group
-  `SIGKILL` (`start_kill`, no runtime required), so an abandoned connection — a
-  detached connect thread, a teardown with the sidecar runtime already gone — never
-  leaks its process tree. A per-server
-  log file is size-capped and created owner-only (0600, Unix), so its captured server
-  stderr is not group- or world-readable.
-- **Environment hygiene.** The code-injection environment variables (`LD_*`, `DYLD_*`,
-  `PYTHONPATH`, `PERL5LIB`, `RUBYLIB`) are stripped from every spawned child — the shell
-  tool and the MCP stdio server share one canonical list — but the *remaining* daemon
-  environment is inherited by the child unchanged, because a blanket `env_clear()` would
-  break servers that rely on inherited `PATH`/`HOME`/`SSH_AUTH_SOCK`. Operators must
-  therefore **not** rely on the daemon's environment to carry secrets to an MCP server;
-  set only what a server needs via that server's `env` in the MCP config (optionally a
-  `${VAR}` reference expanded from the environment), where the value is scoped to that
-  one server rather than leaked to every spawned child.
-- **Capability honesty.** The client never advertises elicitation/sampling/roots it
-  cannot honor, so a server demanding an undeclared capability fails with the missing
-  capability surfaced rather than a silent hang.
-- **Least privilege.** An MCP server runs with the daemon user's authority; the mobile
-  tool policy excludes MCP entirely, and this adds no auto-approval — tool invocation
-  keeps the same broadcast/visibility semantics as every other tool.
-- **Egress.** A remote server is contacted only when explicitly configured; there is no
-  discovery of servers from arbitrary content. Credentials are a static token in
-  `headers` or a keystore-stored OAuth grant (see **Remote-server OAuth** under
-  **Client-facing MCP surfaces**), never shared across issuers.
+Two consequences belong to the system view rather than to any one module. An MCP
+server runs with the daemon user's authority, so the daemon's environment is NOT
+a secret channel: the code-injection variables are stripped but everything else is
+inherited, and anything a server needs must be set through that server's own
+`env`. And credentials are per-server: a static token in `headers`, or a
+keystore-stored OAuth grant keyed to the canonical target (`choreo-mcp`'s
+`auth::keying`), so a re-pointed project `.mcp.json` cannot be handed an existing
+grant.
 
 ### MCP connection lifecycle (off the command loop)
 
@@ -1087,44 +907,15 @@ Connecting an MCP server is I/O (spawn, handshake, `tools/list`, OAuth refresh),
 never runs on the daemon command loop and never before a client's acknowledgement. The
 command loop's only MCP job is to install a finished result and swap the tool catalogue
 (the sanctioned single-writer `ArcSwap`, exception #4); the handshake itself runs on a
-worker thread that posts a `DaemonCommand` back.
-
-- **Startup.** `DaemonState::open` only loads `mcp.json` and queues the daemon-tier
-  `shared` servers, so the socket is bound and the first client served immediately;
-  the daemon core drains that queue into one background connect per server once the
-  command channel and OAuth runtime exist. The per-server connect budget is generous
-  (60 s) precisely because it is off the critical path, and a request already on a
-  turn keeps its previous registry snapshot — the next turn sees the server's tools.
-- **Unlock.** Those startup connects run while the daemon is still LOCKED and an
-  OAuth grant is still encrypted, so such a server 401s; the unlock tail schedules a
-  resync of every `mcp:`-keyed server on background workers, and only AFTER the
-  acting client's `Unlocked` reply and the lock-state broadcast are enqueued, so an
-  unlock never delays the reply.
-- **Session overlays and reconnect.** A session's project / per-session servers are
-  planned pool-only, pushed as a partial overlay, then connected on a worker that
-  posts one result **per entry as it settles**, so a fast server's tools land
-  without waiting for a slow sibling's handshake. A superseded result is discarded
-  rather than resurrecting a stale connection, and a re-resolve that reuses the
-  connections keeps its resolve generation. A daemon-tier *shared* server always
-  connects on a worker (a manual `/mcp reconnect` parks its reply on that connect,
-  and `/mcp reload` defers the changed servers' reconnects); only a project or
-  per-session server is rebuilt in place, because a daemon-tier connect would pool a
-  second, shared connection whose tools duplicate the session's private ones.
-
-The mechanics behind each of those phases — the install/generation check, the reply
-parking, the coalescing of a resync that arrives during a connect — are documented
-in-source (`choreo-daemon`'s `daemon::mcp_commands` with its `reconnect` and
-`overlay` children, and `choreo-mcp`'s `session` module), held complete by the
-`#![warn(missing_docs)]` + `doc-check` gate.
-
-Two values inside the `rmcp` engine are sanctioned shared-state exceptions (see
-AGENTS.md, exceptions **8** and **9**): the live `RunningService` handle in a
-`tokio::sync::Mutex<Option<..>>` — a connection-lifecycle handle closed exactly
-once and never touched per message, the lock held only across the bounded
-`close_with_timeout` on shutdown — and the `ClientHandler`'s notification rate
-limiter in an `Arc<std::sync::Mutex<LimiterState>>`, because `rmcp` delivers
-notifications on more than one task; that lock guards a handful of integers and is
-never held across an `await`.
+worker thread that posts a `DaemonCommand` back. That holds for all three phases —
+startup (which only queues the daemon-tier `shared` servers so the socket is bound
+and the first client served immediately), the post-unlock resync that retries the
+OAuth servers whose first connect ran against a still-encrypted grant, and the
+per-session overlay connects — and each phase's mechanics (the install/generation
+check, reply parking, connect coalescing, per-entry result posting, and the
+in-place rebuild reserved for project/per-session servers) are documented in-source
+(`choreo-daemon`'s `daemon::mcp_commands` and `mcp` modules, `choreo-mcp`'s
+`session`), held complete by the `#![warn(missing_docs)]` + `doc-check` gate.
 
 ---
 
