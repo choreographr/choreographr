@@ -826,6 +826,7 @@ fn send_message_by_fails_promptly_when_the_deadline_has_elapsed() {
         server_result.err()
     );
 }
+
 /// A caller asking for more than the codec's message cap is a LOCAL fault, so it
 /// is refused at the source as `InternalInvariant` — never `InvalidFragment`,
 /// which `choreo-client-core` classifies as a handshake refusal and renders as
