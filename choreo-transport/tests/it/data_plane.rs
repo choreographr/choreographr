@@ -826,3 +826,57 @@ fn send_message_by_fails_promptly_when_the_deadline_has_elapsed() {
         server_result.err()
     );
 }
+/// A caller asking for more than the codec's message cap is a LOCAL fault, so it
+/// is refused at the source as `InternalInvariant` — never `InvalidFragment`,
+/// which `choreo-client-core` classifies as a handshake refusal and renders as
+/// enrollment remediation. The check runs before any fragment is staged, so
+/// nothing reaches the wire: the peer only sees the connection close.
+#[test]
+#[ignore = "integration"]
+fn an_oversize_outgoing_message_is_an_internal_invariant() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+            // The client wrote nothing, so this is its close.
+            match server.recv_message() {
+                Err(TransportError::ConnectionClosed) | Ok(_) => Ok(()),
+                Err(e) => Err(format!("unexpected recv error: {e:?}")),
+            }
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+
+    let oversize = vec![0xABu8; choreo_proto::MAX_FRAME_SIZE + 1];
+    let error = client
+        .send_message(&oversize)
+        .expect_err("one byte past the message cap must be refused");
+    assert!(
+        matches!(error, TransportError::InternalInvariant(_)),
+        "an over-cap outgoing message is a local fault, not a peer violation: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("exceeds the"),
+        "the refusal must name the cap it broke: {error}"
+    );
+
+    drop(client);
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must return instead of hanging");
+    assert!(
+        server_result.is_ok(),
+        "server side should report the client's graceful close: {:?}",
+        server_result.err()
+    );
+}

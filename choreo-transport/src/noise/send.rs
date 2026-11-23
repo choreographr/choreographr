@@ -73,8 +73,10 @@ impl NoiseStream {
     /// # Errors
     ///
     /// Returns [`TransportError::ConcurrentAccess`] if another thread is
-    /// concurrently sending on this stream, [`TransportError::InvalidFragment`]
-    /// if the plaintext exceeds [`MAX_FRAME_SIZE`],
+    /// concurrently sending on this stream, [`TransportError::InternalInvariant`]
+    /// if the plaintext exceeds [`MAX_FRAME_SIZE`] (a caller asking for more than
+    /// the codec's message cap — never a peer's doing, so it is kept out of
+    /// [`TransportError::InvalidFragment`]),
     /// [`TransportError::ConnectionClosed`]/I/O errors from the socket, or snow
     /// errors from encryption.
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
@@ -110,7 +112,7 @@ impl NoiseStream {
     /// # Errors
     ///
     /// As [`Self::send_message`] — including [`TransportError::ConcurrentAccess`]
-    /// and [`TransportError::InvalidFragment`] — plus: a deadline that has already
+    /// and [`TransportError::InternalInvariant`] — plus: a deadline that has already
     /// elapsed (or passes mid-message) and a write that accepts nothing for
     /// `stall` both make an armed write return `WouldBlock`/`TimedOut`, which
     /// converts into [`TransportError::Io`] through the `From<io::Error>` impl — a
@@ -177,10 +179,15 @@ impl NoiseStream {
         bound: Option<WriteBound>,
     ) -> Result<usize, TransportError> {
         // Mirror the receiver's reassembly cap so an over-limit message is
-        // rejected at the source instead of by the peer's recv_message.
+        // rejected at the source instead of by the peer's recv_message. This is a
+        // LOCAL policy violation (a caller handed us more than this transport can
+        // frame), so it is `InternalInvariant`, not `InvalidFragment`: the peer did
+        // nothing, and a caller that reads it as a wire violation would be
+        // misdiagnosing its own bug as the remote end's.
         if plaintext.len() > MAX_FRAME_SIZE {
-            return Err(TransportError::InvalidFragment(format!(
-                "outgoing message exceeds the {MAX_FRAME_SIZE}-byte limit"
+            return Err(TransportError::InternalInvariant(format!(
+                "outgoing message of {} bytes exceeds the {MAX_FRAME_SIZE}-byte cap",
+                plaintext.len()
             )));
         }
         trace!(plaintext_len = plaintext.len(), "sending Noise message");

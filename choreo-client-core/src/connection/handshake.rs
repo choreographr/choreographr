@@ -51,7 +51,13 @@ pub(super) fn client_transport_keypair()
 /// Everything else is NOT a refusal: [`TransportError::HandshakeTimeout`] (the
 /// peer is reachable but slow — a timeout, not a verdict), any other I/O kind
 /// (broken pipe, aborted socket), [`TransportError::ConnectionClosed`], a
-/// [`TransportError::Protocol`] framing error, and the local key-file variants.
+/// [`TransportError::Protocol`] framing error, and the three **local** variants
+/// whose remediation is never "re-enroll" —
+/// [`TransportError::InternalInvariant`] (a defect in this build or a caller
+/// asking for more than the transport can express),
+/// [`TransportError::HandshakeStaticMissing`] (the XX responder broke its own
+/// contract), [`TransportError::ConcurrentAccess`] (a caller bug: two actors in
+/// one direction on one stream) — plus the local key-file variants.
 pub(super) fn is_handshake_refusal(error: &TransportError) -> bool {
     match error {
         TransportError::AuthFailed

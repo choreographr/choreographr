@@ -41,12 +41,12 @@ const MODE: HandshakeMode = HandshakeMode::Xx;
 /// this. On success returns `(NoiseStream, [u8; 32])` — the encrypted transport
 /// and the server's static public key learned from the handshake. Fails if
 /// the server never transmitted its static key (an XX protocol-contract
-/// violation, surfaced as `InvalidFragment`).
+/// violation, surfaced as [`TransportError::HandshakeStaticMissing`]).
 ///
 /// # Errors
 ///
 /// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds the
-/// `HANDSHAKE_TIMEOUT` budget, [`TransportError::InvalidFragment`] if the
+/// `HANDSHAKE_TIMEOUT` budget, [`TransportError::HandshakeStaticMissing`] if the
 /// server omits its static key, or the snow/`TransportError` errors raised
 /// by the exchange itself.
 pub fn handshake_initiator_xx(
@@ -67,7 +67,7 @@ pub fn handshake_initiator_xx(
 /// # Errors
 ///
 /// Returns [`TransportError::HandshakeTimeout`] if the exchange exceeds
-/// `timeout`, [`TransportError::InvalidFragment`] if the server omits its
+/// `timeout`, [`TransportError::HandshakeStaticMissing`] if the server omits its
 /// static key, or the snow/`TransportError` errors raised by the exchange
 /// itself.
 pub fn handshake_initiator_xx_with_timeout(
@@ -107,9 +107,10 @@ pub(super) fn initiator(
     // Learn the server's static key — the entire reason this mode exists, and
     // it has to be read BEFORE the state machine becomes a transport. XX always
     // transmits `s` in message 2, so an absent value is a protocol contract
-    // violation, not an authentication failure; InvalidFragment is the closest
-    // honest variant (the responder side DOES use AuthFailed for the analogous
-    // check, because there it gates the ACL decision).
+    // violation, not an authentication failure: HandshakeStaticMissing is the
+    // honest variant, and it is deliberately not a handshake refusal — the
+    // responder side DOES use AuthFailed for the analogous check, because there
+    // it gates the ACL decision.
     let server_pk = match handshake.get_remote_static() {
         Some(bytes) => static_key_32(bytes, "XX server static key")?,
         None => {

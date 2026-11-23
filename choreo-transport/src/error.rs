@@ -26,14 +26,16 @@ pub enum TransportError {
     /// reported as [`Self::ConcurrentAccess`] instead.
     #[error("invalid transport fragment: {0}")]
     InvalidFragment(String),
-    /// A buffer-size or length invariant this crate relies on did not hold, so
-    /// the frame could not be built or split. This is a **bug in this build**,
-    /// not a peer violation: every offset involved is an internal size
-    /// invariant, and a peer can only ever reach this through a defect here.
+    /// A length or size invariant this crate relies on did not hold, so a frame
+    /// could not be built, split, or accepted as one this implementation may put
+    /// on the wire. This is a **local** fault — a bug in this build, or a caller
+    /// asking for something the transport cannot express (an outgoing message
+    /// past the codec's cap, a static key that is not the 32 bytes this crate's
+    /// patterns guarantee) — and never a peer violation.
     ///
     /// It is kept apart from [`Self::InvalidFragment`] precisely because the
     /// caller-side classification differs — a peer framing violation is a
-    /// handshake refusal worth surfacing as remediation, whereas an internal
+    /// handshake refusal worth surfacing as remediation, whereas a local
     /// invariant break must never be blamed on the peer (see
     /// `choreo-client-core`'s `is_handshake_refusal`).
     #[error("internal transport invariant violated: {0}")]

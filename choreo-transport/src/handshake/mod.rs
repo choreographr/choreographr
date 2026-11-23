@@ -151,7 +151,19 @@ pub(crate) fn build(
     // intermediary that rewrote the preamble byte) cannot complete this
     // handshake. It lives for the builder's borrow below.
     let prologue = mode.prologue();
-    let mut builder = Builder::new(mode.pattern().parse()?)
+    // A pattern string this build cannot parse is a compile-time constant that
+    // went wrong, not anything a peer did — so it is reported as the local
+    // invariant break it is, NOT as a snow protocol error. `TransportError::Noise`
+    // is a handshake refusal (see `choreo-client-core`'s `is_handshake_refusal`),
+    // so mapping this here would turn a defect in this build into enrollment
+    // remediation for the user.
+    let params = mode.pattern().parse().map_err(|e| {
+        TransportError::InternalInvariant(format!(
+            "the {mode} noise pattern {} failed to parse: {e}",
+            mode.pattern()
+        ))
+    })?;
+    let mut builder = Builder::new(params)
         .local_private_key(static_sk)?
         .prologue(&prologue)?;
     if let Some(remote_pk) = remote_pk {
@@ -171,10 +183,17 @@ pub(crate) fn build(
 /// algorithm the pattern names. This crate only ever builds `*_25519_*`
 /// patterns, so 32 bytes is guaranteed — but the copy is checked rather than
 /// `copy_from_slice`'d, because a length mismatch there would panic in a
-/// connection thread while this returns the crate's protocol error.
+/// connection thread.
+///
+/// The mismatch is a [`TransportError::InternalInvariant`], not an
+/// [`TransportError::InvalidFragment`]: only a defect in this build (a pattern
+/// whose DH is not 25519, or a `snow` change) can produce a different length, so
+/// it must never reach a caller as a peer's framing violation — which
+/// `choreo-client-core` classifies as a handshake refusal and renders as
+/// enrollment remediation.
 pub(super) fn static_key_32(bytes: &[u8], what: &str) -> Result<[u8; 32], TransportError> {
     <[u8; 32]>::try_from(bytes).map_err(|_| {
-        TransportError::InvalidFragment(format!(
+        TransportError::InternalInvariant(format!(
             "{what} is {} bytes, expected a 32-byte X25519 key",
             bytes.len()
         ))
@@ -267,5 +286,38 @@ pub(super) fn require_mode(
             expected: expected.byte(),
             got: got.byte(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::static_key_32;
+    use crate::error::TransportError;
+
+    /// A static key that is not the 32 bytes this crate's `*_25519_*` patterns
+    /// guarantee can only come from a defect here, so it is the crate's
+    /// `InternalInvariant` — never `InvalidFragment`, which
+    /// `choreo-client-core` classifies as a handshake refusal and renders as
+    /// enrollment remediation. Pinned because that classification is what decides
+    /// whether a user is told to re-enroll a key nobody judged.
+    #[test]
+    fn a_wrong_length_static_key_is_an_internal_invariant() {
+        for len in [0usize, 1, 16, 31, 33, 64] {
+            let bytes = vec![0xABu8; len];
+            let err = static_key_32(&bytes, "peer static key").expect_err("wrong length");
+            assert!(
+                matches!(err, TransportError::InternalInvariant(_)),
+                "a {len}-byte static key must be the local invariant break, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("32-byte X25519 key"),
+                "the refusal must name the expected length: {err}"
+            );
+        }
+        // Exactly 32 bytes is the only length that yields a key.
+        assert_eq!(
+            static_key_32(&[0x5Au8; 32], "peer static key").expect("32 bytes is a key"),
+            [0x5Au8; 32]
+        );
     }
 }
