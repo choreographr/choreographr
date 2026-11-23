@@ -750,7 +750,7 @@ fn noise_large_message_daemon_to_client() {
 /// with `confirm`. The server public key learned from the XX handshake is
 /// sent over `learned_tx` so the test can assert the XX contract (the
 /// learned key IS the daemon's real static) — the same hook a real UI uses
-/// to render the fingerprint for out-of-band comparison.
+/// to render the base64 public key for out-of-band comparison.
 ///
 /// The keypair-override reasoning is identical to [`NoiseClient::connect`]
 /// (thread-local `set_test_config_root` must be re-installed on the

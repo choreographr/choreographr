@@ -20,7 +20,7 @@ pub fn is_valid_account_name(name: &str) -> bool {
 }
 
 /// Syntactic check for a base64-encoded 32-byte transport public key (the
-/// form both the daemon ACL and the fingerprint renderer use). Returns the
+/// form both the daemon ACL and the `choreographr pubkey` export use). Returns the
 /// usage-error message on failure. The daemon re-validates authoritatively —
 /// this only keeps obvious typos from a network round trip.
 fn validate_pubkey_b64(b64: &str) -> Result<(), String> {

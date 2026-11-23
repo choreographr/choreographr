@@ -1,12 +1,10 @@
-//! On-disk Noise IK transport keypair management, key encoding, and
-//! public-key fingerprints.
+//! On-disk Noise IK transport keypair management and key encoding.
 //!
 //! Provides the standard keypair paths under `{config}/choreographr`, the
 //! [`ensure_transport_keypair`] loader/generator (race-safe via an advisory
-//! file lock), its read-only counterpart [`load_transport_keypair`], the
+//! file lock), its read-only counterpart [`load_transport_keypair`], and the
 //! canonical base64 encoding of a 32-byte key ([`pubkey_base64`] /
-//! [`parse_pubkey_base64`]), and the human-comparable [`fingerprint`] of a
-//! 32-byte public key.
+//! [`parse_pubkey_base64`]) — the ONE textual form of a transport public key.
 //!
 //! # On-disk secret key format
 //!
@@ -39,10 +37,9 @@
 //! mismatch, surfacing later as an inexplicable handshake failure where the peer
 //! sees a key the operator's own file does not show. With no second copy there
 //! is nothing to go stale, and no key file an operator could edit into a
-//! disagreement. A public key is exported through a query instead
-//! ([`load_transport_keypair`] plus [`pubkey_base64`], the daemon's `pubkey`
-//! subcommand); [`transport_pub_path`] remains only as the name of the legacy
-//! location older layouts wrote.
+//! disagreement. A public key is exported as standard base64 through a query
+//! instead ([`load_transport_keypair`] plus [`pubkey_base64`], the daemon's
+//! `pubkey` subcommand).
 
 use std::path::{Path, PathBuf};
 
@@ -158,9 +155,9 @@ fn keypair_from_secret(sk: [u8; 32]) -> (TransportSecretKey, [u8; 32]) {
 
 /// Encode a 32-byte key as standard-alphabet base64 (44 characters).
 ///
-/// This is the canonical key encoding: the ACL stores pubkeys in exactly this
-/// form and [`fingerprint`] is a regrouping of it, so an operator can compare a
-/// fingerprint against a stored key by eye.
+/// This is the canonical — and only — textual form of a transport public key:
+/// the ACL stores pubkeys in exactly this form, and the value an operator reads
+/// out of `choreographr pubkey` is byte-for-byte this string.
 #[must_use]
 pub fn pubkey_base64(pk: &[u8; 32]) -> String {
     base64::engine::general_purpose::STANDARD.encode(pk)
@@ -171,12 +168,15 @@ pub fn pubkey_base64(pk: &[u8; 32]) -> String {
 /// The inverse of [`pubkey_base64`], and tolerant of the trailing newline the
 /// on-disk form carries.
 ///
+/// Only the canonical form is accepted: the value must decode to exactly 32
+/// bytes. A space-grouped key is not base64 and is refused with a message that
+/// says so, so an operator who pasted a grouped value is told to send the plain
+/// form rather than silently connecting to nothing.
+///
 /// # Errors
 ///
 /// Returns [`TransportError::Io`] (with [`std::io::ErrorKind::InvalidData`])
-/// when the text is not valid base64 or does not decode to exactly 32 bytes —
-/// the same shape [`read_server_pk`] and [`fingerprint_of_file`] use for a key
-/// that is present but malformed.
+/// when the text is not valid base64 or does not decode to exactly 32 bytes.
 pub fn parse_pubkey_base64(text: &str) -> Result<[u8; 32], TransportError> {
     decode_key_base64(text).map_err(|detail| {
         TransportError::Io(std::io::Error::new(
@@ -241,115 +241,6 @@ fn keypair_dir() -> Result<PathBuf, TransportError> {
 /// exists.
 pub fn transport_sec_path() -> Result<PathBuf, TransportError> {
     Ok(keypair_dir()?.join("transport.sec"))
-}
-
-/// Path to the legacy Noise IK public key file
-/// (~/.config/choreographr/transport.pub).
-///
-/// **Nothing writes this file**: the public key is derived from the secret (see
-/// the module docs), so an instance has exactly one key file, `transport.sec`.
-/// The path survives as the name of a location older layouts wrote, which an
-/// operator may still point [`read_server_pk`] or [`fingerprint_of_file`] at;
-/// treat its contents as an unverified copy, not as this instance's public half.
-///
-/// # Errors
-///
-/// Returns [`TransportError::ConfigDirNotFound`] when no config directory
-/// exists.
-pub fn transport_pub_path() -> Result<PathBuf, TransportError> {
-    Ok(keypair_dir()?.join("transport.pub"))
-}
-
-/// Resolve a server public key value from an optional file path.
-///
-/// If `path` is `Some`, reads 32 bytes from that file.
-/// If `path` is `None`, defaults to [`transport_pub_path()`] — the legacy
-/// public-key location, which nothing writes, so this fallback normally fails
-/// with "file not found" on a current instance. Callers that want *this*
-/// machine's key derive it instead ([`load_transport_keypair`]).
-///
-/// Returns the 32-byte key on success, or a `TransportError` on I/O
-/// failure, invalid length, or missing config directory.
-///
-/// # Errors
-///
-/// Returns [`TransportError`] on file I/O failure, a key file of a length
-/// other than exactly 32 bytes, or a missing config directory (from the
-/// [`transport_pub_path`] fallback).
-pub fn read_server_pk(path: Option<&str>) -> Result<[u8; 32], TransportError> {
-    let pk_path = path.map_or_else(
-        || transport_pub_path().unwrap_or_else(|_| PathBuf::from("transport.pub")),
-        PathBuf::from,
-    );
-    let bytes = std::fs::read(&pk_path)?;
-    if bytes.len() != 32 {
-        return Err(TransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "server public key must be 32 bytes",
-        )));
-    }
-    let mut pk = [0u8; 32];
-    pk.copy_from_slice(&bytes);
-    Ok(pk)
-}
-
-/// Render a 32-byte transport public key as a human-comparable fingerprint.
-///
-/// The fingerprint is the base64 (standard alphabet — the SAME encoding the
-/// daemon's ACL uses for pubkeys) of the key itself, clustered into
-/// 4-character groups: e.g. `3F2A 9C11 7B04 ... 8xE=`. Because the key is
-/// only 32 bytes, the fingerprint is BIJECTIVE with the key — no hashing
-/// (SSH hashes because host keys can be much longer), so comparing two
-/// fingerprints compares the actual keys, and a fingerprint can be traced
-/// back to its key by eye or by decoding.
-///
-/// This is the string both sides of an enrollment exchange render and
-/// compare: the daemon operator reads out the server's fingerprint (or the
-/// client's, for the ACL), and the client's first-contact flow displays it
-/// for the human confirm step. The base64 cluster groups are small enough
-/// to compare by eye without mistaking a single changed character.
-///
-/// # Errors
-///
-/// Never fails; infallible by construction.
-#[must_use]
-pub fn fingerprint(pk: &[u8; 32]) -> String {
-    let b64 = pubkey_base64(pk);
-    // Cluster the 44-char base64 string into 4-char groups joined by
-    // spaces. 44 % 4 == 0, so every group is exactly 4 chars — no ragged
-    // tail to special-case. (from_utf8_lossy, not unwrap: the base64
-    // alphabet is ASCII so lossy decoding is identity, but production code
-    // has no unwrap escape hatches.)
-    let groups: Vec<String> = b64
-        .as_bytes()
-        .chunks(4)
-        .map(|c| String::from_utf8_lossy(c).into_owned())
-        .collect();
-    groups.join(" ")
-}
-
-/// [`fingerprint`] of the 32-byte key stored in a file.
-///
-/// Used by the `fingerprint` subcommand to render either side's key: with
-/// no argument, the local `transport.pub`; with a path, a copied server key
-/// (to verify a download) or any pinned known-servers entry. Enforces the
-/// 32-byte length exactly like [`read_server_pk`] — a truncated or padded
-/// file is an error, never a quietly wrong fingerprint.
-///
-/// # Errors
-///
-/// Returns [`TransportError`] on file I/O failure or a key file of a
-/// length other than exactly 32 bytes.
-pub fn fingerprint_of_file(path: &std::path::Path) -> Result<String, TransportError> {
-    let bytes = std::fs::read(path)?;
-    let len = bytes.len();
-    let pk: [u8; 32] = bytes.try_into().map_err(|_| {
-        TransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("key file must be exactly 32 bytes, got {len}"),
-        ))
-    })?;
-    Ok(fingerprint(&pk))
 }
 
 /// Read and decode the secret key file at `path`.
@@ -483,8 +374,8 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
 /// secret — and **never generating one**.
 ///
 /// The read-only counterpart of [`ensure_transport_keypair`], and the accessor
-/// every query uses (the daemon's `pubkey` and no-argument `fingerprint`
-/// subcommands). It exists so that printing a key cannot create the identity it
+/// every query uses (the daemon's `pubkey` subcommand). It exists so that
+/// printing a key cannot create the identity it
 /// prints: an absent secret is reported, not minted, because an identity minted
 /// by a query would be one no daemon ever loaded — and, worse, would look to the
 /// operator like the instance they were asking about.
@@ -837,64 +728,45 @@ mod tests {
 
         assert!(parse_pubkey_base64("not base64!!").is_err());
         // Valid base64 of the wrong length decodes but must not be accepted.
-        assert!(parse_pubkey_base64("AAAA").is_err());
+        // The error must say so (lengths, never bytes) so an operator knows the
+        // value was a well-formed key of the wrong size, not a typo.
+        let short_err = parse_pubkey_base64("AAAA").expect_err("16 bits is not a key");
+        assert!(
+            short_err.to_string().contains("expected 32"),
+            "a wrong-length key must name the expected length: {short_err}"
+        );
     }
 
-    /// A fixed known key: the fingerprint must be deterministic, purely a
-    /// regrouping of the base64 encoding (so the ACL's base64 form and the
-    /// fingerprint are trivially cross-checkable), 11 groups of exactly 4
-    /// chars (44 base64 chars + 10 separators = 54), and decodable back to
-    /// the original key.
+    /// Only the canonical 44-character base64 form parses. A space-grouped
+    /// value (the grouping some tools add for human comparison) is NOT base64
+    /// and is refused — the project has exactly one textual key form, so the
+    /// parser must not paper over a grouped paste.
     #[test]
-    fn fingerprint_is_deterministic_grouped_and_bijective() {
-        // Base64 engine trait, needed by the decode at the bottom of the
-        // test; hoisted to the first statement per items_after_statements.
-        use base64::Engine as _;
+    fn parse_pubkey_base64_rejects_grouped_and_wrong_length_values() {
+        let pk = [0xA5u8; 32];
+        let canonical = pubkey_base64(&pk);
+        assert_eq!(canonical.len(), 44, "a 32-byte key is 44 base64 chars");
 
-        let pk = [
-            0x3F, 0x2A, 0x9C, 0x11, 0x7B, 0x04, 0xE5, 0xD8, 0xA1, 0xC6, 0x42, 0xD9, 0x08, 0xF3,
-            0xB7, 0xE2, 0x5D, 0x60, 0x19, 0xAB, 0xCC, 0x37, 0x84, 0x0E, 0x71, 0xFA, 0x92, 0x63,
-            0xDD, 0x4B, 0x26, 0x50,
-        ];
-        let fp = fingerprint(&pk);
-        assert_eq!(fp, fingerprint(&pk), "fingerprint must be deterministic");
+        // A group-of-four rendering of the SAME key must be refused, even
+        // though it carries the right characters — the spaces make it invalid
+        // base64, and the parser accepts only the canonical form.
+        let grouped: String = canonical
+            .as_bytes()
+            .chunks(4)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let grouped_err = parse_pubkey_base64(&grouped).expect_err("grouped is not base64");
+        assert!(
+            grouped_err.to_string().contains("not valid base64"),
+            "a grouped value must be reported as invalid base64: {grouped_err}"
+        );
 
-        let groups: Vec<&str> = fp.split(' ').collect();
-        assert_eq!(groups.len(), 11, "32 bytes -> 44 base64 chars -> 11 groups");
-        for g in &groups {
-            assert_eq!(g.len(), 4, "every group is exactly 4 chars: {g}");
-        }
-
-        // Stripping the separators yields the plain base64 — the same
-        // string the ACL stores — and decoding THAT is the original key.
-        let joined: String = groups.concat();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(&joined)
-            .expect("regrouped fingerprint must still be valid base64");
-        assert_eq!(decoded, pk, "fingerprint is bijective with the key");
-    }
-
-    /// `fingerprint_of_file` round-trips a real key file and REJECTS a
-    /// wrong-length file (a truncated download must never render as a
-    /// plausible-looking fingerprint of something else).
-    #[test]
-    fn fingerprint_of_file_round_trips_and_rejects_bad_length() {
-        let temp = tempfile::TempDir::new().expect("tempdir");
-        let path = temp.path().join("key.bin");
-        let pk = [7u8; 32];
-        std::fs::write(&path, pk).expect("write key file");
-
-        let fp = fingerprint_of_file(&path).expect("32-byte file renders");
-        assert_eq!(fp, fingerprint(&pk));
-
-        // 31 bytes (a classic truncation) must error, not render.
-        std::fs::write(&path, [7u8; 31]).expect("write truncated file");
-        assert!(fingerprint_of_file(&path).is_err());
-
-        // 33 bytes (a trailing newline accident) must error too.
-        let mut long = vec![7u8; 32];
-        long.push(b'\n');
-        std::fs::write(&path, long).expect("write overlong file");
-        assert!(fingerprint_of_file(&path).is_err());
+        // Too few / too many decoded bytes are both refused.
+        assert!(parse_pubkey_base64("AAAA").is_err(), "4 chars is 3 bytes");
+        assert!(
+            parse_pubkey_base64(&format!("{canonical}AAAA")).is_err(),
+            "48 chars is more than 32 bytes"
+        );
     }
 }

@@ -202,19 +202,20 @@ struct Cli {
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
 
-    /// Path to the server's Noise IK public key (defaults to the pinned key
-    /// in `known_servers.toml`; on first contact the key is learned via the
-    /// Noise XX handshake and must be confirmed interactively)
-    #[arg(long = "server-pk")]
-    server_pk: Option<String>,
+    /// The server's Noise IK transport public key as one base64 string (a
+    /// 32-byte X25519 key; `choreographr pubkey` on the server prints exactly
+    /// this value). Used directly for the IK connection. Without it, a
+    /// `--tcp-addr` connection pins the key from `known_servers.toml`.
+    #[arg(long = "server-pubkey")]
+    server_pubkey: Option<String>,
 
-    /// Pre-approve the server fingerprint for first contact (headless mode:
-    /// the fingerprint, with or without spaces, must match exactly —
-    /// including letter case — the key the daemon presents during the XX
-    /// probe; compare against the value the daemon operator reads out with
-    /// 'choreographr fingerprint'). Ignored when --server-pk is given.
-    #[arg(long = "trust-fingerprint")]
-    trust_fingerprint: Option<String>,
+    /// Pre-approve the server's transport public key for first contact
+    /// (headless mode): the base64 value — with or without surrounding
+    /// whitespace, but case-EXACT — must match the key the daemon presents
+    /// during the XX probe. Copy it from `choreographr pubkey` on the daemon
+    /// operator's machine. Ignored when --server-pubkey is given.
+    #[arg(long = "trust-pubkey")]
+    trust_pubkey: Option<String>,
 
     /// Open this session id at startup instead of waiting for one to be picked.
     /// Equivalent to running `/session switch <id>` once the initial session
@@ -226,14 +227,14 @@ struct Cli {
 /// Resolve the connection mode for a TCP address, implementing the trust
 /// flow. Resolution order:
 ///
-/// 1. explicit `--server-pk` file — operator-provided pin, used directly
+/// 1. explicit `--server-pubkey` base64 — operator-provided pin, used directly
 ///    (IK against it; this is the original out-of-band mechanism and wins
 ///    over everything);
 /// 2. a pin in `known_servers.toml` — IK against the pinned key, with the
 ///    loud re-pair guidance on handshake failure (`TcpPinned`);
 /// 3. otherwise FIRST CONTACT: probe the daemon's key with the Noise XX
-///    handshake and require the human to confirm its fingerprint (either
-///    `expected_fingerprint` for headless use, or an interactive y/N prompt
+///    handshake and require the human to confirm its base64 public key (either
+///    `expected_pubkey` for headless use, or an interactive y/N prompt
 ///    — this runs in `main()` while the terminal is still in cooked mode, so
 ///    the prompt is a plain stdout/stdin exchange, no TUI involved) before
 ///    pinning and connecting.
@@ -250,16 +251,16 @@ struct Cli {
 /// all the way into the TUI and only fail later with a cryptic I/O error.
 fn resolve_connect_mode(
     addr: &str,
-    server_pk_path: Option<&str>,
-    expected_fingerprint: Option<&str>,
+    server_pubkey: Option<&str>,
+    expected_pubkey: Option<&str>,
 ) -> anyhow::Result<choreo_client_core::ConnectionMode> {
     use choreo_client_core::ConnectionMode;
 
-    // 1. Explicit operator-provided key file wins over the store.
-    if let Some(path) = server_pk_path {
-        let pk = choreo_client_core::read_server_pk(Some(path))
-            .context("failed to read server public key")?;
-        tracing::info!(addr, path, "using explicitly provided server public key");
+    // 1. Explicit operator-provided key wins over the store.
+    if let Some(value) = server_pubkey {
+        let pk = choreo_client_core::parse_pubkey_base64(value)
+            .context("invalid --server-pubkey: expected 32 bytes as base64")?;
+        tracing::info!(addr, "using explicitly provided server public key");
         preflight_daemon_authorization(addr, &pk)?;
         return Ok(ConnectionMode::Tcp {
             addr: addr.to_string(),
@@ -272,50 +273,51 @@ fn resolve_connect_mode(
     if let Some(pk) = known.lookup(addr)? {
         tracing::info!(
             addr,
-            fingerprint = %choreo_client_core::fingerprint(&pk),
+            pubkey = %choreo_client_core::pubkey_base64(&pk),
             "connecting with pinned server key"
         );
         preflight_daemon_authorization(addr, &pk)?;
         return Ok(ConnectionMode::TcpPinned(addr.to_string()));
     }
 
-    // 3. First contact: learn the key, confirm the fingerprint, pin.
+    // 3. First contact: learn the key, confirm its base64, pin.
     let learned = choreo_client_core::probe_server_key(addr)
         .context("first-contact probe failed (is the daemon running with --tcp-addr, and is this client's key enrolled in its ACL?)")?;
-    let fp = choreo_client_core::fingerprint(&learned);
+    let pk_b64 = choreo_client_core::pubkey_base64(&learned);
 
-    let confirmed = if let Some(expected) = expected_fingerprint {
-        // Headless: compare against the pre-approved fingerprint (whitespace
-        // is insignificant — accept either the grouped or the plain form).
-        let matches = strip_fp_whitespace(expected) == strip_fp_whitespace(&fp);
+    let confirmed = if let Some(expected) = expected_pubkey {
+        // Headless: compare against the pre-approved key. Whitespace is
+        // insignificant (a pasted value may wrap), case is exact (see
+        // `strip_whitespace`).
+        let matches = strip_whitespace(expected) == strip_whitespace(&pk_b64);
         if !matches {
             tracing::error!(
                 addr,
                 expected = %expected,
-                actual = %fp,
-                "--trust-fingerprint does not match the server's key"
+                actual = %pk_b64,
+                "--trust-pubkey does not match the server's key"
             );
         }
         matches
     } else {
         // Interactive: ask the human. The daemon operator should have sent
-        // this fingerprint out-of-band in the enrollment conversation.
+        // this public key out-of-band in the enrollment conversation.
         let mut stdin = std::io::stdin().lock();
         let mut stdout = std::io::stdout();
-        confirm_first_contact(addr, &fp, &mut stdin, &mut stdout)?
+        confirm_first_contact(addr, &pk_b64, &mut stdin, &mut stdout)?
     };
 
     if !confirmed {
         anyhow::bail!(
             "first contact with {addr} not confirmed — refusing to connect; \
-             verify the daemon's fingerprint with its operator and retry"
+             verify the server's public key with its operator and retry"
         );
     }
 
     known
         .pin(addr, &learned)
         .context("failed to persist the confirmed server key")?;
-    tracing::info!(addr, fingerprint = %fp, "server key confirmed and pinned");
+    tracing::info!(addr, pubkey = %pk_b64, "server key confirmed and pinned");
     preflight_daemon_authorization(addr, &learned)?;
     Ok(ConnectionMode::Tcp {
         addr: addr.to_string(),
@@ -355,27 +357,22 @@ fn preflight_failure_message(
              is the daemon running, and did it start with --tcp-addr?",
         ),
         choreo_client_core::PreflightError::Rejected(_) => {
-            // The identity block: fingerprint for human comparison, plus the
-            // raw base64 pubkey the operator's enrollment command consumes —
-            // everything the TUI-only user needs, nothing left for them to
-            // run on this machine.
+            // The identity block: just this client's public key as base64 —
+            // exactly what the operator's enrollment command consumes, nothing
+            // the TUI-only user has to run on this machine.
             let identity = client_pk.map_or_else(
                 || {
                     "your client key could not be read from this machine's config directory.\n"
                         .to_string()
                 },
                 |pk| {
-                    use base64::Engine as _;
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(pk);
+                    let b64 = choreo_client_core::pubkey_base64(pk);
                     format!(
-                        "your client fingerprint:\n\
-                         {}\n\
-                         your public key (send this to the daemon operator):\n\
+                        "your public key (send this to the daemon operator):\n\
                          {b64}\n\
                          the operator enrolls it on the daemon machine with:\n\
                          choreographr acl-add {b64}\n\
                          (or '/acl add {b64}' from a local TUI connection there)\n",
-                        choreo_client_core::fingerprint(pk),
                     )
                 },
             );
@@ -391,35 +388,35 @@ fn preflight_failure_message(
     }
 }
 
-/// Normalize a fingerprint for comparison: drop the grouping spaces, keep
+/// Normalize a pasted public-key value for comparison: drop whitespace, keep
 /// case EXACTLY. Base64's standard alphabet is case-sensitive, and the
-/// fingerprint gate is the only thing standing between a first-contact MITM
-/// and the daemon's private key — so the comparison must not widen the
+/// first-contact comparison is the only thing standing between a first-contact
+/// MITM and the daemon's private key — so the comparison must not widen the
 /// match: a case-insensitive compare would let an attacker whose key
 /// differs from the real one only in letter case pass the check after
-/// ~2^28 key-generation tries. Whitespace stays insignificant (copy-paste
-/// with or without the 4-char grouping must both work), but any case
-/// difference is a mismatch — a transcribed-but-mistyped fingerprint
-/// SHOULD be refused and re-read rather than fuzzily accepted.
-fn strip_fp_whitespace(fp: &str) -> String {
-    fp.chars().filter(|c| !c.is_whitespace()).collect()
+/// ~2^28 key-generation tries. Whitespace stays insignificant (a pasted value
+/// may wrap across lines), but any case difference is a mismatch — a
+/// transcribed-but-mistyped key SHOULD be refused and re-read rather than
+/// fuzzily accepted.
+fn strip_whitespace(pk: &str) -> String {
+    pk.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Interactive first-contact confirmation: render the fingerprint, ask for
-/// y/N, read the answer. Factored with injected I/O so tests can drive it
+/// Interactive first-contact confirmation: render the server's public key, ask
+/// for y/N, read the answer. Factored with injected I/O so tests can drive it
 /// without a real terminal.
 fn confirm_first_contact(
     addr: &str,
-    fingerprint: &str,
+    pubkey: &str,
     input: &mut dyn std::io::BufRead,
     output: &mut dyn std::io::Write,
 ) -> anyhow::Result<bool> {
     writeln!(output, "First contact with {addr}.")?;
-    writeln!(output, "Server fingerprint:")?;
-    writeln!(output, "  {fingerprint}")?;
+    writeln!(output, "Server public key (base64):")?;
+    writeln!(output, "  {pubkey}")?;
     writeln!(
         output,
-        "Compare this with the fingerprint the daemon operator sent you,"
+        "Compare this with the public key the daemon operator sent you,"
     )?;
     writeln!(output, "then trust and pin this server? [y/N]")?;
     output.flush()?;
@@ -548,7 +545,7 @@ fn restore_terminal_after_panic() {
 /// # Errors
 ///
 /// Returns an error when CLI argument parsing fails, the TCP connection
-/// mode cannot be resolved (server-key probe, fingerprint confirmation, or
+/// mode cannot be resolved (server-key probe, base64 confirmation, or
 /// daemon-authorization preflight), or the TUI application itself fails
 /// while running.
 pub fn main() -> anyhow::Result<()> {
@@ -581,11 +578,27 @@ pub fn main() -> anyhow::Result<()> {
     // `install_panic_hook`).
     install_panic_hook();
 
+    // Log this machine's OWN transport public key once, up front, so a
+    // client-only machine learns its identity without having to fail a
+    // connection first — the operator can enroll it in the daemon's ACL from
+    // this one line. Best-effort: reading/generating the keypair cannot stop
+    // the TUI from starting, so a failure is logged and startup continues.
+    match choreo_client_core::own_transport_pubkey() {
+        Ok(pk) => tracing::info!(
+            pubkey = %choreo_client_core::pubkey_base64(&pk),
+            "client transport public key"
+        ),
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not read this client's transport public key"
+        ),
+    }
+
     let mode = if let Some(addr) = cli.tcp_addr {
         resolve_connect_mode(
             &addr,
-            cli.server_pk.as_deref(),
-            cli.trust_fingerprint.as_deref(),
+            cli.server_pubkey.as_deref(),
+            cli.trust_pubkey.as_deref(),
         )?
     } else {
         // Unix-socket mode: NO pre-flight probe. The TUI connects directly;

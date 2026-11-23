@@ -23,8 +23,7 @@ tracing.workspace = true
 zeroize.workspace = true
 # known_servers.toml — the client's pinned server public keys (SSH
 # known_hosts analogue). toml parses/persists the store; base64 decodes
-# the pinned pubkeys (same standard-alphabet convention as the daemon ACL
-# and the fingerprint renderer).
+# the pinned pubkeys (same standard-alphabet convention as the daemon ACL).
 toml.workspace = true
 base64.workspace = true
 # KnownServerEntry derives Serialize/Deserialize for the TOML store.

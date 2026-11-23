@@ -3,7 +3,7 @@
 //! The trust model (see ARCHITECTURE.md "Enrollment & transport trust") is
 //! asymmetric: the daemon learns client keys from the ACL, but the CLIENT
 //! learns server keys by running the Noise XX first-contact handshake and
-//! confirming the fingerprint with a human. Whatever key survives that
+//! confirming the base64 public key with a human. Whatever key survives that
 //! confirmation is PINNED here, keyed by `host:port`, and every later
 //! connection to that address uses Noise IK against the pinned key — with a
 //! loud, hard failure if the server's key ever changes (the `known_hosts`
@@ -20,7 +20,7 @@
 //! Failure policy is deliberately tolerant on LOAD and strict on WRITE:
 //! a missing, unreadable, or unparseable store loads as EMPTY (worst case:
 //! the next connect is treated as first contact again, which re-runs the
-//! human fingerprint confirmation — it can never silently trust a server),
+//! human public-key confirmation — it can never silently trust a server),
 //! while a bad individual entry is skipped with a warning. Writes, by
 //! contrast, take an advisory exclusive file lock and rewrite the whole
 //! file (the same discipline as `ensure_transport_keypair`), so concurrent
@@ -266,7 +266,7 @@ impl KnownServers {
     ///
     /// Pinning an address that already has an entry replaces ONLY its
     /// transport pin — the deliberate re-pairing path after a legitimate
-    /// server key rotation: the human confirms the NEW fingerprint, then a
+    /// server key rotation: the human confirms the NEW public key, then a
     /// re-pin, and only then does IK succeed again. The per-daemon keystore
     /// unlock key is an INDEPENDENT field and must survive a re-pin — an
     /// entry that carries both a pin and an unlock key (a TCP daemon after
@@ -295,7 +295,7 @@ impl KnownServers {
         self.persist()?;
         info!(
             addr,
-            fingerprint = %choreo_transport::key::fingerprint(pk),
+            pubkey = %choreo_transport::key::pubkey_base64(pk),
             "pinned server public key"
         );
         Ok(())

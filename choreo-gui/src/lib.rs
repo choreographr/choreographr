@@ -35,7 +35,7 @@ use crate::client::apply_daemon_message;
 use crate::components::{Composer, HistoryList, SetupDialog, Toolbar};
 use crate::hooks::use_daemon_connection;
 use crate::state::{AppState, UiEvent};
-use choreo_client_core::{ConnectionMode, read_server_pk};
+use choreo_client_core::{ConnectionMode, parse_pubkey_base64};
 use choreo_proto::socket_path;
 use choreo_shared::clap_styles;
 use choreo_shared::logging::{ConsoleSink, LogOptions, Verbosity};
@@ -276,11 +276,12 @@ struct Cli {
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
 
-    /// Path to the server's Noise IK public key — a file of 32 raw bytes (see
-    /// `choreographr pubkey` on the server for the key itself). Without it, a
-    /// `--tcp-addr` connection pins the key from `known_servers.toml`.
-    #[arg(long = "server-pk")]
-    server_pk: Option<String>,
+    /// The server's Noise IK transport public key as one base64 string (a
+    /// 32-byte X25519 key; `choreographr pubkey` on the server prints exactly
+    /// this value). Without it, a `--tcp-addr` connection pins the key from
+    /// `known_servers.toml`.
+    #[arg(long = "server-pubkey")]
+    server_pubkey: Option<String>,
 
     /// Write the GUI's log file to this path instead of the default
     /// (`{base}/log/gui-<pid>.log`, else `$XDG_STATE_HOME/choreographr`, else
@@ -320,14 +321,14 @@ pub fn main() {
     });
 
     let mode = if let Some(addr) = cli.tcp_addr {
-        match cli.server_pk {
-            // An explicit key file wins: the operator has the server's public
-            // key in hand, so dial with it directly and skip the pin lookup.
-            Some(path) => {
-                let server_pk = match read_server_pk(Some(path.as_str())) {
+        match cli.server_pubkey {
+            // An explicit key wins: the operator supplied the server's public
+            // key as base64, so dial with it directly and skip the pin lookup.
+            Some(value) => {
+                let server_pk = match parse_pubkey_base64(&value) {
                     Ok(pk) => pk,
                     Err(e) => {
-                        eprintln!("failed to read server public key: {e}");
+                        eprintln!("invalid server public key: {e}");
                         // Deliberate CLI startup exit: this is pre-launch
                         // argument validation in a binary entry point (before
                         // any UI runs), not daemon or library code — there is
@@ -343,9 +344,9 @@ pub fn main() {
             // No key given: dial in pinned mode, resolving the server's key
             // from this client's own `known_servers.toml` at connect time
             // (first contact via the XX probe, then the pin is verified).
-            // There is deliberately no local key-file fallback: a daemon
+            // There is deliberately no local key file fallback: a daemon
             // derives its public key and writes no `transport.pub`, and the
-            // only key file a client machine has is its OWN — reading it as
+            // only key a client machine has is its OWN — using it as
             // the server's would pin a key the server never presents. iOS
             // takes this path for the same reason plus one more: its sandbox
             // could not read the old file anyway.

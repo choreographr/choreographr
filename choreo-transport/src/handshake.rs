@@ -455,7 +455,7 @@ where
 /// the server's static key in advance — that is the point of first-contact
 /// mode. The server's static public key is transmitted (encrypted) in
 /// handshake message 2 and is returned alongside the transport so the caller
-/// can verify it out-of-band (fingerprint confirmation) BEFORE any encrypted
+/// can verify it out-of-band (base64 confirmation) BEFORE any encrypted
 /// protocol traffic other than the handshake itself flows.
 ///
 /// * `stream` — the already-connected TCP stream (the handshake-mode

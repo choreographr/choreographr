@@ -25,7 +25,7 @@ fn version_flag_displays_package_version() {
 fn confirm_with(answer: &str) -> (bool, String) {
     let mut input = std::io::Cursor::new(answer.as_bytes().to_vec());
     let mut output: Vec<u8> = Vec::new();
-    let confirmed = confirm_first_contact("host:9443", "ABCD EFGH", &mut input, &mut output)
+    let confirmed = confirm_first_contact("host:9443", "ABCDEFGHIJKLMNOP", &mut input, &mut output)
         .expect("confirmation prompt");
     (confirmed, String::from_utf8(output).expect("utf8 output"))
 }
@@ -54,41 +54,37 @@ fn confirm_rejects_on_eof() {
 }
 
 #[test]
-fn confirm_prompt_renders_the_fingerprint() {
+fn confirm_prompt_renders_the_public_key() {
     let (_, output) = confirm_with("y\n");
     assert!(output.contains("host:9443"), "the address must be shown");
+    // The key is printed as plain (UNGROUPED) base64 — no space grouping.
     assert!(
-        output.contains("ABCD EFGH"),
-        "the fingerprint must be shown"
+        output.contains("ABCDEFGHIJKLMNOP"),
+        "the public key must be shown"
+    );
+    assert!(
+        !output.contains("ABCD EFGH"),
+        "the key must not be space-grouped"
+    );
+    assert!(
+        output.lines().any(|l| l.trim() == "ABCDEFGHIJKLMNOP"),
+        "the key must appear on its own UNGROUPED line"
     );
     assert!(output.contains("[y/N]"), "the default must be refuse");
 }
 
 #[test]
-fn fingerprint_comparison_ignores_whitespace_but_not_case() {
-    // The headless --trust-fingerprint comparison accepts the grouped
-    // form and the plain form interchangeably (whitespace is
-    // insignificant), but case is EXACT: base64 is case-sensitive, and
-    // loosening case would widen the MITM match window on the trust
-    // gate. A case-different "match" must be refused.
-    assert_eq!(
-        strip_fp_whitespace("AB CD EF"),
-        strip_fp_whitespace("ABCDEF")
-    );
-    assert_eq!(strip_fp_whitespace("  AbCd  Ef  "), "AbCdEf");
-    assert_ne!(
-        strip_fp_whitespace("AB CD EF"),
-        strip_fp_whitespace("AB CD EE")
-    );
+fn pubkey_comparison_ignores_whitespace_but_not_case() {
+    // The headless --trust-pubkey comparison tolerates whitespace in a pasted
+    // value (a key may wrap), but case is EXACT: base64 is case-sensitive, and
+    // loosening case would widen the MITM match window on the trust gate. A
+    // case-different "match" must be refused.
+    assert_eq!(strip_whitespace("AB CD EF"), strip_whitespace("ABCDEF"));
+    assert_eq!(strip_whitespace("  AbCd  Ef  "), "AbCdEf");
+    assert_ne!(strip_whitespace("AB CD EF"), strip_whitespace("AB CD EE"));
     // Case slips must NOT match — the compare is case-sensitive.
-    assert_ne!(
-        strip_fp_whitespace("AB CD EF"),
-        strip_fp_whitespace("abcdef")
-    );
-    assert_ne!(
-        strip_fp_whitespace("AB CD EF"),
-        strip_fp_whitespace("ab cd ef")
-    );
+    assert_ne!(strip_whitespace("AB CD EF"), strip_whitespace("abcdef"));
+    assert_ne!(strip_whitespace("AB CD EF"), strip_whitespace("ab cd ef"));
 }
 
 // ── Preflight failure messages ─────────────────────────
@@ -119,12 +115,9 @@ fn preflight_unreachable_message_points_at_the_network() {
 /// A REJECTED handshake (daemon up, ACL miss / key change) must read as
 /// an authorization problem and carry the enrollment remediation with
 /// THIS client's identity EMBEDDED — the TUI user has no choreographr
-/// binary, so the message itself must carry the fingerprint and the
-/// copy-pasteable base64 pubkey.
+/// binary, so the message itself must carry the copy-pasteable base64 pubkey.
 #[test]
 fn preflight_rejected_message_carries_enrollment_remediation() {
-    use base64::Engine as _;
-
     let err = choreo_client_core::PreflightError::Rejected(
         choreo_transport::error::TransportError::AuthFailed,
     );
@@ -133,7 +126,7 @@ fn preflight_rejected_message_carries_enrollment_remediation() {
         0xE2, 0x5D, 0x60, 0x19, 0xAB, 0xCC, 0x37, 0x84, 0x0E, 0x71, 0xFA, 0x92, 0x63, 0xDD, 0x4B,
         0x26, 0x50,
     ];
-    let pk_b64 = base64::engine::general_purpose::STANDARD.encode(pk);
+    let pk_b64 = choreo_client_core::pubkey_base64(&pk);
     let msg = preflight_failure_message("host:9443", &err, Some(&pk));
     assert!(
         msg.contains("did not authorize this client's transport key"),
@@ -141,12 +134,12 @@ fn preflight_rejected_message_carries_enrollment_remediation() {
     );
     // The client's identity is IN the message — nothing to run locally.
     assert!(
-        msg.contains(&choreo_client_core::fingerprint(&pk)),
-        "rejected must embed the client's fingerprint, got: {msg}"
-    );
-    assert!(
         msg.contains(&pk_b64),
         "rejected must embed the copy-pasteable base64 pubkey, got: {msg}"
+    );
+    assert!(
+        !msg.contains("fingerprint"),
+        "the message must not mention a fingerprint concept, got: {msg}"
     );
     assert!(
         msg.contains(&format!("choreographr acl-add {pk_b64}")),

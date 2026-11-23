@@ -1075,7 +1075,7 @@ fn noise_handshake_times_out_against_dribbling_peer() {
 /// XX differs from IK in one contract-critical way: the client does NOT know
 /// the server's static key in advance — it LEARNS it from handshake message
 /// 2. The returned key must be exactly the server's real static (that is
-/// what the caller later verifies out-of-band / fingerprint-compares), and
+/// what the caller later verifies out-of-band / base64-compares), and
 /// the derived transport must carry encrypted traffic (Ping -> Pong) exactly
 /// like the IK transport.
 #[test]

@@ -226,7 +226,7 @@ pub enum ConnectionMode {
     },
     /// Connect via TCP/Noise IK against the key PINNED in
     /// `known_servers.toml` for the address. The pin is loaded at connect
-    /// time; a handshake failure is reported WITH the pinned fingerprint and
+    /// time; a handshake failure is reported WITH the pinned public key and
     /// the re-pair guidance, so a server key change is loud instead of an
     /// opaque connection error (the `known_hosts` behavior).
     TcpPinned(String),
@@ -373,7 +373,7 @@ fn ik_handshake_and_serve(
 /// Use this when the client has NO pinned server public key for `addr`: the
 /// XX handshake reveals the server's static key, which is handed to
 /// `on_first_contact` BEFORE the encrypted session loop starts. The caller
-/// is expected to render the key's fingerprint for a human and return
+/// is expected to render the key's base64 for a human and return
 /// `true` only after an out-of-band confirmation (this is the trust gate —
 /// on `false` the connection is closed and NOTHING is sent, in particular
 /// no `Unlock`, so a first-contact MITM can never harvest the daemon's
@@ -536,7 +536,7 @@ fn serve_noise_connection(
 /// stream — no data-plane message is ever sent or received. This is the
 /// building block UIs use to implement the trust flow synchronously (in a
 /// normal-mode terminal, before any TUI/GUI starts): learn the key, show
-/// the fingerprint, get the human's confirmation, pin, and only then open
+/// the base64, get the human's confirmation, pin, and only then open
 /// the real connection with [`ConnectionMode::Tcp`] / IK.
 ///
 /// The probe itself authenticates NOTHING about the server (there is no pin
@@ -595,7 +595,7 @@ pub enum PreflightError {
 
 /// The client's OWN Noise transport public key (generating the on-disk
 /// keypair first if absent). This is the identity the daemon's ACL judges:
-/// UIs embed it (and its fingerprint) in enrollment-remediation messages so
+/// UIs embed it (in base64) in enrollment-remediation messages so
 /// a TUI-only user never needs the daemon binary just to read out their key.
 ///
 /// # Errors
@@ -662,7 +662,7 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 /// `addr` (the [`ConnectionMode::TcpPinned`] path).
 ///
 /// The whole point of this wrapper is the failure UX: a HANDSHAKE failure
-/// against the pinned key carries the pinned fingerprint and the explicit
+/// against the pinned key carries the pinned public key and the explicit
 /// re-pair instructions, so a server key change is a loud, actionable
 /// message rather than an opaque error (the `known_hosts` behavior). The
 /// dial is performed HERE, as a separate step, so a network-down daemon is
@@ -689,13 +689,13 @@ pub fn run_daemon_tcp_connection_pinned(
         .lookup(addr)?
         .ok_or_else(|| {
             ClientError::Io(std::io::Error::other(format!(
-                "no pinned server key for {addr}: complete first contact (probe + fingerprint confirmation) before using the pinned mode"
+                "no pinned server key for {addr}: complete first contact (probe + base64 confirmation) before using the pinned mode"
             )))
         })?;
 
     info!(
         addr,
-        fingerprint = %choreo_transport::key::fingerprint(&pinned),
+        pubkey = %choreo_transport::key::pubkey_base64(&pinned),
         "connecting with pinned server key"
     );
 
@@ -724,17 +724,17 @@ pub fn run_daemon_tcp_connection_pinned(
             ClientError::Io(io)
                 if io.kind() == std::io::ErrorKind::ConnectionRefused =>
             {
-                // Multi-line guidance: the fingerprint is what the user
+                // Multi-line guidance: the public key is what the user
                 // compares against the daemon operator's out-of-band
                 // readout; the two follow-up lines separate the expected
                 // remediation from the warning when the change was NOT
                 // expected.
                 let msg = format!(
                     "handshake with the pinned server key failed: {e}\n\
-                     pinned fingerprint for {addr}: {}\n\
-                     if the server's key legitimately changed, remove the entry for {addr} from known_servers.toml and reconnect to re-confirm the new fingerprint;\n\
+                     pinned server public key for {addr}: {}\n\
+                     if the server's key legitimately changed, remove the entry for {addr} from known_servers.toml and reconnect to re-confirm the new public key;\n\
                      if you did NOT expect a change, do not reconnect — investigate the network first",
-                    choreo_transport::key::fingerprint(&pinned)
+                    choreo_transport::key::pubkey_base64(&pinned)
                 );
                 ClientError::Io(std::io::Error::other(msg))
             }

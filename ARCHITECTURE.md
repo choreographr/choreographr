@@ -115,12 +115,19 @@ touch a trusted machine — never by the network. Any future feature that seems
 to require in-band trust bootstrapping is a sign of trying to automate
 operator trust; revisit the XX confirm UX before weakening the gate. A
 daemon-as-client future reuses this shape: one keypair per daemon serving both
-roles, enrollment operator-driven, headless confirmation via the fingerprint
-flag.
+roles, enrollment operator-driven, headless confirmation via the base64
+public-key flag (`--trust-pubkey`).
+
+The value compared during first contact is the peer's **transport public key in
+standard base64** — there is no separate fingerprint notion. An operator
+obtains a key with `choreographr pubkey` on the machine that owns it; no
+public-key file is stored, because the public half is derived from
+`transport.sec` on every load. A client supplies a server's key directly for a
+stateless/no-store-write connection with `--server-pubkey <base64>`.
 
 Every mechanism behind that model — the ACL provisioning paths and their
-advisory-lock write discipline, the parse-compare reload policy, the
-fingerprint rendering, the first-contact gate that structurally holds back
+advisory-lock write discipline, the parse-compare reload policy, the base64
+public-key rendering, the first-contact gate that structurally holds back
 every queued message (including auto-`Unlock`) until the human confirms, the
 pin/unlock-key store's own hardening, and the zeroizing of the plaintext frame
 and the transport's staging buffer — is documented in-source

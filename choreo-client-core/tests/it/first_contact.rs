@@ -311,7 +311,7 @@ fn pinned_mode_connects_and_round_trips() {
 }
 
 /// THE `known_hosts` pin: connecting in pinned mode when the server's key has
-/// CHANGED must fail, and the error must carry the pinned fingerprint and
+/// CHANGED must fail, and the error must carry the pinned public key and
 /// the explicit re-pair guidance — not a bare `ConnectionRefused`.
 #[test]
 #[ignore = "integration"]
@@ -358,12 +358,12 @@ fn pinned_mode_key_change_fails_loud() {
     let err = result.expect_err("pinned handshake against a changed key must fail");
     let rendered = err.to_string();
     assert!(
-        rendered.contains("pinned fingerprint"),
-        "the error must surface the pinned fingerprint for comparison, got: {rendered}"
+        rendered.contains("pinned server public key"),
+        "the error must surface the pinned public key for comparison, got: {rendered}"
     );
     assert!(
-        rendered.contains(&choreo_client_core::fingerprint(&key_a.pk)),
-        "the error must contain the PINNED key's fingerprint, got: {rendered}"
+        rendered.contains(&choreo_client_core::pubkey_base64(&key_a.pk)),
+        "the error must contain the PINNED key's base64, got: {rendered}"
     );
     assert!(
         rendered.contains("known_servers.toml"),

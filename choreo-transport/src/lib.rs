@@ -5,7 +5,7 @@
 //! AES-256-GCM stream that length-prefixes and fragments every message. The
 //! [`error`] module defines the shared error type, [`handshake`] the handshake
 //! state machines and their absolute-deadline budgeting, [`key`] the on-disk
-//! transport keypair and its fingerprint, and [`noise`] the encrypted stream
+//! transport keypair and its base64 encoding, and [`noise`] the encrypted stream
 //! itself.
 
 // Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):

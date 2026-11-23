@@ -61,7 +61,7 @@ pub mod shell;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
-pub use choreo_transport::key::{fingerprint, read_server_pk};
+pub use choreo_transport::key::{load_transport_keypair, parse_pubkey_base64, pubkey_base64};
 pub use command_catalog::{
     CommandGroup, CommandMatch, CommandSpec, command_catalog, match_commands,
 };

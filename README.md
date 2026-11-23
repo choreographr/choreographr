@@ -1442,21 +1442,22 @@ binding; the next connect auto-binds a fresh key.
   browsing — credentials are only needed at prompt time.
 - Remote connections (over TCP) use the Noise IK handshake with X25519 key
   agreement, giving an authenticated, encrypted transport for clients like
-  `choreo-gui` (via `--tcp-addr` / `--server-pk`). TCP wire v5 prepends a
-  1-byte handshake-mode preamble: `0x01` selects Noise IK (the normal mode,
-  client already knows the server's pinned public key) and `0x02` selects
+  `choreo-gui` (via `--tcp-addr` / `--server-pubkey <base64>`). TCP wire v5
+  prepends a 1-byte handshake-mode preamble: `0x01` selects Noise IK (the
+  normal mode, client already knows the server's pinned public key) and
+  `0x02` selects
   Noise XX first contact, where the client does not yet know the server's
-  key — the handshake reveals it, the client verifies its fingerprint
+  key — the handshake reveals it, the client verifies its base64 public key
   out-of-band before any protocol traffic (in particular the `Unlock` that
   carries the daemon's private key) is sent, and IK is used for every
   connection after that.
 - The client-side trust flow (SSH `known_hosts` model): the daemon's key is
-  learned on first contact via the XX probe and confirmed by comparing
-  fingerprints with the daemon operator, then pinned to
+  learned on first contact via the XX probe and confirmed by comparing its
+  base64 public key with the daemon operator, then pinned to
   `~/.config/choreographr/known_servers.toml`; every later connection
   authenticates against the pin and a changed server key fails LOUDLY with
-  the pinned fingerprint and re-pair guidance (`--trust-fingerprint`
-  pre-approves the fingerprint for headless clients). That file also carries
+  the pinned public key and re-pair guidance (`--trust-pubkey <base64>`
+  pre-approves the key for headless clients). That file also carries
   the per-daemon private unlock keys, so it is written and read `0600`,
   opened with `O_NOFOLLOW` on both paths, and checked to be a regular file
   owned by the current user — a symlink or foreign-owned file is refused, and

@@ -32,7 +32,7 @@
 # Scope of the "prove serve" check (deliberate, not laziness): the shipped
 # artifact set is the daemon (a server) and choreo-tui — and the TUI has NO
 # non-interactive mode. Its CLI only takes TCP flags (--tcp-addr/
-# --server-pk/--trust-fingerprint, which are for the Noise XX first-contact
+# --server-pubkey/--trust-pubkey, which are for the Noise XX first-contact
 # flow), and after that flow it enters crossterm raw mode, which cannot run
 # headless. So a full Noise-encrypted client round-trip is NOT achievable with
 # shipped binaries alone and is NOT faked here. The check is:
@@ -295,7 +295,7 @@ fi
 
 # Hermeticity proof: the daemon wrote its Noise identity (transport.sec) into
 # THIS config dir, and `pubkey` — which only DERIVES the public half from that
-# secret and never generates one (see choreo-daemon/src/cli.rs) — reads it back
+# secret and never generates one (see choreo-daemon/src/cli/mod.rs) — reads it back
 # from there. Both succeeding under the scratch env proves the daemon's keypair
 # landed in the scratch config dir and the daemon never touched the runner's
 # real one.
