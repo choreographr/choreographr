@@ -10,7 +10,10 @@
 //!
 //! Both functions are allocation-free on the encode side (a fixed `[u8; N]`) and
 //! bounds-checked on both, so a broken internal invariant becomes the crate's
-//! protocol error rather than a panic in a connection thread.
+//! [`TransportError::InternalInvariant`] rather than a panic in a connection
+//! thread. A length a *peer* declared above the cap is a wire violation and is
+//! reported as [`TransportError::InvalidFragment`] instead — the two are kept
+//! apart so a caller can tell a bug in this build from a malicious peer.
 
 use crate::buf::invalid_slice;
 use crate::error::TransportError;
@@ -23,10 +26,10 @@ use crate::error::TransportError;
 /// peer, so a sender can never produce a frame the receiver refuses. The
 /// conversion is checked rather than cast even though a valid `cap` makes it
 /// infallible: an over-long frame is a broken internal invariant, and this
-/// reports it as the crate's protocol error instead of truncating the prefix
-/// into a frame no peer could reassemble. A `cap` wider than the width can
-/// express is guarded the same way — the cap alone cannot stop a value the
-/// `N` bytes cannot carry.
+/// reports it as [`TransportError::InternalInvariant`] (never a peer violation)
+/// instead of truncating the prefix into a frame no peer could reassemble. A
+/// `cap` wider than the width can express is guarded the same way — the cap
+/// alone cannot stop a value the `N` bytes cannot carry.
 pub(crate) fn encode<const N: usize>(
     n: usize,
     cap: usize,
@@ -34,9 +37,12 @@ pub(crate) fn encode<const N: usize>(
 ) -> Result<[u8; N], TransportError> {
     // One message for both failure shapes — "above the caller's cap" and "too
     // wide for the prefix" — because either way the frame is not one this
-    // implementation may put on the wire.
-    let too_long =
-        || TransportError::InvalidFragment(format!("{what} {n} exceeds the {cap}-byte cap"));
+    // implementation may put on the wire, which is a local bug, not a peer's.
+    let too_long = || {
+        TransportError::InternalInvariant(format!(
+            "{what} {n} exceeds the {cap}-byte cap (cannot be encoded)"
+        ))
+    };
     if n > cap {
         return Err(too_long());
     }
@@ -178,11 +184,12 @@ mod tests {
         );
 
         // 70_000 fits a u32 but not two bytes; with a 70_000 cap the cap check
-        // alone would let it through and truncate the prefix to 4464.
+        // alone would let it through and truncate the prefix to 4464. This is a
+        // local bug, so it is an `InternalInvariant`, not a peer violation.
         let err = encode::<2>(70_000, 70_000, "frame").expect_err("70000 must not truncate");
         assert!(
-            matches!(err, TransportError::InvalidFragment(_)),
-            "a width overflow must be the crate's protocol error: {err}"
+            matches!(err, TransportError::InternalInvariant(_)),
+            "a width overflow must be the crate's internal-invariant error: {err}"
         );
         assert!(
             err.to_string().contains("70000"),
@@ -190,18 +197,19 @@ mod tests {
         );
     }
 
-    /// A prefix that is shorter than the declared width is the crate's protocol
-    /// error, not a panic — the bounds-checked `get` is what lets the no-panic
-    /// policy hold on both framing paths.
+    /// A prefix that is shorter than the declared width is the crate's
+    /// internal-invariant error (both call sites pass an exactly `N`-byte head),
+    /// not a panic — the bounds-checked `get` is what lets the no-panic policy
+    /// hold on both framing paths.
     #[test]
-    fn a_short_prefix_is_a_protocol_error() {
+    fn a_short_prefix_is_an_internal_invariant() {
         assert!(matches!(
             decode::<4>(&[0u8, 0, 1], 65_535, "frame"),
-            Err(TransportError::InvalidFragment(_))
+            Err(TransportError::InternalInvariant(_))
         ));
         assert!(matches!(
             decode::<2>(&[], 1024, "frame"),
-            Err(TransportError::InvalidFragment(_))
+            Err(TransportError::InternalInvariant(_))
         ));
     }
 }

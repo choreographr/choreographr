@@ -55,6 +55,33 @@ fn cloned_slots_share_one_right_per_direction() {
     }
 }
 
+/// The exclusion holds ACROSS threads, which is the shape the connection relies
+/// on: the reader and writer run on separate threads over clones of one stream.
+/// Deterministic, not timing-based — the main thread holds the guard before the
+/// worker is even spawned, so the worker's claim can only ever see it held.
+#[test]
+fn a_clone_contended_from_another_thread_is_refused() {
+    let slot = SingleSlot::new("recv_message");
+    let held = slot.acquire().expect("claim on the original");
+    let clone = slot.clone();
+
+    let refusal = std::thread::spawn(move || clone.acquire().map(|_| ()))
+        .join()
+        .expect("worker thread must not panic");
+    let Err(err) = refusal else {
+        panic!("a clone contended from another thread must be refused");
+    };
+    assert!(
+        err.to_string().contains("concurrent recv_message"),
+        "the refusal names the entry point and direction: {err}"
+    );
+
+    // Dropping the held guard frees the slot for the next holder.
+    drop(held);
+    slot.acquire()
+        .expect("the slot is free once the holder drops");
+}
+
 /// The wipe exemption is a fail-safe allowlist: `Image` (raw attachment
 /// bytes) is the only variant that skips the wipe, while a credential-bearing
 /// variant and any unlisted variant are treated as secret. A memory-safety

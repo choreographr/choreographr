@@ -24,77 +24,17 @@
 //!    sink moves into the writer thread and before the reader tail keeps its own
 //!    end, so neither is borrowed from the thread that owns it.
 //!
-//! The writer's two time bounds also live here (see [`WRITER_STALL`] and
-//! [`message_budget`]), because they are one policy for every transport: the
-//! transport applies them, the connection decides them.
+//! The writer's two time bounds (`WRITER_STALL` and `message_budget`) are one
+//! policy shared with the daemon's Noise writer, so they live in `choreo-proto`
+//! beside the bounded-write loop; the connection applies them, the transport only
+//! carries the bytes.
 
 use crate::error::ClientError;
 use choreo_proto::{ClientMessage, DaemonMessage, UnixStream};
 use crossbeam_channel::Receiver;
 use std::net::{Shutdown, TcpStream};
 use std::thread;
-use std::time::Duration;
 use tracing::{error, warn};
-
-/// How long a single write syscall may wait for progress before the peer is
-/// treated as wedged.
-///
-/// This is the **detection latency** bound: a peer that accepts nothing for this
-/// long has stopped reading, so the write fails, the sink closes the transport,
-/// and the connection tears down. It is deliberately independent of the message
-/// size — a silent peer is noticed in five seconds whether the message is one
-/// kilobyte or one mebibyte.
-pub(super) const WRITER_STALL: Duration = Duration::from_secs(5);
-
-/// Floor throughput a writer must sustain to a peer for a message to be worth
-/// finishing, in bytes per second.
-///
-/// A slow-but-alive link is allowed to take longer for a bigger message, so the
-/// per-message budget scales with the frame size at this rate instead of being
-/// one fixed number that would false-kill a large legitimate frame.
-pub(super) const WRITER_MIN_RATE_BYTES_PER_SEC: u64 = 8 * 1024;
-
-/// Ceiling on the per-message budget, so a single large frame cannot make the
-/// connection's own teardown wait for the full rate-derived time.
-///
-/// Without a cap, a 64 MiB frame at [`WRITER_MIN_RATE_BYTES_PER_SEC`] implies
-/// ~8192 s, letting a peer that accepts only a handful of bytes per second keep
-/// the writer — and the `join()` that tears it down after the reader ends —
-/// alive for hours. The cap bounds that worst case to a couple of minutes: a
-/// frame that cannot finish within this window is a peer the connection is
-/// better off abandoning. Raising it tolerates slower links at the cost of a
-/// slower worst-case teardown.
-pub(super) const WRITER_MAX_BUDGET: Duration = Duration::from_secs(120);
-
-/// The absolute budget for writing one message of `wire_len` bytes: never less
-/// than [`WRITER_STALL`], the message's own size divided by the floor rate, and
-/// never more than [`WRITER_MAX_BUDGET`].
-///
-/// Both halves are needed. The size-scaled part is what lets a large frame
-/// finish on a link that is merely slow; the [`WRITER_STALL`] floor is what
-/// keeps a silent peer's detection latency at five seconds regardless of size,
-/// since a size-scaled budget for a multi-megabyte frame would otherwise be
-/// minutes of waiting on a peer that will never read a byte. The
-/// [`WRITER_MAX_BUDGET`] ceiling bounds the other end: a peer that is alive but
-/// glacially slow cannot stretch one write, and therefore the connection's
-/// teardown, past it.
-///
-/// Integer arithmetic throughout, with saturating operations: a 64 MiB frame
-/// must not overflow the millisecond computation, and no input may panic.
-pub(super) fn message_budget(wire_len: usize) -> Duration {
-    // `usize` is 64-bit on every target we ship, but converting rather than
-    // casting keeps a 128-bit-`usize` future (or a narrower one) from silently
-    // truncating; saturation is unreachable in practice and cannot panic.
-    let bytes = u64::try_from(wire_len).unwrap_or(u64::MAX);
-    // bytes / rate seconds, in milli-seconds, so a sub-second frame keeps its
-    // precision instead of rounding down to zero.
-    let millis = bytes
-        .saturating_mul(1000)
-        .saturating_div(WRITER_MIN_RATE_BYTES_PER_SEC);
-    Duration::from_millis(millis)
-        .max(WRITER_STALL)
-        .min(WRITER_MAX_BUDGET)
-}
 
 /// A handle that can close this connection from another thread.
 ///

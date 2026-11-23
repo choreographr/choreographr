@@ -224,9 +224,10 @@ mod tests {
     }
 
     /// A declared body length inside the cap is accepted and one above it is
-    /// rejected with the crate's protocol error — the pre-authentication bound.
-    /// Calls the validation path directly, so no socket and no allocation is
-    /// involved.
+    /// rejected — the pre-authentication bound. A *declared* length above the cap
+    /// is a peer violation (`InvalidFragment`); an *encoded* length above it is a
+    /// local bug (`InternalInvariant`), and this test pins both. Calls the
+    /// validation paths directly, so no socket and no allocation is involved.
     #[test]
     fn declared_length_above_cap_is_rejected() {
         let at_cap = encode_frame_len(MAX_HANDSHAKE_FRAME).expect("at the cap encodes");
@@ -237,13 +238,15 @@ mod tests {
         let empty = encode_frame_len(0).expect("an empty body is a legal length");
         assert_eq!(declared_frame_len(&empty).expect("empty allowed"), 0);
 
+        // Encoding a body past the cap is a local bug (`InternalInvariant`): the
+        // sender must never produce such a frame.
         let over = encode_frame_len(MAX_HANDSHAKE_FRAME + 1);
         assert!(
-            matches!(over, Err(TransportError::InvalidFragment(_))),
-            "a length one past the cap must be refused, got {over:?}"
+            matches!(over, Err(TransportError::InternalInvariant(_))),
+            "encoding a length one past the cap must be refused as an internal bug, got {over:?}"
         );
         // The whole 16-bit range a hostile peer can declare is rejected above
-        // the cap, including the maximum.
+        // the cap as a peer violation, including the maximum.
         let max = declared_frame_len(&u16::MAX.to_be_bytes());
         assert!(
             matches!(max, Err(TransportError::InvalidFragment(_))),
@@ -252,10 +255,15 @@ mod tests {
     }
 
     /// The outbound side enforces the same cap as the inbound side, and reports
-    /// it as an over-long frame rather than as a broken buffer invariant.
+    /// an over-long message as the local invariant break it is rather than as a
+    /// peer violation — the sender is the one at fault.
     #[test]
     fn encoding_above_the_cap_is_refused() {
         let over = encode_frame_len(MAX_HANDSHAKE_FRAME + 1).expect_err("over the cap");
+        assert!(
+            matches!(over, TransportError::InternalInvariant(_)),
+            "an over-long outgoing frame is an internal bug: {over}"
+        );
         assert!(
             over.to_string().contains("exceeds the"),
             "an over-long message must name the cap: {over}"

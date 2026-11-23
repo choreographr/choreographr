@@ -823,13 +823,14 @@ each connection's writer gets a socket write timeout, so a wedged client cannot
 stall its writer forever — the write fails, the writer shuts the socket down
 itself, and the reader's blocking read unblocks into the normal teardown. And
 **evictions are not silent**: each increments `choreo_evictions_total`, served
-on `/metrics`, so a permanently wedged subscriber stays observable. And **the
-two sides bound their writers differently**: the daemon bounds its writer in
-**bytes** through lag eviction, while the client bounds its own in **time** —
-one absolute budget per message, scaled by that message's size, plus a
-per-syscall stall so a silent daemon is noticed promptly. The split is
-deliberate: the queue accounting lag eviction leans on has no client-side
-equivalent.
+on `/metrics`, so a permanently wedged subscriber stays observable. And **both
+sides bound outbound writes in time, the daemon also in bytes**: the client and
+the daemon's Noise writer apply the same per-message policy from `choreo-proto`
+— one absolute budget scaled by the message's size plus a per-syscall stall, so
+a silent peer or a large frame is bounded the same way on either end. The
+daemon has an additional, byte-based bound the client has no equivalent for:
+lag eviction caps each connection's outbound queue by the bytes in flight, whose
+queue accounting is what the client side lacks.
 
 Four sanctioned shared-state exceptions sit behind this design — the
 delivery-lag byte counters (#6), `ClientId` (#10), the log-directory test

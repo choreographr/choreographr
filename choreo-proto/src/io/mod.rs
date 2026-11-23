@@ -1,11 +1,12 @@
 //! Socket I/O for the wire protocol: the unix-socket path/dial policy and the
 //! framed message codec.
 //!
-//! The deadline/stall-bounded blocking write machinery these paths share lives
-//! in the private `write` submodule, re-exported here so every caller keeps
-//! naming it through `choreo_proto::`. This module owns the socket-path
-//! resolution, the cross-platform dial and its failure classification, and the
-//! length-prefixed read/write of one framed message.
+//! The deadline/stall-bounded blocking write machinery these paths share, and the
+//! per-message writer budget that sizes it, live in the private `write`
+//! submodule, re-exported here so every caller keeps naming them through
+//! `choreo_proto::`. This module owns the socket-path resolution, the
+//! cross-platform dial and its failure classification, and the length-prefixed
+//! read/write of one framed message.
 
 mod write;
 
@@ -14,7 +15,10 @@ use crate::frame::{MAX_FRAME_SIZE, decode_frame, encode_frame};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub use write::{TimedWrite, write_all_by, write_all_with_stall};
+pub use write::{
+    TimedWrite, WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, WRITER_STALL, message_budget,
+    write_all_by, write_all_with_stall,
+};
 
 /// Environment variable that overrides the default unix-socket path; when set
 /// (and non-empty) its value is returned verbatim by [`socket_path`], so the

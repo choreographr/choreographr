@@ -72,10 +72,11 @@ impl NoiseStream {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::InvalidFragment`] if another thread is
-    /// concurrently sending on this stream or the plaintext exceeds
-    /// [`MAX_FRAME_SIZE`], [`TransportError::ConnectionClosed`]/I/O errors
-    /// from the socket, or snow errors from encryption.
+    /// Returns [`TransportError::ConcurrentAccess`] if another thread is
+    /// concurrently sending on this stream, [`TransportError::InvalidFragment`]
+    /// if the plaintext exceeds [`MAX_FRAME_SIZE`],
+    /// [`TransportError::ConnectionClosed`]/I/O errors from the socket, or snow
+    /// errors from encryption.
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         self.send_message_bounded(plaintext, None)
     }
@@ -108,11 +109,12 @@ impl NoiseStream {
     ///
     /// # Errors
     ///
-    /// As [`Self::send_message`], plus: a deadline that has already elapsed (or
-    /// passes mid-message) and a write that accepts nothing for `stall` both make
-    /// an armed write return `WouldBlock`/`TimedOut`, which converts into
-    /// [`TransportError::Io`] through the `From<io::Error>` impl — a fired bound
-    /// is reported as the socket's own error, not a bespoke variant.
+    /// As [`Self::send_message`] — including [`TransportError::ConcurrentAccess`]
+    /// and [`TransportError::InvalidFragment`] — plus: a deadline that has already
+    /// elapsed (or passes mid-message) and a write that accepts nothing for
+    /// `stall` both make an armed write return `WouldBlock`/`TimedOut`, which
+    /// converts into [`TransportError::Io`] through the `From<io::Error>` impl — a
+    /// fired bound is reported as the socket's own error, not a bespoke variant.
     pub fn send_message_by(
         &mut self,
         plaintext: &[u8],

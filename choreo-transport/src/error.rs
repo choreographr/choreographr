@@ -16,16 +16,28 @@ pub enum TransportError {
     Protocol(#[from] choreo_proto::ProtoError),
     /// The peer violated the transport framing contract: an oversized fragment
     /// length, a reassembly that would exceed the codec's message cap or the
-    /// per-message fragment-count bound, a fragment too short to carry its
-    /// authenticated continuation header, or a broken internal buffer-size
-    /// invariant. A wire-level violation leaves the stream unusable, because the
-    /// framing it relied on is no longer trustworthy.
+    /// per-message fragment-count bound, or a fragment too short to carry its
+    /// authenticated continuation header. A wire-level violation leaves the
+    /// stream unusable, because the framing it relied on is no longer
+    /// trustworthy.
     ///
     /// A concurrent second sender or reader on one stream is deliberately NOT
     /// this: it is a caller misuse that leaves the stream intact, and it is
     /// reported as [`Self::ConcurrentAccess`] instead.
     #[error("invalid transport fragment: {0}")]
     InvalidFragment(String),
+    /// A buffer-size or length invariant this crate relies on did not hold, so
+    /// the frame could not be built or split. This is a **bug in this build**,
+    /// not a peer violation: every offset involved is an internal size
+    /// invariant, and a peer can only ever reach this through a defect here.
+    ///
+    /// It is kept apart from [`Self::InvalidFragment`] precisely because the
+    /// caller-side classification differs — a peer framing violation is a
+    /// handshake refusal worth surfacing as remediation, whereas an internal
+    /// invariant break must never be blamed on the peer (see
+    /// `choreo-client-core`'s `is_handshake_refusal`).
+    #[error("internal transport invariant violated: {0}")]
+    InternalInvariant(String),
     /// A second sender or reader used one [`crate::noise::NoiseStream`] while
     /// another call still held that direction.
     ///

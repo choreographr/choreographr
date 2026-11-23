@@ -9,7 +9,8 @@ use tracing::{debug, trace};
 use zeroize::{Zeroize, Zeroizing};
 
 use super::NoiseStream;
-use super::frame::{self, FRAGMENT_CONTINUATION, FRAGMENT_HEADER_LEN, LEN_PREFIX_LEN, decode_len};
+use super::frame::{FRAGMENT_CONTINUATION, FRAGMENT_HEADER_LEN, LEN_PREFIX_LEN, decode_len};
+use super::reassembly::Reassembly;
 use crate::buf::{at, slice, slice_mut};
 use crate::error::TransportError;
 
@@ -84,17 +85,19 @@ impl NoiseStream {
     ///
     /// # Errors
     ///
-    /// Returns [`TransportError::ConnectionClosed`] on EOF before a complete
-    /// message, [`TransportError::InvalidFragment`] on a frame exceeding the
-    /// per-frame cap, the per-message byte cap or the fragment-count bound, or a
-    /// continuation-header violation, and I/O or snow errors otherwise.
+    /// Returns [`TransportError::ConcurrentAccess`] if another thread is
+    /// concurrently receiving on this stream, [`TransportError::ConnectionClosed`]
+    /// on EOF before a complete message, [`TransportError::InvalidFragment`] on a
+    /// frame exceeding the per-frame cap or below the tag-plus-header minimum, the
+    /// per-message byte cap or the fragment-count bound, or a continuation-header
+    /// violation, and I/O or snow errors otherwise.
     pub(super) fn recv_message_plain(&mut self) -> Result<Vec<u8>, TransportError> {
         // The inbound single-reader right: two concurrent receives on one
         // connection would splice two logical messages together with no error
         // at all, so the slot turns that misuse into a protocol error — the
         // mirror of what `send_message` takes for the outbound direction.
         let _guard = self.recv_slot.acquire()?;
-        let mut assembly = frame::Reassembly::new();
+        let mut assembly = Reassembly::new();
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
             // lock: snow tracks separate send and recv nonce counters, so an
@@ -132,9 +135,11 @@ impl NoiseStream {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .read_message(&self.recv_ct_buf, &mut self.recv_pt_buf)?;
             // Every fragment from this implementation carries the 1-byte
-            // continuation header, so a zero-length plaintext is impossible
-            // from a legitimate peer; guard the index below rather than panic
-            // on a hostile or corrupted 16-byte ciphertext (a bare GCM tag).
+            // continuation header, so a zero-length plaintext is impossible from
+            // a legitimate peer; `decode_len` already refuses a ciphertext below
+            // tag + header, so `n >= 1` for any frame that reaches here. The guard
+            // is kept as defence in depth — it keeps the index below panic-free
+            // even if that minimum bound were ever loosened.
             if n == 0 {
                 return Err(TransportError::InvalidFragment(
                     "fragment carries no authenticated continuation header".to_string(),

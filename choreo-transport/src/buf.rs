@@ -6,8 +6,10 @@
 //! peer-controlled input, but a workspace-wide deny on `indexing_slicing`
 //! exists because an out-of-range slice panics, and a panic inside a
 //! connection thread is a crash surface. These helpers turn a broken
-//! invariant into [`TransportError::InvalidFragment`] instead, so the
-//! no-panic policy holds on both paths.
+//! invariant into [`TransportError::InternalInvariant`] instead, so the
+//! no-panic policy holds on both paths — and, because it is the *internal*
+//! variant rather than [`TransportError::InvalidFragment`], callers never
+//! mistake a defect in this build for a peer violating the wire format.
 //!
 //! They live here — outside both `handshake` and `noise` — because the data
 //! plane has no business reaching through the handshake module for them.
@@ -16,9 +18,9 @@ use std::slice;
 
 use crate::error::TransportError;
 
-/// The crate's protocol error for a broken internal buffer-size invariant.
+/// The crate's error for a broken internal buffer-size invariant.
 pub(crate) fn invalid_slice(what: &str) -> TransportError {
-    TransportError::InvalidFragment(format!("internal buffer size invariant violated ({what})"))
+    TransportError::InternalInvariant(format!("buffer size invariant violated ({what})"))
 }
 
 /// `&buf[i]` composed with the bounds check.
@@ -78,20 +80,20 @@ mod tests {
         let buf = [1u8, 2, 3];
 
         assert!(
-            matches!(at(&buf, 3, "at"), Err(TransportError::InvalidFragment(_))),
+            matches!(at(&buf, 3, "at"), Err(TransportError::InternalInvariant(_))),
             "an out-of-range index must be an error, not a panic"
         );
         assert!(
             matches!(
                 slice(&buf, 2..5, "slice"),
-                Err(TransportError::InvalidFragment(_))
+                Err(TransportError::InternalInvariant(_))
             ),
             "an out-of-range range must be an error, not a panic"
         );
         assert!(
             matches!(
                 slice(&buf, 4.., "slice"),
-                Err(TransportError::InvalidFragment(_))
+                Err(TransportError::InternalInvariant(_))
             ),
             "an out-of-range start must be an error, not a panic"
         );
@@ -100,14 +102,14 @@ mod tests {
         assert!(
             matches!(
                 at_mut(&mut owned, 3, "at_mut"),
-                Err(TransportError::InvalidFragment(_))
+                Err(TransportError::InternalInvariant(_))
             ),
             "an out-of-range mutable index must be an error, not a panic"
         );
         assert!(
             matches!(
                 slice_mut(&mut owned, 2..5, "slice_mut"),
-                Err(TransportError::InvalidFragment(_))
+                Err(TransportError::InternalInvariant(_))
             ),
             "an out-of-range mutable range must be an error, not a panic"
         );

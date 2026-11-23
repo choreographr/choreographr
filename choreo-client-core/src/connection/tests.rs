@@ -8,9 +8,6 @@
 //! live in `tests/it/`.
 
 use super::handshake::{handshake_error, is_handshake_refusal};
-use super::serve::{
-    WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, WRITER_STALL, message_budget,
-};
 use super::*;
 use choreo_proto::ClientMessageType;
 use choreo_proto::DaemonMessageType;
@@ -18,7 +15,6 @@ use choreo_proto::SessionSummary;
 use choreo_transport::error::TransportError;
 use std::io;
 use std::thread;
-use std::time::Duration;
 
 /// Bare in-process link — two crossbeam channels, NO real daemon. The
 /// fake-daemon threads below play the daemon side of an `EmbeddedLink`:
@@ -395,6 +391,15 @@ fn handshake_non_refusals_keep_their_own_meaning() {
     };
     assert!(!is_handshake_refusal(&concurrent));
 
+    // A local buffer-invariant break is a bug in this build, never a peer
+    // refusal: it must not surface as enrollment or re-pair remediation.
+    let internal = TransportError::InternalInvariant("handshake frame body".to_string());
+    assert!(!is_handshake_refusal(&internal));
+    match handshake_error(internal) {
+        ClientError::Io(io) => assert_eq!(io.kind(), io::ErrorKind::Other),
+        other => panic!("a local invariant break must keep Io(..), got {other:?}"),
+    }
+
     // A local key-file failure is neither a refusal nor a network problem.
     let local = TransportError::ConfigDirNotFound;
     assert!(!is_handshake_refusal(&local));
@@ -408,38 +413,4 @@ fn handshake_non_refusals_keep_their_own_meaning() {
         }
         other => panic!("a local failure must keep Io(..), got {other:?}"),
     }
-}
-
-/// A small frame cannot finish in less than the stall, so its budget is exactly
-/// [`WRITER_STALL`].
-#[test]
-fn a_small_frame_budgets_exactly_the_writer_stall() {
-    assert_eq!(message_budget(64), WRITER_STALL);
-    assert_eq!(message_budget(0), WRITER_STALL);
-    // 20 KiB at the floor rate is 2.5 s — still below the stall.
-    assert_eq!(message_budget(20 * 1024), WRITER_STALL);
-}
-
-/// Above the boundary where the rate-derived duration overtakes the stall, the
-/// budget is the rate-derived one: a big frame on a slow link is allowed the
-/// time its size implies.
-#[test]
-fn a_frame_past_the_rate_boundary_gets_the_rate_derived_budget() {
-    // 48 KiB at 8 KiB/s is 6 s, past the 5 s stall.
-    let wire_len = 48 * 1024;
-    let expected = Duration::from_millis(
-        u64::try_from(wire_len).expect("fits u64") * 1000 / WRITER_MIN_RATE_BYTES_PER_SEC,
-    );
-    assert!(expected > WRITER_STALL, "the boundary case must exceed it");
-    assert_eq!(message_budget(wire_len), expected);
-}
-
-/// A 64 MiB frame — the codec's maximum — must not overflow the millisecond
-/// computation, and its rate-derived budget (~8192 s) is clamped to the
-/// [`WRITER_MAX_BUDGET`] ceiling so it cannot stall the connection's teardown.
-#[test]
-fn a_64_mib_frame_is_clamped_to_the_max_budget() {
-    let wire_len = 64 * 1024 * 1024;
-    assert_eq!(message_budget(wire_len), WRITER_MAX_BUDGET);
-    assert!(message_budget(wire_len) > WRITER_STALL);
 }

@@ -14,17 +14,15 @@
 
 use crate::error::ClientError;
 use choreo_proto::{
-    ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix, encode_frame, read_message,
+    ClientMessage, DaemonMessage, ProtoError, UnixStream, WRITER_STALL, connect_unix, encode_frame,
+    message_budget, read_message,
 };
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use std::io::{BufRead, BufReader};
 use std::net::Shutdown;
 use std::time::Instant;
 
-use super::serve::{
-    CloseHandle, ConnectionSink, ConnectionSource, Inbound, WRITER_STALL, message_budget, serve,
-    serve_source,
-};
+use super::serve::{CloseHandle, ConnectionSink, ConnectionSource, Inbound, serve, serve_source};
 
 /// The inbound half of any length-prefixed message stream.
 ///

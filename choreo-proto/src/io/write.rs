@@ -72,6 +72,82 @@ fn write_stall_elapsed(pending: usize) -> std::io::Error {
     )
 }
 
+// ── per-message writer budget ──
+//
+// A long-lived connection writer needs two numbers for every outbound message,
+// and both callers — the client's connection sink and the daemon's Noise writer
+// — must agree on them, so they live here beside the bounded-write loop rather
+// than in either caller:
+//
+// - [`WRITER_STALL`] is the per-syscall **detection latency**: a peer that
+//   accepts nothing for this long has stopped reading, so the write fails and the
+//   connection tears down.
+// - [`message_budget`] is the whole-message **total** budget, scaled by the
+//   message's size so a large frame on a slow-but-alive link still finishes while
+//   a peer that is alive but glacially slow cannot stretch one write past
+//   [`WRITER_MAX_BUDGET`].
+
+/// How long a single write syscall may wait for progress before the peer is
+/// treated as wedged.
+///
+/// This is the **detection latency** bound handed to [`write_all_with_stall`]: a
+/// peer that accepts nothing for this long has stopped reading, so the write
+/// fails, the caller closes the transport, and the connection tears down. It is
+/// deliberately independent of the message size — a silent peer is noticed in
+/// five seconds whether the message is one kilobyte or one mebibyte.
+pub const WRITER_STALL: Duration = Duration::from_secs(5);
+
+/// Floor throughput a writer must sustain to a peer for a message to be worth
+/// finishing, in bytes per second.
+///
+/// A slow-but-alive link is allowed to take longer for a bigger message, so the
+/// per-message budget scales with the frame size at this rate instead of being
+/// one fixed number that would false-kill a large legitimate frame.
+pub const WRITER_MIN_RATE_BYTES_PER_SEC: u64 = 8 * 1024;
+
+/// Ceiling on the per-message budget, so a single large frame cannot make the
+/// connection's own teardown wait for the full rate-derived time.
+///
+/// Without a cap, a 64 MiB frame at [`WRITER_MIN_RATE_BYTES_PER_SEC`] implies
+/// ~8192 s, letting a peer that accepts only a handful of bytes per second keep
+/// the writer — and the `join()` that tears it down after the reader ends —
+/// alive for hours. The cap bounds that worst case to a couple of minutes: a
+/// frame that cannot finish within this window is a peer the connection is
+/// better off abandoning. Raising it tolerates slower links at the cost of a
+/// slower worst-case teardown.
+pub const WRITER_MAX_BUDGET: Duration = Duration::from_secs(120);
+
+/// The absolute budget for writing one message of `wire_len` bytes: never less
+/// than [`WRITER_STALL`], the message's own size divided by the floor rate, and
+/// never more than [`WRITER_MAX_BUDGET`].
+///
+/// Both halves are needed. The size-scaled part is what lets a large frame
+/// finish on a link that is merely slow; the [`WRITER_STALL`] floor is what
+/// keeps a silent peer's detection latency at five seconds regardless of size,
+/// since a size-scaled budget for a multi-megabyte frame would otherwise be
+/// minutes of waiting on a peer that will never read a byte. The
+/// [`WRITER_MAX_BUDGET`] ceiling bounds the other end: a peer that is alive but
+/// glacially slow cannot stretch one write, and therefore the connection's
+/// teardown, past it.
+///
+/// Integer arithmetic throughout, with saturating operations: a 64 MiB frame
+/// must not overflow the millisecond computation, and no input may panic.
+#[must_use]
+pub fn message_budget(wire_len: usize) -> Duration {
+    // `usize` is 64-bit on every target we ship, but converting rather than
+    // casting keeps a 128-bit-`usize` future (or a narrower one) from silently
+    // truncating; saturation is unreachable in practice and cannot panic.
+    let bytes = u64::try_from(wire_len).unwrap_or(u64::MAX);
+    // bytes / rate seconds, in milli-seconds, so a sub-second frame keeps its
+    // precision instead of rounding down to zero.
+    let millis = bytes
+        .saturating_mul(1000)
+        .saturating_div(WRITER_MIN_RATE_BYTES_PER_SEC);
+    Duration::from_millis(millis)
+        .max(WRITER_STALL)
+        .min(WRITER_MAX_BUDGET)
+}
+
 /// Write all of `data`, with the whole write bounded by `deadline`.
 ///
 /// Before every `write` syscall this re-arms the socket's write stall to the
@@ -253,7 +329,10 @@ fn write_bounded<W: TimedWrite>(
 
 #[cfg(test)]
 mod tests {
-    use super::{TimedWrite, write_all_by, write_all_with_stall};
+    use super::{
+        TimedWrite, WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, WRITER_STALL, message_budget,
+        write_all_by, write_all_with_stall,
+    };
     use std::cell::RefCell;
     use std::io::{self, Write};
     use std::time::{Duration, Instant};
@@ -578,5 +657,40 @@ mod tests {
             "the total budget is the bound that fired: {error}"
         );
         assert_eq!(writer.calls(), 0);
+    }
+
+    /// A small frame cannot finish in less than the stall, so its budget is
+    /// exactly [`WRITER_STALL`].
+    #[test]
+    fn a_small_frame_budgets_exactly_the_writer_stall() {
+        assert_eq!(message_budget(64), WRITER_STALL);
+        assert_eq!(message_budget(0), WRITER_STALL);
+        // 20 KiB at the floor rate is 2.5 s — still below the stall.
+        assert_eq!(message_budget(20 * 1024), WRITER_STALL);
+    }
+
+    /// Above the boundary where the rate-derived duration overtakes the stall,
+    /// the budget is the rate-derived one: a big frame on a slow link is allowed
+    /// the time its size implies.
+    #[test]
+    fn a_frame_past_the_rate_boundary_gets_the_rate_derived_budget() {
+        // 48 KiB at 8 KiB/s is 6 s, past the 5 s stall.
+        let wire_len = 48 * 1024;
+        let expected = Duration::from_millis(
+            u64::try_from(wire_len).expect("fits u64") * 1000 / WRITER_MIN_RATE_BYTES_PER_SEC,
+        );
+        assert!(expected > WRITER_STALL, "the boundary case must exceed it");
+        assert_eq!(message_budget(wire_len), expected);
+    }
+
+    /// A 64 MiB frame — the codec's maximum — must not overflow the millisecond
+    /// computation, and its rate-derived budget (~8192 s) is clamped to the
+    /// [`WRITER_MAX_BUDGET`] ceiling so it cannot stall the connection's
+    /// teardown.
+    #[test]
+    fn a_64_mib_frame_is_clamped_to_the_max_budget() {
+        let wire_len = 64 * 1024 * 1024;
+        assert_eq!(message_budget(wire_len), WRITER_MAX_BUDGET);
+        assert!(message_budget(wire_len) > WRITER_STALL);
     }
 }

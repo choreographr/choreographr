@@ -3,7 +3,7 @@
 //! service loop both TCP connection modes run.
 
 use crate::error::ClientError;
-use choreo_proto::{ClientMessage, DaemonMessage, encode_payload};
+use choreo_proto::{ClientMessage, DaemonMessage, WRITER_STALL, encode_payload, message_budget};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::handshake_initiator;
 use choreo_transport::key::ensure_transport_keypair;
@@ -12,9 +12,7 @@ use crossbeam_channel::Receiver as CrossbeamReceiver;
 use std::net::Shutdown;
 use std::time::Instant;
 
-use super::serve::{
-    CloseHandle, ConnectionSink, ConnectionSource, Inbound, WRITER_STALL, message_budget, serve,
-};
+use super::serve::{CloseHandle, ConnectionSink, ConnectionSource, Inbound, serve};
 
 /// This process's client transport keypair, generating one on first use.
 ///

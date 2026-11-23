@@ -3,7 +3,7 @@ use crate::daemon::DaemonCommand;
 use crate::sessions::SessionCommand;
 use choreo_proto::{
     ClientMessage, ClientMessageType, ContextConfig, DaemonMessage, DaemonMessageType, MessageKind,
-    ProtoError, SessionEvent, read_message, write_message,
+    ProtoError, SessionEvent, encode_payload, message_budget, read_message, write_message,
 };
 use choreo_transport::key::TransportSecretKey;
 use std::io::{self, BufReader, BufWriter, Write};
@@ -26,9 +26,12 @@ use uds_windows::UnixStream;
 /// the call site in `cleanup_client`).
 const WRITER_JOIN_GRACE: Duration = Duration::from_secs(5);
 
-/// Socket write timeout applied to every connection's writer. Bounds a single
-/// blocking `write` syscall so a wedged client — one whose socket receive
-/// window is permanently zero — cannot stall its writer thread forever.
+/// Socket write timeout applied to every connection's writer. For the Unix path
+/// it is the socket's `SO_SNDTIMEO`; for the TCP/Noise path it is the per-syscall
+/// stall handed to the deadline-bounded send (see `NoiseConnectionWriter`).
+/// Either way it bounds a single blocking `write` syscall so a wedged client —
+/// one whose socket receive window is permanently zero — cannot stall its writer
+/// thread forever.
 ///
 /// This is the mechanism that makes LAG EVICTION work without the daemon
 /// holding a force-close handle on the connection (no retained socket clone,
@@ -72,12 +75,39 @@ impl ConnectionWriter for BufWriter<UnixStream> {
     }
 }
 
-impl ConnectionWriter for choreo_transport::noise::NoiseStream {
+/// The Noise transport's writer sink.
+///
+/// Every outbound message is bounded the same way the client bounds its writer:
+/// one absolute per-message budget scaled by the frame size (a large `Image`
+/// reply is allowed the time its size implies on a slow-but-alive link) plus a
+/// per-syscall stall (a peer that stops reading entirely is noticed promptly).
+/// Without the whole-message budget, a large frame to a wedged peer could
+/// occupy the writer — and the teardown that joins it — for far longer than the
+/// stall alone suggests.
+///
+/// The stall is the daemon's configured `writer_write_timeout` (injectable for a
+/// wedged-writer test), not a hard-coded constant, so the daemon keeps one knob
+/// for how fast it gives up on a non-reading client.
+struct NoiseConnectionWriter {
+    stream: choreo_transport::noise::NoiseStream,
+    /// Per-syscall stall: the daemon's writer timeout (default
+    /// [`WRITER_WRITE_TIMEOUT`]).
+    stall: Duration,
+}
+
+impl ConnectionWriter for NoiseConnectionWriter {
     fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
-        self.send_daemon_message(msg).map_err(|e| e.to_string())
+        // Encode the payload once, then hand it to the deadline-bounded send: the
+        // whole-message budget lets a large frame finish on a slow-but-alive link
+        // while the stall notices a peer that stops reading entirely.
+        let payload = encode_payload(msg).map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + message_budget(payload.len());
+        self.stream
+            .send_message_by(&payload, deadline, self.stall)
+            .map_err(|e| e.to_string())
     }
     fn shutdown(&mut self) {
-        let _ = self.get_ref().shutdown(Shutdown::Both);
+        let _ = self.stream.get_ref().shutdown(Shutdown::Both);
     }
 }
 
@@ -733,18 +763,21 @@ pub(crate) fn tcp_client_thread(
     args: ConnThreadArgs,
     writer_write_timeout: Duration,
 ) -> io::Result<()> {
-    // Writer thread: blocks on writer_rx, sends via NoiseStream encryption.
-    // Bound the underlying socket's blocking writes (see
-    // `DaemonState::writer_write_timeout`, default [`WRITER_WRITE_TIMEOUT`]) so
-    // a wedged client cannot stall the writer forever; the timeout applies to
-    // every clone of the TcpStream.
-    noise
-        .get_ref()
-        .set_write_timeout(Some(writer_write_timeout))?;
+    // Writer thread: blocks on writer_rx, sends via the bounded Noise sink below.
+    // The sink bounds EACH message itself (a whole-message budget plus a
+    // per-syscall stall) rather than arming one socket timeout, so a large frame
+    // to a wedged client cannot occupy the writer for the whole message's worth
+    // of per-syscall stalls.
     let writer_buf = noise.try_clone()?;
 
     let client_id = args.client_id;
-    let mut conn = ClientConn::new(args, writer_buf);
+    let mut conn = ClientConn::new(
+        args,
+        NoiseConnectionWriter {
+            stream: writer_buf,
+            stall: writer_write_timeout,
+        },
+    );
 
     // The writer channel was registered with the daemon by the acceptor
     // (register_client_writer) before this thread was spawned, so the shutdown

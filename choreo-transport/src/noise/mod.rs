@@ -7,9 +7,9 @@
 //! the typed `ClientMessage`/`DaemonMessage` conveniences are in `typed`, and
 //! each direction lives in its own submodule: `send` owns framing, encryption and
 //! the outbound write, `recv` owns reassembly, decryption and the peer-close
-//! classification, and `frame` owns the fragment sizes, the length-prefix codec
-//! and the reassembly bound. `slot` owns the per-direction single-actor right both
-//! of them take.
+//! classification, `frame` owns the fragment sizes and the length-prefix codec,
+//! and `reassembly` owns the message-level byte and fragment-count bounds.
+//! `slot` owns the per-direction single-actor right both directions take.
 //!
 //! The `TransportState` is shared through an `Arc<Mutex<…>>` because a
 //! connection has one reader thread and one writer thread over a
@@ -18,6 +18,7 @@
 //! the spirit of the cancellation-flag exception.
 
 mod frame;
+mod reassembly;
 mod recv;
 mod send;
 mod slot;
