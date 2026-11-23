@@ -17,8 +17,8 @@ pub use frame::{MAX_FRAME_SIZE, PROTOCOL_VERSION, decode_frame, encode_frame, en
 pub use io::{
     CONNECTION_STALL, SOCKET_PATH_ENV, TimedRead, TimedWrite, UnixStream, WRITER_MAX_BUDGET,
     WRITER_MIN_RATE_BYTES_PER_SEC, connect_unix, default_socket_path, dial_error_means_no_listener,
-    message_budget, read_exact_by, read_message, read_payload, socket_listening, socket_path,
-    write_all_by, write_all_with_stall, write_message,
+    message_budget, read_exact_by, read_exact_with_stall, read_message, read_payload,
+    socket_listening, socket_path, write_all_by, write_all_with_stall, write_message,
 };
 pub use types::{
     AccountInfo, AssistantToolCallRecord, CHAT_REASONING_WIRE_KEYS, CatalogProvider,

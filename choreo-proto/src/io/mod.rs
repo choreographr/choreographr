@@ -27,7 +27,7 @@ pub use path::{
     SOCKET_PATH_ENV, UnixStream, connect_unix, default_socket_path, dial_error_means_no_listener,
     socket_listening, socket_path,
 };
-pub use read::{TimedRead, read_exact_by};
+pub use read::{TimedRead, read_exact_by, read_exact_with_stall};
 pub use write::{
     CONNECTION_STALL, TimedWrite, WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, message_budget,
     write_all_by, write_all_with_stall,
