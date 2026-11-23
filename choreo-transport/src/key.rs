@@ -27,6 +27,13 @@
 //! key, turning a recoverable typo into a fleet-wide re-enrollment. Only an
 //! absent (or zero-length) file means "generate".
 //!
+//! Generation publishes the secret ATOMICALLY — a sibling temp file, fsync,
+//! rename, via [`choreo_shared::atomic_write::write_private_atomic`] — under the
+//! advisory lock that serializes concurrent starts. A crash therefore leaves
+//! either no secret (which regenerates) or a complete one: it can never leave a
+//! truncated file, whose bytes would be rejected as `InvalidSecretKey` and would
+//! wedge the instance until an operator removed it by hand.
+//!
 //! # Public key derivation
 //!
 //! The public half is always **derived** from the secret
@@ -317,10 +324,6 @@ fn decode_secret(bytes: &[u8]) -> Result<[u8; 32], String> {
 /// Returns [`TransportError`] on config-directory resolution, file I/O,
 /// lock/unlock failures, or an unparseable secret key file.
 pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), TransportError> {
-    // Hoisted to the top of the function per clippy::items_after_statements:
-    // the traits are needed in the write path below.
-    use std::io::{Seek, SeekFrom, Write};
-
     let sec_path = transport_sec_path()?;
 
     // Fast path: a loadable secret means the keypair already exists, so this
@@ -337,8 +340,9 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
 
     // Advisory exclusive lock (std::fs::File::lock, stable since 1.89) so
     // concurrently-starting processes serialize keypair generation; on Unix
-    // new secret files are created owner-only (0o600).
-    let mut sec_file = open_locked_for_write(&sec_path)?;
+    // new secret files are created owner-only (0o600). The lock is held on the
+    // target path for the whole generate-and-publish step.
+    let sec_file = open_locked_for_write(&sec_path)?;
 
     // Re-check under the lock: a concurrent process may have written a valid
     // key while we waited, in which case its key wins and ours is discarded —
@@ -349,14 +353,14 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
             debug!("loaded existing transport secret key (written concurrently)");
             return Ok(keypair_from_secret(sk));
         }
-        let encoded = encode_secret(&secret);
-        sec_file.set_len(0)?;
-        sec_file.seek(SeekFrom::Start(0))?;
-        sec_file.write_all(encoded.as_bytes())?;
-        sec_file.sync_all()?;
+        // Publish the secret atomically (sibling temp file, fsync, rename): a
+        // crash mid-write leaves either no secret (which regenerates) or a
+        // complete one, never a truncated file whose bytes are not a key.
         // The secret is the whole on-disk identity: the public half is derived
         // from it on every load, so no second file is written to disagree with
         // it (and no crash can leave one half behind the other).
+        let encoded = encode_secret(&secret);
+        choreo_shared::atomic_write::write_private_atomic(&sec_path, encoded.as_bytes())?;
         info!(
             "generated and wrote new Noise IK transport keypair to {}",
             sec_path.display()

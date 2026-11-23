@@ -27,14 +27,17 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 zeroize.workspace = true
 
+# The sibling-temp-file half of `atomic_write`: a temp file created in the
+# target's own directory (so the rename never crosses a filesystem boundary),
+# written, fsynced, then renamed into place. Already in the tree via
+# `choreo-ai-protocols`' catalog writer.
+tempfile.workspace = true
+
 # The hardened file/directory helpers (`perm` — O_NOFOLLOW, euid check, fchmod)
 # and the log-file opener (`logging`) that builds on them are Unix-only; Windows
 # builds inherit the parent directory's ACLs instead and pull no rustix.
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true
 
 # Workspace-wide lints (see [workspace.lints.clippy] in the root Cargo.toml).
 [lints]

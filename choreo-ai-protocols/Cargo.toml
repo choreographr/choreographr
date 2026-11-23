@@ -69,10 +69,6 @@ serde_json.workspace = true
 # JSON Schema derivation for the image-option enums, consumed by the
 # daemon's `generate_image` tool-args schema (tools/image_gen.rs).
 schemars.workspace = true
-# Atomic artifact writes: temp file in the same dir → fsync → rename (see
-# `catalog/persist.rs`), used by `catalog-gen` for `catalog.bin` and the
-# gitignored snapshot cache.
-tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true

@@ -47,10 +47,14 @@
 //!   [`net::is_blocked_ip_literal`]) the workspace's peer-URL fetchers share, so
 //!   "a blocked range" means the same thing to the media download and the MCP
 //!   discovery hop (a request must never be steered onto an internal service).
+//! - [`atomic_write`] — the one crash-safe replacement writer
+//!   ([`atomic_write::write_private_atomic`]: sibling temp file, fsync, rename)
+//!   the transport identity and the catalog artifacts are written through, so a
+//!   reader never observes a torn file and a crash cannot publish half a key.
 //!
 //! It is deliberately a *leaf* (deps: `base64`, `clap`, `dirs`, `serde`,
-//! `serde_json`, `tracing`, `tracing-subscriber`, and `zeroize`) and holds no
-//! transport logic — `choreo-proto` stays the wire protocol.
+//! `serde_json`, `tempfile`, `tracing`, `tracing-subscriber`, and `zeroize`) and
+//! holds no transport logic — `choreo-proto` stays the wire protocol.
 //!
 //! Logging precedence follows the Unix convention: **explicit CLI flags win
 //! over the ambient environment** (see [`logging`]).
@@ -60,6 +64,7 @@
 // `-D warnings`.
 #![warn(missing_docs)]
 
+pub mod atomic_write;
 pub mod clap_styles;
 pub mod credential;
 pub mod form;

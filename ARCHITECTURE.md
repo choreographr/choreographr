@@ -129,8 +129,10 @@ Every mechanism behind that model — the ACL provisioning paths and their
 advisory-lock write discipline, the parse-compare reload policy, the base64
 public-key rendering, the first-contact gate that structurally holds back
 every queued message (including auto-`Unlock`) until the human confirms, the
-pin/unlock-key store's own hardening, and the zeroizing of the plaintext frame
-and the transport's staging buffer — is documented in-source
+pin/unlock-key store's own hardening, the zeroizing of the plaintext frame
+and the transport's staging buffer, and the atomic publish of the transport
+secret (a sibling temp file, fsync, rename — `choreo-shared`'s `atomic_write`,
+the same writer the catalog artifacts use) — is documented in-source
 (`choreo-daemon`'s `server/acl`, `choreo-transport`'s `key` and `noise`,
 `choreo-client-core`'s `known_servers` and `connection`, `choreo-tui`'s
 `lib`).

@@ -2807,7 +2807,6 @@ dependencies = [
  "serde_json",
  "serial_test",
  "structured-zstd",
- "tempfile",
  "thiserror 2.0.21",
  "toml",
  "tracing",
