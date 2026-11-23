@@ -1,0 +1,123 @@
+//! Where the daemon's unix-domain socket lives, and how to dial it.
+//!
+//! The socket path is resolved in ONE place so the daemon and every client agree
+//! on it: [`socket_path`] honours [`SOCKET_PATH_ENV`] and otherwise delegates the
+//! whole default chain to `choreo_shared::paths`. [`connect_unix`] is the one
+//! cross-platform dial — std's `UnixStream` on unix, the `uds_windows` shim on
+//! Windows — re-exported as [`UnixStream`] so every call site names the same type.
+//!
+//! The framed message codec that runs over that stream lives in the sibling
+//! [`super::framing`] module; the deadline-bounded I/O in [`super::read`] and
+//! [`super::write`].
+
+/// Environment variable that overrides the default unix-socket path; when set
+/// (and non-empty) its value is returned verbatim by [`socket_path`], so the
+/// daemon and every client resolve the same path from one place.
+pub const SOCKET_PATH_ENV: &str = "CHOREOGRAPHR_SOCKET_PATH";
+
+// The unix-socket stream type, resolved per platform: std's `UnixStream` on
+// unix, the `uds_windows` named-pipe shim on Windows (std's Windows
+// `UnixStream` is still unstable — feature `windows_unix_domain_sockets`,
+// rust-lang/rust#150487). Re-exported here so every dial site in the
+// workspace names the SAME type; the `#[cfg]` split lives in exactly one
+// place instead of being re-inlined at each call site.
+#[cfg(unix)]
+pub use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+pub use uds_windows::UnixStream;
+
+/// The default Unix-socket path when `CHOREOGRAPHR_SOCKET_PATH` is unset.
+///
+/// The whole chain is owned by `choreo_shared::paths::default_socket_path`, and
+/// this function only stringifies it: under a base dir
+/// `{base}/run/choreographr.sock`; otherwise the XDG runtime directory,
+/// `$XDG_RUNTIME_DIR/choreographr.sock` (the spec's home for sockets); and when
+/// no runtime dir is available — macOS/Windows, or a bare environment — a
+/// per-uid private directory under the PLATFORM temp dir
+/// (`temp_dir()/choreographr-<uid>/choreographr.sock`, TMPDIR-aware, so
+/// Android/Termux lands in the app's writable prefix tmp dir instead of a
+/// hardcoded `/tmp` that yields EACCES).
+///
+/// Delegating rather than re-deriving the fallback here is deliberate: the
+/// daemon and every client must resolve the SAME path, and a second copy of the
+/// chain is how the two drift apart.
+#[must_use]
+pub fn default_socket_path() -> String {
+    choreo_shared::paths::default_socket_path()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Returns the configured socket path, honoring `CHOREOGRAPHR_SOCKET_PATH`.
+#[must_use]
+pub fn socket_path() -> String {
+    socket_path_impl(|| std::env::var(SOCKET_PATH_ENV).ok())
+}
+
+pub(crate) fn socket_path_impl(get_env: impl Fn() -> Option<String>) -> String {
+    get_env().unwrap_or_else(default_socket_path)
+}
+
+/// Dial the unix-domain socket at `path`, returning the connected stream.
+///
+/// This is the ONE cross-platform dial primitive: std's `UnixStream` on unix,
+/// the `uds_windows` shim on Windows (see the [`UnixStream`] re-export).
+/// Re-exporting both the type and the dial keeps every socket-probe site in
+/// the workspace — the TUI autostart wait, the client connection path, and the
+/// daemon's stale-socket probe — on the exact same mechanism, so their
+/// classifications cannot drift.
+///
+/// # Errors
+///
+/// Propagates the dial error (e.g. `NotFound` when the socket file does not
+/// exist, `PermissionDenied` on a path the user cannot reach).
+pub fn connect_unix(path: &str) -> std::io::Result<UnixStream> {
+    UnixStream::connect(path)
+}
+
+/// Whether something is currently accepting connections at the unix-domain
+/// socket `path`: a successful dial proves a live listener. The boolean
+/// convenience over [`connect_unix`] for callers that only need the yes/no
+/// answer (the TUI's "wait for our spawned child" poll and the daemon's
+/// stale-socket probe).
+#[must_use]
+pub fn socket_listening(path: &str) -> bool {
+    connect_unix(path).is_ok()
+}
+
+/// Whether a unix-socket DIAL failure means "nothing is listening at the
+/// path" — the only condition a daemon autostart (or a stale-socket cleanup)
+/// is allowed to act on:
+///
+/// - `NotFound` — the socket file does not exist at all (no daemon has ever
+///   run, or the socket file was removed).
+/// - `ConnectionRefused` — the socket file exists but nothing is bound to it
+///   (a stale leftover from a crashed daemon, which the daemon unlinks at
+///   startup).
+///
+/// Every OTHER dial failure (`PermissionDenied`, a wedged listener timing out
+/// on the backlog, …) means a live-or-unknown daemon state that autostart
+/// cannot fix, so the error must be surfaced verbatim instead of spawning a
+/// second daemon.
+///
+/// Takes the WHOLE error (not its `kind`) so a caller cannot accidentally pass
+/// an unrelated error's kind; the classification reads `error.kind()`
+/// internally.
+///
+/// This predicate lives in `choreo-proto` (not in the client or the daemon)
+/// because BOTH sides classify dials and they must never disagree: the TUI
+/// connection path (`choreo-client-core`'s
+/// `run_daemon_connection_with_autostart`) uses it to decide when to fire the
+/// autostart hook, and the daemon's `remove_stale_socket` uses the same
+/// connect-probe shape to decide whether an existing socket file is safe to
+/// unlink. A platform whose dial error for "no listener" ever changes (e.g.
+/// Windows returning an unexpected kind through `uds_windows`) then needs a
+/// one-line fix here, not two divergent `matches!` on opposite sides of the
+/// wire.
+#[must_use]
+pub fn dial_error_means_no_listener(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+    )
+}

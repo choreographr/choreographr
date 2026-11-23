@@ -6,6 +6,10 @@
 //! frame) re-arms the stall to the time remaining on each iteration. That loop,
 //! the [`TimedWrite`] capability that arms it, and the two bounds it honours
 //! live here once so the handshake and the data plane cannot drift apart.
+//!
+//! The read direction's counterpart is [`super::read`], which states the same
+//! re-arm rule for a fixed-length buffer; the two sit beside each other so
+//! neither side of a connection hand-rolls its own budget arithmetic.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
