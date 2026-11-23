@@ -17,6 +17,14 @@ use super::super::writer::UnixConnectionWriter;
 /// such as `AclAdd`, no transport authentication), so a foreign uid must never
 /// reach the dispatcher. Only Linux exposes the peer's uid without extra ceremony
 /// (`SO_PEERCRED`); elsewhere the file mode remains the control.
+///
+/// This reader is deliberately **unbounded**, unlike the TCP one. The threat a read
+/// bound answers on the network path does not exist here: the peer is the same uid
+/// (checked above), `AF_UNIX` is node-local so no slow link can carry it, and a
+/// client whose process dies takes the socket with it — the reader sees EOF. What
+/// remains is a live-but-wedged local process, which would pin one of
+/// `MAX_CONCURRENT_CONNECTIONS` slots; that is a nuisance its owner can clear by
+/// restarting, and it does not justify putting a clock on the local path.
 pub(crate) fn client_thread(
     stream: UnixStream,
     args: ConnThreadArgs,

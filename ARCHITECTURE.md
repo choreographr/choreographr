@@ -818,20 +818,19 @@ command loop or a session thread, with memory bounded by lag-based eviction
 instead of drops. The policy, `LagLimits`, the counter-balance invariant, and
 the solicited-`Image` carve-out are that module's docs.
 
-Three facts cross layer lines. **Eviction needs no daemon-held socket handle**:
-each connection's writer bounds every write in time, so a wedged client cannot
-stall its writer forever — the write fails, the writer shuts the socket down
-itself, and the reader's blocking read unblocks into the normal teardown. And
-**evictions are not silent**: each increments `choreo_evictions_total`, served
-on `/metrics`, so a permanently wedged subscriber stays observable. And **both
-sides bound outbound writes in time, the daemon also in bytes**: every writer on
-either end — both client transports and both daemon transports — applies the
-same per-message policy from `choreo-proto`: one absolute budget scaled by the
-message's size plus a per-syscall stall, so a silent peer or a large frame is
-bounded the same way wherever it is written. The daemon has an additional,
-byte-based bound the client has no equivalent for: lag eviction caps each
-connection's outbound queue by the bytes in flight, whose queue accounting is
-what the client side lacks.
+Three facts cross layer lines. **A stalled peer is bounded in every direction,
+an idle one in none**: both ends bound an outbound write by a per-message budget
+scaled by the size plus a per-syscall stall, and bound an inbound message by that
+same stall once it has started arriving — while a connection with nothing in
+flight is idle, not broken, so no clock may touch it. A peer that vanished is the
+third case, and the socket's TCP keepalive answers it. The daemon also bounds
+outbound memory, which the client has no equivalent for: lag eviction caps each
+connection's outbound queue by the bytes in flight. **Eviction needs no
+daemon-held socket handle**: the writer's own bounds fail the wedged write, the
+writer shuts the socket down itself, and the reader's blocking read unblocks into
+the normal teardown. And **evictions are not silent**: each increments
+`choreo_evictions_total`, served on `/metrics`, so a permanently wedged subscriber
+stays observable.
 
 Four sanctioned shared-state exceptions sit behind this design — the
 delivery-lag byte counters (#6), `ClientId` (#10), the log-directory test
