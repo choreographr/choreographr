@@ -30,7 +30,7 @@ pub(crate) use conn::ConnThreadArgs;
 pub(crate) use threads::{
     EmbeddedConnArgs, client_thread, embedded_client_thread, tcp_handshake_and_client_thread,
 };
-pub(crate) use writer::{WRITER_WRITE_TIMEOUT, register_client_writer};
+pub(crate) use writer::{PEER_STALL, register_client_writer};
 
 // The handler module and the unit tests build these directly.
 pub(super) use conn::{ClientCtx, switch_attached_session};
@@ -40,7 +40,7 @@ pub(super) use reply::ReplyHandle;
 // their owning modules.
 #[cfg(test)]
 pub(super) use writer::{
-    ChannelConnectionWriter, ConnectionWriter, WRITER_JOIN_GRACE, writer_stall, writer_thread,
+    ChannelConnectionWriter, ConnectionWriter, WRITER_JOIN_GRACE, peer_stall, writer_thread,
 };
 
 #[cfg(test)]

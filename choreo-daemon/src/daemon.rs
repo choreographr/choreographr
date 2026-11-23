@@ -373,14 +373,13 @@ pub struct DaemonState {
     /// Lag thresholds (per-client cap + daemon-wide budget). Injectable so
     /// tests can use tiny caps; defaults are 64 MiB / 512 MiB.
     pub lag_limits: LagLimits,
-    /// Socket write timeout applied to every connection's writer thread
-    /// (bounds a single blocking `write` syscall so a wedged client — receive
-    /// window permanently zero — is reaped by lag eviction instead of stalling
-    /// its writer forever). Injectable so a wedged-writer test can use a tiny
-    /// value; production uses `crate::server::connection::WRITER_WRITE_TIMEOUT`
-    /// (5 s). Read once by the transport adapters when a connection is
-    /// accepted.
-    pub writer_write_timeout: Duration,
+    /// Per-syscall stall applied to every connection, in both directions
+    /// (bounds a single blocking socket syscall so a wedged client — receive
+    /// window permanently zero — is reaped instead of stalling its writer
+    /// forever). Injectable so a wedged-writer test can use a tiny value;
+    /// production uses `crate::server::connection::PEER_STALL` (5 s). Read once
+    /// by the transport adapters when a connection is accepted.
+    pub peer_stall: Duration,
     /// Cached provider model lists, keyed by account name, with the instant
     /// they were fetched. The command loop is its single writer (the
     /// [`DaemonCommand::ModelPrefetchResult`] insert); `MODEL_CACHE_TTL` (in

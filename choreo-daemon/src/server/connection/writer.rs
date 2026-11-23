@@ -4,7 +4,7 @@
 //! Every transport's writer is bounded by the SAME policy, stated once in
 //! `choreo-proto`: an absolute per-message budget scaled by the frame size
 //! ([`choreo_proto::message_budget`]) plus a per-syscall stall
-//! ([`WRITER_WRITE_TIMEOUT`]). A large frame to a slow-but-alive client is allowed
+//! ([`PEER_STALL`]). A large frame to a slow-but-alive client is allowed
 //! the time its size implies, while a client that has stopped reading is noticed
 //! promptly — whichever transport carried it. Before this policy was shared, the
 //! Noise writer had it and the Unix writer had only a socket-level timeout armed
@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use choreo_proto::{
-    DaemonMessage, DaemonMessageType, UnixStream, WRITER_STALL, encode_frame, encode_payload,
+    CONNECTION_STALL, DaemonMessage, DaemonMessageType, UnixStream, encode_frame, encode_payload,
     message_budget, write_all_with_stall,
 };
 use tracing::warn;
@@ -34,38 +34,38 @@ use tracing::warn;
 use crate::broadcast::ClientId;
 use crate::daemon::DaemonCommand;
 
-/// Per-syscall stall applied to every connection's writer: how long one blocking
-/// `write` syscall may wait for progress before the peer counts as wedged.
+/// Per-syscall stall applied to every connection in BOTH directions: how long one
+/// blocking socket syscall may wait for progress before the peer counts as
+/// wedged.
 ///
-/// It is the daemon's own statement of [`choreo_proto::WRITER_STALL`] — the same
-/// policy the client applies to its side of the connection — so the two ends
-/// cannot drift into different detection latencies. The name stays because this
-/// is the daemon's knob: `DaemonState::writer_write_timeout` carries it into every
-/// connection thread, and a test substitutes a tiny value to exercise the
-/// wedged-writer reap without waiting out the default.
+/// It is the daemon's own statement of [`choreo_proto::CONNECTION_STALL`] — the
+/// same policy the client applies to its side of the connection — so the two ends
+/// cannot drift into different detection latencies. The name is the daemon's
+/// knob: `DaemonState::peer_stall` carries it into every connection thread, and a
+/// test substitutes a tiny value to exercise the wedged-writer reap without
+/// waiting out the default.
 ///
-/// Raising it above `choreo_proto::WRITER_STALL` has no effect on a small message:
-/// the effective wait is `min(stall, message_budget(len))`, and the budget's floor
-/// IS that constant. Lowering it (the only direction a test needs) is fully
-/// effective.
-pub(crate) const WRITER_WRITE_TIMEOUT: Duration = WRITER_STALL;
+/// On the write side, raising it above `choreo_proto::CONNECTION_STALL` has no
+/// effect on a small message: the effective wait is
+/// `min(stall, message_budget(len))`, and the budget's floor IS that constant.
+/// Lowering it (the only direction a test needs) is fully effective.
+pub(crate) const PEER_STALL: Duration = CONNECTION_STALL;
 
 /// Bound for joining a connection's writer thread during cleanup.
 ///
-/// Strictly greater than [`WRITER_WRITE_TIMEOUT`], and that ordering is
+/// Strictly greater than [`PEER_STALL`], and that ordering is
 /// load-bearing: cleanup waits for a writer that may be mid-syscall for up to the
 /// stall, so equal values would run out the join window in exactly the worst case
 /// the join exists to cover and detach a writer that was about to exit cleanly. A
 /// healthy writer exits immediately on channel disconnect (dropping the sink
 /// disconnects its receiver), so the grace only ever matters for the wedged case.
-pub(crate) const WRITER_JOIN_GRACE: Duration =
-    WRITER_WRITE_TIMEOUT.saturating_add(Duration::from_secs(1));
+pub(crate) const WRITER_JOIN_GRACE: Duration = PEER_STALL.saturating_add(Duration::from_secs(1));
 
 // Compile-time, because nothing about the relationship is conditional: a smaller
 // grace is a defect, and it must not be possible to introduce one by editing
 // either constant.
 const _: () = assert!(
-    WRITER_JOIN_GRACE.as_nanos() > WRITER_WRITE_TIMEOUT.as_nanos(),
+    WRITER_JOIN_GRACE.as_nanos() > PEER_STALL.as_nanos(),
     "WRITER_JOIN_GRACE must outlast the writer stall it waits out"
 );
 
@@ -78,22 +78,22 @@ const _: () = assert!(
 /// connection down; the floor turns that into a one-millisecond bound instead. One
 /// millisecond is the smallest value the kernel reliably honours (a smaller
 /// timeout rounds up to it anyway).
-const MIN_WRITER_STALL: Duration = Duration::from_millis(1);
+const MIN_PEER_STALL: Duration = Duration::from_millis(1);
 
-/// Validate a configured writer stall, flooring it at [`MIN_WRITER_STALL`].
+/// Validate a configured writer stall, flooring it at [`MIN_PEER_STALL`].
 ///
 /// The single seam every stall passes through on its way to a socket timeout, so
 /// neither sink can arm a zero. A config that resolves to zero is a mistake rather
 /// than a request to disable the bound — the bound is what reaps a wedged writer —
 /// so it is floored and warned about rather than propagated.
-pub(crate) fn writer_stall(configured: Duration) -> Duration {
-    if configured < MIN_WRITER_STALL {
+pub(crate) fn peer_stall(configured: Duration) -> Duration {
+    if configured < MIN_PEER_STALL {
         warn!(
             configured = ?configured,
-            floor = ?MIN_WRITER_STALL,
+            floor = ?MIN_PEER_STALL,
             "writer stall is below the socket's minimum; flooring it (a zero timeout is rejected by the kernel, not read as unbounded)"
         );
-        return MIN_WRITER_STALL;
+        return MIN_PEER_STALL;
     }
     configured
 }
@@ -122,16 +122,16 @@ pub(crate) trait ConnectionWriter {
 /// must be the socket that is written to.
 pub(crate) struct UnixConnectionWriter {
     stream: UnixStream,
-    /// Per-syscall stall, already through [`writer_stall`].
+    /// Per-syscall stall, already through [`peer_stall`].
     stall: Duration,
 }
 
 impl UnixConnectionWriter {
-    /// Wrap `stream`, validating the stall through [`writer_stall`].
+    /// Wrap `stream`, validating the stall through [`peer_stall`].
     pub(crate) fn new(stream: UnixStream, stall: Duration) -> Self {
         Self {
             stream,
-            stall: writer_stall(stall),
+            stall: peer_stall(stall),
         }
     }
 }
@@ -161,16 +161,16 @@ impl ConnectionWriter for UnixConnectionWriter {
 /// the stall alone suggests.
 pub(crate) struct NoiseConnectionWriter {
     stream: choreo_transport::noise::NoiseStream,
-    /// Per-syscall stall, already through [`writer_stall`].
+    /// Per-syscall stall, already through [`peer_stall`].
     stall: Duration,
 }
 
 impl NoiseConnectionWriter {
-    /// Wrap `stream`, validating the stall through [`writer_stall`].
+    /// Wrap `stream`, validating the stall through [`peer_stall`].
     pub(crate) fn new(stream: choreo_transport::noise::NoiseStream, stall: Duration) -> Self {
         Self {
             stream,
-            stall: writer_stall(stall),
+            stall: peer_stall(stall),
         }
     }
 }
@@ -246,7 +246,7 @@ impl ConnectionWriter for ChannelConnectionWriter {
 /// ever writing to or closing the socket. (`ShuttingDown` is only ever enqueued
 /// by the daemon's shutdown broadcast; Evicted by a lag eviction.) An error at
 /// any point stops the loop and SHUTS THE SOCKET DOWN — a send error can be a
-/// broken pipe (socket gone) or a [`WRITER_WRITE_TIMEOUT`] on a wedged client
+/// broken pipe (socket gone) or a [`PEER_STALL`] on a wedged client
 /// whose receive window is zero (socket still open); either way, shutting
 /// down unblocks the reader's blocking read so `cleanup_client` reaps the
 /// connection (shutdown on an already-broken socket is a harmless no-op).

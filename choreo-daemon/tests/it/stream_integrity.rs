@@ -461,10 +461,10 @@ fn evicts_client_that_stops_reading() {
             let mut state = common::test_daemon_state_with_limits(limits);
             // Shrink the connection write timeout from the 5 s production
             // default to 200 ms: the daemon under test reaps the wedged
-            // writer via this timeout (see `DaemonState::writer_write_timeout`),
+            // writer via this timeout (see `DaemonState::peer_stall`),
             // so a tiny value exercises the exact same code path without
             // making the test sit on the 5 s default.
-            state.writer_write_timeout = std::time::Duration::from_millis(200);
+            state.peer_stall = std::time::Duration::from_millis(200);
             // Seed the mock account so a session created with it resolves
             // its provider lazily (via ResolveAccountCmd) against its OWN
             // socket registry — the per-session-registry wiring under test.

@@ -79,10 +79,10 @@ pub(crate) struct DaemonCore {
     /// `state` moves into the command-loop thread (`start_daemon_core`).
     pub db: Arc<redb::Database>,
     /// Socket write timeout handed to each accepted connection's writer thread
-    /// (cloned from [`DaemonState::writer_write_timeout`] before `state` moves
+    /// (cloned from [`DaemonState::peer_stall`] before `state` moves
     /// into the command loop). Injectable so a wedged-writer test can use a
     /// tiny value instead of the 5 s production default.
-    pub writer_write_timeout: Duration,
+    pub peer_stall: Duration,
     /// `JoinHandle` of the command-loop thread; the shutdown drain joins it
     /// after sending `Shutdown` and dropping `daemon_tx`.
     pub cmd_handle: thread::JoinHandle<()>,
@@ -426,9 +426,9 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
     // `session_attachments` store directly (see DaemonCore::db).
     let db = Arc::clone(&state.db);
 
-    // Connection writer write timeout (see DaemonCore::writer_write_timeout);
+    // Connection writer write timeout (see DaemonCore::peer_stall);
     // `Duration` is `Copy`, so reading it before the move is trivial.
-    let writer_write_timeout = state.writer_write_timeout;
+    let peer_stall = state.peer_stall;
 
     // Daemon-wide live-connection counter backing MAX_CONCURRENT_CONNECTIONS.
     // Both accept paths take a slot per accepted connection, so the cap is
@@ -544,7 +544,7 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
         global_lag,
         conn_count,
         db,
-        writer_write_timeout,
+        peer_stall,
         cmd_handle,
     }
 }

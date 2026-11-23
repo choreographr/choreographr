@@ -45,7 +45,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
     transport_sk: TransportSecretKey,
     acl: &std::sync::Arc<SharedAcl>,
     args: ConnThreadArgs,
-    writer_write_timeout: Duration,
+    peer_stall: Duration,
 ) -> io::Result<()> {
     // Disable Nagle before the responder handshake: the accepted socket is
     // otherwise untouched, and the handshake is a small request/response
@@ -84,7 +84,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
         }
     };
 
-    tcp_client_thread(noise, args, writer_write_timeout)
+    tcp_client_thread(noise, args, peer_stall)
 }
 
 /// The encrypted read loop over an established
@@ -97,9 +97,9 @@ pub(crate) fn tcp_handshake_and_client_thread(
 pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
     args: ConnThreadArgs,
-    writer_write_timeout: Duration,
+    peer_stall: Duration,
 ) -> io::Result<()> {
-    let writer_buf = NoiseConnectionWriter::new(noise.try_clone()?, writer_write_timeout);
+    let writer_buf = NoiseConnectionWriter::new(noise.try_clone()?, peer_stall);
 
     let client_id = args.client_id;
     let mut conn = ClientConn::new(args, writer_buf);

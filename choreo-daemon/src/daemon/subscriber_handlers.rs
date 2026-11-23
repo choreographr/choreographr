@@ -395,8 +395,8 @@ impl DaemonState {
     /// handle: the `Evicted` advisory is enqueued best-effort, and the
     /// connection is reaped by its own writer thread — a healthy writer
     /// flushes the advisory and closes its socket (notify-before-EOF); a
-    /// wedged writer (client not reading) hits its socket write timeout
-    /// (`server::connection::WRITER_WRITE_TIMEOUT`), the write fails, and
+    /// wedged writer (client not reading) hits its per-syscall stall
+    /// (`server::connection::PEER_STALL`), the write fails, and
     /// the writer shuts the socket down, unblocking the reader's blocking
     /// read and running the normal `cleanup_client` teardown.
     pub(super) fn handle_evict_client(&mut self, client_id: ClientId) {

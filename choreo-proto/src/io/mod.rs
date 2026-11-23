@@ -29,7 +29,7 @@ pub use path::{
 };
 pub use read::{TimedRead, read_exact_by};
 pub use write::{
-    TimedWrite, WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, WRITER_STALL, message_budget,
+    CONNECTION_STALL, TimedWrite, WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, message_budget,
     write_all_by, write_all_with_stall,
 };
 

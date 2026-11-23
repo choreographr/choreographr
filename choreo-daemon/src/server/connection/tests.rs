@@ -160,7 +160,7 @@ fn writer_thread_flushes_evicted_then_shuts_down_and_stops() {
 
 /// A send error is fatal for the connection: the loop stops AND shuts the
 /// socket down. A send error is either a broken pipe (socket gone —
-/// shutdown is a harmless no-op) or a [`WRITER_WRITE_TIMEOUT`] on a wedged
+/// shutdown is a harmless no-op) or a [`PEER_STALL`] on a wedged
 /// client whose receive window is zero (socket still open — shutdown is
 /// what unblocks the reader's blocking read so the connection is reaped).
 #[test]
@@ -1970,8 +1970,8 @@ fn writer_thread_delivers_shutting_down_before_channel_close() {
 #[test]
 fn the_writer_stall_is_the_shared_protocol_constant() {
     assert_eq!(
-        WRITER_WRITE_TIMEOUT,
-        choreo_proto::WRITER_STALL,
+        PEER_STALL,
+        choreo_proto::CONNECTION_STALL,
         "the daemon's stall must BE choreo-proto's, not a copy of its value"
     );
 }
@@ -1984,8 +1984,8 @@ fn the_writer_stall_is_the_shared_protocol_constant() {
 #[test]
 fn the_join_grace_outlasts_the_writer_stall() {
     assert!(
-        WRITER_JOIN_GRACE > WRITER_WRITE_TIMEOUT,
-        "join grace {WRITER_JOIN_GRACE:?} must exceed the stall {WRITER_WRITE_TIMEOUT:?}"
+        WRITER_JOIN_GRACE > PEER_STALL,
+        "join grace {WRITER_JOIN_GRACE:?} must exceed the stall {PEER_STALL:?}"
     );
 }
 
@@ -2003,7 +2003,7 @@ fn a_zero_writer_stall_is_floored() {
         Duration::from_millis(1) - Duration::from_nanos(1),
     ] {
         assert_eq!(
-            writer_stall(configured),
+            peer_stall(configured),
             Duration::from_millis(1),
             "{configured:?} must floor to the one-millisecond minimum"
         );
@@ -2012,8 +2012,8 @@ fn a_zero_writer_stall_is_floored() {
     // lets the wedged-writer integration tests substitute their own tiny-but-legal
     // value instead of waiting out the production default.
     assert_eq!(
-        writer_stall(Duration::from_millis(200)),
+        peer_stall(Duration::from_millis(200)),
         Duration::from_millis(200)
     );
-    assert_eq!(writer_stall(WRITER_WRITE_TIMEOUT), WRITER_WRITE_TIMEOUT);
+    assert_eq!(peer_stall(PEER_STALL), PEER_STALL);
 }

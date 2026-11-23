@@ -472,8 +472,8 @@ pub fn run_server(
     let db = Arc::clone(&core.db);
     // Socket write timeout for each accepted connection's writer thread
     // (`Duration` is `Copy`, so the accept closures below capture a copy
-    // without disturbing this binding). See DaemonCore::writer_write_timeout.
-    let writer_write_timeout = core.writer_write_timeout;
+    // without disturbing this binding). See DaemonCore::peer_stall.
+    let peer_stall = core.peer_stall;
 
     // Signal-consumer thread: drains the handler ALREADY REGISTERED above,
     // setting the shutdown flag and connecting to our own socket to unblock
@@ -679,7 +679,7 @@ pub fn run_server(
                                     transport_sk,
                                     &acl,
                                     conn_args,
-                                    writer_write_timeout,
+                                    peer_stall,
                                 )
                             {
                                 error!(error = %e, "TCP client error");
@@ -766,11 +766,8 @@ pub fn run_server(
                             // The Unix socket is the LOCAL trust domain.
                             is_unix: true,
                         };
-                        let result = crate::server::connection::client_thread(
-                            stream,
-                            conn_args,
-                            writer_write_timeout,
-                        );
+                        let result =
+                            crate::server::connection::client_thread(stream, conn_args, peer_stall);
                         if let Err(e) = result {
                             error!(error = %e, "client error");
                         }

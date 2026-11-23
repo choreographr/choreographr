@@ -3,7 +3,9 @@
 //! service loop both TCP connection modes run.
 
 use crate::error::ClientError;
-use choreo_proto::{ClientMessage, DaemonMessage, WRITER_STALL, encode_payload, message_budget};
+use choreo_proto::{
+    CONNECTION_STALL, ClientMessage, DaemonMessage, encode_payload, message_budget,
+};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::handshake_initiator;
 use choreo_transport::key::ensure_transport_keypair;
@@ -144,7 +146,7 @@ pub(super) fn ik_handshake_and_serve(
 /// - Reader (the calling thread): blocks on `recv_daemon_message`; a clean peer
 ///   close ends the loop, any other transport error is fatal.
 /// - Writer thread: `select_biased!` on `from_ui` (drained first) and the
-///   internal stop channel, each message written under [`WRITER_STALL`] and the
+///   internal stop channel, each message written under [`CONNECTION_STALL`] and the
 ///   size-scaled [`message_budget`]. A failed write shuts the socket down, which
 ///   unblocks the reader.
 /// - Shutdown: blocks on `shutdown_rx.recv()`, then shuts the TCP stream down.
@@ -186,11 +188,11 @@ impl ConnectionSink for NoiseStream {
     fn send_message(&mut self, message: &ClientMessage) -> Result<(), String> {
         // The encrypted stream writes its own length-prefixed fragments, so it
         // takes the payload rather than a pre-framed message. Both time bounds
-        // are the connection's: a silent peer is noticed after `WRITER_STALL`,
+        // are the connection's: a silent peer is noticed after `CONNECTION_STALL`,
         // while a large frame is allowed the time its size implies.
         let payload = encode_payload(message).map_err(|error| error.to_string())?;
         let deadline = Instant::now() + message_budget(payload.len());
-        self.send_message_by(&payload, deadline, WRITER_STALL)
+        self.send_message_by(&payload, deadline, CONNECTION_STALL)
             .map_err(|error| error.to_string())
     }
 

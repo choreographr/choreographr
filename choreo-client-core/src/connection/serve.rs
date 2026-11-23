@@ -24,10 +24,12 @@
 //!    sink moves into the writer thread and before the reader tail keeps its own
 //!    end, so neither is borrowed from the thread that owns it.
 //!
-//! The writer's two time bounds (`WRITER_STALL` and `message_budget`) are one
-//! policy shared with the daemon's Noise writer, so they live in `choreo-proto`
-//! beside the bounded-write loop; the connection applies them, the transport only
-//! carries the bytes.
+//! The writer's two time bounds (`CONNECTION_STALL` and `message_budget`) are one
+//! policy shared with the daemon's writers, so they live in `choreo-proto` beside
+//! the bounded-write loop; the connection applies them, the transport only
+//! carries the bytes. The stall is the connection's — the reader applies it too —
+//! while the rate-derived budget is writer-only, because a reader cannot know a
+//! message's total size until it has all of it.
 
 use crate::error::ClientError;
 use choreo_proto::{ClientMessage, DaemonMessage, UnixStream};

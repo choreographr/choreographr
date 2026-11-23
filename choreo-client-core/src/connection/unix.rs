@@ -14,8 +14,8 @@
 
 use crate::error::ClientError;
 use choreo_proto::{
-    ClientMessage, DaemonMessage, ProtoError, UnixStream, WRITER_STALL, connect_unix, encode_frame,
-    message_budget, read_message,
+    CONNECTION_STALL, ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix,
+    encode_frame, message_budget, read_message,
 };
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use std::io::{BufRead, BufReader};
@@ -65,7 +65,7 @@ impl ConnectionSink for UnixStream {
         // one bounded write with nothing left to flush afterwards.
         let frame = encode_frame(msg).map_err(|error| error.to_string())?;
         let deadline = Instant::now() + message_budget(frame.len());
-        choreo_proto::write_all_with_stall(self, deadline, WRITER_STALL, &frame)
+        choreo_proto::write_all_with_stall(self, deadline, CONNECTION_STALL, &frame)
             .map_err(|error| error.to_string())
     }
 

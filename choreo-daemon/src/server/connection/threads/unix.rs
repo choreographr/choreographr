@@ -20,7 +20,7 @@ use super::super::writer::UnixConnectionWriter;
 pub(crate) fn client_thread(
     stream: UnixStream,
     args: ConnThreadArgs,
-    writer_write_timeout: Duration,
+    peer_stall: Duration,
 ) -> io::Result<()> {
     // Capture the id before `args` is consumed by `ClientConn::new`; the
     // rejection path below and the connect log both need it.
@@ -67,7 +67,7 @@ pub(crate) fn client_thread(
     // stall is re-armed per syscall inside `write_all_with_stall`, which is what
     // makes a partly-accepted frame fail instead of waiting out a whole message.
     let reader = BufReader::new(stream.try_clone()?);
-    let writer = UnixConnectionWriter::new(stream, writer_write_timeout);
+    let writer = UnixConnectionWriter::new(stream, peer_stall);
 
     let mut conn = ClientConn::new(args, writer);
 
