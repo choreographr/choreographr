@@ -14,7 +14,7 @@
 //! ```toml
 //! [[server]]
 //! addr = "192.168.1.20:9443"
-//! pubkey = "<base64 of the 32-byte transport.pub>"
+//! pubkey = "<base64 of the server's 32-byte public key, `choreographr pubkey`>"
 //! ```
 //!
 //! Failure policy is deliberately tolerant on LOAD and strict on WRITE:

@@ -39,6 +39,17 @@ pub enum TransportError {
     /// The OS exposed no configuration directory to place the keypair in.
     #[error("could not determine config directory")]
     ConfigDirNotFound,
+    /// No transport secret key file exists: this instance has no identity yet.
+    ///
+    /// Returned only by the read-only [`crate::key::load_transport_keypair`],
+    /// which refuses to generate one — creating an identity belongs to daemon
+    /// startup, so a query reports the absence and the operator can start the
+    /// daemon rather than discovering a key that was minted by the question.
+    #[error("no transport secret key at {path}")]
+    MissingSecretKey {
+        /// Path the secret was expected at, rendered for display.
+        path: String,
+    },
     /// The on-disk transport secret key file exists but holds no usable key:
     /// neither a legacy raw 32-byte key nor base64 that decodes to 32 bytes.
     ///

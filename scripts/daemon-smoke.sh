@@ -16,7 +16,7 @@
 #
 #   * CHOREOGRAPHR_SOCKET_PATH → scratch socket (choreo-proto/src/io.rs)
 #   * XDG_CONFIG_HOME / XDG_STATE_HOME / XDG_RUNTIME_DIR / HOME → scratch tree
-#     on POSIX: config (transport.sec/pub, authorized_clients.toml, config.toml,
+#     on POSIX: config (transport.sec, authorized_clients.toml, config.toml,
 #     accounts.toml — under dirs::config_dir()/choreographr), state (log files
 #     under $XDG_STATE_HOME/choreographr), and runtime (the default socket under
 #     $XDG_RUNTIME_DIR) all resolve inside the scratch dir
@@ -293,19 +293,45 @@ PYEOF
     fi
 fi
 
-# Hermeticity proof: `fingerprint` with no argument reads THIS config dir's
-# auto-generated transport.pub (see choreo-daemon/src/cli.rs). It succeeding
-# under the scratch env proves the daemon's keypair landed in the scratch
-# config dir and the daemon never touched the runner's real one.
-echo "==> daemon fingerprint (proves config-dir hermeticity)"
-if "$DAEMON" fingerprint >"$TMP/fingerprint.out" 2>"$TMP/fingerprint.err"; then
-    # tracing writes to stdout, so the fingerprint line arrives mixed with
-    # INFO events; the fingerprint is the last line that is not a log event.
-    FP="$(grep -v ' INFO \| WARN \| ERROR ' "$TMP/fingerprint.out" | tail -n1)"
-    echo "  ok: fingerprint from scratch config dir: $FP"
+# Hermeticity proof: the daemon wrote its Noise identity (transport.sec) into
+# THIS config dir, and `pubkey` — which only DERIVES the public half from that
+# secret and never generates one (see choreo-daemon/src/cli.rs) — reads it back
+# from there. Both succeeding under the scratch env proves the daemon's keypair
+# landed in the scratch config dir and the daemon never touched the runner's
+# real one.
+#
+# The file assertion is POSIX-only: on Windows the config dir resolves through
+# the known-folder API and ignores the XDG redirects (see the header), so the
+# keypair lands in the ephemeral runner profile there. `pubkey` still runs on
+# both, since it reads whatever config dir the platform actually resolved.
+if [ "$OS" != windows ]; then
+    SEC_PATH="$SCRATCH_CONFIG/choreographr/transport.sec"
+    if [ -f "$SEC_PATH" ]; then
+        echo "  ok: transport identity written to the scratch config dir"
+    else
+        echo "  FAIL: no transport.sec in the scratch config dir ($SEC_PATH)" >&2
+        dump_log
+        exit 1
+    fi
+fi
+
+echo "==> daemon pubkey (proves config-dir hermeticity)"
+if "$DAEMON" pubkey >"$TMP/pubkey.out" 2>"$TMP/pubkey.err"; then
+    # tracing writes to stdout, so log events may be mixed in with the value;
+    # the public key is the last line that is not a log event. It must be ONE
+    # line of 44 standard-base64 characters (a 32-byte key).
+    PK_LINE="$(grep -v ' INFO \| WARN \| ERROR ' "$TMP/pubkey.out" | tail -n1)"
+    if printf '%s' "$PK_LINE" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; then
+        echo "  ok: pubkey from scratch config dir: $PK_LINE"
+    else
+        echo "  FAIL: pubkey is not a single 44-char base64 line: $PK_LINE" >&2
+        cat "$TMP/pubkey.out" >&2 || true
+        dump_log
+        exit 1
+    fi
 else
-    echo "  FAIL: fingerprint failed against the scratch config dir" >&2
-    cat "$TMP/fingerprint.err" >&2 || true
+    echo "  FAIL: pubkey failed against the scratch config dir" >&2
+    cat "$TMP/pubkey.err" >&2 || true
     dump_log
     exit 1
 fi

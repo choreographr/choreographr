@@ -52,11 +52,10 @@ static CONNECTION_MODE: OnceLock<ConnectionMode> = OnceLock::new();
 /// fails (see `embedded_connection_mode`). The Android build keeps the
 /// Unix-socket default because Termux exposes one. `TcpPinned` resolves the
 /// server key from `known_servers.toml` at connect time, so the pin lives in
-/// the app's own config dir (the iOS sandbox) and no
-/// `~/.config/.../transport.pub` file — which the sandbox cannot read — is
-/// needed. The same-address pin can be established by any choreographr client
-/// on the same host (TUI first-use flow); until then the connect fails loudly
-/// with the re-pair guidance.
+/// the app's own config dir (the iOS sandbox) and no key file has to be read —
+/// the daemon derives its public key and writes none. The same-address pin can
+/// be established by any choreographr client on the same host (TUI first-use
+/// flow); until then the connect fails loudly with the re-pair guidance.
 // Desktop/Android never reference the fallback constant (only the iOS body of
 // `default_connection_mode` does), so silence the dead_code warning there —
 // the constant is deliberately shared, not cfg-duplicated.
@@ -277,7 +276,9 @@ struct Cli {
     #[arg(long = "tcp-addr")]
     tcp_addr: Option<String>,
 
-    /// Path to the server's Noise IK public key (defaults to ~/.config/choreographr/transport.pub)
+    /// Path to the server's Noise IK public key — a file of 32 raw bytes (see
+    /// `choreographr pubkey` on the server for the key itself). Without it, a
+    /// `--tcp-addr` connection pins the key from `known_servers.toml`.
     #[arg(long = "server-pk")]
     server_pk: Option<String>,
 
@@ -319,27 +320,36 @@ pub fn main() {
     });
 
     let mode = if let Some(addr) = cli.tcp_addr {
-        // On iOS there is no `~/.config/choreographr/transport.pub` to read —
-        // the app sandbox cannot see it — so an explicit `--tcp-addr` dials in
-        // pinned-key mode (pin sourced from the sandbox `known_servers.toml`)
-        // instead of failing at startup on a key file that cannot exist.
-        if cfg!(target_os = "ios") {
-            ConnectionMode::TcpPinned(addr)
-        } else {
-            let server_pk = match read_server_pk(cli.server_pk.as_deref()) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    eprintln!("failed to read server public key: {e}");
-                    // Deliberate CLI startup exit: this is pre-launch argument
-                    // validation in a binary entry point (before any UI runs),
-                    // not daemon or library code — there is nothing to fail
-                    // gracefully in yet. Wrapped in a closure so the exit stays
-                    // scoped to this single startup path.
-                    let startup_exit = |code: i32| std::process::exit(code);
-                    startup_exit(1)
-                }
-            };
-            ConnectionMode::Tcp { addr, server_pk }
+        match cli.server_pk {
+            // An explicit key file wins: the operator has the server's public
+            // key in hand, so dial with it directly and skip the pin lookup.
+            Some(path) => {
+                let server_pk = match read_server_pk(Some(path.as_str())) {
+                    Ok(pk) => pk,
+                    Err(e) => {
+                        eprintln!("failed to read server public key: {e}");
+                        // Deliberate CLI startup exit: this is pre-launch
+                        // argument validation in a binary entry point (before
+                        // any UI runs), not daemon or library code — there is
+                        // nothing to fail gracefully in yet. Wrapped in a
+                        // closure so the exit stays scoped to this single
+                        // startup path.
+                        let startup_exit = |code: i32| std::process::exit(code);
+                        startup_exit(1)
+                    }
+                };
+                ConnectionMode::Tcp { addr, server_pk }
+            }
+            // No key given: dial in pinned mode, resolving the server's key
+            // from this client's own `known_servers.toml` at connect time
+            // (first contact via the XX probe, then the pin is verified).
+            // There is deliberately no local key-file fallback: a daemon
+            // derives its public key and writes no `transport.pub`, and the
+            // only key file a client machine has is its OWN — reading it as
+            // the server's would pin a key the server never presents. iOS
+            // takes this path for the same reason plus one more: its sandbox
+            // could not read the old file anyway.
+            None => ConnectionMode::TcpPinned(addr),
         }
     } else {
         default_connection_mode()

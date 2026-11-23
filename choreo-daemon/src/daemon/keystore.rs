@@ -460,11 +460,16 @@ fn bind_keystore(state: &mut DaemonState, key: &[u8; 32]) -> Result<(), Keystore
             // One-time, security-relevant event: LOUD on purpose. Operators
             // must be able to see when a daemon's keystore became bound to a
             // key (any later unlock requires exactly that key).
+            //
+            // Base64, not hex: every public key this project shows an operator
+            // is spelled the canonical 44-character form (`pubkey_base64`), so
+            // this line can be compared by eye against `choreographr pubkey`
+            // output, an ACL entry, or a `known_servers.toml` pin.
             info!(
                 "KEYSTORE BOUND: adopted unlock key via BindKeystore (TOFU); \
-                 public key (hex) = {} — all future Unlock attempts must \
+                 public key (base64) = {} — all future Unlock attempts must \
                  present this key, others are rejected",
-                hex::encode(derived.as_bytes())
+                choreo_transport::key::pubkey_base64(derived.as_bytes())
             );
             // Flip the cached status flag the command loop reads to derive the
             // authoritative `KeystoreState` (`Unbound` → now bound). This is

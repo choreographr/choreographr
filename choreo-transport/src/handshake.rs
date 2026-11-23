@@ -271,7 +271,8 @@ pub fn read_handshake_preamble_with_timeout(
 ///
 /// * `stream` — the already-connected TCP stream.
 /// * `static_sk` — the client's transport.sec (32-byte X25519 secret key).
-/// * `server_pk` — the server's transport.pub (32-byte X25519 public key).
+/// * `server_pk` — the server's transport public key (32-byte X25519 key, as
+///   printed by `choreographr pubkey` on the server).
 ///
 /// On success returns a `NoiseStream` ready for encrypted message I/O.
 ///

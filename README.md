@@ -945,7 +945,7 @@ the platform defaults:
 ```text
 {base}/config/   config.toml, accounts.toml, mcp.json, trust.toml,
                  models-overlay.toml, authorized_clients.toml,
-                 identity.pk, transport.sec/.pub, known_servers.toml
+                 identity.pk, transport.sec, known_servers.toml
 {base}/data/     state.redb, catalog.bin
 {base}/run/      choreographr.sock
 {base}/log/      <binary>.log
@@ -1473,6 +1473,10 @@ binding; the next connect auto-binds a fresh key.
   connected over the LOCAL Unix socket (remote clients are refused — the
   approver for a trust decision must be at the machine). The daemon also
   broadcasts an `AclUpdated` count to connected clients on every change.
+  Either side's public key is obtained with `choreographr pubkey` on that
+  machine, which prints it as one base64 line on stdout and — being a
+  read-only export — never creates an identity: the daemon derives its public
+  key from `transport.sec` and writes no public-key file.
 
 ## Monitoring
 

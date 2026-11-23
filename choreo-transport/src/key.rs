@@ -3,9 +3,10 @@
 //!
 //! Provides the standard keypair paths under `{config}/choreographr`, the
 //! [`ensure_transport_keypair`] loader/generator (race-safe via an advisory
-//! file lock), the canonical base64 encoding of a 32-byte key
-//! ([`pubkey_base64`] / [`parse_pubkey_base64`]), and the human-comparable
-//! [`fingerprint`] of a 32-byte public key.
+//! file lock), its read-only counterpart [`load_transport_keypair`], the
+//! canonical base64 encoding of a 32-byte key ([`pubkey_base64`] /
+//! [`parse_pubkey_base64`]), and the human-comparable [`fingerprint`] of a
+//! 32-byte public key.
 //!
 //! # On-disk secret key format
 //!
@@ -31,12 +32,17 @@
 //! # Public key derivation
 //!
 //! The public half is always **derived** from the secret
-//! (`PublicKey::from(&StaticSecret::from(sk))`), never read back from disk. A
-//! stored copy can be stale or truncated — a crash between the secret's fsync
-//! and the public write leaves exactly that state — and reading it back would
-//! silently load the mismatch, surfacing later as an inexplicable handshake
-//! failure where the peer sees a key the operator's own file does not show.
-//! `transport.pub` is still written as an output artifact; loading ignores it.
+//! (`PublicKey::from(&StaticSecret::from(sk))`), never read back from disk, and
+//! never persisted: only `transport.sec` is written. A stored copy could be
+//! stale or truncated — a crash between the secret's fsync and the public write
+//! leaves exactly that state — and reading it back would silently load the
+//! mismatch, surfacing later as an inexplicable handshake failure where the peer
+//! sees a key the operator's own file does not show. With no second copy there
+//! is nothing to go stale, and no key file an operator could edit into a
+//! disagreement. A public key is exported through a query instead
+//! ([`load_transport_keypair`] plus [`pubkey_base64`], the daemon's `pubkey`
+//! subcommand); [`transport_pub_path`] remains only as the name of the legacy
+//! location older layouts wrote.
 
 use std::path::{Path, PathBuf};
 
@@ -237,11 +243,14 @@ pub fn transport_sec_path() -> Result<PathBuf, TransportError> {
     Ok(keypair_dir()?.join("transport.sec"))
 }
 
-/// Path to the Noise IK static public key (~/.config/choreographr/transport.pub)
+/// Path to the legacy Noise IK public key file
+/// (~/.config/choreographr/transport.pub).
 ///
-/// An output artifact of keypair generation. Loading a keypair does **not** read
-/// it: the public half is derived from the secret, so this file can never
-/// disagree with it.
+/// **Nothing writes this file**: the public key is derived from the secret (see
+/// the module docs), so an instance has exactly one key file, `transport.sec`.
+/// The path survives as the name of a location older layouts wrote, which an
+/// operator may still point [`read_server_pk`] or [`fingerprint_of_file`] at;
+/// treat its contents as an unverified copy, not as this instance's public half.
 ///
 /// # Errors
 ///
@@ -254,7 +263,10 @@ pub fn transport_pub_path() -> Result<PathBuf, TransportError> {
 /// Resolve a server public key value from an optional file path.
 ///
 /// If `path` is `Some`, reads 32 bytes from that file.
-/// If `path` is `None`, defaults to [`transport_pub_path()`].
+/// If `path` is `None`, defaults to [`transport_pub_path()`] — the legacy
+/// public-key location, which nothing writes, so this fallback normally fails
+/// with "file not found" on a current instance. Callers that want *this*
+/// machine's key derive it instead ([`load_transport_keypair`]).
 ///
 /// Returns the 32-byte key on success, or a `TransportError` on I/O
 /// failure, invalid length, or missing config directory.
@@ -391,13 +403,17 @@ fn decode_secret(bytes: &[u8]) -> Result<[u8; 32], String> {
     decode_key_base64(text).map_err(|detail| format!("{len}-byte file: {detail}"))
 }
 
-/// Ensure that a Noise IK transport keypair exists at the standard paths
-/// (~/.config/choreographr/transport.sec and ~/.config/choreographr/transport.pub).
+/// Ensure that a Noise IK transport keypair exists at the standard path
+/// (~/.config/choreographr/transport.sec).
 ///
 /// If the secret file exists and decodes (base64, or a legacy raw 32-byte key),
 /// loads it and returns it paired with the public key **derived** from it.
-/// Otherwise generates a new X25519 keypair and writes both files — the secret
-/// as base64 text, and `transport.pub` as the raw 32-byte public key.
+/// Otherwise generates a new X25519 keypair and writes the secret as base64
+/// text — the only file it writes: there is no public-key file to write, since
+/// the public half is derived from the secret on every load.
+///
+/// Generating is the daemon's startup behaviour and nothing else's; a query that
+/// must not mint an identity uses [`load_transport_keypair`] instead.
 ///
 /// A secret file that exists but does not decode is reported as
 /// [`TransportError::InvalidSecretKey`] and left untouched; it is never
@@ -415,7 +431,6 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
     use std::io::{Seek, SeekFrom, Write};
 
     let sec_path = transport_sec_path()?;
-    let pub_path = transport_pub_path()?;
 
     // Fast path: a loadable secret means the keypair already exists, so this
     // takes no lock at all on the common start-up path.
@@ -448,10 +463,9 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
         sec_file.seek(SeekFrom::Start(0))?;
         sec_file.write_all(encoded.as_bytes())?;
         sec_file.sync_all()?;
-        // `transport.pub` is written as an artifact for operators and the
-        // `fingerprint` subcommand; nothing reads it back to reconstruct a
-        // keypair, so a crash between the two writes cannot corrupt anything.
-        std::fs::write(&pub_path, public)?;
+        // The secret is the whole on-disk identity: the public half is derived
+        // from it on every load, so no second file is written to disagree with
+        // it (and no crash can leave one half behind the other).
         info!(
             "generated and wrote new Noise IK transport keypair to {}",
             sec_path.display()
@@ -463,6 +477,37 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
     let pair = write_result?;
     unlock_result?;
     Ok(pair)
+}
+
+/// Load an existing transport keypair, deriving its public half from the
+/// secret — and **never generating one**.
+///
+/// The read-only counterpart of [`ensure_transport_keypair`], and the accessor
+/// every query uses (the daemon's `pubkey` and no-argument `fingerprint`
+/// subcommands). It exists so that printing a key cannot create the identity it
+/// prints: an absent secret is reported, not minted, because an identity minted
+/// by a query would be one no daemon ever loaded — and, worse, would look to the
+/// operator like the instance they were asking about.
+///
+/// No lock is taken: this only reads an existing file, and a concurrent
+/// generation either wins (a complete secret is written and fsynced before this
+/// read sees it) or the read reports the absence.
+///
+/// # Errors
+///
+/// Returns [`TransportError::MissingSecretKey`] when no secret file (or an empty
+/// one) is present, [`TransportError::InvalidSecretKey`] when one exists but
+/// does not decode, [`TransportError::ConfigDirNotFound`] when no config
+/// directory resolves, or [`TransportError::Io`] on a read failure.
+pub fn load_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), TransportError> {
+    let sec_path = transport_sec_path()?;
+    let Some(secret) = load_secret_key(&sec_path)? else {
+        return Err(TransportError::MissingSecretKey {
+            path: sec_path.display().to_string(),
+        });
+    };
+    debug!("loaded existing transport secret key (read-only)");
+    Ok(keypair_from_secret(secret))
 }
 
 /// Open `path` for writing (creating it if needed) and take an advisory
@@ -535,12 +580,63 @@ mod tests {
                 .join("transport.sec")
                 .exists()
         );
+        // The public half is derived on every load, so generation writes ONE
+        // file: a `transport.pub` on disk would be a second copy that could
+        // drift from the secret.
         assert!(
-            temp.path()
+            !temp
+                .path()
                 .join("choreographr")
                 .join("transport.pub")
-                .exists()
+                .exists(),
+            "generation must not write a public-key file"
         );
+    }
+
+    /// The read-only accessor loads an existing secret and derives the same
+    /// public half the generator returned — and, with no secret present, ERRORS
+    /// without creating one. That refusal is the whole point: a query must never
+    /// mint an identity.
+    #[test]
+    #[serial]
+    fn load_transport_keypair_derives_and_never_generates() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = install_temp_root(&temp);
+        let sec_path = dir.join("transport.sec");
+
+        // No identity yet: an error, and the directory is left exactly as it was.
+        let err = load_transport_keypair().expect_err("absent secret must not load");
+        assert!(
+            matches!(err, TransportError::MissingSecretKey { .. }),
+            "expected MissingSecretKey, got {err:?}"
+        );
+        assert!(
+            !sec_path.exists(),
+            "a read-only load must not create the secret"
+        );
+
+        // Generate, then load: the public half matches the generator's.
+        let (sk, pk) = ensure_transport_keypair().expect("generate keypair");
+        let before = std::fs::read(&sec_path).expect("read secret file");
+
+        let (sk2, pk2) = load_transport_keypair().expect("load existing keypair");
+        assert_eq!(sk2.as_bytes(), sk.as_bytes());
+        assert_eq!(pk2, pk);
+        assert_eq!(
+            std::fs::read(&sec_path).expect("re-read secret file"),
+            before,
+            "the read-only load must not rewrite the secret"
+        );
+
+        // An empty file is what a crash mid-creation leaves behind; it holds no
+        // identity, so it is reported as missing rather than silently made up.
+        std::fs::write(&sec_path, b"").expect("empty the secret file");
+        assert!(matches!(
+            load_transport_keypair().expect_err("empty secret must not load"),
+            TransportError::MissingSecretKey { .. }
+        ));
+
+        set_test_config_root(None);
     }
 
     #[test]

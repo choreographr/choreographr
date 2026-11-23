@@ -5,10 +5,16 @@
 //! cannot both be expressed as one base. This subcommand is the one place that
 //! reads them together — through `choreo_shared::paths::default_*`, which
 //! deliberately ignore any base override — and copies (or moves) them under
-//! `{base}/config` and `{base}/data`. Copying the keystore files verbatim
-//! (`identity.pk`, `transport.sec`/`.pub`) is what preserves the instance
-//! identity, so a client's pinned server key keeps verifying after the move
-//! (no re-pair) and the DB's keystore binding still holds.
+//! `{base}/config` and `{base}/data`.
+//!
+//! The transfer is a whole-directory copy, so the instance identity moves with
+//! it: `identity.pk` (the unlock key the keystore binding was created against)
+//! and `transport.sec` (the Noise transport secret the daemon's public key is
+//! derived from). Copying them verbatim is what keeps a client's pinned server
+//! key verifying after the move (no re-pair) and the DB's keystore binding
+//! valid. A legacy `transport.pub` from an older layout is copied along with
+//! every other file, but it carries no identity: the public key is derived from
+//! the secret, so nothing reads it.
 
 use std::fs;
 use std::io;

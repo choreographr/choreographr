@@ -3,9 +3,13 @@
 //! [`main`] is the binary's entry point — it parses the command line, installs
 //! logging, opens the daemon state, and then either runs the server (the
 //! default, no-subcommand case) or dispatches one of the offline utility
-//! subcommands (`acl-add`, `fingerprint`, `migrate`, `mcp`). The serve flags
-//! (base-dir, listeners, log destination, auto-exit) live on the parent command
-//! so `choreographr --tcp-addr …` keeps working without a subcommand.
+//! subcommands (`acl-add`, `pubkey`, `fingerprint`, `migrate`, `mcp`). The serve
+//! flags (base-dir, listeners, log destination, auto-exit) live on the parent
+//! command so `choreographr --tcp-addr …` keeps working without a subcommand.
+//!
+//! Every utility subcommand either prints ONE machine-readable line on stdout
+//! (the value) or nothing at all; diagnostics go to stderr through `tracing`, so
+//! a shell script can consume stdout directly.
 
 use crate::config::{DaemonConfig, load_daemon_config};
 use crate::daemon::DaemonState;
@@ -13,7 +17,7 @@ use anyhow::Context;
 use choreo_proto::socket_path;
 use choreo_shared::clap_styles;
 use choreo_shared::logging::{ConsoleSink, LogOptions, Verbosity};
-use choreo_transport::key::ensure_transport_keypair;
+use choreo_transport::key::{ensure_transport_keypair, pubkey_base64};
 use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
@@ -91,10 +95,16 @@ enum Command {
     /// daemon hot-reloads it, so the client can connect immediately without
     /// a restart. Works while the daemon is locked and needs no socket.
     AclAdd {
-        /// Base64 of the client's 32-byte transport public key (the client
-        /// prints it with `choreo-tui`'s help or reads its transport.pub)
+        /// Base64 of the client's 32-byte transport public key — the client
+        /// machine prints it with `choreographr pubkey`.
         pubkey: String,
     },
+    /// Print this machine's transport public key as base64: one line on stdout,
+    /// nothing else. Add it to a daemon's `authorized_clients.toml` (via
+    /// `acl-add`) to authorize this client, or compare it against the entry a
+    /// `known_servers.toml` pin holds. Read-only: with no identity in the config
+    /// dir it reports that instead of generating one.
+    Pubkey,
     /// Print the human-comparable fingerprint of a transport public key —
     /// with no argument, this machine's own (read out to the client operator
     /// during enrollment); with a path, any key file (verify a copied
@@ -191,17 +201,47 @@ fn acl_add_to(path: &std::path::Path, pubkey_b64: &str) -> anyhow::Result<usize>
     Ok(count)
 }
 
+/// This machine's transport public key as canonical base64 (44 characters):
+/// the value `pubkey` prints.
+///
+/// Read-only by construction — [`load_transport_keypair`] derives the public
+/// half from the identity the daemon wrote at startup and NEVER generates one,
+/// so running this in an empty config dir reports the absence rather than
+/// minting an identity that no daemon would ever serve. The secret is dropped
+/// (zeroized) as soon as the public half is derived.
+///
+/// [`load_transport_keypair`]: choreo_transport::key::load_transport_keypair
+///
+/// # Errors
+///
+/// Returns an error when this config dir holds no transport identity, when the
+/// secret is unreadable or does not decode, or when no config directory
+/// resolves.
+fn pubkey_value() -> anyhow::Result<String> {
+    use choreo_transport::key::load_transport_keypair;
+    let (secret, public) = load_transport_keypair().context(
+        "no transport identity in this config dir yet — start the daemon once to create it",
+    )?;
+    // Dropped here, not held: only the public half leaves this function, and
+    // `TransportSecretKey` zeroizes its bytes on drop.
+    drop(secret);
+    Ok(pubkey_base64(&public))
+}
+
 /// Print the fingerprint of a transport public key (see `Command::Fingerprint`).
 fn fingerprint_cli(path: Option<&str>) -> anyhow::Result<()> {
-    use choreo_transport::key::{fingerprint, fingerprint_of_file, read_server_pk};
+    use choreo_transport::key::{fingerprint, fingerprint_of_file, load_transport_keypair};
     let fp = if let Some(p) = path {
         fingerprint_of_file(std::path::Path::new(p))
             .with_context(|| format!("failed to fingerprint key file {p}"))?
     } else {
-        let pk = read_server_pk(None).context(
-            "failed to read this machine's transport public key (has the daemon ever run here?)",
+        // No argument means THIS machine's key, which is derived from its
+        // secret — there is no public-key file to read.
+        let (secret, public) = load_transport_keypair().context(
+            "failed to load this machine's transport identity — start the daemon once to create it",
         )?;
-        fingerprint(&pk)
+        drop(secret);
+        fingerprint(&public)
     };
     println!("{fp}");
     Ok(())
@@ -636,6 +676,13 @@ pub fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         Some(Command::Fingerprint { path }) => return fingerprint_cli(path.as_deref()),
+        Some(Command::Pubkey) => {
+            // Exactly one line on stdout — the value, nothing else — so a shell
+            // script can capture it without filtering. Diagnostics travel on
+            // stderr through tracing.
+            println!("{}", pubkey_value()?);
+            return Ok(());
+        }
         Some(Command::Migrate {
             move_,
             dry_run,
@@ -725,8 +772,16 @@ pub fn main() -> anyhow::Result<()> {
     .context("failed to open daemon state")?;
 
     // Load or generate the transport keypair for Noise IK.
-    let (transport_sk, _transport_pk) =
+    let (transport_sk, transport_pk) =
         ensure_transport_keypair().context("failed to load/generate transport keypair")?;
+    // The public half is not secret, and operators need it to enroll a client
+    // (`acl-add`) and to check a client's `known_servers.toml` pin — so it is
+    // logged ONCE here, at startup, rather than per connection. The secret never
+    // reaches a log line.
+    info!(
+        pubkey = %pubkey_base64(&transport_pk),
+        "transport public key"
+    );
 
     // Load the ACL of authorized client public keys.
     let acl_path = choreo_keystore::paths::authorized_clients_path()
@@ -903,6 +958,53 @@ mod tests {
         assert!(acl_add_to(&path, &short).is_err());
         // Nothing was written for the rejected keys.
         assert!(!path.exists(), "a rejected add must not create the file");
+    }
+
+    // ── pubkey CLI core ────────────────────────────────────────────────
+
+    /// `pubkey` prints exactly the canonical base64 of the derived public key
+    /// (44 chars, no newline in the value), and — with no identity present —
+    /// reports the absence instead of generating one.
+    #[test]
+    fn pubkey_value_prints_derived_key_and_never_generates() {
+        use base64::Engine as _;
+        use choreo_transport::key::{ensure_transport_keypair, set_test_config_root};
+
+        let dir = tempfile::tempdir().unwrap();
+        let sec_path = dir.path().join("choreographr").join("transport.sec");
+        // The keypair dir override is thread-local, so this redirects keypair
+        // resolution on THIS test's thread only; nextest isolates the process.
+        set_test_config_root(Some(dir.path().to_path_buf()));
+
+        // No identity yet: an error, and — the point of the read-only accessor —
+        // nothing was created by the query.
+        let missing = pubkey_value();
+        assert!(
+            missing.is_err(),
+            "a query must not mint the identity it prints"
+        );
+        assert!(!sec_path.exists(), "no secret may be created by `pubkey`");
+
+        // Create the identity the way the daemon does at startup.
+        let (_sk, pk) = ensure_transport_keypair().unwrap();
+        let value = pubkey_value();
+        set_test_config_root(None);
+
+        let value = value.unwrap();
+        assert_eq!(value.len(), 44, "a 32-byte key is 44 base64 chars");
+        assert!(
+            !value.contains('\n'),
+            "the value itself carries no trailing newline (println adds it)"
+        );
+        let decoded: [u8; 32] = base64::engine::general_purpose::STANDARD
+            .decode(&value)
+            .expect("the value must be valid base64")
+            .try_into()
+            .expect("the value must decode to 32 bytes");
+        assert_eq!(
+            decoded, pk,
+            "the printed key is the one derived from the secret"
+        );
     }
 
     #[test]
