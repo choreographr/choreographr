@@ -23,7 +23,7 @@ pub enum TransportError {
     /// The Noise IK handshake did not complete within its total budget. The
     /// budget bounds the WHOLE handshake, not just a single read: a peer that
     /// dribbles bytes to keep resetting the per-read socket timeout is still
-    /// cut off (see `handshake::read_handshake_exact`).
+    /// cut off (see `handshake::frame::read_handshake_exact`).
     #[error("Noise handshake timed out")]
     HandshakeTimeout,
     /// The peer presented credentials that the ACL check rejected.
