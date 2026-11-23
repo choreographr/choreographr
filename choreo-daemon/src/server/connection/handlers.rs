@@ -7,11 +7,16 @@
 //! single-writer transport layer, and the accept/read loops — mirroring the
 //! `sessions.rs` -> `sessions/handlers.rs` split.
 
-use super::{
-    ClientCtx, ClientMessage, ClientMessageType, ContextConfig, DaemonCommand, DaemonMessageType,
-    MessageKind, ReplyHandle, SessionCommand, SessionEvent, debug, info, io, mpsc,
-    switch_attached_session, warn,
+use choreo_proto::{
+    ClientMessage, ClientMessageType, ContextConfig, DaemonMessageType, MessageKind, SessionEvent,
 };
+use std::io;
+use std::sync::mpsc;
+use tracing::{debug, info, warn};
+
+use super::{ClientCtx, ReplyHandle, switch_attached_session};
+use crate::daemon::DaemonCommand;
+use crate::sessions::SessionCommand;
 use choreo_keystore::ServiceCredential;
 
 /// Dispatch a decoded `ClientMessage` through the shared handler functions.

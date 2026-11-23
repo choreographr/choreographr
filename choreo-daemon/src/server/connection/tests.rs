@@ -1,7 +1,16 @@
 use super::handlers::*;
 use super::*;
 use crate::broadcast::{ClientId, test_sink};
-use std::sync::LazyLock;
+use choreo_proto::{
+    ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, MessageKind, SessionEvent,
+};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, mpsc};
+
+use crate::daemon::DaemonCommand;
+use crate::sessions::SessionCommand;
+use std::io;
+use std::time::Duration;
 
 /// Test-only shorthand for a raw client id.
 fn cid(n: u32) -> ClientId {
@@ -356,10 +365,7 @@ fn writer_thread_drains_and_decrements_abandoned_backlog() {
 fn reply_handle_dropped_unanswered_trips_guard() {
     let (sink, _rx) = test_sink();
     let global_lag = Arc::new(AtomicUsize::new(0));
-    let handle = ReplyHandle {
-        sink: crate::broadcast::ReplySink::new(7, sink, global_lag),
-        sent: false,
-    };
+    let handle = ReplyHandle::new(7, sink, global_lag);
     // Never sent: the guard must fire here.
     drop(handle);
 }
@@ -372,10 +378,7 @@ fn reply_handle_dropped_unanswered_trips_guard() {
 fn reply_handle_send_stamps_id_and_accounts_bytes() {
     let (sink, rx) = test_sink();
     let global_lag = Arc::new(AtomicUsize::new(0));
-    let handle = ReplyHandle {
-        sink: crate::broadcast::ReplySink::new(99, sink, Arc::clone(&global_lag)),
-        sent: false,
-    };
+    let handle = ReplyHandle::new(99, sink, Arc::clone(&global_lag));
     handle.send(DaemonMessageType::Pong);
 
     let msg = rx.recv().unwrap();
@@ -1959,4 +1962,58 @@ fn writer_thread_delivers_shutting_down_before_channel_close() {
         out_rx.recv().is_err(),
         "after the notification the channel must be closed (recv errors)"
     );
+}
+
+/// The daemon's writer stall IS the shared `choreo-proto` policy, not a second
+/// number that happens to match: both ends of a connection must give up on a
+/// wedged peer at the same rate, so the daemon states the constant once.
+#[test]
+fn the_writer_stall_is_the_shared_protocol_constant() {
+    assert_eq!(
+        WRITER_WRITE_TIMEOUT,
+        choreo_proto::WRITER_STALL,
+        "the daemon's stall must BE choreo-proto's, not a copy of its value"
+    );
+}
+
+/// `cleanup_client`'s bounded join must outlast the stall it is waiting out: a
+/// writer may sit in one syscall for up to the stall, so an equal grace would run
+/// out in exactly the worst case the join exists to cover and detach a writer
+/// that was about to exit cleanly. A `const` assertion in `writer` pins it too;
+/// this states the property where a reader of the constants will look.
+#[test]
+fn the_join_grace_outlasts_the_writer_stall() {
+    assert!(
+        WRITER_JOIN_GRACE > WRITER_WRITE_TIMEOUT,
+        "join grace {WRITER_JOIN_GRACE:?} must exceed the stall {WRITER_WRITE_TIMEOUT:?}"
+    );
+}
+
+/// A zero (or sub-millisecond) stall never reaches a socket timeout: `std` rejects
+/// `Some(Duration::ZERO)` with `InvalidInput` rather than reading it as
+/// "unbounded", so without the floor the very first write would fail and tear the
+/// connection down. The floor keeps a mistake a slow bound instead of a dead
+/// connection.
+#[test]
+fn a_zero_writer_stall_is_floored() {
+    for configured in [
+        Duration::ZERO,
+        Duration::from_nanos(1),
+        Duration::from_micros(500),
+        Duration::from_millis(1) - Duration::from_nanos(1),
+    ] {
+        assert_eq!(
+            writer_stall(configured),
+            Duration::from_millis(1),
+            "{configured:?} must floor to the one-millisecond minimum"
+        );
+    }
+    // At or above the floor the configured value is used verbatim, which is what
+    // lets the wedged-writer integration tests substitute their own tiny-but-legal
+    // value instead of waiting out the production default.
+    assert_eq!(
+        writer_stall(Duration::from_millis(200)),
+        Duration::from_millis(200)
+    );
+    assert_eq!(writer_stall(WRITER_WRITE_TIMEOUT), WRITER_WRITE_TIMEOUT);
 }
