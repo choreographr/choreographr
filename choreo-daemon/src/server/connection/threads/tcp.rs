@@ -99,7 +99,14 @@ pub(crate) fn tcp_client_thread(
     args: ConnThreadArgs,
     peer_stall: Duration,
 ) -> io::Result<()> {
-    let writer_buf = NoiseConnectionWriter::new(noise.try_clone()?, peer_stall);
+    let mut reader = noise;
+    // Both directions of this connection give up on a peer that stops making
+    // progress at the same rate: the writer sink takes `peer_stall`, and so does
+    // the reader's mid-message bound. The reader's wait *between* messages stays
+    // unbounded — an idle client is not a wedged one — and a client that vanished
+    // outright is caught by the socket's keepalive.
+    reader.set_read_stall(peer_stall);
+    let writer_buf = NoiseConnectionWriter::new(reader.try_clone()?, peer_stall);
 
     let client_id = args.client_id;
     let mut conn = ClientConn::new(args, writer_buf);
@@ -118,7 +125,6 @@ pub(crate) fn tcp_client_thread(
     // dispatch_client_message). A TCP connection is NOT auto-registered here, so
     // a client that never asked is never sent broadcasts about other clients'
     // sessions.
-    let mut reader = noise;
     loop {
         match reader.recv_client_message() {
             Ok(msg) => {

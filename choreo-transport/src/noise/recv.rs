@@ -36,11 +36,38 @@ fn classify_stream_error(e: io::Error) -> TransportError {
     }
 }
 
-/// `read_exact` that classifies peer-close error kinds via
-/// [`classify_stream_error`], so `recv_message` can surface a graceful
-/// disconnect as [`TransportError::ConnectionClosed`].
-fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), TransportError> {
-    stream.read_exact(buf).map_err(classify_stream_error)
+/// Read **some** bytes of the next message with no time bound at all, returning how
+/// many arrived.
+///
+/// This is the transport's one unbounded read, and it is deliberate: it is where a
+/// connection legitimately sits when the peer has nothing to say — an idle client, a
+/// front-end waiting on a turn — so a bound must start at the first byte that
+/// arrives, not before it. Bounding this read is exactly the bug that would kill
+/// every idle connection.
+///
+/// It exists as its own step because the socket's read timeout is sticky (`std` has
+/// no way to clear it other than setting another), so "unbounded from here until the
+/// first byte" cannot be expressed by passing a deadline to the bounded helper.
+///
+/// `0` bytes means the peer closed cleanly between messages, reported as
+/// [`TransportError::ConnectionClosed`]. The caller must pass a non-empty buffer.
+fn read_some_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, TransportError> {
+    debug_assert!(
+        !buf.is_empty(),
+        "the unbounded first read needs a byte to read into"
+    );
+    loop {
+        match stream.read(buf) {
+            Ok(0) => {
+                debug!("Noise stream closed by peer");
+                return Err(TransportError::ConnectionClosed);
+            }
+            Ok(n) => return Ok(n),
+            // A signal interrupting the syscall says nothing about the peer.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(classify_stream_error(e)),
+        }
+    }
 }
 
 impl NoiseStream {
@@ -66,6 +93,21 @@ impl NoiseStream {
 
     /// Receive a decrypted message into a plain buffer the caller owns.
     ///
+    /// The receive is bounded in **two phases**, and the split is what keeps an idle
+    /// connection alive:
+    ///
+    /// 1. **Waiting for the next message is unbounded.** A connection with nothing in
+    ///    flight is idle, not broken — a front-end waiting on a turn, a client left
+    ///    open overnight — so the read timeout is cleared and the first byte is read
+    ///    with no bound at all. A vanished peer is caught by the connection's TCP
+    ///    keepalive, not here.
+    /// 2. **A message in flight is bounded by a per-syscall stall** (see
+    ///    [`NoiseStream::read_stall`]): every read after that first byte fails if it
+    ///    makes no progress for the stall. There is deliberately no wall clock on the
+    ///    whole message: a large payload on a slow link legitimately takes minutes,
+    ///    and a bound on total time would kill exactly the client the transport is
+    ///    meant to serve.
+    ///
     /// Reads one or more length-prefixed ciphertext fragments, decrypting
     /// each into a shared plaintext buffer, until a fragment whose
     /// AUTHENTICATED continuation header is clear arrives — that fragment
@@ -87,28 +129,52 @@ impl NoiseStream {
     ///
     /// Returns [`TransportError::ConcurrentAccess`] if another thread is
     /// concurrently receiving on this stream, [`TransportError::ConnectionClosed`]
-    /// on EOF before a complete message, [`TransportError::InvalidFragment`] on a
+    /// on EOF before a complete message, [`TransportError::Io`] (a `TimedOut`) when
+    /// the peer stalls mid-message for longer than the stall, and
+    /// [`TransportError::InvalidFragment`] on a
     /// frame exceeding the per-frame cap or below the tag-plus-header minimum, the
     /// per-message byte cap or the fragment-count bound, or a continuation-header
-    /// violation, and I/O or snow errors otherwise.
+    /// violation, plus any other I/O or snow errors.
     pub(super) fn recv_message_plain(&mut self) -> Result<Vec<u8>, TransportError> {
         // The inbound single-reader right: two concurrent receives on one
         // connection would splice two logical messages together with no error
         // at all, so the slot turns that misuse into a protocol error — the
         // mirror of what `send_message` takes for the outbound direction.
         let _guard = self.recv_slot.acquire()?;
+
+        // Phase 1 — unbounded. The previous message left the socket's read timeout
+        // armed at the last stall the bounded reads computed, and that option is
+        // sticky, so it must be cleared before the wait for the next message or this
+        // "idle" read would inherit a five-second bound and tear down a healthy idle
+        // connection. This is the receive-side counterpart of the send path's rule
+        // that one entry point owns the socket's bounds.
+        self.tcp.set_read_timeout(None)?;
+        let mut len_buf = [0u8; LEN_PREFIX_LEN];
+        // The one read with no bound: whatever arrives next starts a message. `0`
+        // bytes here is the peer closing between messages.
+        let mut prefix_filled = read_some_or_closed(&mut self.tcp, &mut len_buf)?;
+
+        // Phase 2 — bounded by the stall from here on.
         let mut assembly = Reassembly::new();
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
-            // lock: snow tracks separate send and recv nonce counters, so an
+            // lock: snow tracks separate send and recv byte counters, so an
             // interleaved send_message from another thread is safe, and a
             // sender can never be blocked by this reader. If recv_message
-            // instead held the mutex while blocked on read_exact, the
+            // instead held the mutex while blocked on a read, the
             // connection's own writer thread (which sends everything, including
             // ShuttingDown, for this connection) would block forever on a reader
             // waiting for data that may never come — a shutdown deadlock.
-            let mut len_buf = [0u8; LEN_PREFIX_LEN];
-            read_exact_or_closed(&mut self.tcp, &mut len_buf)?;
+            //
+            // The first iteration may already hold part of the prefix from the
+            // unbounded read above; later fragments read their whole prefix here.
+            choreo_proto::read_exact_with_stall(
+                &mut self.tcp,
+                self.read_stall,
+                slice_mut(&mut len_buf, prefix_filled.., "length prefix tail")?,
+            )
+            .map_err(classify_stream_error)?;
+            prefix_filled = 0;
             // The prefix is unauthenticated and is validated against snow's
             // per-message cap BEFORE anything is allocated for the body (see
             // `frame::decode_len`).
@@ -124,7 +190,12 @@ impl NoiseStream {
             // the length (growing if this fragment is the largest seen), so
             // capacity carries across messages — no per-fragment allocation.
             self.recv_ct_buf.resize(ct_len, 0);
-            read_exact_or_closed(&mut self.tcp, &mut self.recv_ct_buf)?;
+            choreo_proto::read_exact_with_stall(
+                &mut self.tcp,
+                self.read_stall,
+                &mut self.recv_ct_buf,
+            )
+            .map_err(classify_stream_error)?;
 
             // Take the lock briefly to decrypt this one fragment, then
             // release it before the next blocking read (see above).

@@ -34,8 +34,9 @@ use crate::noise::NoiseStream;
 /// side spends ONE budget on the preamble read plus the handshake (see
 /// [`super::handshake_responder_auto`]), so stalling before the mode byte buys no
 /// extra time. It is cleared before the `TransportState` is handed over (see
-/// [`finish`]); the data plane has no timeout by design — readers block until a
-/// message or EOF, and the daemon's shutdown path closes sockets to unblock them.
+/// [`finish`]), which is what lets the data plane apply its own, differently shaped
+/// bounds: a per-syscall stall while a message is in flight, and none at all while
+/// the connection is merely idle.
 ///
 /// The handshake runs BEFORE any authentication (the responder's ACL check
 /// happens mid-handshake), so without a bound an unauthenticated peer could
@@ -180,11 +181,12 @@ where
 
 /// Hand a completed handshake's socket to the data plane.
 ///
-/// Restores the unbounded I/O the deadline machinery replaced — BOTH socket
-/// timeouts, since the handshake armed `SO_RCVTIMEO` and `SO_SNDTIMEO` — and
-/// derives the `TransportState`. The data plane has no timeout by design:
-/// readers block until a message or EOF, and shutdown closes the socket to
-/// unblock them.
+/// Restores the unbounded I/O the handshake's deadline machinery replaced — BOTH
+/// socket timeouts, since it armed `SO_RCVTIMEO` and `SO_SNDTIMEO` — and derives
+/// the `TransportState`. Clearing them is what leaves the data plane free to set
+/// its own: each direction then bounds a stalled peer (a per-syscall stall on the
+/// write, and the same on the read once a message is in flight) without putting a
+/// clock on an idle connection or on a legitimate slow transfer.
 ///
 /// The socket is also handed to the data plane with Nagle disabled
 /// (`TCP_NODELAY`): the encrypted stream carries small, interactive messages

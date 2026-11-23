@@ -11,6 +11,14 @@
 //! and `reassembly` owns the message-level byte and fragment-count bounds.
 //! `slot` owns the per-direction single-actor right both directions take.
 //!
+//! The two directions bound a stalled peer the same way and an idle connection not
+//! at all. A send uses the caller's deadline and stall; a receive clears the socket
+//! timeout, reads the first byte of the next message with no bound (an idle
+//! connection is a normal state, not a fault) and then applies [`NoiseStream`]'s
+//! `read_stall` to everything after it. Neither puts a wall clock on a legitimate
+//! slow transfer, and a peer that vanished has its own bound in the socket's TCP
+//! keepalive.
+//!
 //! The `TransportState` is shared through an `Arc<Mutex<…>>` because a
 //! connection has one reader thread and one writer thread over a
 //! `try_clone`d socket (see AGENTS.md's sanctioned shared-state exception for
@@ -26,6 +34,7 @@ mod typed;
 
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use snow::TransportState;
 
@@ -72,6 +81,19 @@ pub struct NoiseStream {
     /// writer clone's copy stays empty). Wiped after every fragment is copied
     /// out.
     recv_pt_buf: Vec<u8>,
+    /// The receive direction's no-progress bound: a read fails if it accepts
+    /// nothing for this long. Defaults to [`choreo_proto::CONNECTION_STALL`], the
+    /// same detection latency the writer applies to the same connection, and is
+    /// settable so the daemon can inject a shorter one under test.
+    ///
+    /// This is a **stall**, not a deadline, and that is deliberate: a message's
+    /// total size is unknown until its last fragment arrives, so there is no figure
+    /// to scale a whole-message budget from, and any fixed wall clock would kill a
+    /// legitimate large transfer on a slow link. A peer that keeps making progress
+    /// passes however long the message takes; one that stops is caught here. The
+    /// idle wait *between* messages is unbounded and lives outside this bound (see
+    /// `recv::recv_message_plain`).
+    read_stall: Duration,
 }
 
 impl NoiseStream {
@@ -90,6 +112,7 @@ impl NoiseStream {
             send_frag: Vec::new(),
             recv_ct_buf: Vec::new(),
             recv_pt_buf: Vec::new(),
+            read_stall: choreo_proto::CONNECTION_STALL,
         }
     }
 
@@ -115,7 +138,21 @@ impl NoiseStream {
             send_frag: Vec::new(),
             recv_ct_buf: Vec::new(),
             recv_pt_buf: Vec::new(),
+            // The bound is a property of the connection, not of one direction's
+            // buffer, so a clone inherits it.
+            read_stall: self.read_stall,
         })
+    }
+
+    /// Override the receive direction's no-progress bound.
+    ///
+    /// The default is [`choreo_proto::CONNECTION_STALL`], which is what a
+    /// production connection wants on both sides — the same detection latency its
+    /// writer applies. It is settable so a caller can reuse its own configured knob
+    /// (the daemon hands its `peer_stall` to both directions) and so a test can
+    /// shrink it instead of waiting out five seconds.
+    pub fn set_read_stall(&mut self, stall: Duration) {
+        self.read_stall = stall;
     }
 
     /// Access the underlying `TcpStream` for shutdown etc.

@@ -881,3 +881,112 @@ fn an_oversize_outgoing_message_is_an_internal_invariant() {
         server_result.err()
     );
 }
+
+/// A connection with nothing in flight is **idle, not broken**: the receive path
+/// bounds only a message that is already arriving, and clears the socket's (sticky)
+/// read timeout before waiting for the next one. This is the test the naive
+/// implementation fails — arming a timeout across the whole receive would reap this
+/// connection, which is exactly what a front-end left open overnight does.
+///
+/// The peer sends nothing for several stalls, then sends a message: that message
+/// must arrive. Only a *stalled message* is a fault, never a silent connection.
+#[test]
+#[ignore = "integration"]
+fn an_idle_connection_between_messages_survives() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    // Short enough that an "idle counts as stalled" implementation fails fast, long
+    // enough that the write below is not racing the assertion.
+    let stall = Duration::from_millis(250);
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<String, String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+            server.set_read_stall(stall);
+            // The peer is silent here for several stalls: this read must block
+            // rather than fail.
+            let message = server
+                .recv_message()
+                .map_err(|e| format!("an idle connection must not be reaped: {e:?}"))?;
+            Ok(String::from_utf8_lossy(&message).into_owned())
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+
+    // Stay quiet well past the stall, then speak. No sleeps: the client simply does
+    // its work late, which the server's blocked read cannot distinguish from an idle
+    // session.
+    thread::sleep(stall * 4);
+    client
+        .send_message(b"still here")
+        .expect("send after idling");
+
+    let received = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server must answer instead of hanging")
+        .expect("the message sent after the idle period must be received");
+    assert_eq!(received, "still here");
+}
+
+/// A peer that starts a message and then stops is a fault, and is reaped after the
+/// stall rather than holding the connection forever. This is the case the
+/// per-message bound exists for: it pins a connection slot, a thread and up to the
+/// reassembly cap of memory, and unlike a vanished peer it is not caught by
+/// keepalive (the socket is alive; the sender has just gone quiet mid-frame).
+#[test]
+#[ignore = "integration"]
+fn a_stalled_message_is_reaped_after_the_stall() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let stall = Duration::from_millis(250);
+
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+            server.set_read_stall(stall);
+            match server.recv_message() {
+                Err(TransportError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => Ok(()),
+                other => Err(format!(
+                    "a peer that stops mid-message must be reaped with a TimedOut, got {other:?}"
+                )),
+            }
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+
+    // The start of a length prefix and one payload byte, then silence: the message
+    // is in flight and will never complete. Written through `get_ref` because the
+    // tampered wire needs raw bytes `send_message` would never produce.
+    {
+        let mut wire = std::io::BufWriter::new(client.get_ref());
+        wire.write_all(&[0, 0, 0xFF, 0xFF]).expect("write prefix");
+        wire.write_all(&[0xAB]).expect("write partial body");
+        wire.flush().expect("flush partial frame");
+    }
+
+    let outcome = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server must return instead of hanging");
+    assert!(
+        outcome.is_ok(),
+        "a stalled message must be reaped: {:?}",
+        outcome.err()
+    );
+    drop(client);
+}

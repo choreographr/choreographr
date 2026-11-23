@@ -40,9 +40,11 @@ pub(super) fn dial_control_tcp(addr: &str) -> std::io::Result<std::net::TcpStrea
 ///   and an internal writer-shutdown channel
 /// - Shutdown: blocks on `shutdown_rx.recv()`, then shuts down the TCP stream
 ///
-/// The reader thread has no read timeout — it blocks until a message arrives
-/// or the connection is closed. The writer thread blocks until a real message
-/// or the internal stop signal arrives (no polling).
+/// The reader thread puts no clock on an *idle* connection — it blocks until a
+/// message arrives or the connection is closed — but it does bound a message that
+/// has started arriving and then stops, at the same per-syscall stall the writer
+/// uses (see `NoiseStream::set_read_stall`). The writer thread blocks until a real
+/// message or the internal stop signal arrives (no polling).
 ///
 /// # Errors
 ///
