@@ -510,16 +510,25 @@ mod tests {
 
         // Mirror the production handshake (handshake_initiator /
         // handshake_responder) exactly: same pattern string, same key roles
-        // (client = initiator with server's public key, server = responder).
+        // (client = initiator with server's public key, server = responder),
+        // and the same prologue both sides of an IK handshake derive from
+        // PREAMBLE_IK — the prologue feeds the handshake hash the transport
+        // keys come from, so omitting it would derive states a production peer
+        // could not interop with.
+        let prologue = crate::handshake::noise_prologue(crate::handshake::PREAMBLE_IK);
         let mut initiator = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse().unwrap())
             .local_private_key(&client_sk)
             .unwrap()
             .remote_public_key(&server_pk)
             .unwrap()
+            .prologue(&prologue)
+            .unwrap()
             .build_initiator()
             .unwrap();
         let mut responder = Builder::new("Noise_IK_25519_AESGCM_SHA256".parse().unwrap())
             .local_private_key(&server_sk)
+            .unwrap()
+            .prologue(&prologue)
             .unwrap()
             .build_responder()
             .unwrap();

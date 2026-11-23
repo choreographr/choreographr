@@ -88,11 +88,18 @@ fn handshake_initiator_xx_impl(
 
     let deadline = Instant::now() + timeout;
 
+    // The prologue binds the domain-separation tag and this flow's mode byte
+    // into the handshake hash; the XX responder derives the identical buffer
+    // from the same PREAMBLE_XX, so the mode is part of the authenticated
+    // transcript rather than a claim the wire makes unchecked.
+    let prologue = super::noise_prologue(super::PREAMBLE_XX);
+
     // XX initiator: NO `.remote_public_key()` — the server's static key is
     // unknown until the handshake reveals it (IK hard-codes it here, which
     // is what makes IK a 2-message pattern instead of XX's 3).
     let mut handshake = Builder::new(PATTERN.parse()?)
         .local_private_key(static_sk)?
+        .prologue(&prologue)?
         .build_initiator()?;
 
     // One buffer carries every outbound frame and every decryption output, so
@@ -216,8 +223,13 @@ where
 
     let deadline = Instant::now() + timeout;
 
+    // Same prologue as the XX initiator above — the two halves of the XX flow
+    // must derive an identical handshake hash, so both take PREAMBLE_XX.
+    let prologue = super::noise_prologue(super::PREAMBLE_XX);
+
     let mut handshake = Builder::new(PATTERN.parse()?)
         .local_private_key(static_sk)?
+        .prologue(&prologue)?
         .build_responder()?;
 
     // Snow's decrypted handshake payloads land here — empty for these

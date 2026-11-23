@@ -1,8 +1,9 @@
 use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{
-    handshake_initiator, handshake_initiator_xx, handshake_responder,
+    PREAMBLE_IK, handshake_initiator, handshake_initiator_xx, handshake_responder,
     handshake_responder_with_timeout, handshake_responder_xx, handshake_responder_xx_with_timeout,
+    noise_prologue,
 };
 use choreo_transport::noise::NoiseStream;
 use snow::Builder;
@@ -750,13 +751,15 @@ fn noise_rejects_oversized_fragment_prefix() {
 /// Responder half of the Noise IK handshake with the production wire format
 /// (2-byte BE length-prefixed handshake messages), returning the raw
 /// `TcpStream` and the derived `TransportState`. Byte-for-byte what
-/// [`handshake_responder`] does, but keeps the raw pieces so a test can write
-/// frames the public API cannot express (e.g. a tampered length prefix).
+/// [`handshake_responder`] does — including the IK prologue — but keeps the
+/// raw pieces so a test can write frames the public API cannot express (e.g. a
+/// tampered length prefix).
 fn raw_handshake_responder(
     mut stream: TcpStream,
     server_sk: &[u8; 32],
     expected_client_pk: &[u8; 32],
 ) -> Result<(TcpStream, snow::TransportState), String> {
+    let prologue = noise_prologue(PREAMBLE_IK);
     let mut handshake = Builder::new(
         "Noise_IK_25519_AESGCM_SHA256"
             .parse()
@@ -764,6 +767,8 @@ fn raw_handshake_responder(
     )
     .local_private_key(server_sk)
     .map_err(|e| format!("server key failed: {e:?}"))?
+    .prologue(&prologue)
+    .map_err(|e| format!("prologue failed: {e:?}"))?
     .build_responder()
     .map_err(|e| format!("build responder failed: {e:?}"))?;
 
@@ -819,6 +824,7 @@ fn raw_handshake_initiator(
     client_sk: &[u8; 32],
     server_pk: &[u8; 32],
 ) -> Result<(TcpStream, snow::TransportState), String> {
+    let prologue = noise_prologue(PREAMBLE_IK);
     let mut handshake = Builder::new(
         "Noise_IK_25519_AESGCM_SHA256"
             .parse()
@@ -828,6 +834,8 @@ fn raw_handshake_initiator(
     .map_err(|e| format!("client key failed: {e:?}"))?
     .remote_public_key(server_pk)
     .map_err(|e| format!("server pk failed: {e:?}"))?
+    .prologue(&prologue)
+    .map_err(|e| format!("prologue failed: {e:?}"))?
     .build_initiator()
     .map_err(|e| format!("build initiator failed: {e:?}"))?;
 

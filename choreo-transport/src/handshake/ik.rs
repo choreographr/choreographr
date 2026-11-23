@@ -77,9 +77,17 @@ fn handshake_initiator_impl(
 
     let deadline = Instant::now() + timeout;
 
+    // The prologue binds the domain-separation tag and this flow's mode byte
+    // into the handshake hash; the IK responder derives the identical buffer
+    // from the same PREAMBLE_IK, so a peer that ran a different mode (or an
+    // intermediary that rewrote the preamble byte) cannot complete this
+    // handshake.
+    let prologue = super::noise_prologue(super::PREAMBLE_IK);
+
     let mut handshake = Builder::new(PATTERN.parse()?)
         .local_private_key(static_sk)?
         .remote_public_key(server_pk)?
+        .prologue(&prologue)?
         .build_initiator()?;
 
     // Message 1 (-> e, es, s, ss): the ephemeral key plus the client's static,
@@ -183,8 +191,13 @@ where
 
     let deadline = Instant::now() + timeout;
 
+    // Same prologue as the IK initiator above — the two halves of the IK flow
+    // must derive an identical handshake hash, so both take PREAMBLE_IK.
+    let prologue = super::noise_prologue(super::PREAMBLE_IK);
+
     let mut handshake = Builder::new(PATTERN.parse()?)
         .local_private_key(static_sk)?
+        .prologue(&prologue)?
         .build_responder()?;
 
     // Snow's decrypted handshake payloads land here — empty for these
