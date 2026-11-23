@@ -130,10 +130,13 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
 /// open the real connection with [`super::ConnectionMode::Tcp`] / IK.
 ///
 /// The probe itself authenticates NOTHING about the server (there is no pin
-/// yet — that is the point), but it does authenticate the probe TO the
-/// daemon, so the daemon's ACL applies: probing requires the client's key
-/// to be enrolled. The daemon ACL check completes inside the XX handshake
-/// (after message 3), so a not-yet-enrolled client gets `Err` here too.
+/// yet — that is the point), and it does **not** test enrollment either: the XX
+/// initiator completes its side of the exchange after sending message 3, before
+/// the responder runs its ACL check, so a client the daemon would reject still
+/// gets its key back from here. What this returns is "a Noise responder holding
+/// the key the daemon prints answered at this address" — reachability plus the
+/// key to compare out of band. Use [`verify_daemon_authorization`] (IK) to find
+/// out whether the daemon will actually admit this client.
 ///
 /// # Errors
 ///
@@ -167,6 +170,12 @@ pub enum PreflightError {
     /// The daemon could not be reached at all (dial failure).
     #[error("cannot reach the daemon: {0}")]
     Unreachable(#[source] std::io::Error),
+    /// This client's own transport identity could not be loaded or generated, so
+    /// the daemon was never dialed. Reported apart from [`Self::Unreachable`]
+    /// because the remediation is local — a config directory this process can
+    /// read and write — not a network or daemon problem.
+    #[error("cannot load this client's transport keypair: {0}")]
+    Identity(#[source] std::io::Error),
     /// The daemon was reached but the Noise IK handshake failed: the
     /// daemon either does not hold the expected server key, or its ACL
     /// did not admit this client's transport key. (An IK handshake is the
@@ -212,16 +221,18 @@ pub fn own_transport_pubkey() -> Result<[u8; 32], ClientError> {
 ///
 /// # Errors
 ///
-/// Returns [`PreflightError`] if the recorded key is missing, unreadable,
-/// corrupt, or does not match `server_pk`.
+/// Returns [`PreflightError::Identity`] if this client's transport keypair
+/// cannot be loaded or generated, [`PreflightError::Unreachable`] if the dial
+/// fails, or [`PreflightError::Rejected`] if the IK handshake does not complete
+/// — which means the daemon does not hold `server_pk`, or its ACL did not admit
+/// this client.
 pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(), PreflightError> {
     info!(
         addr,
         "authorization preflight: probing daemon with IK handshake"
     );
 
-    let (client_sk, _client_pk) =
-        client_transport_keypair().map_err(PreflightError::Unreachable)?;
+    let (client_sk, _client_pk) = client_transport_keypair().map_err(PreflightError::Identity)?;
 
     // Dial failure = the daemon is down / unreachable — reported as-is so
     // the caller's message can point at the network, not at enrollment.
@@ -283,11 +294,13 @@ pub fn run_daemon_tcp_connection_pinned(
         "connecting with pinned server key"
     );
 
+    // The keypair is loaded BEFORE the dial, as on every other connect path, so
+    // a local identity failure never leaves a dialed socket to drop.
+    let (client_sk, _client_pk) = client_transport_keypair()?;
+
     // Dial as its own step (plain error, no trust guidance — the daemon
     // being down has nothing to do with the pin).
     let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
-
-    let (client_sk, _client_pk) = client_transport_keypair()?;
 
     // The dial already succeeded, so a `ConnectionRefused` coming back from
     // `ik_handshake_and_serve` can only be its handshake-failure wrapper —

@@ -358,6 +358,12 @@ fn preflight_failure_message(
             "cannot reach the daemon at {addr}: {io}\n\
              is the daemon running, and did it start with --tcp-addr?",
         ),
+        // A local identity failure: the daemon was never contacted, so no
+        // enrollment advice applies — the fix is on this machine's filesystem.
+        choreo_client_core::PreflightError::Identity(io) => format!(
+            "this client's transport keypair could not be loaded: {io}\n\
+             check that the config directory is owned by you and writable, then reconnect.",
+        ),
         choreo_client_core::PreflightError::Rejected(_) => {
             // The identity block: just this client's public key as base64 —
             // exactly what the operator's enrollment command consumes, nothing

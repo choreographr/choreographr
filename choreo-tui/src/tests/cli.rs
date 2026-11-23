@@ -219,6 +219,30 @@ fn preflight_rejected_message_degrades_without_the_client_key() {
     );
 }
 
+/// A LOCAL identity failure (the keypair could not be loaded) must read as a
+/// filesystem problem on this machine — never as a network problem and never
+/// with enrollment remediation, because the daemon was never contacted.
+#[test]
+fn preflight_identity_failure_message_points_at_the_local_config() {
+    let err = choreo_client_core::PreflightError::Identity(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "permission denied",
+    ));
+    let msg = preflight_failure_message("host:9443", &err, None);
+    assert!(
+        msg.contains("transport keypair could not be loaded"),
+        "the identity failure must be named, got: {msg}"
+    );
+    assert!(
+        msg.contains("config directory"),
+        "the remediation must point at the local config, got: {msg}"
+    );
+    assert!(
+        !msg.contains("--tcp-addr") && !msg.contains("acl-add"),
+        "a local failure must not suggest a daemon or enrollment fix, got: {msg}"
+    );
+}
+
 // ── File logging setup (the Termux /tmp regression) ────
 
 /// The log file must be pid-keyed and land in the resolved log directory

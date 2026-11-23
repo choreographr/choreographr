@@ -18,9 +18,12 @@ use tracing::{error, info, warn};
 /// socket receive window is permanently zero — cannot stall the client's writer
 /// thread forever. On a timeout the writer shuts the socket down (see
 /// [`serve_noise_connection`]), which unblocks the reader's blocking
-/// `recv_daemon_message` and tears the connection down. It mirrors the daemon's
-/// own `WRITER_WRITE_TIMEOUT`. A slow-but-alive daemon is never falsely killed:
-/// the timeout is per syscall, so any socket that makes progress survives.
+/// `recv_daemon_message` and tears the connection down. It matches the daemon's
+/// own default writer write timeout (a daemon operator can widen its own with
+/// `DaemonState::writer_write_timeout`; the pair only has to be close enough
+/// that neither side waits on the other indefinitely). A slow-but-alive daemon is
+/// never falsely killed: the timeout is per syscall, so any socket that makes
+/// progress survives.
 const CLIENT_WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// This process's client transport keypair, generating one on first use.
@@ -28,7 +31,7 @@ const CLIENT_WRITER_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Every connect path needs the same identity (the daemon's ACL judges it) and
 /// the same failure mapping, so both live here instead of in each site. The
 /// `io::Error` shape is deliberate: the callers wrap it in their own error
-/// variant — [`ClientError::Io`] for a session, `PreflightError::Unreachable`
+/// variant — [`ClientError::Io`] for a session, `PreflightError::Identity`
 /// for the preflight — without repeating the conversion.
 pub(super) fn client_transport_keypair()
 -> Result<(choreo_transport::key::TransportSecretKey, [u8; 32]), std::io::Error> {

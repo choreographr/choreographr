@@ -14,17 +14,16 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::thread;
 use tracing::{debug, error, info, warn};
 
-/// Read `DaemonMessages` from `reader` in a blocking loop, calling
-/// `handle_daemon_message` for each successfully decoded message.
-///
-/// Returns `Ok(())` when the stream ends cleanly (EOF / connection reset).
-/// Returns `Err` on protocol or I/O errors.
 /// Drain a `BufRead` of framed `DaemonMessages` until EOF.
+///
+/// Returns `Ok(())` when the stream ends cleanly (EOF / connection reset), and
+/// carries on past a per-message decode failure — the framing is length-prefixed,
+/// so a corrupt payload never desynchronises the stream.
 ///
 /// # Errors
 ///
-/// Returns [`ClientError`] when the stream ends (EOF/closed connection), a
-/// frame fails to decode, or an I/O error occurs mid-stream.
+/// Returns [`ClientError`] when the stream ends on a non-EOF I/O error (broken
+/// pipe, aborted connection) or a frame fails to decode fatally.
 pub fn run_daemon_reader<R: BufRead>(
     mut reader: R,
     mut handle_daemon_message: impl FnMut(DaemonMessage),
