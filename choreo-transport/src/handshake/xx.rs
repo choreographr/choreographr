@@ -13,10 +13,11 @@
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use super::HandshakeMode;
 use super::entry::responder_requiring;
 use super::frame::{Wire, write_preamble};
-use super::{
-    HANDSHAKE_TIMEOUT, HandshakeMode, Role, authorize_client, build, deadline_from, static_key_32,
+use super::support::{
+    HANDSHAKE_TIMEOUT, Role, authorize_client, build, deadline_from, finish, static_key_32,
 };
 use crate::error::TransportError;
 use crate::noise::NoiseStream;
@@ -118,7 +119,7 @@ pub(super) fn initiator(
         }
     };
 
-    let noise = super::finish(stream, handshake, MODE, Role::Initiator)?;
+    let noise = finish(stream, handshake, MODE, Role::Initiator)?;
     Ok((noise, server_pk))
 }
 
@@ -216,5 +217,5 @@ where
     wire.read(&mut handshake, &mut stream, deadline)?;
     authorize_client(&handshake, check_client, MODE)?;
 
-    super::finish(stream, handshake, MODE, Role::Responder)
+    finish(stream, handshake, MODE, Role::Responder)
 }

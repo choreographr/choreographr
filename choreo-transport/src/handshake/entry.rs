@@ -14,7 +14,8 @@
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
-use super::{HANDSHAKE_TIMEOUT, HandshakeMode, deadline_from, ik, read_preamble, require_mode, xx};
+use super::support::{HANDSHAKE_TIMEOUT, deadline_from};
+use super::{HandshakeMode, ik, read_preamble, require_mode, xx};
 use crate::error::TransportError;
 use crate::noise::NoiseStream;
 
