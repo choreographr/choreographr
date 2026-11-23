@@ -166,7 +166,7 @@ impl McpTrustStore {
         };
         let serialized = toml::to_string_pretty(&file)
             .map_err(|e| format!("failed to serialize trust.toml: {e}"))?;
-        write_private_atomic(&self.path, serialized.as_bytes())
+        publish_trust_file(&self.path, serialized.as_bytes())
             .map_err(|e| format!("failed to write {}: {e}", self.path.display()))
     }
 }
@@ -209,40 +209,21 @@ fn normalize_lexically(path: &Path) -> PathBuf {
     out
 }
 
-/// Write `bytes` to `path` atomically: a sibling temp file (0600) renamed over
-/// the target; the parent directory is created (0700) if needed.
-fn write_private_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    std::fs::create_dir_all(parent)?;
-    set_dir_private(parent);
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    {
-        let mut file = std::fs::File::create(&tmp)?;
-        set_file_private(&tmp);
-        file.write_all(bytes)?;
-        file.sync_all()?;
+/// Publish `bytes` over `path` atomically, with the trust store's permissions:
+/// the parent directory owner-only (`0700`) and the file `0600`.
+///
+/// The publish mechanism itself is the workspace's one implementation
+/// ([`choreo_shared::atomic_write::write_private_atomic`]: sibling temp file,
+/// fsync, rename, `0600`), so there is no second copy of the rename discipline
+/// to keep correct. What this wrapper adds is the directory mode: a trust file
+/// lists project roots the daemon is willing to run MCP servers for, so its
+/// parent is narrowed to the owner before anything is written into it.
+fn publish_trust_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        choreo_shared::perm::ensure_private_dir(parent)?;
     }
-    std::fs::rename(&tmp, path)
+    choreo_shared::atomic_write::write_private_atomic(path, bytes)
 }
-
-#[cfg(unix)]
-fn set_dir_private(dir: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-}
-
-#[cfg(not(unix))]
-fn set_dir_private(_dir: &Path) {}
-
-#[cfg(unix)]
-fn set_file_private(path: &Path) {
-    use std::os::unix::fs::PermissionsExt as _;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_file_private(_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -357,7 +338,7 @@ mod tests {
     #[test]
     fn failed_write_leaves_trust_set_unchanged() {
         // Point the trust file at `<regular-file>/trust.toml`: the parent is an
-        // existing regular FILE, so `write_private_atomic`'s
+        // existing regular FILE, so `publish_trust_file`'s
         // `create_dir_all(parent)` fails deterministically (no timing needed).
         let dir = tempfile::tempdir().expect("tempdir");
         let not_a_dir = dir.path().join("not-a-dir");
