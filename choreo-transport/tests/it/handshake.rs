@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Duration;
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::common::noise_test_pair;
+use crate::common::{dribbling_peer_is_cut_off, noise_test_pair};
 
 /// Test full Noise IK handshake between client and server.
 #[test]
@@ -172,59 +172,15 @@ fn noise_handshake_times_out_when_peer_silent() {
 /// so the total duration cannot exceed it no matter how the peer paces its
 /// bytes: the slow-loris case a per-read timeout alone does not cover. (A
 /// per-recv-only timeout would accept these dribbles past this test's wait
-/// window; only the absolute deadline cuts them off.)
+/// window; only the absolute deadline cuts them off.) An IK msg1 (-> e, es, s,
+/// ss) is ~96 bytes on the wire, so the peer claims 96 and then paces single
+/// bytes — see `common::dribbling_peer_is_cut_off`, which the XX variant
+/// shares.
 #[test]
 #[ignore = "integration"]
 fn noise_handshake_times_out_against_dribbling_peer() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_sk_bytes = server_sk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept");
-        // 500 ms total budget: the dribbler sends one byte every 150 ms, so
-        // each byte lands well within any single read's window while the
-        // TOTAL stretches far past the deadline.
-        let result = handshake_responder_with_timeout(
-            stream,
-            &server_sk_bytes,
-            |_| true,
-            Duration::from_millis(500),
-        );
-        tx.send(result.map(|_| ())).expect("send server result");
-    });
-
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    // The responder reads the mode preamble before the frame stream, so send it
-    // first — the dribbling starts where the slow-loris attack would: the
-    // handshake's length prefix.
-    stream
-        .write_all(&[HandshakeMode::Ik.byte()])
-        .expect("write preamble");
-    // A real IK msg1 is ~80-96 bytes; claim 96 with the 2-byte prefix...
-    stream
-        .write_all(&(96u16).to_be_bytes())
-        .expect("write prefix");
-    // ...then dribble: one byte every 150 ms. The responder must give up at
-    // the 500 ms deadline instead of accepting each slow byte forever. Later
-    // writes may fail once the responder has errored and closed the socket,
-    // which is the desired outcome — tolerate the error.
-    for _ in 0..8 {
-        thread::sleep(Duration::from_millis(150));
-        let _ = stream.write_all(&[0xAB]);
-    }
-
-    let server_result = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("responder must return instead of accepting dribbles forever");
-    match server_result {
-        Err(TransportError::HandshakeTimeout) => {}
-        other => panic!("a dribbling peer must be cut off with HandshakeTimeout, got {other:?}"),
-    }
+    dribbling_peer_is_cut_off(HandshakeMode::Ik, 96)
+        .expect("a dribbling IK peer must be cut off with HandshakeTimeout");
 }
 
 /// Test the full Noise XX handshake between client and server (first-contact
@@ -531,56 +487,11 @@ fn noise_xx_handshake_times_out_when_peer_silent() {
 /// XX variant of `noise_handshake_times_out_against_dribbling_peer`: a peer
 /// that dribbles bytes to keep every individual read alive must still be cut
 /// off by the absolute deadline. An XX msg1 (-> e) is 48 bytes on the wire
-/// (32-byte ephemeral + 16-byte GCM tag), so the dribbler claims 48 and then
-/// paces single bytes — each within the read window, the total far past it.
+/// (32-byte ephemeral + 16-byte GCM tag), so the peer claims 48 and then paces
+/// single bytes — each within the read window, the total far past it.
 #[test]
 #[ignore = "integration"]
 fn noise_xx_handshake_times_out_against_dribbling_peer() {
-    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
-    let server_sk_bytes = server_sk.to_bytes();
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let addr = listener.local_addr().expect("local addr");
-
-    let (tx, rx) = mpsc::channel();
-
-    thread::spawn(move || {
-        let (stream, _) = listener.accept().expect("accept");
-        // 500 ms total budget, one dribbled byte per 150 ms — same shape as
-        // the IK variant (see its comment for why this defeats a per-recv
-        // timeout but not the absolute deadline).
-        let result = handshake_responder_xx_with_timeout(
-            stream,
-            &server_sk_bytes,
-            |_| true,
-            Duration::from_millis(500),
-        );
-        tx.send(result.map(|_| ())).expect("send server result");
-    });
-
-    let mut stream = TcpStream::connect(addr).expect("connect");
-    // The XX preamble goes first (the responder reads it before the frame
-    // stream), so the dribble happens where the attack targets: the handshake's
-    // length prefix.
-    stream
-        .write_all(&[HandshakeMode::Xx.byte()])
-        .expect("write preamble");
-    // An XX msg1 is 48 bytes on the wire; claim 48 with the 2-byte prefix...
-    stream
-        .write_all(&(48u16).to_be_bytes())
-        .expect("write prefix");
-    // ...then dribble. Later writes may fail once the responder has errored
-    // and closed the socket — tolerate the error.
-    for _ in 0..8 {
-        thread::sleep(Duration::from_millis(150));
-        let _ = stream.write_all(&[0xAB]);
-    }
-
-    let server_result = rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("responder must return instead of accepting dribbles forever");
-    match server_result {
-        Err(TransportError::HandshakeTimeout) => {}
-        other => panic!("a dribbling peer must be cut off with HandshakeTimeout, got {other:?}"),
-    }
+    dribbling_peer_is_cut_off(HandshakeMode::Xx, 48)
+        .expect("a dribbling XX peer must be cut off with HandshakeTimeout");
 }

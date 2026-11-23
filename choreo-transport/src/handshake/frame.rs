@@ -1,21 +1,18 @@
-//! The handshake's framing and deadline plumbing.
+//! The handshake's wire framing: the lengths, the 2-byte prefix and the
+//! scratch buffers.
 //!
 //! One read path and one write path serve all four Noise flows in the sibling
-//! `ik` and `xx` modules, so the bounded read and the coalesced bounded write
+//! `ik` and `xx` modules, so the framed read and the coalesced framed write
 //! exist exactly once. The 2-byte big-endian length prefix is produced and
 //! validated through the shared [`crate::len_prefix`] codec, so the width/cap
 //! arithmetic is not restated here. [`Wire`] packages the scratch buffers those
 //! paths need, so a flow reads as a sequence of `wire.read(..)` /
 //! `wire.write(..)` steps and allocates nothing.
 //!
-//! Every handshake read and write is bounded by an ABSOLUTE deadline: a
-//! silent or dribbling unauthenticated peer must not be able to hold a
-//! connection thread and socket FD open, which a per-read socket timeout
-//! alone does not prevent (a peer can dribble one byte per read window
-//! forever). The socket timeout is therefore re-armed before every individual
-//! read and write to the time remaining until the deadline.
+//! The deadline those reads and writes are bounded by lives one module over, in
+//! [`super::deadline`]: framing decides WHAT bytes go on the wire, the deadline
+//! helpers decide how long any one syscall may take to move them.
 
-use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::time::Instant;
 
@@ -23,6 +20,8 @@ use snow::HandshakeState;
 
 use crate::buf::slice_mut;
 use crate::error::TransportError;
+
+use super::deadline::{read_handshake_exact, write_handshake_all};
 
 /// Largest handshake frame body accepted from (or sent to) a peer, in bytes.
 ///
@@ -78,95 +77,6 @@ fn declared_frame_len(len_buf: &[u8]) -> Result<usize, TransportError> {
 /// reported as what it is instead of as a broken internal invariant.
 fn encode_frame_len(n: usize) -> Result<[u8; LEN_PREFIX_LEN], TransportError> {
     crate::len_prefix::encode(n, MAX_HANDSHAKE_FRAME, "handshake frame length")
-}
-
-/// Read exactly `buf.len()` bytes from `stream`, never taking longer than
-/// `deadline` in total.
-///
-/// A bare `read_exact` under `SO_RCVTIMEO` only bounds each individual `recv`:
-/// a peer that dribbles one byte per read window could stretch the handshake
-/// out indefinitely. Here every read is limited to the time *remaining* until
-/// `deadline` (the socket timeout is re-armed before each call), so the total
-/// duration is bounded by `deadline` plus scheduler slop no matter how the
-/// peer paces its bytes. EOF before the buffer fills is `UnexpectedEof`,
-/// matching `read_exact`'s semantics.
-///
-/// Fills a caller-provided buffer rather than returning a `Vec`, so a whole
-/// handshake performs no heap allocation.
-pub(super) fn read_handshake_exact(
-    stream: &mut TcpStream,
-    deadline: Instant,
-    buf: &mut [u8],
-) -> Result<(), TransportError> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(TransportError::HandshakeTimeout);
-        }
-        // Bound THIS read by the remaining budget so a slow peer cannot
-        // stretch the total past `deadline` by dribbling bytes.
-        stream.set_read_timeout(Some(remaining))?;
-        let n = match stream.read(slice_mut(buf, filled.., "handshake read tail")?) {
-            Ok(n) => n,
-            // The read timeout was armed to exactly the time remaining until
-            // `deadline`, and the socket is BLOCKING (never non-blocking), so
-            // a WouldBlock/TimedOut can only mean the deadline fired — a slow
-            // peer cannot otherwise produce them. Surface it as the honest
-            // HandshakeTimeout variant rather than leaking a raw
-            // io::Error::WouldBlock that callers cannot distinguish from a
-            // genuine non-blocking-mode condition.
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                return Err(TransportError::HandshakeTimeout);
-            }
-            Err(e) => return Err(e.into()),
-        };
-        if n == 0 {
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
-        }
-        filled += n;
-    }
-    Ok(())
-}
-
-/// Write exactly `data` to `stream`, never taking longer than `deadline` in
-/// total. Mirrors [`read_handshake_exact`]: the socket write timeout is
-/// re-armed to the time remaining until `deadline` before every write, so a
-/// peer that stops reading mid-handshake cannot hold the writer past the
-/// deadline (in practice handshake messages are a few hundred bytes and fit
-/// the socket buffer, so this bound is a backstop, not the normal path).
-pub(super) fn write_handshake_all(
-    stream: &mut TcpStream,
-    deadline: Instant,
-    data: &[u8],
-) -> Result<(), TransportError> {
-    let mut written = 0;
-    while written < data.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(TransportError::HandshakeTimeout);
-        }
-        // Bound THIS write by the remaining budget, exactly like the read
-        // side: a peer that stops draining the socket (or vanishes) must not
-        // be able to hold the handshake past `deadline`.
-        stream.set_write_timeout(Some(remaining))?;
-        match stream.write(crate::buf::slice(data, written.., "data tail")?) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-            Ok(n) => written += n,
-            // Same argument as read_handshake_exact: the socket is blocking
-            // and the write timeout is armed to the remaining budget, so a
-            // WouldBlock/TimedOut means the deadline fired.
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                return Err(TransportError::HandshakeTimeout);
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
 }
 
 /// Write the 1-byte handshake-mode preamble, bounded by `deadline`.

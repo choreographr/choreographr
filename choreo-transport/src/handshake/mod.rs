@@ -36,14 +36,16 @@
 //! byte and then again inside the handshake. Every read and write is bounded by
 //! the time remaining until that deadline —
 //! `HANDSHAKE_TIMEOUT` by default, or an explicit budget via the `_with_timeout`
-//! variants.
+//! variants — through the one pair of bounded helpers in `deadline`.
 //!
 //! A flow is a sequence of message steps, not a copy of the framing: the two
 //! message-order differences live in the `ik` and `xx` submodules, while the
-//! mode type and its wire/prologue encoding live in `mode`, the framing and
-//! deadline plumbing in `frame`, and the parts every flow shares — building the
-//! state machine, the ACL check, handing the socket to the data plane — here.
+//! mode type and its wire/prologue encoding live in `mode`, the framing in
+//! `frame`, the deadline-bound socket I/O in `deadline`, and the parts every
+//! flow shares — building the state machine, the ACL check, handing the socket
+//! to the data plane — here.
 
+mod deadline;
 mod frame;
 mod ik;
 mod mode;
@@ -233,7 +235,7 @@ pub(super) fn read_preamble(
     deadline: Instant,
 ) -> Result<HandshakeMode, TransportError> {
     let mut byte = [0u8; 1];
-    frame::read_handshake_exact(stream, deadline, &mut byte)?;
+    deadline::read_handshake_exact(stream, deadline, &mut byte)?;
     // The bounded read above filled exactly one byte, so the index is in bounds
     // by construction; the access is bounds-checked anyway (see the slice
     // helpers) rather than panicking.

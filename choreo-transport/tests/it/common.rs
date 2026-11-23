@@ -6,10 +6,14 @@
 //! prefix). Declared once at the crate root and reached from each test module as
 //! `crate::common`.
 
+use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{HandshakeMode, MAX_HANDSHAKE_FRAME};
 use snow::Builder;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 #[cfg(unix)]
@@ -195,4 +199,88 @@ pub(crate) fn raw_handshake_initiator(
         .into_transport_mode()
         .map_err(|e| format!("client transport failed: {e:?}"))?;
     Ok((stream, ts))
+}
+
+/// The responder budget the dribble helpers arm: far shorter than the total a
+/// dribbling peer would need, so what the test proves is that the ABSOLUTE
+/// deadline cuts the peer off (a per-recv timeout would let it continue).
+const DRIBBLE_BUDGET: Duration = Duration::from_millis(500);
+
+/// The dribbler's pace: one byte per gap, each well inside any single read's
+/// window, with the total stretching far past [`DRIBBLE_BUDGET`].
+const DRIBBLE_GAP: Duration = Duration::from_millis(150);
+
+/// How many dribbled bytes to attempt. Enough for the total to pass the budget
+/// several times over; later writes may fail once the responder has errored and
+/// closed the socket, which is the outcome under test.
+const DRIBBLE_BYTES: usize = 8;
+
+/// Drive the `mode` responder from a peer that claims a `frame_len`-byte
+/// handshake message and then dribbles it one byte per [`DRIBBLE_GAP`], and
+/// report whether the responder gave up with `HandshakeTimeout`.
+///
+/// This is the slow-loris shape every handshake read is bounded against: no
+/// individual read ever waits longer than one gap, so only the absolute deadline
+/// ends the exchange. Both flows take the same preamble and length prefix from a
+/// peer, so they need the same behaviour here and differ only in which responder
+/// the accepted stream is handed to — which is exactly what this one driver
+/// pins, so the IK and XX timeout contracts cannot drift apart.
+///
+/// Err describes what happened instead of the expected timeout; the caller (a
+/// `#[test]` fn) turns that into a failure.
+pub(crate) fn dribbling_peer_is_cut_off(mode: HandshakeMode, frame_len: u16) -> Result<(), String> {
+    let server_sk_bytes = StaticSecret::random_from_rng(&mut rand::rng()).to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let result = match mode {
+            HandshakeMode::Ik => choreo_transport::handshake::handshake_responder_with_timeout(
+                stream,
+                &server_sk_bytes,
+                |_| true,
+                DRIBBLE_BUDGET,
+            ),
+            HandshakeMode::Xx => choreo_transport::handshake::handshake_responder_xx_with_timeout(
+                stream,
+                &server_sk_bytes,
+                |_| true,
+                DRIBBLE_BUDGET,
+            ),
+        };
+        let _ = tx.send(result.map(|_| ()));
+    });
+
+    let mut stream = TcpStream::connect(addr).map_err(|e| e.to_string())?;
+    // The mode preamble goes first (the responder reads it before the frame
+    // stream), so the dribble happens where the attack targets: the handshake's
+    // length prefix and body.
+    stream
+        .write_all(&[mode.byte()])
+        .map_err(|e| format!("write preamble: {e}"))?;
+    stream
+        .write_all(&frame_len.to_be_bytes())
+        .map_err(|e| format!("write length prefix: {e}"))?;
+    for _ in 0..DRIBBLE_BYTES {
+        thread::sleep(DRIBBLE_GAP);
+        let _ = stream.write_all(&[0xAB]);
+    }
+
+    // The expected outcome is a timeout; every other outcome is a failure this
+    // helper reports to its caller rather than panicking on.
+    match rx
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|e| format!("responder did not return: {e}"))?
+    {
+        Err(TransportError::HandshakeTimeout) => Ok(()),
+        Err(e) => Err(format!(
+            "responder returned {e} instead of HandshakeTimeout"
+        )),
+        Ok(()) => Err("responder accepted the dribbled handshake".to_string()),
+    }
 }
