@@ -814,7 +814,13 @@ each connection's writer gets a socket write timeout, so a wedged client cannot
 stall its writer forever — the write fails, the writer shuts the socket down
 itself, and the reader's blocking read unblocks into the normal teardown. And
 **evictions are not silent**: each increments `choreo_evictions_total`, served
-on `/metrics`, so a permanently wedged subscriber stays observable.
+on `/metrics`, so a permanently wedged subscriber stays observable. The client
+bounds its own outbound writer the other way about, **in time**: one absolute
+budget per message, scaled by the message's size, plus a per-syscall stall so a
+silent daemon is noticed promptly, where the daemon bounds its writer in
+**bytes** through lag eviction. The two are deliberately different mechanisms
+for the same hazard, because the queue accounting lag eviction leans on has no
+client-side equivalent.
 
 Four sanctioned shared-state exceptions sit behind this design — the
 delivery-lag byte counters (#6), `ClientId` (#10), the log-directory test

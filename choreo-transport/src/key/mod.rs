@@ -180,6 +180,12 @@ impl AsRef<[u8; 32]> for TransportSecretKey {
 /// only copy that outlives this call is the one inside the returned
 /// [`TransportSecretKey`].
 fn keypair_from_secret(sk: TransportSecretKey) -> (TransportSecretKey, [u8; 32]) {
+    // The deref below is the one transient copy of the secret this API forces:
+    // `StaticSecret::from` takes a `[u8; 32]` by value and offers no slice
+    // constructor. It is still wiped — the copied array is moved into the
+    // `StaticSecret`, whose `Drop` zeroizes it, and `zeroize` is an explicit
+    // feature of this workspace's `x25519-dalek` dependency, so a future
+    // `default-features = false` cannot silently drop that wipe.
     let public =
         x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk.as_bytes())).to_bytes();
     (sk, public)
