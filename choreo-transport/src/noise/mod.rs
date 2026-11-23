@@ -21,9 +21,9 @@ mod send;
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
-use choreo_proto::{ClientMessage, DaemonMessage, decode_frame, encode_payload};
+use choreo_proto::{ClientMessage, DaemonMessage, DaemonMessageType, decode_frame, encode_payload};
 use snow::TransportState;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::TransportError;
 use send::SendSlot;
@@ -121,13 +121,29 @@ impl NoiseStream {
 
     /// Receive a typed `DaemonMessage` (convenience for clients).
     ///
+    /// The raw frame buffer is wiped after decoding UNLESS the decoded variant
+    /// is one the daemon can only ever send in cleartext-equivalent bulk data
+    /// (see `daemon_message_may_carry_secret`): [`DaemonMessageType::Image`]
+    /// carries raw attachment bytes up to the 64 MiB frame cap, so exempting it
+    /// avoids a pointless 64 MiB memset on the largest payload the daemon sends,
+    /// while every credential-bearing variant (`Credential`, `Keystore`, …) and
+    /// every variant not on the allowlist is still wiped. A decode failure is
+    /// unknown content and is wiped too.
+    ///
     /// # Errors
     ///
-    /// Returns any error propagated by [`Self::recv_message`] or the payload
-    /// decoding.
+    /// Returns any error propagated by `recv_message_plain` or the
+    /// payload decoding.
     pub fn recv_daemon_message(&mut self) -> Result<DaemonMessage, TransportError> {
-        let payload = self.recv_message()?;
-        Ok(decode_frame(&payload)?)
+        let mut payload = self.recv_message_plain()?;
+        let decoded = decode_frame(&payload);
+        // Wipe the frame unless it decoded to a known non-secret bulk variant;
+        // the guard is an allowlist, so unknown content (a decode error, a
+        // future variant) is wiped rather than skipped.
+        if !matches!(&decoded, Ok(msg) if !daemon_message_may_carry_secret(msg)) {
+            payload.zeroize();
+        }
+        Ok(decoded?)
     }
 
     /// Send a typed `DaemonMessage` (convenience for servers).
@@ -159,10 +175,64 @@ impl NoiseStream {
     }
 }
 
+/// Whether an inbound [`DaemonMessage`] may carry credential material, and so
+/// must have its raw frame wiped after decoding.
+///
+/// This is the ONE place the receive path decides to skip the wipe, and it is a
+/// **fail-safe allowlist**: only a variant whose payload is structurally
+/// incapable of holding a secret is listed false, and anything else — including
+/// every future variant and a frame that failed to decode — is treated as
+/// secret and wiped. A missed entry therefore only costs the memset it was
+/// trying to save, never a leaked credential.
+///
+/// [`DaemonMessageType::Image`] is the only exemption: it carries raw attachment
+/// bytes (`Option<Vec<u8>>`) and is the largest payload the daemon sends (up to
+/// the 64 MiB frame cap), so skipping its wipe turns the per-message zeroize
+/// from a 64 MiB memset into nothing for the one bulk, provably non-secret case.
+/// Every credential-bearing variant (`Credential`, `Keystore`, `Unlock`-adjacent
+/// state, …) falls through to `true` and is wiped.
+fn daemon_message_may_carry_secret(msg: &DaemonMessage) -> bool {
+    !matches!(&msg.inner, DaemonMessageType::Image { .. })
+}
+
 #[cfg(test)]
 mod tests {
     use snow::Builder;
     use x25519_dalek::{PublicKey, StaticSecret};
+
+    /// The wipe exemption is a fail-safe allowlist: `Image` (raw attachment
+    /// bytes) is the only variant that skips the wipe, while a credential-bearing
+    /// variant and any unlisted variant are treated as secret. A memory-safety
+    /// regression here would be a silent credential leak, so it is pinned.
+    #[test]
+    fn only_image_is_exempt_from_the_post_decode_wipe() {
+        use choreo_proto::{DaemonMessage, DaemonMessageType, ImageKey};
+
+        let image = DaemonMessage::broadcast(DaemonMessageType::Image {
+            session_id: 1,
+            turn_id: 1,
+            key: ImageKey::Displayed { index: 0 },
+            data: Some(vec![0u8; 8]),
+        });
+        assert!(
+            !super::daemon_message_may_carry_secret(&image),
+            "Image carries raw attachment bytes and is the one exempt bulk variant"
+        );
+
+        // A credential-bearing reply is always wiped...
+        let credential = DaemonMessage::broadcast(DaemonMessageType::Credential {
+            service: "anthropic".to_string(),
+            key: Some("sk-secret".to_string()),
+        });
+        assert!(super::daemon_message_may_carry_secret(&credential));
+
+        // ...and so is an arbitrary unlisted variant (the fail-safe default).
+        let pong = DaemonMessage::broadcast(DaemonMessageType::Pong);
+        assert!(
+            super::daemon_message_may_carry_secret(&pong),
+            "an unlisted variant must default to being wiped"
+        );
+    }
 
     /// In-memory crypto test (no sockets, no sleeps): prove that flipping a
     /// single ciphertext byte makes GCM decryption fail. The flipped byte is

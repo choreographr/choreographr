@@ -1,10 +1,12 @@
 //! The handshake's framing and deadline plumbing.
 //!
 //! One read path and one write path serve all four Noise flows in the sibling
-//! `ik` and `xx` modules, so the 2-byte big-endian length prefix, the bounded
-//! read and the coalesced bounded write exist exactly once. [`Wire`] packages
-//! the scratch buffers those paths need, so a flow reads as a sequence of
-//! `wire.read(..)` / `wire.write(..)` steps and allocates nothing.
+//! `ik` and `xx` modules, so the bounded read and the coalesced bounded write
+//! exist exactly once. The 2-byte big-endian length prefix is produced and
+//! validated through the shared [`crate::len_prefix`] codec, so the width/cap
+//! arithmetic is not restated here. [`Wire`] packages the scratch buffers those
+//! paths need, so a flow reads as a sequence of `wire.read(..)` /
+//! `wire.write(..)` steps and allocates nothing.
 //!
 //! Every handshake read and write is bounded by an ABSOLUTE deadline: a
 //! silent or dribbling unauthenticated peer must not be able to hold a
@@ -30,10 +32,14 @@ use crate::error::TransportError;
 /// authenticated anything. 1 KiB is generous: with the empty payloads these
 /// patterns use, the largest handshake message is on the order of 96 bytes
 /// (32-byte key material plus the 16-byte GCM tag), so no legitimate peer
-/// comes close. A larger declaration is rejected by [`declared_frame_len`]
+/// comes close. A larger declaration is rejected by `declared_frame_len`
 /// before any read happens, and a larger encoded message is refused by
-/// [`encode_frame_len`].
-pub(super) const MAX_HANDSHAKE_FRAME: usize = 1024;
+/// `encode_frame_len`.
+///
+/// Public (re-exported as [`crate::handshake::MAX_HANDSHAKE_FRAME`]) because it
+/// is a wire contract value: a test harness driving `snow` directly must size
+/// its buffers by THIS bound rather than a private copy that could drift.
+pub const MAX_HANDSHAKE_FRAME: usize = 1024;
 
 /// Length of the big-endian handshake length prefix that precedes every
 /// handshake frame body.
@@ -46,30 +52,21 @@ pub(super) const LEN_PREFIX_LEN: usize = 2;
 /// whole frame.
 pub(super) const HANDSHAKE_FRAME_BUF_LEN: usize = LEN_PREFIX_LEN + MAX_HANDSHAKE_FRAME;
 
-/// Decode a 2-byte big-endian length prefix.
-fn be_len16(len_buf: &[u8]) -> Result<u16, TransportError> {
-    len_buf
-        .get(..LEN_PREFIX_LEN)
-        .and_then(|prefix| <&[u8] as TryInto<[u8; 2]>>::try_into(prefix).ok())
-        .map(u16::from_be_bytes)
-        .ok_or_else(|| crate::buf::invalid_slice("length prefix"))
-}
-
 /// Decode a length prefix and validate it against [`MAX_HANDSHAKE_FRAME`].
 ///
 /// This is the single place a peer-declared handshake body length is trusted,
 /// and it runs before anything is read for the body: an unauthenticated peer
 /// that declares a frame above the cap is rejected with
 /// [`TransportError::InvalidFragment`] instead of making the responder read
-/// and hand an arbitrary buffer to snow.
+/// and hand an arbitrary buffer to snow. The 2-byte big-endian arithmetic lives
+/// in the shared [`crate::len_prefix`] codec, so this path and the data plane's
+/// 4-byte prefix are one implementation parameterised by width and cap.
 fn declared_frame_len(len_buf: &[u8]) -> Result<usize, TransportError> {
-    let declared = usize::from(be_len16(len_buf)?);
-    if declared > MAX_HANDSHAKE_FRAME {
-        return Err(TransportError::InvalidFragment(format!(
-            "handshake frame length {declared} exceeds the {MAX_HANDSHAKE_FRAME}-byte cap"
-        )));
-    }
-    Ok(declared)
+    crate::len_prefix::decode::<LEN_PREFIX_LEN>(
+        len_buf,
+        MAX_HANDSHAKE_FRAME,
+        "handshake frame length",
+    )
 }
 
 /// Encode a body length as its 2-byte big-endian prefix, refusing a body this
@@ -79,17 +76,8 @@ fn declared_frame_len(len_buf: &[u8]) -> Result<usize, TransportError> {
 /// two bounds are one policy stated twice — and the explicit check (rather
 /// than a cast plus a later slice failure) means an over-long message is
 /// reported as what it is instead of as a broken internal invariant.
-fn encode_frame_len(n: usize) -> Result<[u8; 2], TransportError> {
-    let too_long = || {
-        TransportError::InvalidFragment(format!(
-            "handshake frame length {n} exceeds the {MAX_HANDSHAKE_FRAME}-byte cap"
-        ))
-    };
-    let len = u16::try_from(n).map_err(|_| too_long())?;
-    if usize::from(len) > MAX_HANDSHAKE_FRAME {
-        return Err(too_long());
-    }
-    Ok(len.to_be_bytes())
+fn encode_frame_len(n: usize) -> Result<[u8; LEN_PREFIX_LEN], TransportError> {
+    crate::len_prefix::encode(n, MAX_HANDSHAKE_FRAME, "handshake frame length")
 }
 
 /// Read exactly `buf.len()` bytes from `stream`, never taking longer than
@@ -308,14 +296,15 @@ impl Wire {
 mod tests {
     use super::*;
 
-    /// The 2-byte length prefix round-trips: a length encodes to big-endian
-    /// bytes and decodes back unchanged. Deterministic, no sockets.
+    /// The 2-byte length prefix round-trips through the shared codec: a length
+    /// encodes to big-endian bytes and decodes back unchanged, and the high byte
+    /// comes first. Deterministic, no sockets.
     #[test]
     fn length_prefix_round_trips() {
         for len in [0usize, 1, 48, 96, MAX_HANDSHAKE_FRAME] {
             let encoded = encode_frame_len(len).expect("length encodes");
             assert_eq!(
-                usize::from(be_len16(&encoded).expect("prefix decodes")),
+                declared_frame_len(&encoded).expect("prefix decodes"),
                 len,
                 "length prefix must round-trip"
             );

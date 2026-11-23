@@ -6,11 +6,7 @@
 //! prefix). Declared once at the crate root and reached from each test module as
 //! `crate::common`.
 
-use choreo_transport::handshake::HandshakeMode;
-
-/// The largest handshake frame body the transport accepts (mirrors the
-/// crate's own cap, so a raw test cannot declare more than a real peer may).
-const MAX_HANDSHAKE_FRAME: usize = 1024;
+use choreo_transport::handshake::{HandshakeMode, MAX_HANDSHAKE_FRAME};
 use snow::Builder;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};

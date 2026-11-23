@@ -44,7 +44,27 @@ fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), Tr
 }
 
 impl NoiseStream {
-    /// Receive a decrypted message.
+    /// Receive a decrypted message into a `Zeroizing` buffer.
+    ///
+    /// The returned buffer is [`Zeroizing`]: a received frame may carry secret
+    /// material (a credential riding `AddCredential`, for instance), so it is
+    /// wiped when the caller drops it instead of being left in freed memory —
+    /// the mirror of what [`choreo_proto::encode_payload`] guarantees for an
+    /// outgoing frame, and of the `send_frag` wipe [`Self::send_message`]
+    /// performs. This covers the RAW FRAME buffer; the typed helpers
+    /// ([`Self::recv_daemon_message`] / [`Self::recv_client_message`]) decode it
+    /// into an owned message whose `String`s are the caller's to drop —
+    /// zeroizing a deserialized value is out of scope (see the crate docs on the
+    /// typed path's much narrower wipe policy for a known non-secret variant).
+    ///
+    /// # Errors
+    ///
+    /// As `recv_message_plain`.
+    pub fn recv_message(&mut self) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+        Ok(Zeroizing::new(self.recv_message_plain()?))
+    }
+
+    /// Receive a decrypted message into a plain buffer the caller owns.
     ///
     /// Reads one or more length-prefixed ciphertext fragments, decrypting
     /// each into a shared plaintext buffer, until a fragment whose
@@ -54,12 +74,14 @@ impl NoiseStream {
     /// is returned — the read-loop callers treat that as a graceful
     /// disconnect, distinct from a protocol failure.
     ///
-    /// The returned buffer is [`Zeroizing`]: a received frame may carry secret
-    /// material (a credential riding `AddCredential`, for instance), so it is
-    /// wiped when the caller drops it instead of being left in freed memory —
-    /// the mirror of what [`choreo_proto::encode_payload`] guarantees for an
-    /// outgoing frame, and of the `send_frag` wipe
-    /// [`Self::send_message`] performs.
+    /// The reassembly buffer is `Zeroizing` for the DURATION of the receive, so
+    /// an error mid-message (a GCM failure on a later fragment, a cap breach)
+    /// wipes the partial plaintext rather than dropping it unwiped. On success
+    /// the buffer is moved out un-wiped, so the caller decides whether to clear
+    /// it: [`Self::recv_message`] wraps it in `Zeroizing`, and the typed receive
+    /// helper clears it only when the decoded variant may carry a secret — the
+    /// bulk non-secret `Image` reply skips the memset (see
+    /// [`Self::recv_daemon_message`]).
     ///
     /// # Errors
     ///
@@ -67,7 +89,7 @@ impl NoiseStream {
     /// message, [`TransportError::InvalidFragment`] on a frame exceeding the
     /// per-frame or per-message cap or a continuation-header violation, and I/O
     /// or snow errors otherwise.
-    pub fn recv_message(&mut self) -> Result<Zeroizing<Vec<u8>>, TransportError> {
+    pub(super) fn recv_message_plain(&mut self) -> Result<Vec<u8>, TransportError> {
         let mut plaintext = Zeroizing::new(Vec::new());
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
@@ -140,7 +162,12 @@ impl NoiseStream {
 
             if !more {
                 trace!(message_len = plaintext.len(), "received Noise message");
-                return Ok(plaintext);
+                // Move the buffer out un-wiped: the caller chooses whether to
+                // clear it (`recv_message` wraps it in `Zeroizing`; the typed
+                // path clears it only for a secret-bearing variant). The
+                // `Zeroizing` guard is left holding an empty `Vec`, so its drop
+                // zeroizes nothing.
+                return Ok(std::mem::take(&mut *plaintext));
             }
         }
     }

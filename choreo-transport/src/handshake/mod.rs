@@ -57,6 +57,7 @@ use snow::{Builder, HandshakeState};
 use crate::error::TransportError;
 use crate::noise::NoiseStream;
 
+pub use frame::MAX_HANDSHAKE_FRAME;
 pub use ik::{
     handshake_initiator, handshake_initiator_with_timeout, handshake_responder,
     handshake_responder_with_timeout,

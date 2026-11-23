@@ -55,43 +55,29 @@ pub(super) const FRAG_BUF_LEN: usize = FRAGMENT_HEADER_LEN + MAX_PLAINTEXT_CHUNK
 ///
 /// The bound is the SAME cap [`decode_len`] enforces on a peer, stated from one
 /// constant, so the sender can never produce a frame the receiver would refuse.
-/// The conversion to `u32` is checked rather than cast even though the cap makes
-/// it infallible: an over-long frame is a broken internal invariant, and this
-/// reports it as the crate's protocol error instead of truncating the prefix
-/// into a frame no peer could reassemble.
+/// The encode/decode arithmetic itself lives in the shared [`crate::len_prefix`]
+/// codec, so the data plane's 4-byte prefix and the handshake's 2-byte prefix
+/// are one implementation parameterised by width and cap.
 pub(super) fn encode_len(n: usize) -> Result<[u8; LEN_PREFIX_LEN], TransportError> {
-    if n > MAX_CIPHERTEXT_LEN {
-        return Err(TransportError::InvalidFragment(format!(
-            "encrypted frame length {n} exceeds the {MAX_CIPHERTEXT_LEN}-byte Noise cap"
-        )));
-    }
-    let len = u32::try_from(n).map_err(|_| crate::buf::invalid_slice("frame length"))?;
-    Ok(len.to_be_bytes())
+    crate::len_prefix::encode(n, MAX_CIPHERTEXT_LEN, "encrypted frame length")
 }
 
 /// Decode a peer's length prefix and validate it against snow's per-message
 /// cap.
 ///
-/// This is the single place a peer-declared frame length is trusted, and it
-/// runs before anything is allocated for the body: the prefix is NOT
+/// This is the single place a peer-declared data-plane frame length is trusted,
+/// and it runs before anything is allocated for the body: the prefix is NOT
 /// authenticated (it precedes the GCM ciphertext), so a hostile or corrupted
 /// peer could otherwise declare 4 GiB and make the reader allocate — and then
 /// block in `read_exact` — that much. Any smaller tamper changes `ct_len` and
 /// is caught by the GCM authentication instead: a wrong byte count never
 /// decrypts, so a wire flip can never silently truncate or extend a message.
 pub(super) fn decode_len(prefix: &[u8]) -> Result<usize, TransportError> {
-    let declared = prefix
-        .get(..LEN_PREFIX_LEN)
-        .and_then(|head| <&[u8] as TryInto<[u8; LEN_PREFIX_LEN]>>::try_into(head).ok())
-        .map(u32::from_be_bytes)
-        .ok_or_else(|| crate::buf::invalid_slice("fragment length prefix"))?;
-    let declared = declared as usize;
-    if declared > MAX_CIPHERTEXT_LEN {
-        return Err(TransportError::InvalidFragment(format!(
-            "fragment ciphertext length {declared} exceeds the {MAX_CIPHERTEXT_LEN}-byte Noise cap"
-        )));
-    }
-    Ok(declared)
+    crate::len_prefix::decode::<LEN_PREFIX_LEN>(
+        prefix,
+        MAX_CIPHERTEXT_LEN,
+        "fragment ciphertext length",
+    )
 }
 
 /// Would appending a fragment of `ct_len` ciphertext bytes push a reassembly
@@ -118,10 +104,13 @@ pub(super) fn reassembly_exceeds_cap(assembled: usize, ct_len: usize) -> bool {
 mod tests {
     use super::*;
 
-    /// The prefix round-trips through big-endian bytes, and the high byte comes
-    /// first (the peer decodes it the same way).
+    /// The data plane wires the shared codec with a 4-byte prefix and snow's
+    /// ciphertext cap: a length at the cap round-trips, the high byte comes
+    /// first, and one past the cap is refused on both sides by naming the cap.
+    /// The codec arithmetic itself is pinned in `crate::len_prefix`; this keeps
+    /// only the wiring — width and cap — the data plane chooses.
     #[test]
-    fn length_prefix_round_trips() {
+    fn length_prefix_uses_the_u32_width_and_the_frame_cap() {
         for len in [0usize, 1, MAX_PLAINTEXT_CHUNK, MAX_CIPHERTEXT_LEN] {
             let encoded = encode_len(len).expect("length encodes");
             assert_eq!(
@@ -130,44 +119,21 @@ mod tests {
                 "length prefix must round-trip"
             );
         }
-        // Big-endian by construction: the high byte comes first, so a small
-        // length fills the prefix's tail.
+        // Big-endian in a 4-byte field: a small length fills the prefix's tail.
         assert_eq!(encode_len(0x01_02).expect("encodes"), [0, 0, 0x01, 0x02]);
-    }
 
-    /// A declared length above the cap is refused by naming the cap, and the
-    /// whole 32-bit range a hostile peer can declare is refused with it — this
-    /// check is what keeps an unauthenticated prefix from costing memory.
-    #[test]
-    fn declared_length_above_the_cap_is_rejected() {
-        let at_cap = u32::try_from(MAX_CIPHERTEXT_LEN).expect("a frame fits u32");
-        assert_eq!(
-            decode_len(&at_cap.to_be_bytes()).expect("at the cap is allowed"),
-            MAX_CIPHERTEXT_LEN
-        );
-        for over in [at_cap + 1, u32::MAX] {
+        // One past the cap is refused on both sides, naming the cap; the whole
+        // 32-bit range a hostile peer can declare is refused with it, which is
+        // what keeps an unauthenticated prefix from costing memory.
+        assert!(encode_len(MAX_CIPHERTEXT_LEN + 1).is_err());
+        for over in [
+            u32::try_from(MAX_CIPHERTEXT_LEN).expect("fits u32") + 1,
+            u32::MAX,
+        ] {
             let err = decode_len(&over.to_be_bytes()).expect_err("over the cap");
             assert!(
                 err.to_string().contains(&MAX_CIPHERTEXT_LEN.to_string()),
                 "the refusal must name the cap: {err}"
-            );
-        }
-    }
-
-    /// The outbound side cannot produce a frame the receiver would refuse: the
-    /// encoding and the decoding bound are one policy stated from one
-    /// constant.
-    #[test]
-    fn encoding_above_the_cap_is_refused() {
-        for over in [
-            MAX_CIPHERTEXT_LEN + 1,
-            usize::try_from(u32::MAX).expect("fits usize") + 1,
-            usize::MAX,
-        ] {
-            let err = encode_len(over).expect_err("over the cap");
-            assert!(
-                err.to_string().contains(&MAX_CIPHERTEXT_LEN.to_string()),
-                "an over-long frame must name the cap: {err}"
             );
         }
     }
