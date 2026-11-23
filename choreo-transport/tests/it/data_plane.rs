@@ -13,7 +13,7 @@ use std::io::Write;
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::common::{
     noise_test_pair, raw_handshake_initiator, raw_handshake_responder, shrink_socket_buffers,
@@ -701,6 +701,126 @@ fn noise_rejects_tampered_length_prefix() {
     assert!(
         server_result.is_ok(),
         "tampered length prefix must be rejected: {:?}",
+        server_result.err()
+    );
+}
+
+/// `send_message_by` with a generous deadline round-trips a fragmented message:
+/// the deadline path writes every fragment exactly like `send_message`, and a
+/// follow-up send proves the shared `TransportState` nonces stay in sync across
+/// the deadline-bounded frames (each is re-armed to the time remaining, but
+/// that is a write-policy detail, not a framing one).
+#[test]
+#[ignore = "integration"]
+fn send_message_by_round_trips_a_fragmented_message() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+
+            // One byte past the single-fragment capacity: the sender splits this
+            // into two fragments, and the receiver glues them back.
+            let expected = vec![0x5Au8; 65518 + 1];
+            let payload = server
+                .recv_message()
+                .map_err(|e| format!("recv fragmented message failed: {e:?}"))?;
+            if payload.as_slice() != expected.as_slice() {
+                return Err(format!(
+                    "fragmented payload mismatch: got {} bytes, want {} bytes of 0x5A",
+                    payload.len(),
+                    expected.len()
+                ));
+            }
+
+            // The follow-up proves the send/recv nonces stayed in sync across the
+            // deadline-bounded fragments: a desync would fail this decrypt.
+            let tail = server
+                .recv_message()
+                .map_err(|e| format!("recv tail failed: {e:?}"))?;
+            if tail.as_slice() != b"tail" {
+                return Err(format!("expected b\"tail\", got {tail:?}"));
+            }
+            Ok(())
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+
+    // A budget far larger than the local loopback round trip needs.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let payload = vec![0x5Au8; 65518 + 1];
+    client
+        .send_message_by(&payload, deadline)
+        .expect("send fragmented payload within the deadline");
+    client
+        .send_message_by(b"tail", Instant::now() + Duration::from_secs(30))
+        .expect("send tail within the deadline");
+
+    let server_result = rx.recv().expect("recv server result");
+    assert!(
+        server_result.is_ok(),
+        "server should reassemble both deadline-bounded messages: {:?}",
+        server_result.err()
+    );
+}
+
+/// An already-elapsed deadline must fail immediately, not block: `write_all_by`
+/// returns `TimedOut` before its first syscall, which surfaces as
+/// `TransportError::Io`. The receiver is left with no bytes and reports the
+/// client's close as a graceful disconnect.
+#[test]
+#[ignore = "integration"]
+fn send_message_by_fails_promptly_when_the_deadline_has_elapsed() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
+                .map_err(|e| format!("server handshake failed: {e:?}"))?;
+            // The client writes nothing (its deadline fired first), then closes;
+            // the server sees that as a graceful disconnect rather than a frame.
+            match server.recv_message() {
+                Err(TransportError::ConnectionClosed) | Ok(_) => Ok(()),
+                Err(e) => Err(format!("unexpected recv error: {e:?}")),
+            }
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+
+    match client.send_message_by(b"never sent", Instant::now()) {
+        Err(TransportError::Io(e)) => assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::TimedOut,
+            "an elapsed deadline must surface as a TimedOut-shaped Io error"
+        ),
+        other => panic!("expected Io(TimedOut) from an elapsed deadline, got {other:?}"),
+    }
+
+    // Close our end so the server's blocking recv returns instead of hanging.
+    drop(client);
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must return instead of hanging");
+    assert!(
+        server_result.is_ok(),
+        "server side should report the client's graceful close: {:?}",
         server_result.err()
     );
 }

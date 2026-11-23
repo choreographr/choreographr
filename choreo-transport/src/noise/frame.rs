@@ -8,7 +8,8 @@
 //!
 //! [`Reassembly`] is here rather than in `recv` because it is the other half of
 //! that same accounting: the per-frame sizes above bound one fragment, and the
-//! reassembly cap bounds the message those fragments add up to.
+//! reassembly bounds — the byte total AND the fragment count — bound the message
+//! those fragments add up to.
 
 use zeroize::Zeroizing;
 
@@ -37,6 +38,20 @@ pub(super) const MAX_CIPHERTEXT_LEN: usize = 65535;
 /// fragment.
 pub(super) const MAX_PLAINTEXT_CHUNK: usize =
     MAX_CIPHERTEXT_LEN - GCM_TAG_LEN - FRAGMENT_HEADER_LEN;
+
+/// Most fragments a legitimate sender produces for one message.
+///
+/// A message is capped at [`choreo_proto::MAX_FRAME_SIZE`] and each fragment
+/// carries at most [`MAX_PLAINTEXT_CHUNK`] plaintext bytes, so a legitimate
+/// sender emits `MAX_FRAME_SIZE / MAX_PLAINTEXT_CHUNK` full fragments (1024
+/// today) plus at most one shorter remainder — the `+ 1` — and an empty payload
+/// emits its single frame within that same allowance. The byte total alone
+/// cannot bound a peer that sends an endless run of continuation-marked frames
+/// carrying NO payload: each contributes zero bytes, so the byte cap never
+/// trips while the receive loop runs forever at roughly one wire frame per
+/// iteration. This count is what bounds that stream.
+pub(super) const MAX_FRAGMENTS_PER_MESSAGE: usize =
+    choreo_proto::MAX_FRAME_SIZE / MAX_PLAINTEXT_CHUNK + 1;
 
 /// Bit 0 of a fragment's first plaintext byte: 1 = more fragments of the same
 /// logical message follow, 0 = this fragment terminates it. Because the byte
@@ -86,26 +101,31 @@ pub(super) fn decode_len(prefix: &[u8]) -> Result<usize, TransportError> {
     )
 }
 
-/// One logical message's reassembly: the plaintext accumulated so far, and the
-/// cap that bounds it.
+/// One logical message's reassembly: the plaintext accumulated so far, the cap
+/// that bounds it, and the fragment count.
 ///
 /// The per-frame cap in [`decode_len`] bounds one fragment; it does not bound a
 /// message, because a peer can send an endless stream of continuation-marked
-/// fragments that are each individually legal. This type owns the bound on the
-/// running total, and it is the only way the receive loop touches that total:
-/// a frame's declared length must be [`accept_frame`](Self::accept_frame)d to
-/// obtain an [`AcceptedFrame`], and [`extend`](Self::extend) demands one — so
-/// "append a fragment whose length was never checked" is not expressible, and
-/// the check cannot be dropped from the loop without the loop failing to
-/// compile.
+/// fragments that are each individually legal. This type owns BOTH bounds on the
+/// message: the running plaintext total AND the number of fragments that make it
+/// up. The count is required because the byte total cannot bound a run of
+/// zero-payload frames (each adds nothing), while the receive loop still iterates
+/// once per frame — so bytes alone leave an endless message possible.
 ///
-/// The bound is enforced on the frame's **unauthenticated** length prefix,
-/// BEFORE that frame's body is read or the buffer grows, so a message that never
-/// terminates costs at most `MAX_FRAME_SIZE` of plaintext rather than an
-/// unbounded amount.
+/// It is the only way the receive loop touches the total: a frame must be
+/// [`accept_frame`](Self::accept_frame)d to obtain an [`AcceptedFrame`], and
+/// [`extend`](Self::extend) demands one — so "append a fragment whose length was
+/// never checked" is not expressible, and the check cannot be dropped from the
+/// loop without the loop failing to compile.
+///
+/// Both bounds are enforced BEFORE that frame's body is read or the buffer grows,
+/// so a message that never terminates costs at most `MAX_FRAME_SIZE` of plaintext
+/// and [`MAX_FRAGMENTS_PER_MESSAGE`] frames rather than an unbounded amount.
 pub(super) struct Reassembly {
     plaintext: Zeroizing<Vec<u8>>,
     cap: usize,
+    /// Fragments accepted so far; bounded by [`MAX_FRAGMENTS_PER_MESSAGE`].
+    frames: usize,
 }
 
 /// Proof that one frame's declared ciphertext length was checked against the
@@ -126,22 +146,31 @@ impl Reassembly {
         Self {
             plaintext: Zeroizing::new(Vec::new()),
             cap,
+            frames: 0,
         }
     }
 
-    /// Validate a frame's declared ciphertext length against the cap and the
-    /// plaintext accumulated so far, before anything is read or appended.
+    /// Validate a frame against the fragment count, then its declared ciphertext
+    /// length against the byte cap and the plaintext accumulated so far, before
+    /// anything is read or appended.
     ///
     /// A fragment contributes at most `ct_len - (tag + continuation header)`
     /// plaintext bytes; the subtraction saturates, so a frame too short to carry
     /// any payload counts as no contribution instead of wrapping into a huge
-    /// one.
+    /// one. The fragment count is checked first so a run of zero-payload frames
+    /// is refused once the count is exhausted even though it never moves the byte
+    /// total.
     ///
     /// # Errors
     ///
     /// [`TransportError::InvalidFragment`] when accepting this frame would push
-    /// the message past the cap.
-    pub(super) fn accept_frame(&self, ct_len: usize) -> Result<AcceptedFrame, TransportError> {
+    /// the message past the byte cap or the fragment-count bound.
+    pub(super) fn accept_frame(&mut self, ct_len: usize) -> Result<AcceptedFrame, TransportError> {
+        if self.frames >= MAX_FRAGMENTS_PER_MESSAGE {
+            return Err(TransportError::InvalidFragment(format!(
+                "message exceeds the {MAX_FRAGMENTS_PER_MESSAGE}-fragment limit"
+            )));
+        }
         let contribution = ct_len.saturating_sub(GCM_TAG_LEN + FRAGMENT_HEADER_LEN);
         if self.plaintext.len().saturating_add(contribution) > self.cap {
             return Err(TransportError::InvalidFragment(format!(
@@ -149,6 +178,7 @@ impl Reassembly {
                 self.cap
             )));
         }
+        self.frames += 1;
         Ok(AcceptedFrame(()))
     }
 
@@ -231,6 +261,7 @@ mod tests {
         let assembled = |len: usize| Reassembly {
             plaintext: Zeroizing::new(vec![0u8; len]),
             cap,
+            frames: 0,
         };
 
         // Filling the cap exactly is allowed...
@@ -251,19 +282,17 @@ mod tests {
     }
 
     /// A fragment that carries no plaintext — exactly a GCM tag plus the
-    /// continuation header, or fewer bytes than that — never trips the cap, so
-    /// an empty-fragment stream cannot be refused for the wrong reason (it is
-    /// refused by the continuation-header check instead, and costs one wire
-    /// frame each).
+    /// continuation header — never moves the byte cap, so an empty-fragment
+    /// stream cannot be refused by the byte total. That is exactly why the
+    /// separate fragment-count bound exists: the byte cap stays put while the
+    /// receive loop keeps iterating, so bytes alone cannot end such a stream.
     #[test]
     fn zero_payload_fragments_never_trip_the_cap() {
         let cap = 8usize;
         let mut assembly = Reassembly::with_cap(cap);
         // Fill the cap, so there is no room left for a payload byte at all.
-        assembly.extend(
-            assembly.accept_frame(cap).expect("fills the cap"),
-            &[0xAB; 8],
-        );
+        let filling = assembly.accept_frame(cap).expect("fills the cap");
+        assembly.extend(filling, &[0xAB; 8]);
         assert_eq!(assembly.len(), cap);
         for ct_len in [0, 1, GCM_TAG_LEN, GCM_TAG_LEN + FRAGMENT_HEADER_LEN] {
             assert!(
@@ -271,6 +300,34 @@ mod tests {
                 "a {ct_len}-byte frame contributes no plaintext"
             );
         }
+    }
+
+    /// The fragment-count bound is what refuses a stream the byte cap cannot:
+    /// each zero-payload frame adds nothing to the total, so only the count
+    /// stops it. Driven directly through `accept_frame` with a small cap, so no
+    /// socket and no 64 MiB allocation is involved.
+    #[test]
+    fn zero_payload_fragments_are_bounded_by_the_fragment_count() {
+        let mut assembly = Reassembly::with_cap(8);
+        // A tag plus header decrypts to a valid continuation byte and zero
+        // payload, so `contribution` saturates to zero and the byte total never
+        // moves.
+        let empty_frame = GCM_TAG_LEN + FRAGMENT_HEADER_LEN;
+        for n in 0..MAX_FRAGMENTS_PER_MESSAGE {
+            assembly
+                .accept_frame(empty_frame)
+                .unwrap_or_else(|e| panic!("frame {n} is within the count bound: {e}"));
+            assert_eq!(assembly.len(), 0, "a zero-payload frame appends nothing");
+        }
+        // The next frame is one past the bound and is refused, naming the limit.
+        let err = assembly
+            .accept_frame(empty_frame)
+            .expect_err("the count bound must refuse the frame past it");
+        assert!(
+            err.to_string()
+                .contains(&MAX_FRAGMENTS_PER_MESSAGE.to_string()),
+            "the refusal must name the fragment limit: {err}"
+        );
     }
 
     /// Driving the type the way the receive loop does: each frame must be

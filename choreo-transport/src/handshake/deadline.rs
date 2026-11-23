@@ -12,7 +12,7 @@
 //! Re-arming the timeout to `deadline - now` before every call makes the total
 //! duration bounded no matter how the peer paces its bytes.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::net::TcpStream;
 use std::time::Instant;
 
@@ -75,34 +75,32 @@ pub(super) fn read_handshake_exact(
 /// peer that stops reading mid-handshake cannot hold the writer past the
 /// deadline (in practice handshake messages are a few hundred bytes and fit
 /// the socket buffer, so this bound is a backstop, not the normal path).
+///
+/// The re-arm-per-syscall loop itself lives in [`choreo_proto::write_all_by`],
+/// shared with the data plane, so the handshake and the message path bound a
+/// write one way rather than each carrying its own copy. Only the handshake's
+/// error mapping differs.
 pub(super) fn write_handshake_all(
     stream: &mut TcpStream,
     deadline: Instant,
     data: &[u8],
 ) -> Result<(), TransportError> {
-    let mut written = 0;
-    while written < data.len() {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(TransportError::HandshakeTimeout);
+    // The socket is blocking and armed to the remaining budget, so a
+    // WouldBlock/TimedOut means the deadline fired — surface it as the honest
+    // HandshakeTimeout rather than leaking a raw io::Error that callers cannot
+    // distinguish from a genuine non-blocking-mode condition. WriteZero (a
+    // writer accepting no bytes) is what `write_all_by` returns and flows through
+    // the generic arm carrying its own kind, matching `write_all`'s semantics.
+    match choreo_proto::write_all_by(stream, deadline, data) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            Err(TransportError::HandshakeTimeout)
         }
-        // Bound THIS write by the remaining budget, exactly like the read
-        // side: a peer that stops draining the socket (or vanishes) must not
-        // be able to hold the handshake past `deadline`.
-        stream.set_write_timeout(Some(remaining))?;
-        match stream.write(crate::buf::slice(data, written.., "data tail")?) {
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),
-            Ok(n) => written += n,
-            // Same argument as read_handshake_exact: the socket is blocking
-            // and the write timeout is armed to the remaining budget, so a
-            // WouldBlock/TimedOut means the deadline fired.
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
-            {
-                return Err(TransportError::HandshakeTimeout);
-            }
-            Err(e) => return Err(e.into()),
-        }
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }

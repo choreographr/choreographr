@@ -16,7 +16,7 @@ use crate::buf::invalid_slice;
 use crate::error::TransportError;
 
 /// Encode `n` as a big-endian length prefix of `N` bytes, refusing a length the
-/// caller's `cap` cannot express.
+/// caller's `cap` cannot express or the width cannot hold.
 ///
 /// `N` is a compile-time prefix width (2 for the handshake, 4 for the data
 /// plane) and `cap` is the same bound the matching [`decode`] enforces on a
@@ -24,7 +24,9 @@ use crate::error::TransportError;
 /// conversion is checked rather than cast even though a valid `cap` makes it
 /// infallible: an over-long frame is a broken internal invariant, and this
 /// reports it as the crate's protocol error instead of truncating the prefix
-/// into a frame no peer could reassemble.
+/// into a frame no peer could reassemble. A `cap` wider than the width can
+/// express is guarded the same way — the cap alone cannot stop a value the
+/// `N` bytes cannot carry.
 pub(crate) fn encode<const N: usize>(
     n: usize,
     cap: usize,
@@ -39,6 +41,15 @@ pub(crate) fn encode<const N: usize>(
         return Err(too_long());
     }
     let value = u64::try_from(n).map_err(|_| too_long())?;
+    // A width narrower than 8 bytes cannot represent a value whose higher
+    // bytes are non-zero: `to_be_bytes` would keep only the low `N` bytes and
+    // silently describe a shorter frame than the caller asked for (a 2-byte
+    // prefix over 70_000 would encode as 4464). Refuse it rather than truncate.
+    // `N < 8` keeps the shift defined, and `N > 8` is already refused by the
+    // `checked_sub` below.
+    if N < 8 && (value >> (8 * N)) != 0 {
+        return Err(too_long());
+    }
     let be = value.to_be_bytes();
     // The value occupies the low `N` bytes of the 8-byte big-endian form. A
     // width the form cannot cover (N > 8) is refused rather than panicking on
@@ -149,6 +160,34 @@ mod tests {
         let err = decode::<4>(&u32::MAX.to_be_bytes(), cap, "frame")
             .expect_err("the maximum 32-bit length must be rejected");
         assert!(matches!(err, TransportError::InvalidFragment(_)));
+    }
+
+    /// A `cap` wider than the prefix width cannot be trusted to bound the value:
+    /// the guard refuses a length the `N` bytes cannot hold instead of
+    /// truncating it into a shorter frame. The widest value the width can
+    /// express still encodes, so the guard only rejects genuine overflow.
+    #[test]
+    fn a_cap_wider_than_the_prefix_refuses_rather_than_truncating() {
+        // 0xFFFF is the largest value a 2-byte prefix can carry; it must encode
+        // as the two all-ones bytes and decode back unchanged.
+        let widest = encode::<2>(0xFFFF, 0xFFFF, "frame").expect("the widest value encodes");
+        assert_eq!(widest, [0xFF, 0xFF]);
+        assert_eq!(
+            decode::<2>(&widest, 0xFFFF, "frame").expect("decodes"),
+            0xFFFF
+        );
+
+        // 70_000 fits a u32 but not two bytes; with a 70_000 cap the cap check
+        // alone would let it through and truncate the prefix to 4464.
+        let err = encode::<2>(70_000, 70_000, "frame").expect_err("70000 must not truncate");
+        assert!(
+            matches!(err, TransportError::InvalidFragment(_)),
+            "a width overflow must be the crate's protocol error: {err}"
+        );
+        assert!(
+            err.to_string().contains("70000"),
+            "the refusal must name the length: {err}"
+        );
     }
 
     /// A prefix that is shorter than the declared width is the crate's protocol

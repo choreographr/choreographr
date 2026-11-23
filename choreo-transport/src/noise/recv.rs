@@ -86,8 +86,8 @@ impl NoiseStream {
     ///
     /// Returns [`TransportError::ConnectionClosed`] on EOF before a complete
     /// message, [`TransportError::InvalidFragment`] on a frame exceeding the
-    /// per-frame or per-message cap or a continuation-header violation, and I/O
-    /// or snow errors otherwise.
+    /// per-frame cap, the per-message byte cap or the fragment-count bound, or a
+    /// continuation-header violation, and I/O or snow errors otherwise.
     pub(super) fn recv_message_plain(&mut self) -> Result<Vec<u8>, TransportError> {
         // The inbound single-reader right: two concurrent receives on one
         // connection would splice two logical messages together with no error
@@ -100,9 +100,9 @@ impl NoiseStream {
             // lock: snow tracks separate send and recv nonce counters, so an
             // interleaved send_message from another thread is safe, and a
             // sender can never be blocked by this reader. If recv_message
-            // instead held the mutex while blocked on read_exact, a
-            // concurrent sender (e.g. the daemon's shutdown-notification
-            // thread sending ShuttingDown) would block forever on a reader
+            // instead held the mutex while blocked on read_exact, the
+            // connection's own writer thread (which sends everything, including
+            // ShuttingDown, for this connection) would block forever on a reader
             // waiting for data that may never come — a shutdown deadlock.
             let mut len_buf = [0u8; LEN_PREFIX_LEN];
             read_exact_or_closed(&mut self.tcp, &mut len_buf)?;

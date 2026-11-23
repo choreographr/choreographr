@@ -53,6 +53,29 @@ pub(crate) fn noise_test_pair() -> std::result::Result<NoiseTestPair, String> {
     ))
 }
 
+/// Read one `MAX_HANDSHAKE_FRAME`-bounded handshake frame body: the 2-byte
+/// big-endian length prefix, a refusal above the cap BEFORE any allocation, then
+/// exactly that many body bytes. Production refuses an over-cap declaration the
+/// same way; mirroring it here keeps the harness from being handed an arbitrary
+/// allocation by a peer that declares a huge length.
+fn read_framed(stream: &mut TcpStream, what: &str) -> Result<Vec<u8>, String> {
+    let mut len_buf = [0u8; 2];
+    stream
+        .read_exact(&mut len_buf)
+        .map_err(|e| format!("read {what} len failed: {e}"))?;
+    let msg_len = u16::from_be_bytes(len_buf) as usize;
+    if msg_len > MAX_HANDSHAKE_FRAME {
+        return Err(format!(
+            "{what} length {msg_len} exceeds the {MAX_HANDSHAKE_FRAME}-byte cap"
+        ));
+    }
+    let mut rbuf = vec![0u8; msg_len];
+    stream
+        .read_exact(&mut rbuf)
+        .map_err(|e| format!("read {what} failed: {e}"))?;
+    Ok(rbuf)
+}
+
 /// Responder half of the Noise IK handshake with the production wire format
 /// (1-byte mode preamble, then 2-byte BE length-prefixed handshake messages),
 /// returning the raw `TcpStream` and the derived `TransportState`. Byte-for-byte
@@ -93,15 +116,7 @@ pub(crate) fn raw_handshake_responder(
     .build_responder()
     .map_err(|e| format!("build responder failed: {e:?}"))?;
 
-    let mut len_buf = [0u8; 2];
-    stream
-        .read_exact(&mut len_buf)
-        .map_err(|e| format!("read msg1 len failed: {e}"))?;
-    let msg_len = u16::from_be_bytes(len_buf) as usize;
-    let mut rbuf = vec![0u8; msg_len];
-    stream
-        .read_exact(&mut rbuf)
-        .map_err(|e| format!("read msg1 failed: {e}"))?;
+    let rbuf = read_framed(&mut stream, "msg1")?;
     let mut out_buf = vec![0u8; MAX_HANDSHAKE_FRAME];
     handshake
         .read_message(&rbuf, &mut out_buf)
@@ -182,15 +197,7 @@ pub(crate) fn raw_handshake_initiator(
         .write_all(buf.get(..usize::from(n)).ok_or("buf slice out of bounds")?)
         .map_err(|e| format!("write msg1 failed: {e}"))?;
 
-    let mut len_buf = [0u8; 2];
-    stream
-        .read_exact(&mut len_buf)
-        .map_err(|e| format!("read msg2 len failed: {e}"))?;
-    let msg_len = u16::from_be_bytes(len_buf) as usize;
-    let mut rbuf = vec![0u8; msg_len];
-    stream
-        .read_exact(&mut rbuf)
-        .map_err(|e| format!("read msg2 failed: {e}"))?;
+    let rbuf = read_framed(&mut stream, "msg2")?;
     handshake
         .read_message(&rbuf, &mut buf)
         .map_err(|e| format!("client read msg2 failed: {e:?}"))?;

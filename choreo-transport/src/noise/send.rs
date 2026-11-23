@@ -3,11 +3,15 @@
 //!
 //! Every write goes through one place — [`NoiseStream::write_frame`] — so the
 //! continuation header, the brief `TransportState` lock, the length prefix and
-//! the coalesced `write_all` exist exactly once, whether the message is empty,
-//! a single fragment, or many. The single-writer right itself lives in
-//! [`super::slot`], shared with the read direction.
+//! the coalesced write exist exactly once, whether the message is empty, a single
+//! fragment, or many. Two entry points share that body:
+//! [`NoiseStream::send_message`] (no deadline of its own) and
+//! [`NoiseStream::send_message_by`] (the whole message bounded by one absolute
+//! deadline). The single-writer right itself lives in [`super::slot`], shared with
+//! the read direction.
 
 use std::io::Write;
+use std::time::Instant;
 
 use choreo_proto::MAX_FRAME_SIZE;
 use tracing::trace;
@@ -46,6 +50,11 @@ impl NoiseStream {
     /// fragment). The staged plaintext in `send_frag` is wiped before this
     /// returns (see the callers of `write_frame`).
     ///
+    /// This entry point carries NO deadline of its own: each fragment's write
+    /// uses `std::io::Write::write_all` under whatever per-syscall write timeout
+    /// the caller armed on the socket. Use [`Self::send_message_by`] when the
+    /// WHOLE message must fit a total budget.
+    ///
     /// # Errors
     ///
     /// Returns [`TransportError::InvalidFragment`] if another thread is
@@ -53,8 +62,52 @@ impl NoiseStream {
     /// [`MAX_FRAME_SIZE`], [`TransportError::ConnectionClosed`]/I/O errors
     /// from the socket, or snow errors from encryption.
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
+        self.send_message_bounded(plaintext, None)
+    }
+
+    /// Send one encrypted message with the whole message bounded by `deadline`.
+    ///
+    /// The difference from [`Self::send_message`] is the shape of the bound: the
+    /// deadline covers the ENTIRE message — every fragment's write together —
+    /// not a single syscall. Each fragment's write is re-armed to the time
+    /// remaining until `deadline` before it runs (via
+    /// [`choreo_proto::write_all_by`]), so a large payload split across many
+    /// fragments cannot take `fragments × timeout` to push. The transport holds
+    /// no policy about what the deadline should be; the caller computes it from
+    /// its own total budget.
+    ///
+    /// Do not mix the two entry points on one `NoiseStream`.
+    /// [`choreo_proto::write_all_by`] leaves the socket's write stall armed at the
+    /// last value it computed and never clears it, so a later
+    /// [`Self::send_message`] would inherit that leftover per-syscall timeout
+    /// rather than the policy the caller intended. Pick one entry point for the
+    /// life of the stream.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::send_message`], plus: a deadline that has already elapsed (or
+    /// passes mid-message) makes an armed write return `WouldBlock`/`TimedOut`,
+    /// which converts into [`TransportError::Io`] through the `From<io::Error>`
+    /// impl — a fired deadline is reported as the socket's own error, not a
+    /// bespoke variant.
+    pub fn send_message_by(
+        &mut self,
+        plaintext: &[u8],
+        deadline: Instant,
+    ) -> Result<(), TransportError> {
+        self.send_message_bounded(plaintext, Some(deadline))
+    }
+
+    /// The shared entry point: take the single-writer slot, run the framing, and
+    /// wipe `send_frag` on the way out. `deadline` distinguishes the two public
+    /// entry points; everything else is identical between them.
+    fn send_message_bounded(
+        &mut self,
+        plaintext: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<(), TransportError> {
         let _guard = self.send_slot.acquire()?;
-        match self.send_message_inner(plaintext) {
+        match self.send_message_inner(plaintext, deadline) {
             // Wipe exactly the region this send wrote: the plaintext staging
             // buffer holds a copy of this (possibly secret) message until the
             // next send would overwrite it, so it is cleared on success too.
@@ -83,7 +136,11 @@ impl NoiseStream {
     /// The send body, returning how many bytes of `send_frag` the last frame
     /// staged (its plaintext varies in length with the payload) so the caller
     /// can wipe exactly that prefix.
-    fn send_message_inner(&mut self, plaintext: &[u8]) -> Result<usize, TransportError> {
+    fn send_message_inner(
+        &mut self,
+        plaintext: &[u8],
+        deadline: Option<Instant>,
+    ) -> Result<usize, TransportError> {
         // Mirror the receiver's reassembly cap so an over-limit message is
         // rejected at the source instead of by the peer's recv_message.
         if plaintext.len() > MAX_FRAME_SIZE {
@@ -116,7 +173,7 @@ impl NoiseStream {
             // Every chunk's plaintext sits at the front of the buffer, so the
             // furthest byte any chunk of this send reached is what the caller
             // has to wipe.
-            used = used.max(self.write_frame(chunk, more)?);
+            used = used.max(self.write_frame(chunk, more, deadline)?);
         }
 
         if used == 0 {
@@ -125,14 +182,14 @@ impl NoiseStream {
             // prefix, so an empty message still needs exactly one wire frame.
             // Emit a single fragment carrying only the cleared continuation
             // header, which `recv_message` returns as an empty message.
-            used = self.write_frame(&[], false)?;
+            used = self.write_frame(&[], false, deadline)?;
         }
         Ok(used)
     }
 
     /// Stage `payload` behind the authenticated continuation header, encrypt it
     /// under a brief `TransportState` lock, then write the 4-byte length prefix
-    /// and the ciphertext as ONE `write_all`.
+    /// and the ciphertext as ONE write.
     ///
     /// Returns the number of `send_frag` bytes staged (header + payload) so the
     /// caller can wipe exactly that prefix.
@@ -140,12 +197,22 @@ impl NoiseStream {
     /// Serializing sends is the caller's job (the slot), so the
     /// `TransportState` lock is only needed to make the encrypt call atomic
     /// against the reader's decrypts. It must NEVER be held across the blocking
-    /// `write_all` below: a reader waiting on the lock would stop draining the
-    /// socket, and a peer doing the same in the other direction would deadlock
-    /// once the socket buffers filled. The frame is therefore encrypted under a
-    /// brief lock and written outside it, so the reader can always acquire the
-    /// lock and drain.
-    fn write_frame(&mut self, payload: &[u8], more: bool) -> Result<usize, TransportError> {
+    /// write below: a reader waiting on the lock would stop draining the socket,
+    /// and a peer doing the same in the other direction would deadlock once the
+    /// socket buffers filled. The frame is therefore encrypted under a brief lock
+    /// and written outside it, so the reader can always acquire the lock and
+    /// drain.
+    ///
+    /// `deadline` picks the write policy: `Some` bounds the whole message through
+    /// [`choreo_proto::write_all_by`] (re-arming the socket stall to the time
+    /// remaining before each syscall), while `None` keeps a plain `write_all`
+    /// under whatever per-syscall timeout the caller armed on the socket.
+    fn write_frame(
+        &mut self,
+        payload: &[u8],
+        more: bool,
+        deadline: Option<Instant>,
+    ) -> Result<usize, TransportError> {
         let staged = FRAGMENT_HEADER_LEN
             .checked_add(payload.len())
             .ok_or_else(|| crate::buf::invalid_slice("send_frag stage"))?;
@@ -174,8 +241,8 @@ impl NoiseStream {
         };
 
         // One coalesced write per frame: the prefix is laid into the headroom
-        // ahead of the ciphertext, so a single write_all sends both (one
-        // syscall per fragment instead of two).
+        // ahead of the ciphertext, so a single write sends both (one syscall
+        // per fragment instead of two).
         let prefix = encode_len(n)?;
         slice_mut(
             &mut self.send_buf,
@@ -183,11 +250,16 @@ impl NoiseStream {
             "send_buf length prefix",
         )?
         .copy_from_slice(&prefix);
-        self.tcp.write_all(slice(
-            &self.send_buf,
-            ..LEN_PREFIX_LEN + n,
-            "send_buf frame",
-        )?)?;
+        let frame = slice(&self.send_buf, ..LEN_PREFIX_LEN + n, "send_buf frame")?;
+        match deadline {
+            // The caller owns a total budget for the whole message, so bound this
+            // syscall to the time still remaining: the fragments together then
+            // fit the deadline, not `fragments × timeout`.
+            Some(d) => choreo_proto::write_all_by(&mut self.tcp, d, frame)?,
+            // No deadline: rely on whatever per-syscall write timeout the caller
+            // armed on the socket (`write_all` under SO_SNDTIMEO).
+            None => self.tcp.write_all(frame)?,
+        }
         Ok(staged)
     }
 }

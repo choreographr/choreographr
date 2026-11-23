@@ -16,8 +16,9 @@ pub enum TransportError {
     Protocol(#[from] choreo_proto::ProtoError),
     /// The peer (or this stream's usage) violated the transport framing
     /// contract: an oversized fragment length, a reassembly that would exceed
-    /// the codec's message cap, or a concurrent second sender on one stream.
-    /// The stream is unusable after this error.
+    /// the codec's message cap or the per-message fragment-count bound, or a
+    /// concurrent second sender OR second reader on one stream (each direction
+    /// has its own single-actor slot). The stream is unusable after this error.
     #[error("invalid transport fragment: {0}")]
     InvalidFragment(String),
     /// The Noise handshake did not complete within its total budget. The
@@ -93,4 +94,12 @@ pub enum TransportError {
         /// positions only, never the file's bytes.
         detail: String,
     },
+    /// A textual transport public key (standard-alphabet base64) could not be
+    /// parsed: not base64, or not exactly 32 bytes decoded.
+    ///
+    /// The [`String`] carries the decoder's verdict — a byte count or a decoder
+    /// position — so an operator can tell a typo from a wrong-length value. It
+    /// never carries key bytes.
+    #[error("invalid transport public key: {0}")]
+    InvalidPublicKey(String),
 }

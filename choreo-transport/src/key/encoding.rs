@@ -38,15 +38,11 @@ pub fn pubkey_base64(pk: &[u8; 32]) -> String {
 ///
 /// # Errors
 ///
-/// Returns [`TransportError::Io`] (with [`std::io::ErrorKind::InvalidData`])
-/// when the text is not valid base64 or does not decode to exactly 32 bytes.
+/// Returns [`TransportError::InvalidPublicKey`] (carrying the decoder's
+/// verdict — lengths and positions, never key bytes) when the text is not valid
+/// base64 or does not decode to exactly 32 bytes.
 pub fn parse_pubkey_base64(text: &str) -> Result<[u8; 32], TransportError> {
-    let key = decode_key_base64(text).map_err(|detail| {
-        TransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid base64 key: {detail}"),
-        ))
-    })?;
+    let key = decode_key_base64(text).map_err(TransportError::InvalidPublicKey)?;
     // A public key is not secret, so the copy out of the wiping wrapper is the
     // caller's own array and needs no further care.
     Ok(*key)
@@ -56,12 +52,12 @@ pub fn parse_pubkey_base64(text: &str) -> Result<[u8; 32], TransportError> {
 ///
 /// The single decode implementation behind both the public key parser and the
 /// secret-file loader. The decoded bytes may be a SECRET (the loader's caller),
-/// so they are handed back inside a [`Zeroizing`] buffer and never exist as a
-/// bare array on this path; the intermediate `Vec` the decoder fills is wiped
-/// too. The failure is a message rather than an error type so each caller wraps
-/// it in the error its context calls for (a public key parse is a plain
-/// I/O-shaped error; a secret file names its path and refuses regeneration).
-/// Messages carry lengths and decoder positions only — never the decoded bytes.
+/// so they are handed back inside a [`Zeroizing`] buffer; the intermediate `Vec`
+/// the decoder fills is wiped too. The failure is a message rather than an error
+/// type so each caller wraps it in the error its context calls for (a public key
+/// parse is [`TransportError::InvalidPublicKey`]; a secret file names its path
+/// and refuses regeneration). Messages carry lengths and decoder positions only —
+/// never the decoded bytes.
 fn decode_key_base64(text: &str) -> Result<Zeroizing<[u8; 32]>, String> {
     // `decode_vec` fills a caller-provided buffer, so the decoder's output can be
     // a `Zeroizing` from the first byte rather than a `Vec` that is copied out
@@ -71,14 +67,17 @@ fn decode_key_base64(text: &str) -> Result<Zeroizing<[u8; 32]>, String> {
         .decode_vec(text.trim(), &mut decoded)
         .map_err(|e| format!("not valid base64: {e}"))?;
     let len = decoded.len();
-    // The conversion copies into a fixed array, which is then MOVED into the
-    // wiping wrapper, so the only unwiped lifetime is the freed `decoded`
-    // allocation — and that one is a `Zeroizing` too.
-    let key: [u8; 32] = decoded
-        .as_slice()
-        .try_into()
-        .map_err(|_| format!("decodes to {len} bytes, expected 32"))?;
-    Ok(Zeroizing::new(key))
+    if len != 32 {
+        return Err(format!("decodes to {len} bytes, expected 32"));
+    }
+    // Write the decoded bytes STRAIGHT into the wiping wrapper. Building a bare
+    // `[u8; 32]` first and moving it in would leave an un-wiped copy of this
+    // (possibly SECRET) value on the stack until the move, readable from freed
+    // stack memory. The length check above makes `copy_from_slice`'s equal-length
+    // requirement hold, so no transient bare array is ever formed.
+    let mut key = Zeroizing::new([0u8; 32]);
+    key.copy_from_slice(decoded.as_slice());
+    Ok(key)
 }
 
 /// Encode a secret key for on-disk storage: standard base64 plus a trailing
@@ -103,20 +102,21 @@ pub(super) fn encode_secret(sk: &[u8; 32]) -> Zeroizing<String> {
 /// one representation and it is always a wiping one.
 pub(super) fn decode_secret(bytes: &[u8]) -> Result<TransportSecretKey, String> {
     if bytes.len() == 32 {
-        // Exactly the raw form's length: convert rather than copy, so a
-        // mismatch is an error instead of a panic (it cannot happen — the
-        // length was just checked — but the no-panic policy should not rest on
-        // a reviewer noticing that).
-        let raw: [u8; 32] = <[u8; 32]>::try_from(bytes)
-            .map_err(|_| "32-byte raw key did not convert".to_string())?;
-        return Ok(TransportSecretKey::from(raw));
+        // Write the raw key straight into the wiping wrapper rather than building
+        // a bare `[u8; 32]` first: the intermediate array would hold an un-wiped
+        // copy of this SECRET on the stack until it was moved in. The length check
+        // makes `copy_from_slice`'s equal-length requirement hold, so no transient
+        // bare array is formed.
+        let mut raw = Zeroizing::new([0u8; 32]);
+        raw.copy_from_slice(bytes);
+        return Ok(TransportSecretKey(raw));
     }
     let len = bytes.len();
     let text = std::str::from_utf8(bytes).map_err(|_| {
         format!("{len} bytes of non-UTF-8 data, expected 32 raw bytes or base64 text")
     })?;
     let key = decode_key_base64(text).map_err(|detail| format!("{len}-byte file: {detail}"))?;
-    Ok(TransportSecretKey::from(*key))
+    Ok(TransportSecretKey(key))
 }
 
 #[cfg(test)]
@@ -179,6 +179,33 @@ mod tests {
             parse_pubkey_base64(&format!("{canonical}AAAA")).is_err(),
             "48 chars is more than 32 bytes"
         );
+    }
+
+    /// A pure parse failure surfaces as [`TransportError::InvalidPublicKey`], not
+    /// a misused `Io(InvalidData)` — the taxonomy carries its own variant, and
+    /// its detail names lengths/positions without ever echoing key bytes.
+    #[test]
+    fn parse_pubkey_base64_reports_an_invalid_public_key() {
+        let canonical = pubkey_base64(&[0xA5u8; 32]);
+        let grouped: String = canonical
+            .as_bytes()
+            .chunks(4)
+            .map(|c| String::from_utf8_lossy(c).into_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let oversized = format!("{canonical}AAAA");
+
+        for value in ["not base64!!", "AAAA", grouped.as_str(), oversized.as_str()] {
+            match parse_pubkey_base64(value) {
+                Err(TransportError::InvalidPublicKey(detail)) => {
+                    assert!(
+                        !detail.is_empty(),
+                        "the detail must explain the refusal: {value:?}"
+                    );
+                }
+                other => panic!("expected InvalidPublicKey for {value:?}, got {other:?}"),
+            }
+        }
     }
 
     /// The secret encoding is the same base64 plus the trailing newline the

@@ -139,6 +139,13 @@ impl NoiseStream {
     /// every variant not on the allowlist is still wiped. A decode failure is
     /// unknown content and is wiped too.
     ///
+    /// The wipe covers the raw frame buffer ONLY. Once `decode_frame` succeeds,
+    /// the decoded `DaemonMessage` owns its own `String`/`Vec` fields (a
+    /// credential's `String`, for instance), and those are dropped un-erased —
+    /// the exemption/wiping policy here says nothing about them. Closing that gap
+    /// would mean zeroizing the wire types themselves in `choreo-proto`, so the
+    /// decoded value's owned buffers are explicitly out of scope on this path.
+    ///
     /// # Errors
     ///
     /// Returns any error propagated by `recv_message_plain` or the
