@@ -15,6 +15,15 @@
 //! failure contracts: a load may never regenerate (see below), while a generate
 //! must never publish a partial file.
 //!
+//! # In memory
+//!
+//! The decoded secret lives only inside [`TransportSecretKey`], whose bytes are
+//! a [`zeroize::Zeroizing`] array, and every intermediate on the way there or
+//! back is a `Zeroizing` buffer too: the file's bytes, the base64 text of the
+//! secret, and the decoder's output are all wiped on drop. A key that is only
+//! erased in its final resting place is still readable from the freed buffers it
+//! passed through, so the wipe covers the whole path rather than the last copy.
+//!
 //! # On-disk secret key format
 //!
 //! The secret key is stored as **standard-alphabet base64**: exactly 44
@@ -77,7 +86,7 @@ mod load;
 
 use std::path::PathBuf;
 
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::error::TransportError;
 
@@ -121,33 +130,24 @@ pub fn set_test_config_root(root: Option<PathBuf>) {
 /// stack memory is a copy an attacker who can read this process's memory later
 /// can lift (or that a core dump preserves).
 ///
+/// The bytes live in a [`Zeroizing`] array rather than a plain one, so the wipe
+/// is the wrapper's drop rather than a hand-written one that a refactor could
+/// silently lose. The wrappers on the load and generate paths extend the same
+/// guarantee to the buffers the key passes through (see the module docs).
+///
 /// Deliberately **not `Copy`**. A `Copy` struct is duplicated byte-for-byte by
-/// implicit assignment, and those duplicates escape [`Drop`] — they would be
-/// zeroized nowhere, which defeats the point. A caller that genuinely needs a
-/// second owner makes an explicit `clone` whose lifetime is visible.
+/// implicit assignment, and those duplicates would escape the wipe entirely —
+/// they would be zeroized nowhere, which defeats the point. A caller that
+/// genuinely needs a second owner makes an explicit `clone` whose lifetime is
+/// visible.
 #[derive(Clone)]
-pub struct TransportSecretKey(pub(crate) [u8; 32]);
+pub struct TransportSecretKey(Zeroizing<[u8; 32]>);
 
 impl TransportSecretKey {
     /// Expose the inner bytes for use in handshake APIs.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
-    }
-}
-
-impl Zeroize for TransportSecretKey {
-    /// Overwrite the secret bytes with zeros.
-    fn zeroize(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-impl Drop for TransportSecretKey {
-    /// Zeroize on drop, so ownership ending really does erase the key rather
-    /// than merely returning its memory to the allocator.
-    fn drop(&mut self) {
-        self.zeroize();
     }
 }
 
@@ -158,8 +158,11 @@ impl std::fmt::Debug for TransportSecretKey {
 }
 
 impl From<[u8; 32]> for TransportSecretKey {
+    /// Take ownership of the bytes as-is: the array is MOVED into the
+    /// `Zeroizing` wrapper, so accepting it here leaves no second copy of the
+    /// secret on the caller's stack.
     fn from(bytes: [u8; 32]) -> Self {
-        TransportSecretKey(bytes)
+        TransportSecretKey(Zeroizing::new(bytes))
     }
 }
 
@@ -173,10 +176,13 @@ impl AsRef<[u8; 32]> for TransportSecretKey {
 ///
 /// This is the one place a loaded keypair's public half comes from, which is
 /// what makes "the secret and the public half disagree" unrepresentable: there
-/// is no second source to disagree with.
-fn keypair_from_secret(sk: [u8; 32]) -> (TransportSecretKey, [u8; 32]) {
-    let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(sk)).to_bytes();
-    (TransportSecretKey(sk), public)
+/// is no second source to disagree with. The secret is taken by value so the
+/// only copy that outlives this call is the one inside the returned
+/// [`TransportSecretKey`].
+fn keypair_from_secret(sk: TransportSecretKey) -> (TransportSecretKey, [u8; 32]) {
+    let public =
+        x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk.as_bytes())).to_bytes();
+    (sk, public)
 }
 
 /// Directory that holds the transport keypair files (`<config>/choreographr`).

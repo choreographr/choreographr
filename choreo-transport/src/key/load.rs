@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use tracing::debug;
+use zeroize::Zeroizing;
 
 use super::encoding::decode_secret;
 use super::{TransportSecretKey, keypair_from_secret, transport_sec_path};
@@ -24,9 +25,12 @@ use crate::error::TransportError;
 /// implementation behind both the lock-free fast path and the re-check under
 /// the advisory lock, so the two can never drift into accepting different
 /// things.
-pub(super) fn load_secret_key(path: &Path) -> Result<Option<[u8; 32]>, TransportError> {
+pub(super) fn load_secret_key(path: &Path) -> Result<Option<TransportSecretKey>, TransportError> {
+    // `Zeroizing`: the file's bytes may be the secret itself (the legacy raw
+    // form) or its base64 text, and either way the buffer must not be freed
+    // un-erased after the key has been decoded out of it.
     let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
+        Ok(bytes) => Zeroizing::new(bytes),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(TransportError::Io(e)),
     };

@@ -11,7 +11,9 @@
 //! a paste can silently mix.
 
 use base64::Engine as _;
+use zeroize::Zeroizing;
 
+use super::TransportSecretKey;
 use crate::error::TransportError;
 
 /// Encode a 32-byte key as standard-alphabet base64 (44 characters).
@@ -39,39 +41,55 @@ pub fn pubkey_base64(pk: &[u8; 32]) -> String {
 /// Returns [`TransportError::Io`] (with [`std::io::ErrorKind::InvalidData`])
 /// when the text is not valid base64 or does not decode to exactly 32 bytes.
 pub fn parse_pubkey_base64(text: &str) -> Result<[u8; 32], TransportError> {
-    decode_key_base64(text).map_err(|detail| {
+    let key = decode_key_base64(text).map_err(|detail| {
         TransportError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("invalid base64 key: {detail}"),
         ))
-    })
+    })?;
+    // A public key is not secret, so the copy out of the wiping wrapper is the
+    // caller's own array and needs no further care.
+    Ok(*key)
 }
 
 /// Decode standard-alphabet base64 key text into exactly 32 bytes.
 ///
 /// The single decode implementation behind both the public key parser and the
-/// secret-file loader. The failure is a message rather than an error type so
-/// each caller wraps it in the error its context calls for (a public key parse
-/// is a plain I/O-shaped error; a secret file names its path and refuses
-/// regeneration). Messages carry lengths and decoder positions only — never the
-/// decoded bytes.
-fn decode_key_base64(text: &str) -> Result<[u8; 32], String> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(text.trim())
+/// secret-file loader. The decoded bytes may be a SECRET (the loader's caller),
+/// so they are handed back inside a [`Zeroizing`] buffer and never exist as a
+/// bare array on this path; the intermediate `Vec` the decoder fills is wiped
+/// too. The failure is a message rather than an error type so each caller wraps
+/// it in the error its context calls for (a public key parse is a plain
+/// I/O-shaped error; a secret file names its path and refuses regeneration).
+/// Messages carry lengths and decoder positions only — never the decoded bytes.
+fn decode_key_base64(text: &str) -> Result<Zeroizing<[u8; 32]>, String> {
+    // `decode_vec` fills a caller-provided buffer, so the decoder's output can be
+    // a `Zeroizing` from the first byte rather than a `Vec` that is copied out
+    // and dropped unwiped.
+    let mut decoded = Zeroizing::new(Vec::new());
+    base64::engine::general_purpose::STANDARD
+        .decode_vec(text.trim(), &mut decoded)
         .map_err(|e| format!("not valid base64: {e}"))?;
     let len = decoded.len();
+    // The conversion copies into a fixed array, which is then MOVED into the
+    // wiping wrapper, so the only unwiped lifetime is the freed `decoded`
+    // allocation — and that one is a `Zeroizing` too.
     let key: [u8; 32] = decoded
+        .as_slice()
         .try_into()
         .map_err(|_| format!("decodes to {len} bytes, expected 32"))?;
-    Ok(key)
+    Ok(Zeroizing::new(key))
 }
 
 /// Encode a secret key for on-disk storage: standard base64 plus a trailing
 /// newline, so the file is a well-formed text file (the loader trims it).
-pub(super) fn encode_secret(sk: &[u8; 32]) -> String {
+///
+/// The result is [`Zeroizing`] because base64 of a secret IS the secret: a plain
+/// `String` would be freed un-erased the moment the write returned.
+pub(super) fn encode_secret(sk: &[u8; 32]) -> Zeroizing<String> {
     let mut text = base64::engine::general_purpose::STANDARD.encode(sk);
     text.push('\n');
-    text
+    Zeroizing::new(text)
 }
 
 /// Decode secret key file contents as either the legacy raw 32-byte form or the
@@ -80,20 +98,25 @@ pub(super) fn encode_secret(sk: &[u8; 32]) -> String {
 /// A file of exactly 32 bytes IS the legacy raw key. The base64 form is 44
 /// characters plus a newline (45 bytes), and a 32-character base64 string would
 /// decode to 24 bytes — so the raw length can never be mistaken for text.
-pub(super) fn decode_secret(bytes: &[u8]) -> Result<[u8; 32], String> {
+///
+/// Returns the [`TransportSecretKey`] itself, so the decoded secret has exactly
+/// one representation and it is always a wiping one.
+pub(super) fn decode_secret(bytes: &[u8]) -> Result<TransportSecretKey, String> {
     if bytes.len() == 32 {
         // Exactly the raw form's length: convert rather than copy, so a
         // mismatch is an error instead of a panic (it cannot happen — the
         // length was just checked — but the no-panic policy should not rest on
         // a reviewer noticing that).
-        return <[u8; 32]>::try_from(bytes)
-            .map_err(|_| "32-byte raw key did not convert".to_string());
+        let raw: [u8; 32] = <[u8; 32]>::try_from(bytes)
+            .map_err(|_| "32-byte raw key did not convert".to_string())?;
+        return Ok(TransportSecretKey::from(raw));
     }
     let len = bytes.len();
     let text = std::str::from_utf8(bytes).map_err(|_| {
         format!("{len} bytes of non-UTF-8 data, expected 32 raw bytes or base64 text")
     })?;
-    decode_key_base64(text).map_err(|detail| format!("{len}-byte file: {detail}"))
+    let key = decode_key_base64(text).map_err(|detail| format!("{len}-byte file: {detail}"))?;
+    Ok(TransportSecretKey::from(*key))
 }
 
 #[cfg(test)]
@@ -168,11 +191,16 @@ mod tests {
         let encoded = encode_secret(&sk);
         assert_eq!(encoded.len(), 45, "44 base64 chars plus one newline");
         assert_eq!(encoded.as_bytes().last(), Some(&b'\n'));
-        assert_eq!(decode_secret(encoded.as_bytes()).expect("decode"), sk);
+        assert_eq!(
+            decode_secret(encoded.as_bytes())
+                .expect("decode")
+                .as_bytes(),
+            &sk
+        );
 
         // The legacy raw form: exactly 32 bytes IS the key, not text that
         // happens to be 32 bytes long.
-        assert_eq!(decode_secret(&sk).expect("decode raw"), sk);
+        assert_eq!(decode_secret(&sk).expect("decode raw").as_bytes(), &sk);
 
         // Content that decodes to neither form is refused, with the length in
         // the message (never the bytes).

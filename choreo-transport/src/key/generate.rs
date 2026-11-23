@@ -14,10 +14,17 @@ use super::{TransportSecretKey, keypair_from_secret, transport_sec_path};
 use crate::error::TransportError;
 
 /// Generate a new X25519 keypair for the Noise transport.
-fn generate_keypair() -> ([u8; 32], [u8; 32]) {
+///
+/// The secret is returned already wrapped, so no bare `[u8; 32]` copy of it
+/// exists outside the wiping type: `StaticSecret` itself zeroizes on drop, and
+/// its byte form is moved straight into the wrapper.
+fn generate_keypair() -> (TransportSecretKey, [u8; 32]) {
     let secret = x25519_dalek::StaticSecret::random_from_rng(&mut rand::rng());
     let public = x25519_dalek::PublicKey::from(&secret);
-    (secret.to_bytes(), public.to_bytes())
+    (
+        TransportSecretKey::from(secret.to_bytes()),
+        public.to_bytes(),
+    )
 }
 
 /// Ensure that a Noise transport keypair exists at the standard path
@@ -84,13 +91,16 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
         // The secret is the whole on-disk identity: the public half is derived
         // from it on every load, so no second file is written to disagree with
         // it (and no crash can leave one half behind the other).
-        let encoded = encode_secret(&secret);
+        //
+        // `encode_secret` returns a wiping buffer: base64 of a secret is the
+        // secret, so the text must not outlive the write un-erased.
+        let encoded = encode_secret(secret.as_bytes());
         choreo_shared::atomic_write::write_private_atomic(&sec_path, encoded.as_bytes())?;
         info!(
             "generated and wrote new Noise transport keypair to {}",
             sec_path.display()
         );
-        Ok((TransportSecretKey(secret), public))
+        Ok((secret, public))
     })();
 
     let unlock_result = sec_file.unlock();
