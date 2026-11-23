@@ -5,7 +5,6 @@
 use std::io::{self, Read};
 use std::net::TcpStream;
 
-use choreo_proto::MAX_FRAME_SIZE;
 use tracing::{debug, trace};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -90,7 +89,12 @@ impl NoiseStream {
     /// per-frame or per-message cap or a continuation-header violation, and I/O
     /// or snow errors otherwise.
     pub(super) fn recv_message_plain(&mut self) -> Result<Vec<u8>, TransportError> {
-        let mut plaintext = Zeroizing::new(Vec::new());
+        // The inbound single-reader right: two concurrent receives on one
+        // connection would splice two logical messages together with no error
+        // at all, so the slot turns that misuse into a protocol error — the
+        // mirror of what `send_message` takes for the outbound direction.
+        let _guard = self.recv_slot.acquire()?;
+        let mut assembly = frame::Reassembly::new();
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
             // lock: snow tracks separate send and recv nonce counters, so an
@@ -107,15 +111,12 @@ impl NoiseStream {
             // `frame::decode_len`).
             let ct_len = decode_len(&len_buf)?;
             // Cumulative cap during reassembly: the codec's MAX_FRAME_SIZE is
-            // the effective per-message limit, and enforcing it HERE rather
-            // than after reassembly in decode_frame bounds memory for an
-            // endless stream of continuation-marked fragments, each of which is
-            // individually legal. See `frame::reassembly_exceeds_cap`.
-            if frame::reassembly_exceeds_cap(plaintext.len(), ct_len) {
-                return Err(TransportError::InvalidFragment(format!(
-                    "reassembled message exceeds the {MAX_FRAME_SIZE}-byte limit"
-                )));
-            }
+            // the effective per-message limit, and enforcing it HERE — before
+            // this frame's body is read or the buffer grows — bounds memory for
+            // an endless stream of continuation-marked fragments, each of which
+            // is individually legal. `accept_frame` mints the token `extend`
+            // requires, so a fragment can never be appended unchecked.
+            let accepted = assembly.accept_frame(ct_len)?;
             // Reuse the per-stream ciphertext buffer: `resize` only adjusts
             // the length (growing if this fragment is the largest seen), so
             // capacity carries across messages — no per-fragment allocation.
@@ -147,11 +148,14 @@ impl NoiseStream {
             let more = (*at(&self.recv_pt_buf, 0, "recv_pt_buf continuation header")?
                 & FRAGMENT_CONTINUATION)
                 != 0;
-            plaintext.extend_from_slice(slice(
-                &self.recv_pt_buf,
-                FRAGMENT_HEADER_LEN..n,
-                "recv_pt_buf payload",
-            )?);
+            assembly.extend(
+                accepted,
+                slice(
+                    &self.recv_pt_buf,
+                    FRAGMENT_HEADER_LEN..n,
+                    "recv_pt_buf payload",
+                )?,
+            );
             // Wipe the decrypted fragment now that its payload has been copied
             // out: the reusable buffer would otherwise hold the last received
             // message's plaintext until the next fragment overwrites it, which
@@ -161,13 +165,14 @@ impl NoiseStream {
             slice_mut(&mut self.recv_pt_buf, ..n, "recv_pt_buf plaintext")?.zeroize();
 
             if !more {
-                trace!(message_len = plaintext.len(), "received Noise message");
                 // Move the buffer out un-wiped: the caller chooses whether to
                 // clear it (`recv_message` wraps it in `Zeroizing`; the typed
                 // path clears it only for a secret-bearing variant). The
-                // `Zeroizing` guard is left holding an empty `Vec`, so its drop
-                // zeroizes nothing.
-                return Ok(std::mem::take(&mut *plaintext));
+                // `Zeroizing` guard the assembly used is left holding an empty
+                // `Vec`, so its drop zeroizes nothing.
+                let plaintext = assembly.into_plaintext();
+                trace!(message_len = plaintext.len(), "received Noise message");
+                return Ok(plaintext);
             }
         }
     }

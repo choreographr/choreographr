@@ -156,7 +156,8 @@ where
 /// WHOLE handshake, preamble read included (see `HANDSHAKE_TIMEOUT`; a budget
 /// beyond one day is clamped). Same absolute-deadline plumbing as the IK
 /// responder — every read AND write is bounded by the time remaining until the
-/// deadline.
+/// deadline. A caller that needs a shorter (or longer) bound than the default
+/// passes it here; the budget is a hard ceiling, never a hint.
 ///
 /// # Errors
 ///

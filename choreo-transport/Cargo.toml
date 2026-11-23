@@ -20,8 +20,9 @@ rand.workspace = true
 # Zeroize the reusable plaintext staging buffer after each send, so a sent
 # message's plaintext does not linger in the reused buffer until the next send.
 zeroize.workspace = true
-# Fingerprint rendering of transport public keys (base64, standard alphabet —
-# the same encoding the daemon's ACL uses for pubkeys, so one convention).
+# The crate's one textual key form: standard-alphabet base64 of a 32-byte key,
+# shared by the public key an ACL entry enrolls, the `known_servers.toml` pin and
+# the on-disk secret.
 base64.workspace = true
 
 [dev-dependencies]
@@ -30,7 +31,7 @@ serial_test.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 # Used only to shrink the test sockets' kernel send/recv buffers (SO_SNDBUF /
-# SO_RCVBUF) in noise_integration.rs — TcpStream has no stable API for these.
+# SO_RCVBUF) in tests/it/common.rs — TcpStream has no stable API for these.
 # nix's default features are empty, so opt into the socket feature explicitly.
 nix = { workspace = true, features = ["socket"] }
 

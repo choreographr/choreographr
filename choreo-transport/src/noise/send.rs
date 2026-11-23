@@ -1,15 +1,13 @@
 //! The data plane's send direction: fragmenting, encrypting and framing an
-//! outbound message, plus the single-writer slot that keeps two senders from
-//! interleaving on one stream.
+//! outbound message.
 //!
 //! Every write goes through one place — [`NoiseStream::write_frame`] — so the
 //! continuation header, the brief `TransportState` lock, the length prefix and
 //! the coalesced `write_all` exist exactly once, whether the message is empty,
-//! a single fragment, or many.
+//! a single fragment, or many. The single-writer right itself lives in
+//! [`super::slot`], shared with the read direction.
 
 use std::io::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use choreo_proto::MAX_FRAME_SIZE;
 use tracing::trace;
@@ -22,62 +20,6 @@ use super::frame::{
 };
 use crate::buf::{at_mut, slice, slice_mut};
 use crate::error::TransportError;
-
-/// The stream's single-writer slot, shared across every `try_clone` handle of
-/// one connection.
-///
-/// Fragments of one logical message must never interleave with another
-/// message's on the wire, which holds only while exactly one thread sends per
-/// stream. The daemon and the client give each connection ONE writer thread, so
-/// this is a structural invariant — the slot turns a future violation into a
-/// loud protocol error instead of silent corruption.
-pub(super) struct SendSlot(Arc<AtomicBool>);
-
-impl SendSlot {
-    /// A free (unheld) slot.
-    pub(super) fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
-    }
-
-    /// Claim the slot for one send, or fail if another send already holds it.
-    ///
-    /// The returned [`SendGuard`] releases the slot on every exit path,
-    /// including an early `?` — without that, a sender that errored mid-message
-    /// would leave the flag set and wedge the stream.
-    pub(super) fn acquire(&self) -> Result<SendGuard, TransportError> {
-        // Relaxed is sufficient here and in the guard: the flag publishes no
-        // data (the `TransportState` mutex provides its own ordering for the
-        // cipher state, and socket bytes are kernel-buffered), so exclusion
-        // needs only the atomic coherence of the flag itself — a concurrent
-        // `swap(true)` sees either `false` (the previous holder's drop already
-        // happened) or `true` (still in flight), never both, so exactly one
-        // sender proceeds at a time.
-        if self.0.swap(true, Ordering::Relaxed) {
-            return Err(TransportError::InvalidFragment(
-                "concurrent send_message on one NoiseStream".to_string(),
-            ));
-        }
-        Ok(SendGuard(Arc::clone(&self.0)))
-    }
-}
-
-impl Clone for SendSlot {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
-}
-
-/// Holds a [`SendSlot`] for the duration of one send and frees it on drop.
-///
-/// It owns its own `Arc` clone rather than borrowing the field, so it does not
-/// hold a borrow of the stream across the send body.
-pub(super) struct SendGuard(Arc<AtomicBool>);
-
-impl Drop for SendGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Relaxed);
-    }
-}
 
 impl NoiseStream {
     /// Send an encrypted message.
@@ -247,50 +189,5 @@ impl NoiseStream {
             "send_buf frame",
         )?)?;
         Ok(staged)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The single-writer slot is exclusive while a send holds it and free again
-    /// the moment the guard drops — the invariant that keeps two senders from
-    /// interleaving fragments. Pure state, no socket, no thread, no timer.
-    #[test]
-    fn send_slot_is_exclusive_until_the_guard_drops() {
-        let slot = SendSlot::new();
-
-        let first = slot.acquire().expect("a free slot must be claimable");
-        assert!(
-            slot.acquire().is_err(),
-            "a second sender must be refused while the first holds the slot"
-        );
-
-        // Dropping the guard frees the slot, so the stream is usable again
-        // after a completed (or failed) send.
-        drop(first);
-        let second = slot
-            .acquire()
-            .expect("the slot must be free after the drop");
-        drop(second);
-        slot.acquire().expect("and free again after a second drop");
-    }
-
-    /// Clones share one slot: a `try_clone` handle is the same connection, so
-    /// two clones must contend for the same single-writer right rather than
-    /// each getting its own.
-    #[test]
-    fn cloned_slots_share_one_writer_right() {
-        let slot = SendSlot::new();
-        let clone = slot.clone();
-
-        let held = slot.acquire().expect("claim on the original");
-        assert!(
-            clone.acquire().is_err(),
-            "a clone must see the original's claim"
-        );
-        drop(held);
-        clone.acquire().expect("the clone must see the release");
     }
 }

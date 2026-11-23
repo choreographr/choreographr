@@ -55,8 +55,8 @@ pub fn handshake_initiator(
 /// [`handshake_initiator`] with an explicit total-duration budget for the
 /// WHOLE handshake, preamble write included (see `HANDSHAKE_TIMEOUT` for why the
 /// budget is absolute, not per-read; a budget beyond one day is clamped).
-/// Exposed so integration tests can exercise the timeout path in milliseconds
-/// instead of waiting out the 10 s default.
+/// A caller that needs a shorter (or longer) bound than the default passes it
+/// here; the budget is a hard ceiling on the whole exchange, never a hint.
 ///
 /// # Errors
 ///
@@ -135,8 +135,9 @@ where
 
 /// [`handshake_responder`] with an explicit total-duration budget for the WHOLE
 /// handshake, preamble read included (see `HANDSHAKE_TIMEOUT`; a budget beyond
-/// one day is clamped). Exposed so integration tests can exercise the timeout
-/// path in milliseconds instead of waiting out the 10 s default.
+/// one day is clamped). A caller that needs a shorter (or longer) bound than the
+/// default passes it here; the budget is a hard ceiling on the whole exchange,
+/// never a hint.
 ///
 /// # Errors
 ///

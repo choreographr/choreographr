@@ -104,7 +104,7 @@ const MAX_HANDSHAKE_BUDGET: Duration = Duration::from_hours(24);
 /// Which half of a handshake a flow is running. Carried only for the
 /// completion log line, so one shared `finish` can report both sides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Role {
+pub(crate) enum Role {
     /// The dialing side, which writes the mode preamble first.
     Initiator,
     /// The accepting side, which reads the mode preamble first.
@@ -137,7 +137,7 @@ pub(super) fn deadline_from(timeout: Duration) -> Instant {
 /// * `remote_pk` — the peer's static key, for the flows that know it up front
 ///   (IK's initiator). `None` for XX (whose point is learning it) and for every
 ///   responder.
-pub(super) fn build(
+pub(crate) fn build(
     mode: HandshakeMode,
     static_sk: &[u8; 32],
     remote_pk: Option<&[u8; 32]>,
@@ -341,9 +341,10 @@ where
 }
 
 /// [`handshake_responder_auto`] with an explicit total-duration budget for the
-/// whole unauthenticated phase (preamble read plus handshake). Exposed so
-/// integration tests can exercise the timeout path in milliseconds instead of
-/// waiting out the 10 s default; a budget beyond one day is clamped.
+/// whole unauthenticated phase (preamble read plus handshake). A caller that
+/// needs a shorter (or longer) bound than the default passes it here; the budget
+/// is a hard ceiling on the whole exchange, never a hint, and one beyond one day
+/// is clamped.
 ///
 /// # Errors
 ///

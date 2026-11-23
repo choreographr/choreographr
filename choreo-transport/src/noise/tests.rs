@@ -1,10 +1,59 @@
-//! Tests for the encrypted stream: the post-decode wipe allowlist and the
-//! cipher's own authentication.
+//! Tests for the encrypted stream: the per-direction single-actor slots, the
+//! post-decode wipe allowlist, and the cipher's own authentication.
 //!
-//! Both are in-memory — no sockets, no threads, no timers.
+//! All in-memory — no sockets, no threads, no timers.
 
-use snow::Builder;
 use x25519_dalek::{PublicKey, StaticSecret};
+
+use super::slot::SingleSlot;
+
+/// A slot is exclusive while a call holds it and free again the moment the
+/// guard drops — the invariant that keeps two senders (or two readers) from
+/// interleaving fragments. Pure state, no socket, no thread, no timer.
+#[test]
+fn a_slot_is_exclusive_until_the_guard_drops() {
+    let slot = SingleSlot::new("send_message");
+
+    let first = slot.acquire().expect("a free slot must be claimable");
+    let refusal = slot.acquire();
+    let Err(err) = refusal else {
+        panic!("a second caller must be refused while the first holds the slot");
+    };
+    assert!(
+        err.to_string().contains("concurrent send_message"),
+        "the refusal must name the entry point it guards: {err}"
+    );
+
+    // Dropping the guard frees the slot, so the stream is usable again after a
+    // completed (or failed) call.
+    drop(first);
+    let second = slot
+        .acquire()
+        .expect("the slot must be free after the drop");
+    drop(second);
+    slot.acquire().expect("and free again after a second drop");
+}
+
+/// Clones share one slot: a `try_clone` handle is the same connection, so two
+/// clones must contend for the same single-actor right rather than each getting
+/// its own. Both directions behave identically — the message differs only in the
+/// entry point it names.
+#[test]
+fn cloned_slots_share_one_right_per_direction() {
+    for what in ["send_message", "recv_message"] {
+        let slot = SingleSlot::new(what);
+        let clone = slot.clone();
+
+        let held = slot.acquire().expect("claim on the original");
+        let refused = clone.acquire();
+        let Err(err) = refused else {
+            panic!("a clone must see the original's claim");
+        };
+        assert!(err.to_string().contains(what), "the refusal names {what}");
+        drop(held);
+        clone.acquire().expect("the clone must see the release");
+    }
+}
 
 /// The wipe exemption is a fail-safe allowlist: `Image` (raw attachment
 /// bytes) is the only variant that skips the wipe, while a credential-bearing
@@ -47,39 +96,23 @@ fn only_image_is_exempt_from_the_post_decode_wipe() {
 /// ciphertext itself, not just the tag.
 #[test]
 fn transport_state_rejects_tampered_ciphertext() {
+    use crate::handshake::{HandshakeMode, Role, build};
+
     let client_secret = StaticSecret::random_from_rng(&mut rand::rng());
     let server_secret = StaticSecret::random_from_rng(&mut rand::rng());
     let client_sk = client_secret.to_bytes();
     let server_sk = server_secret.to_bytes();
     let server_pk = PublicKey::from(&server_secret).to_bytes();
 
-    // Mirror the production handshake (handshake_initiator /
-    // handshake_responder) exactly: same pattern string, same key roles
-    // (client = initiator with server's public key, server = responder),
-    // and the same prologue both sides of an IK handshake derive from
-    // HandshakeMode::Ik — the prologue feeds the handshake hash the
-    // transport keys come from, so omitting it would derive states a
-    // production peer could not interop with.
-    let mode = crate::handshake::HandshakeMode::Ik;
-    let prologue = mode.prologue();
-    // The pattern comes from the mode, never a copy: a hand-typed string
-    // here would keep validating a pattern production no longer uses.
-    let mut initiator = Builder::new(mode.pattern().parse().unwrap())
-        .local_private_key(&client_sk)
-        .unwrap()
-        .remote_public_key(&server_pk)
-        .unwrap()
-        .prologue(&prologue)
-        .unwrap()
-        .build_initiator()
-        .unwrap();
-    let mut responder = Builder::new(mode.pattern().parse().unwrap())
-        .local_private_key(&server_sk)
-        .unwrap()
-        .prologue(&prologue)
-        .unwrap()
-        .build_responder()
-        .unwrap();
+    // Build BOTH halves through the production constructor: same pattern, same
+    // key roles (client = initiator, which knows the server's public key;
+    // server = responder) and the same prologue the mode derives. The prologue
+    // feeds the handshake hash the transport keys come from, so a hand-rolled
+    // builder here could derive states a production peer cannot interop with
+    // while still passing this test.
+    let mode = HandshakeMode::Ik;
+    let mut initiator = build(mode, &client_sk, Some(&server_pk), Role::Initiator).expect("build");
+    let mut responder = build(mode, &server_sk, None, Role::Responder).expect("build");
 
     // Message 1: initiator -> responder (ephemeral key + encrypted
     // static key). The plaintext is empty; the point is just to run the
