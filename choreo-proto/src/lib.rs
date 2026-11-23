@@ -15,7 +15,7 @@ mod types;
 pub use error::ProtoError;
 pub use frame::{MAX_FRAME_SIZE, PROTOCOL_VERSION, decode_frame, encode_frame, encode_payload};
 pub use io::{
-    CONNECTION_STALL, SOCKET_PATH_ENV, TimedRead, TimedWrite, UnixStream, WRITER_MAX_BUDGET,
+    CONNECTION_STALL, SOCKET_PATH_ENV, TimedRead, TimedWrite, UnixStream,
     WRITER_MIN_RATE_BYTES_PER_SEC, connect_unix, default_socket_path, dial_error_means_no_listener,
     message_budget, read_exact_by, read_exact_with_stall, read_message, read_payload,
     socket_listening, socket_path, write_all_by, write_all_with_stall, write_message,

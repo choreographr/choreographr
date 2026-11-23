@@ -87,7 +87,8 @@ fn write_stall_elapsed(pending: usize) -> std::io::Error {
 //   accepts nothing for this long has stopped reading, so the write fails and the
 //   connection tears down.
 // - [`message_budget`] is the whole-message **total** budget, scaled by the
-//   message's size so a large frame on a slow-but-alive link still finishes.
+//   message's size so a large frame on a slow-but-alive link still finishes. It has
+//   no ceiling: the floor rate below is what bounds how slow a link may be.
 
 /// How long a socket syscall may wait for progress before the peer is treated as
 /// wedged.
@@ -114,30 +115,26 @@ pub const CONNECTION_STALL: Duration = Duration::from_secs(5);
 /// one fixed number that would false-kill a large legitimate frame.
 pub const WRITER_MIN_RATE_BYTES_PER_SEC: u64 = 8 * 1024;
 
-/// Ceiling on the per-message budget, so a single large frame cannot make the
-/// connection's own teardown wait for the full rate-derived time.
+/// The absolute budget for writing one message of `wire_len` bytes: the message's
+/// own size divided by the floor rate, floored at [`CONNECTION_STALL`] and
+/// **never capped**.
 ///
-/// Without a cap, a 64 MiB frame at [`WRITER_MIN_RATE_BYTES_PER_SEC`] implies
-/// ~8192 s, letting a peer that accepts only a handful of bytes per second keep
-/// the writer — and the `join()` that tears it down after the reader ends —
-/// alive for hours. The cap bounds that worst case to a couple of minutes: a
-/// frame that cannot finish within this window is a peer the connection is
-/// better off abandoning. Raising it tolerates slower links at the cost of a
-/// slower worst-case teardown.
-pub const WRITER_MAX_BUDGET: Duration = Duration::from_secs(120);
-
-/// The absolute budget for writing one message of `wire_len` bytes: never less
-/// than [`CONNECTION_STALL`], the message's own size divided by the floor rate, and
-/// never more than [`WRITER_MAX_BUDGET`].
+/// The size-scaled part is what lets a large frame finish on a link that is merely
+/// slow. The [`CONNECTION_STALL`] floor is a jitter allowance, not a throughput
+/// bound: a small message on a link that is slow but alive still completes each
+/// syscall promptly, and the floor is what absorbs a retransmit or a scheduling gap
+/// without failing the write. A silent peer is caught by the stall instead,
+/// regardless of size.
 ///
-/// Both halves are needed. The size-scaled part is what lets a large frame
-/// finish on a link that is merely slow; the [`CONNECTION_STALL`] floor is what
-/// keeps a silent peer's detection latency at five seconds regardless of size,
-/// since a size-scaled budget for a multi-megabyte frame would otherwise be
-/// minutes of waiting on a peer that will never read a byte. The
-/// [`WRITER_MAX_BUDGET`] ceiling bounds the other end: a peer that is alive but
-/// glacially slow cannot stretch one write, and therefore the connection's
-/// teardown, past it.
+/// There is deliberately no upper bound. A time ceiling and "support the slowest
+/// link we accept for the largest message we can send" are contradictory: 64 MiB at
+/// [`WRITER_MIN_RATE_BYTES_PER_SEC`] legitimately takes 8192 s, so a ceiling below
+/// that silently re-imposes a much higher minimum link speed (a 120 s cap demands
+/// ~4.4 Mbps for the same frame) and a ceiling above it never fires. The bound a
+/// peer is actually held to is the floor rate; one that cannot sustain it trips the
+/// per-syscall stall instead. The cost is that a large transfer on an absurdly slow
+/// link can hold its writer, and its socket, for hours — which the connection's
+/// teardown tolerates by detaching the writer rather than joining it unboundedly.
 ///
 /// Integer arithmetic throughout, with saturating operations: a 64 MiB frame
 /// must not overflow the millisecond computation, and no input may panic.
@@ -152,9 +149,7 @@ pub fn message_budget(wire_len: usize) -> Duration {
     let millis = bytes
         .saturating_mul(1000)
         .saturating_div(WRITER_MIN_RATE_BYTES_PER_SEC);
-    Duration::from_millis(millis)
-        .max(CONNECTION_STALL)
-        .min(WRITER_MAX_BUDGET)
+    Duration::from_millis(millis).max(CONNECTION_STALL)
 }
 
 /// Write all of `data`, with the whole write bounded by `deadline`.
@@ -339,8 +334,8 @@ fn write_bounded<W: TimedWrite>(
 #[cfg(test)]
 mod tests {
     use super::{
-        CONNECTION_STALL, TimedWrite, WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC,
-        message_budget, write_all_by, write_all_with_stall,
+        CONNECTION_STALL, TimedWrite, WRITER_MIN_RATE_BYTES_PER_SEC, message_budget, write_all_by,
+        write_all_with_stall,
     };
     use std::cell::RefCell;
     use std::io::{self, Write};
@@ -696,13 +691,24 @@ mod tests {
     }
 
     /// A 64 MiB frame — the codec's maximum — must not overflow the millisecond
-    /// computation, and its rate-derived budget (~8192 s) is clamped to the
-    /// [`WRITER_MAX_BUDGET`] ceiling so it cannot stall the connection's
-    /// teardown.
+    /// computation, and gets the full rate-derived budget rather than a clamped
+    /// one: supporting the largest message on the slowest link we accept is exactly
+    /// what the floor rate means, so there is no ceiling to hit.
     #[test]
-    fn a_64_mib_frame_is_clamped_to_the_max_budget() {
+    fn a_64_mib_frame_gets_the_full_rate_derived_budget() {
         let wire_len = 64 * 1024 * 1024;
-        assert_eq!(message_budget(wire_len), WRITER_MAX_BUDGET);
-        assert!(message_budget(wire_len) > CONNECTION_STALL);
+        let expected = Duration::from_millis(
+            u64::try_from(wire_len).expect("fits u64") * 1000 / WRITER_MIN_RATE_BYTES_PER_SEC,
+        );
+        assert_eq!(
+            expected,
+            Duration::from_secs(8192),
+            "64 MiB at the 8 KiB/s floor is 2.3 hours"
+        );
+        assert_eq!(message_budget(wire_len), expected);
+        assert!(
+            message_budget(wire_len) > CONNECTION_STALL,
+            "a large frame's budget must dominate the jitter floor"
+        );
     }
 }

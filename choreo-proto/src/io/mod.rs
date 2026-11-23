@@ -29,8 +29,8 @@ pub use path::{
 };
 pub use read::{TimedRead, read_exact_by, read_exact_with_stall};
 pub use write::{
-    CONNECTION_STALL, TimedWrite, WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, message_budget,
-    write_all_by, write_all_with_stall,
+    CONNECTION_STALL, TimedWrite, WRITER_MIN_RATE_BYTES_PER_SEC, message_budget, write_all_by,
+    write_all_with_stall,
 };
 
 // Re-exported for the crate's own tests, which drive the env-override seam
