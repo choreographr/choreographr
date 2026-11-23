@@ -180,12 +180,14 @@ impl AsRef<[u8; 32]> for TransportSecretKey {
 /// only copy that outlives this call is the one inside the returned
 /// [`TransportSecretKey`].
 fn keypair_from_secret(sk: TransportSecretKey) -> (TransportSecretKey, [u8; 32]) {
-    // The deref below is the one transient copy of the secret this API forces:
-    // `StaticSecret::from` takes a `[u8; 32]` by value and offers no slice
-    // constructor. It is still wiped — the copied array is moved into the
-    // `StaticSecret`, whose `Drop` zeroizes it, and `zeroize` is an explicit
-    // feature of this workspace's `x25519-dalek` dependency, so a future
-    // `default-features = false` cannot silently drop that wipe.
+    // The deref below forces the one transient copy of the secret this API
+    // cannot avoid: `StaticSecret::from` takes a `[u8; 32]` by value and offers
+    // no slice constructor. The value that is MOVED INTO the `StaticSecret` is
+    // wiped by its `Drop` (see the `zeroize` feature pinned in the workspace
+    // `x25519-dalek` dependency). A register/stack copy the compiler happens to
+    // make while passing the argument by value cannot be proven gone — that is a
+    // limit of the crate's API, not a choice here — so this is "the one copy we
+    // cannot prove wiped", not "no copy survives".
     let public =
         x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk.as_bytes())).to_bytes();
     (sk, public)

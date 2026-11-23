@@ -162,6 +162,12 @@ impl NoiseStream {
             // is the receive-side counterpart of the `send_frag` wipe (a
             // received frame may carry a credential). Only the decrypted extent
             // is wiped, so the buffer keeps its length for the next fragment.
+            //
+            // `..n` is the complete secret extent, not a shortcut: `read_message`
+            // writes only the `n` decrypted bytes at the front, so `recv_pt_buf[n..]`
+            // is never plaintext — it is zero from the `resize` that grew the
+            // buffer, or was zeroed by an earlier fragment's wipe. A wider wipe
+            // would only memset zeros.
             slice_mut(&mut self.recv_pt_buf, ..n, "recv_pt_buf plaintext")?.zeroize();
 
             if !more {

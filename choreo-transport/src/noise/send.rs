@@ -141,6 +141,15 @@ impl NoiseStream {
             // leaves the buffer at full length for the next call. The
             // `Zeroizing` payload a typed caller holds is wiped independently
             // on its own drop.
+            //
+            // This cannot leave a PRIOR message's residue: `used` is the
+            // furthest byte ANY fragment of THIS message staged (every fragment
+            // stages from the front), so every byte this call wrote is inside
+            // `..used`, and every earlier call zeroed its own, possibly larger,
+            // extent. A smaller message after a bigger one therefore wipes its
+            // own prefix over already-zero bytes — nothing stale survives beyond
+            // it. Do not widen this to the whole allocation on the suspicion that
+            // residue remains; there is none to wipe.
             Ok(used) => {
                 if let Some(written) = self.send_frag.get_mut(..used) {
                     written.zeroize();

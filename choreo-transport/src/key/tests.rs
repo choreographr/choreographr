@@ -2,10 +2,11 @@
 //! format and its dual read, permissions, and the race the advisory lock
 //! closes.
 //!
-//! These mutate the thread-local `TEST_CONFIG_ROOT` seam, so they are
-//! `#[serial]`-marked for libtest (which runs them as threads in one process);
-//! each also restores the seam before returning so a sibling test cannot inherit
-//! a temp root.
+//! These drive the thread-local `TEST_CONFIG_ROOT` seam. That seam is
+//! thread-local, so parallel libtest threads already keep separate overrides and
+//! cannot clobber each other; the `#[serial]` marker is kept only as
+//! belt-and-braces for a run that executes them on one thread, and each test
+//! restores the seam before returning.
 
 use super::encoding::encode_secret;
 use super::*;
@@ -25,10 +26,10 @@ fn derived_public(sk: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk)).to_bytes()
 }
 
-// These tests mutate the shared test-config-root override.
-// Running them in parallel would clobber each other's temp dir
-// mid-flight (one test's restore racing the other's setup), so they are
-// serialized with `#[serial]` to keep them deterministic.
+// The `#[serial]` marker serializes these for libtest. The seam itself is
+// thread-local, so separate test threads would not clobber each other even
+// unmarked; serializing is a cheap safeguard against a run that executes them on
+// one thread, where an unrestored seam WOULD leak into a sibling test's tempdir.
 #[test]
 #[serial]
 fn ensure_transport_keypair_generates_and_loads() {

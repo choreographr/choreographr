@@ -184,6 +184,12 @@ impl Reassembly {
 
     /// Append an accepted fragment's decrypted payload.
     pub(super) fn extend(&mut self, _frame: AcceptedFrame, payload: &[u8]) {
+        // `extend_from_slice` already reserves with amortized growth (`reserve`),
+        // so an explicit `reserve` here would buy nothing — it would reserve the
+        // same amount and reallocate the same number of times. Only an up-front
+        // size guess could help, and the message's total size is unknown until
+        // the continuation byte clears; reserving `cap` (64 MiB) up front would
+        // just waste memory on the common small message. So do not add a reserve.
         self.plaintext.extend_from_slice(payload);
     }
 
