@@ -42,7 +42,6 @@ mod lookup;
 mod modelsdev;
 mod oauth;
 mod overlay;
-mod persist;
 pub mod refresh;
 
 pub use entry::{
@@ -60,7 +59,6 @@ pub use lookup::{
 pub use modelsdev::normalize_modelsdev;
 pub use oauth::oauth_provider_descriptors;
 pub use overlay::merge_overlay;
-pub use persist::write_file_atomic;
 pub use refresh::{RefreshError, RefreshOutcome, fetch_modelsdev};
 
 use std::sync::{Arc, LazyLock};

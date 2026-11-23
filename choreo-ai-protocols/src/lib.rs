@@ -88,7 +88,7 @@ pub use catalog::{
     model_reasoning_capability, model_reasoning_passback, model_request_format,
     model_supports_image_output, model_supports_temperature, model_supports_vision,
     normalize_modelsdev, oauth_provider_descriptors, prompt_cache_ttl, provider_slug_for_model,
-    replace_catalog, write_file_atomic,
+    replace_catalog,
 };
 pub use context_window::ContextWindowConfig;
 pub use google::{GoogleClient, GoogleConfig};

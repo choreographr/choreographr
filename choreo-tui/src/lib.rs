@@ -286,14 +286,16 @@ fn resolve_connect_mode(
     let pk_b64 = choreo_client_core::pubkey_base64(&learned);
 
     let confirmed = if let Some(expected) = expected_pubkey {
-        // Headless: compare against the pre-approved key. Whitespace is
-        // insignificant (a pasted value may wrap), case is exact (see
-        // `strip_whitespace`).
-        let matches = strip_whitespace(expected) == strip_whitespace(&pk_b64);
+        // Headless: confirm against the pre-approved key. The comparison is on
+        // the KEY, not on its text, so any rendering of the real key confirms
+        // while a value that is not a key is refused with its parse error
+        // instead of a spurious mismatch (see `trusted_pubkey`).
+        let expected_pk = trusted_pubkey(expected)?;
+        let matches = expected_pk == learned;
         if !matches {
             tracing::error!(
                 addr,
-                expected = %expected,
+                expected = %choreo_client_core::pubkey_base64(&expected_pk),
                 actual = %pk_b64,
                 "--trust-pubkey does not match the server's key"
             );
@@ -388,16 +390,26 @@ fn preflight_failure_message(
     }
 }
 
-/// Normalize a pasted public-key value for comparison: drop whitespace, keep
-/// case EXACTLY. Base64's standard alphabet is case-sensitive, and the
-/// first-contact comparison is the only thing standing between a first-contact
-/// MITM and the daemon's private key — so the comparison must not widen the
-/// match: a case-insensitive compare would let an attacker whose key
-/// differs from the real one only in letter case pass the check after
-/// ~2^28 key-generation tries. Whitespace stays insignificant (a pasted value
-/// may wrap across lines), but any case difference is a mismatch — a
-/// transcribed-but-mistyped key SHOULD be refused and re-read rather than
-/// fuzzily accepted.
+/// Decode the pre-approved `--trust-pubkey` value into the key it names.
+///
+/// Whitespace is insignificant (a pasted key may wrap across lines) and case is
+/// EXACT: base64's standard alphabet is case-sensitive, and this comparison is
+/// the only thing standing between a first-contact MITM and the daemon's
+/// private key, so it must not widen the match — a case-folding compare would
+/// let an attacker whose key differs from the real one only in letter case pass
+/// after ~2^28 key-generation tries. Decoding first means the comparison is
+/// between KEYS: every rendering of the real key (wrapped, grouped) confirms,
+/// and a value that is not a key is refused with its parse error rather than
+/// reported as a mismatch — which is what `--server-pubkey` does with the same
+/// input, so the two flags cannot disagree about what a key is.
+fn trusted_pubkey(value: &str) -> anyhow::Result<[u8; 32]> {
+    let normalized = strip_whitespace(value);
+    choreo_client_core::parse_pubkey_base64(&normalized)
+        .context("invalid --trust-pubkey: expected a 32-byte transport public key as base64")
+}
+
+/// Drop whitespace from a pasted key value, keeping case exactly (see
+/// [`trusted_pubkey`]).
 fn strip_whitespace(pk: &str) -> String {
     pk.chars().filter(|c| !c.is_whitespace()).collect()
 }

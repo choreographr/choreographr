@@ -17,7 +17,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use choreo_ai_protocols::{ProviderEntry, load_bundled_base, write_file_atomic};
+use choreo_ai_protocols::{ProviderEntry, load_bundled_base};
 use tracing::{debug, warn};
 
 /// Postcard cache filename under the data dir.
@@ -170,11 +170,11 @@ pub(crate) fn write_catalog_cache(base: &[ProviderEntry], bin_path: &Path) -> io
     // the wrong offsets (see `CATALOG_CACHE_SCHEMA`).
     let mut bytes = postcard::to_allocvec(&CATALOG_CACHE_SCHEMA).map_err(io::Error::other)?;
     bytes.extend_from_slice(&postcard::to_allocvec(base).map_err(io::Error::other)?);
-    write_file_atomic(bin_path, &bytes)
+    choreo_shared::atomic_write::write_private_atomic(bin_path, &bytes)
 }
 
 /// Ensure the catalog **data dir** (cache parent) exists before the
-/// maintenance pipeline starts. `write_file_atomic` would create it on first
+/// maintenance pipeline starts. The atomic writer would create it on first
 /// persist anyway; creating it up front means the cache survives a run even if
 /// the first fetch is skipped (a fresh cache). The **config dir** is not
 /// created here — the unified config transport ([`crate::config_watch`]) owns

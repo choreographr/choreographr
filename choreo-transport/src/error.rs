@@ -59,7 +59,7 @@ pub enum TransportError {
     AuthFailed,
     /// The peer closed the connection (EOF before a full frame, or a
     /// connection reset) while this stream was reading. Produced by
-    /// `noise::recv_message` when the underlying `read_exact` fails with an
+    /// `NoiseStream::recv_message` when the underlying `read_exact` fails with an
     /// EOF-class error kind; callers treat it as a graceful disconnect,
     /// distinct from a protocol failure.
     #[error("Connection closed")]

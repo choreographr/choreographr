@@ -170,9 +170,9 @@ fn noise_handshake_times_out_when_peer_silent() {
 /// timeout never fires — is still cut off by the ABSOLUTE handshake deadline.
 /// Every handshake read is bounded by the time remaining until the deadline,
 /// so the total duration cannot exceed it no matter how the peer paces its
-/// bytes: the slow-loris case a per-read timeout alone does not cover. (This
-/// test fails against the old per-recv-timeout-only code, which accepted the
-/// dribbles past the test's wait window.)
+/// bytes: the slow-loris case a per-read timeout alone does not cover. (A
+/// per-recv-only timeout would accept these dribbles past this test's wait
+/// window; only the absolute deadline cuts them off.)
 #[test]
 #[ignore = "integration"]
 fn noise_handshake_times_out_against_dribbling_peer() {

@@ -87,6 +87,55 @@ fn pubkey_comparison_ignores_whitespace_but_not_case() {
     assert_ne!(strip_whitespace("AB CD EF"), strip_whitespace("ab cd ef"));
 }
 
+/// The pre-approved key is confirmed by comparing KEYS, not their text: every
+/// rendering of the real key (canonical, wrapped across lines, space-grouped)
+/// decodes to the same bytes and confirms, a different key does not, and a
+/// value that is not a key at all is a parse error rather than a mismatch. This
+/// is what makes `--trust-pubkey` and `--server-pubkey` agree on what a key is.
+#[test]
+fn trusted_pubkey_compares_keys_and_refuses_non_keys() {
+    let pk = [
+        0x3F, 0x2A, 0x9C, 0x11, 0x7B, 0x04, 0xE5, 0xD8, 0xA1, 0xC6, 0x42, 0xD9, 0x08, 0xF3, 0xB7,
+        0xE2, 0x5D, 0x60, 0x19, 0xAB, 0xCC, 0x37, 0x84, 0x0E, 0x71, 0xFA, 0x92, 0x63, 0xDD, 0x4B,
+        0x26, 0x50,
+    ];
+    let canonical = choreo_client_core::pubkey_base64(&pk);
+    assert_eq!(trusted_pubkey(&canonical).expect("canonical parses"), pk);
+
+    // Wrapped by a terminal or chat client at an arbitrary column.
+    let (head, tail) = canonical.split_at(20);
+    let wrapped = format!("{head}\n  {tail}\n");
+    assert_eq!(trusted_pubkey(&wrapped).expect("wrapped parses"), pk);
+
+    // Space-grouped, the rendering a human transcription tends to produce.
+    let grouped = canonical
+        .as_bytes()
+        .chunks(4)
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert_eq!(
+        trusted_pubkey(&grouped).expect("grouped parses"),
+        pk,
+        "whitespace is insignificant, so the same key in any grouping confirms"
+    );
+
+    // A different key of the right shape never confirms.
+    let other = choreo_client_core::pubkey_base64(&[0x11u8; 32]);
+    assert_ne!(
+        trusted_pubkey(&other).expect("a real key parses"),
+        pk,
+        "a different key must not confirm"
+    );
+
+    // Not a key at all: refused as a parse error, naming the flag.
+    let err = trusted_pubkey("not-a-key").expect_err("garbage is not a key");
+    assert!(
+        err.to_string().contains("--trust-pubkey"),
+        "the parse failure must name the flag: {err}"
+    );
+}
+
 // ── Preflight failure messages ─────────────────────────
 
 /// An UNREACHABLE daemon (dial failure) must read as a network problem,

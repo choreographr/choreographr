@@ -516,10 +516,11 @@ impl AccountManager {
     /// needed.
     ///
     /// The file is written **deterministically** (accounts sorted by name) and
-    /// **atomically** (temp + fsync + rename via `write_file_atomic`). The
-    /// deterministic ordering makes the on-disk file stable and diff-friendly;
-    /// the atomic write means the config-file watcher can never observe a torn
-    /// file mid-write (the daemon and an editor can race on this file).
+    /// **atomically** (temp + fsync + rename via
+    /// [`choreo_shared::atomic_write::write_private_atomic`]). The deterministic
+    /// ordering makes the on-disk file stable and diff-friendly; the atomic
+    /// write means the config-file watcher can never observe a torn file
+    /// mid-write (the daemon and an editor can race on this file).
     ///
     /// # Errors
     ///
@@ -536,7 +537,7 @@ impl AccountManager {
         let file = AccountsFile { accounts: configs };
         let toml_str =
             toml::to_string(&file).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        choreo_ai_protocols::write_file_atomic(&self.config_path, toml_str.as_bytes())
+        choreo_shared::atomic_write::write_private_atomic(&self.config_path, toml_str.as_bytes())
     }
 
     /// Add an account. Errors if the name already exists.

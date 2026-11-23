@@ -5,7 +5,7 @@
 `Choreographr` is a client/server AI assistant built as a Rust workspace. A **daemon** process
 communicates with multiple LLM providers through a pluggable trait-based provider
 system, while **clients** (terminal, desktop, and IM platforms) connect to the daemon
-over a Unix domain socket (or Noise IK encrypted TCP for remote connections) using a custom length-prefixed binary protocol.
+over a Unix domain socket (or a Noise-encrypted TCP connection for remote peers) using a custom length-prefixed binary protocol.
 
 ```
 ┌──────────────┐    Unix socket     ┌──────────────┐    HTTP/SSE     ┌──────────────────────┐
@@ -14,7 +14,7 @@ over a Unix domain socket (or Noise IK encrypted TCP for remote connections) usi
 ├──────────────┤                    │  choreographr  │◄──────────────►│  Anthropic Messages   │
 │ choreo-gui       │◄──────────────────►│              │                ├──────────────────────┤
 │ (desktop/mobile) │  Unix socket or    │              │◄──────────────►│  Google Gemini API    │
-│                  │  TCP/Noise-IK      │              │                │                      │
+│                  │  TCP/Noise         │              │                │                      │
 ├──────────────┤                    │              │                ├──────────────────────┤
 │   choreo-im     │◄──────────────────►│              │◄──────────────►│  Mistral API          │
 │ (IM bridge)  │    Unix socket     │              │                ├──────────────────────┤

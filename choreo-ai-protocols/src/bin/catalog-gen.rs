@@ -43,7 +43,7 @@ use anyhow::{Context, Result, bail};
 use tracing::info;
 
 use choreo_ai_protocols::catalog::{
-    RefreshOutcome, fetch_modelsdev, merge_overlay, normalize_modelsdev, write_file_atomic,
+    RefreshOutcome, fetch_modelsdev, merge_overlay, normalize_modelsdev,
 };
 
 fn main() -> Result<()> {
@@ -108,9 +108,16 @@ fn main() -> Result<()> {
                 // Cache the fetch to the gitignored path so later runs are
                 // offline. Check mode skips even this write: a torn snapshot file
                 // would silently normalize to an empty base later, and check mode
-                // must not mutate the tree.
+                // must not mutate the tree. The write is atomic (temp file,
+                // fsync, rename), so a reader — the daemon embedding the blob,
+                // or a later generator run — sees the whole new snapshot or the
+                // whole old one, never part of one.
                 if !check_only {
-                    write_file_atomic(&snapshot_path, json.as_bytes()).with_context(|| {
+                    choreo_shared::atomic_write::write_private_atomic(
+                        &snapshot_path,
+                        json.as_bytes(),
+                    )
+                    .with_context(|| {
                         format!(
                             "failed to persist the fetched snapshot to {}",
                             snapshot_path.display(),
@@ -155,7 +162,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    write_file_atomic(&out_path, &bytes)
+    // Atomic publish (temp file, fsync, rename) of the one artifact the
+    // workspace embeds: the new snapshot is on disk whole or not at all.
+    choreo_shared::atomic_write::write_private_atomic(&out_path, &bytes)
         .with_context(|| format!("failed to write {}", out_path.display()))?;
 
     let base_model_count: usize = base.iter().map(|e| e.models.len()).sum();

@@ -1,6 +1,9 @@
 //! The data plane over a real socket: encrypted round trips of every size, the
 //! fragmentation and reassembly rules, the peer-close classification, and the
-//! refusals that keep an unauthenticated length prefix from costing memory.
+//! refusals that bound memory — the per-frame cap on an unauthenticated length
+//! prefix here, and the cumulative reassembly cap as a unit test of its
+//! arithmetic in `noise::frame` (reaching it end to end would mean pushing
+//! `MAX_FRAME_SIZE` of ciphertext through the socket).
 
 use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType};
 use choreo_transport::error::TransportError;
@@ -134,7 +137,7 @@ fn noise_large_message_round_trip() {
             let payload = server
                 .recv_message()
                 .map_err(|e| format!("recv large message failed: {e:?}"))?;
-            if payload != expected {
+            if payload.as_slice() != expected.as_slice() {
                 return Err(format!(
                     "payload mismatch: got {} bytes, want {} bytes of 0xAB",
                     payload.len(),
@@ -198,7 +201,7 @@ fn noise_fragmented_message_round_trip() {
             let payload_two = server
                 .recv_message()
                 .map_err(|e| format!("recv 2-fragment message failed: {e:?}"))?;
-            if payload_two != expected_two {
+            if payload_two.as_slice() != expected_two.as_slice() {
                 return Err(format!(
                     "2-fragment payload mismatch: got {} bytes, want {} bytes of 0x11",
                     payload_two.len(),
@@ -212,7 +215,7 @@ fn noise_fragmented_message_round_trip() {
             let payload_mib = server
                 .recv_message()
                 .map_err(|e| format!("recv 17-fragment message failed: {e:?}"))?;
-            if payload_mib != expected_mib {
+            if payload_mib.as_slice() != expected_mib.as_slice() {
                 return Err(format!(
                     "17-fragment payload mismatch: got {} bytes, want {} bytes of 0x22",
                     payload_mib.len(),
@@ -258,7 +261,11 @@ fn noise_fragmented_message_round_trip() {
     let tail = b"tail".to_vec();
     client.send_message(&tail).expect("client send tail");
     let echo = client.recv_message().expect("client recv tail echo");
-    assert_eq!(echo, tail, "server must echo the tail verbatim");
+    assert_eq!(
+        echo.as_slice(),
+        tail.as_slice(),
+        "server must echo the tail verbatim"
+    );
 
     let server_result = rx.recv().expect("recv server result");
     assert!(
@@ -268,13 +275,13 @@ fn noise_fragmented_message_round_trip() {
     );
 }
 
-/// Test that an empty payload still produces a real wire frame: before the
-/// fix, `send_message(&[])` wrote ZERO bytes (the fragment loop emitted
-/// nothing) and the peer's `recv_message` blocked forever on the length
-/// prefix. Now the empty message round-trips as `Ok(vec![])` — proving a real
-/// frame was emitted — and a follow-up non-empty round trip proves the shared
-/// `TransportState` keeps working (send/recv nonces stay in sync across the
-/// empty message).
+/// Test that an empty payload still produces a real wire frame: an empty
+/// message must round-trip as `Ok(vec![])` — one frame carrying only the
+/// cleared continuation header — because the peer's `recv_message` reads a
+/// length prefix first and would otherwise block until some later message's
+/// frame arrived (and then misparse it as this one). A follow-up non-empty
+/// round trip proves the shared `TransportState` keeps working: send/recv
+/// nonces stay in sync across the empty message.
 #[test]
 #[ignore = "integration"]
 fn noise_empty_message_round_trip() {
@@ -308,7 +315,7 @@ fn noise_empty_message_round_trip() {
             let after = server
                 .recv_message()
                 .map_err(|e| format!("recv follow-up failed: {e:?}"))?;
-            if after != b"after" {
+            if after.as_slice() != b"after" {
                 return Err(format!("expected b\"after\", got {after:?}"));
             }
             Ok(())
@@ -319,10 +326,11 @@ fn noise_empty_message_round_trip() {
     let stream = TcpStream::connect(addr).expect("connect");
     let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
-    // Empty message first: with the old code this wrote nothing and the
-    // server's recv_message blocked on the length prefix until the follow-up
-    // frame arrived — which it would have misparsed as the empty message,
-    // failing the is_empty check below.
+    // Empty message first: it must emit exactly one frame and consume exactly
+    // one nonce. An empty send that emitted nothing would leave the server's
+    // recv_message blocked on a length prefix until the follow-up frame
+    // arrived — which it would then misparse as the empty message, failing the
+    // is_empty check below.
     client.send_message(&[]).expect("client send empty");
     client
         .send_message(b"after")
@@ -340,7 +348,7 @@ fn noise_empty_message_round_trip() {
 /// `TransportError::ConnectionClosed` (not a raw `Io(UnexpectedEof)`): the
 /// daemon's read loop branches on that variant to log a graceful disconnect
 /// and run cleanup instead of reporting an error. Pins the EOF classification
-/// in `noise::recv_message`.
+/// in `NoiseStream::recv_message`.
 #[test]
 #[ignore = "integration"]
 fn noise_peer_close_surfaces_as_connection_closed() {
@@ -388,16 +396,15 @@ fn noise_peer_close_surfaces_as_connection_closed() {
 /// directions' in-flight data far exceeds the kernel buffers. Each side runs
 /// a reader thread via `try_clone` (the same writer-thread + reader-thread
 /// shape the daemon uses per connection), so the writer's `write_all` can
-/// only complete if the reader keeps draining the socket. With the old code,
-/// `send_message` held the shared `TransportState` lock across the blocking
-/// `write_all`s: each side's reader drained one fragment (65 KiB, lock-free)
-/// and then blocked at `lock()` while its own writer held the lock and was
-/// blocked in `write_all` (the peer's receive buffer full) — neither side
-/// drained, so both writers blocked forever. With the fix the lock is held
-/// only per-chunk during encryption and never across socket I/O, so the
-/// readers always acquire the lock (briefly) and drain, and every
-/// `write_all` completes. This test pins that fix: it deadlocks (and times
-/// out) against the old code, passes against the new one.
+/// only complete if the reader keeps draining the socket. That drain is
+/// exactly what a `send_message` holding the shared `TransportState` lock
+/// across the blocking `write_all`s prevents: each side's reader drains one
+/// fragment (65 KiB, lock-free) and then blocks at `lock()` while its own
+/// writer holds the lock and is blocked in `write_all` (the peer's receive
+/// buffer full) — neither side drains, so both writers block forever. The
+/// lock must therefore be held only per-chunk during encryption and never
+/// across socket I/O, which is what this test pins: with the wider scope it
+/// times out, with the per-chunk scope every `write_all` completes.
 #[test]
 #[ignore = "integration"]
 fn noise_concurrent_bidirectional_large_messages() {
@@ -432,9 +439,8 @@ fn noise_concurrent_bidirectional_large_messages() {
             // connection, sharing the TransportState through the Arc<Mutex>).
             // The writer thread below sends 1 MiB FIRST; the reader drains
             // the socket concurrently, and that concurrent drain is exactly
-            // what the old lock-across-write_all code prevented (the reader
-            // blocked at lock() while the writer held the lock and blocked in
-            // write_all).
+            // what a lock held across write_all would prevent (the reader
+            // would block at lock() while the writer held it).
             let mut reader = server
                 .try_clone()
                 .map_err(|e| format!("server try_clone failed: {e:?}"))?;
@@ -445,7 +451,7 @@ fn noise_concurrent_bidirectional_large_messages() {
                         .recv_message()
                         .map_err(|e| format!("server recv 1 MiB failed: {e:?}"))?;
                     let expected = vec![0xABu8; 1024 * 1024];
-                    if received != expected {
+                    if received.as_slice() != expected.as_slice() {
                         return Err(format!(
                             "server payload mismatch: got {} bytes, want 1 MiB of 0xAB",
                             received.len()
@@ -457,11 +463,12 @@ fn noise_concurrent_bidirectional_large_messages() {
             });
 
             // SEND BEFORE RECEIVING: the send starts while the reader thread
-            // above drains the other direction. Under the old code this
-            // deadlocked once both sides' receive buffers filled — the reader
-            // could not acquire the TransportState lock to decrypt, so the
-            // writer's write_all never completed. With the fix the send
-            // completes because the reader always drains.
+            // above drains the other direction. Holding the TransportState
+            // lock across write_all would deadlock here once both sides'
+            // receive buffers filled — the reader could not acquire the lock
+            // to decrypt, so this write_all would never complete. It completes
+            // because the lock is taken only per-chunk, so the reader always
+            // drains.
             server
                 .send_message(&server_payload)
                 .map_err(|e| format!("server send 1 MiB failed: {e:?}"))?;
@@ -494,7 +501,7 @@ fn noise_concurrent_bidirectional_large_messages() {
                         .recv_message()
                         .map_err(|e| format!("client recv 1 MiB failed: {e:?}"))?;
                     let expected = vec![0xCDu8; 1024 * 1024];
-                    if received != expected {
+                    if received.as_slice() != expected.as_slice() {
                         return Err(format!(
                             "client payload mismatch: got {} bytes, want 1 MiB of 0xCD",
                             received.len()
@@ -547,12 +554,13 @@ fn noise_concurrent_bidirectional_large_messages() {
 /// allocate a huge buffer or hang: the 4-byte data-plane prefix is NOT
 /// authenticated (it precedes the GCM ciphertext), so a peer can send any
 /// value. `recv_message` must reject a fragment longer than snow's 65535-byte
-/// ciphertext cap BEFORE allocating or reading that many bytes — without the
-/// validation the old code would `vec![0u8; ct_len]` for a `0x7FFF_FFFF`
-/// prefix (~2 GiB) and block in `read_exact` waiting for the bytes.
+/// ciphertext cap BEFORE allocating or reading that many bytes — a receiver
+/// that trusted the prefix would allocate (and then block in `read_exact`
+/// waiting for) the declared `0x7FFF_FFFF` bytes, roughly 2 GiB.
 ///
-/// (The prefix no longer carries a continuation flag — that decision moved
-/// into the authenticated plaintext — so the raw value is just a huge length.)
+/// (The prefix carries only the ciphertext length: the continuation decision
+/// lives in the authenticated plaintext, so the raw value here is just a huge
+/// length.)
 #[test]
 #[ignore = "integration"]
 fn noise_rejects_oversized_fragment_prefix() {
@@ -627,7 +635,7 @@ fn noise_rejects_tampered_length_prefix() {
                 .recv_message()
                 .map_err(|e| format!("control recv failed: {e:?}"))?;
             let expected = vec![0xABu8; 65518 + 100];
-            if payload != expected {
+            if payload.as_slice() != expected.as_slice() {
                 return Err(format!(
                     "control payload mismatch: got {} bytes, want {} bytes of 0xAB",
                     payload.len(),

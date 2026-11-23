@@ -37,6 +37,20 @@
 //! truncated file, whose bytes would be rejected as `InvalidSecretKey` and would
 //! wedge the instance until an operator removed it by hand.
 //!
+//! # Permissions
+//!
+//! The identity is the most sensitive file this instance owns, so its
+//! reachability is narrowed on both ends. Generating it first narrows the
+//! containing directory to owner-only (`0700`) through
+//! [`choreo_shared::perm::ensure_private_dir`] — the same helper the MCP trust
+//! store uses, which also refuses a directory owned by another user rather than
+//! writing a secret into it. Every load then re-asserts the file's own `0600`
+//! mode ([`choreo_shared::perm::set_owner_only_path`]), because the file may
+//! predate that rule: a secret written by an older build, or copied in by hand
+//! under a loose umask, is group- or world-readable until something tightens it,
+//! and nothing else ever opens it for write. A chmod that fails only warns — the
+//! key still loaded, so refusing would wedge the instance over a permission bit.
+//!
 //! # Public key derivation
 //!
 //! The public half is always **derived** from the secret
@@ -218,12 +232,36 @@ fn load_secret_key(path: &Path) -> Result<Option<[u8; 32]>, TransportError> {
         // preserve, and erroring would wedge the instance permanently.
         return Ok(None);
     }
-    decode_secret(&bytes)
-        .map(Some)
-        .map_err(|detail| TransportError::InvalidSecretKey {
-            path: path.display().to_string(),
-            detail,
-        })
+    let secret = decode_secret(&bytes).map_err(|detail| TransportError::InvalidSecretKey {
+        path: path.display().to_string(),
+        detail,
+    })?;
+    // The file holds a real identity, so re-assert its owner-only mode here —
+    // the single point every load passes through (the fast path, the re-check
+    // under the advisory lock, and the read-only accessor). A build that wrote
+    // the secret before this rule existed, or a hand copy under a loose umask,
+    // would otherwise stay group- or world-readable forever: nothing else ever
+    // opens this file for write, so no later write would tighten it.
+    tighten_secret_permissions(path);
+    Ok(Some(secret))
+}
+
+/// Re-assert `0600` on an existing secret file, warning (never failing) if the
+/// filesystem refuses: the key loaded, and refusing here would wedge the
+/// instance over a permission bit it can do nothing about.
+///
+/// Path-based because this is a read path that holds no descriptor for the
+/// file; the containing directory is owner-only (`ensure_private_dir` on the
+/// generate path), which is what bounds a path-based chmod's swap exposure.
+fn tighten_secret_permissions(path: &Path) {
+    if let Err(e) = choreo_shared::perm::set_owner_only_path(path) {
+        tracing::warn!(
+            path = %path.display(),
+            error = %e,
+            "could not set the transport secret to mode 0600; the directory's own mode is the \
+             remaining control"
+        );
+    }
 }
 
 /// Ensure that a Noise transport keypair exists at the standard path
@@ -260,7 +298,11 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
 
     let (secret, public) = generate_keypair();
     if let Some(parent) = sec_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        // Narrow the directory BEFORE anything is written into it: the secret
+        // is the instance's identity, and `ensure_private_dir` both creates it
+        // owner-only (0700) and refuses one owned by another user — never write
+        // a secret into a directory somebody else controls.
+        choreo_shared::perm::ensure_private_dir(parent)?;
     }
 
     // Advisory exclusive lock (std::fs::File::lock, stable since 1.89) so

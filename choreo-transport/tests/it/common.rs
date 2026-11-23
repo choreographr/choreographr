@@ -26,7 +26,7 @@ pub(crate) fn shrink_socket_buffers(stream: &TcpStream) {
 
 /// Non-Unix fallback: no portable way to shrink the kernel buffers, but the
 /// defaults (~64-256 KiB) are still far below the 1 MiB payloads, so the test
-/// reproduces the deadlock against the old code regardless.
+/// forces the writers to block on a full peer buffer either way.
 #[cfg(not(unix))]
 pub(crate) fn shrink_socket_buffers(_stream: &TcpStream) {}
 
