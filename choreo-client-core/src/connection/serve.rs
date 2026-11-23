@@ -54,15 +54,30 @@ pub(super) const WRITER_STALL: Duration = Duration::from_secs(5);
 /// one fixed number that would false-kill a large legitimate frame.
 pub(super) const WRITER_MIN_RATE_BYTES_PER_SEC: u64 = 8 * 1024;
 
+/// Ceiling on the per-message budget, so a single large frame cannot make the
+/// connection's own teardown wait for the full rate-derived time.
+///
+/// Without a cap, a 64 MiB frame at [`WRITER_MIN_RATE_BYTES_PER_SEC`] implies
+/// ~8192 s, letting a peer that accepts only a handful of bytes per second keep
+/// the writer — and the `join()` that tears it down after the reader ends —
+/// alive for hours. The cap bounds that worst case to a couple of minutes: a
+/// frame that cannot finish within this window is a peer the connection is
+/// better off abandoning. Raising it tolerates slower links at the cost of a
+/// slower worst-case teardown.
+pub(super) const WRITER_MAX_BUDGET: Duration = Duration::from_secs(120);
+
 /// The absolute budget for writing one message of `wire_len` bytes: never less
-/// than [`WRITER_STALL`], otherwise the message's own size divided by the floor
-/// rate.
+/// than [`WRITER_STALL`], the message's own size divided by the floor rate, and
+/// never more than [`WRITER_MAX_BUDGET`].
 ///
 /// Both halves are needed. The size-scaled part is what lets a large frame
 /// finish on a link that is merely slow; the [`WRITER_STALL`] floor is what
 /// keeps a silent peer's detection latency at five seconds regardless of size,
 /// since a size-scaled budget for a multi-megabyte frame would otherwise be
-/// minutes of waiting on a peer that will never read a byte.
+/// minutes of waiting on a peer that will never read a byte. The
+/// [`WRITER_MAX_BUDGET`] ceiling bounds the other end: a peer that is alive but
+/// glacially slow cannot stretch one write, and therefore the connection's
+/// teardown, past it.
 ///
 /// Integer arithmetic throughout, with saturating operations: a 64 MiB frame
 /// must not overflow the millisecond computation, and no input may panic.
@@ -76,7 +91,9 @@ pub(super) fn message_budget(wire_len: usize) -> Duration {
     let millis = bytes
         .saturating_mul(1000)
         .saturating_div(WRITER_MIN_RATE_BYTES_PER_SEC);
-    Duration::from_millis(millis).max(WRITER_STALL)
+    Duration::from_millis(millis)
+        .max(WRITER_STALL)
+        .min(WRITER_MAX_BUDGET)
 }
 
 /// A handle that can close this connection from another thread.
@@ -226,6 +243,11 @@ where
     // crossbeam control-plane channel: the reader sends at most one stop signal,
     // so capacity 1 never blocks it.
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+    // A one-shot "the connection finished" signal, so the shutdown watcher below
+    // exits — and drops its cloned socket fd — when the reader ends WITHOUT an
+    // external shutdown ever firing. Without it the watcher thread and its fd
+    // would outlive the connection until the shutdown sender is dropped.
+    let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
 
     // The writer thread is the connection's single send site. Every outbound
     // value is already a framed `ClientMessage`: the front-end owns a
@@ -237,12 +259,14 @@ where
         if let Some(close_handle) = close_handle {
             // A socket transport can be force-closed from another thread, so an
             // external shutdown does exactly what a failed write does: close the
-            // socket, which unblocks the reader immediately.
+            // socket, which unblocks the reader immediately. `select!` also exits
+            // on `done`, so a connection that ended on its own does not leave this
+            // thread (and the duplicated fd) parked until the sender drops.
             thread::spawn(move || {
-                // A disconnected sender still means "shut down", so the
-                // `Result` is ignored either way.
-                let _ = shutdown_rx.recv();
-                close_handle.close();
+                crossbeam_channel::select! {
+                    recv(shutdown_rx) -> _ => close_handle.close(),
+                    recv(done_rx) -> _ => {}
+                }
             });
         } else {
             // No force-close exists (the embedded channel), so an external
@@ -255,8 +279,12 @@ where
             // ends.
             let writer_stop = stop_tx.clone();
             thread::spawn(move || {
-                let _ = shutdown_rx.recv();
-                let _ = writer_stop.send(());
+                crossbeam_channel::select! {
+                    recv(shutdown_rx) -> _ => {
+                        let _ = writer_stop.send(());
+                    }
+                    recv(done_rx) -> _ => {}
+                }
             });
         }
     }
@@ -266,6 +294,10 @@ where
     // this returns.
     let _ = stop_tx.send(());
     let _ = writer_handle.join();
+    // Let the shutdown watcher (if any) exit now that the connection is over. A
+    // panicking reader drops `done_tx` instead, which disconnects `done_rx` and
+    // wakes the watcher just the same.
+    let _ = done_tx.send(());
     result
 }
 

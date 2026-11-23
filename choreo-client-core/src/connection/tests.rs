@@ -8,7 +8,9 @@
 //! live in `tests/it/`.
 
 use super::handshake::{handshake_error, is_handshake_refusal};
-use super::serve::{WRITER_MIN_RATE_BYTES_PER_SEC, WRITER_STALL, message_budget};
+use super::serve::{
+    WRITER_MAX_BUDGET, WRITER_MIN_RATE_BYTES_PER_SEC, WRITER_STALL, message_budget,
+};
 use super::*;
 use choreo_proto::ClientMessageType;
 use choreo_proto::DaemonMessageType;
@@ -378,6 +380,21 @@ fn handshake_non_refusals_keep_their_own_meaning() {
         "a codec error must keep ClientError::Proto"
     );
 
+    // A missing XX static key is a protocol-contract violation, not a refusal:
+    // it must never be reported as enrollment remediation.
+    let missing_static = TransportError::HandshakeStaticMissing;
+    assert!(!is_handshake_refusal(&missing_static));
+    match handshake_error(missing_static) {
+        ClientError::Io(io) => assert_eq!(io.kind(), io::ErrorKind::Other),
+        other => panic!("a protocol violation must keep Io(..), got {other:?}"),
+    }
+
+    // A concurrent-access refusal is a caller bug, not a wire refusal either.
+    let concurrent = TransportError::ConcurrentAccess {
+        what: "send_message",
+    };
+    assert!(!is_handshake_refusal(&concurrent));
+
     // A local key-file failure is neither a refusal nor a network problem.
     let local = TransportError::ConfigDirNotFound;
     assert!(!is_handshake_refusal(&local));
@@ -418,11 +435,11 @@ fn a_frame_past_the_rate_boundary_gets_the_rate_derived_budget() {
 }
 
 /// A 64 MiB frame — the codec's maximum — must not overflow the millisecond
-/// computation, and its budget is far larger than the stall.
+/// computation, and its rate-derived budget (~8192 s) is clamped to the
+/// [`WRITER_MAX_BUDGET`] ceiling so it cannot stall the connection's teardown.
 #[test]
-fn a_64_mib_frame_does_not_overflow_and_is_far_above_the_stall() {
+fn a_64_mib_frame_is_clamped_to_the_max_budget() {
     let wire_len = 64 * 1024 * 1024;
-    // 64 MiB at 8 KiB/s is 8192 s exactly.
-    assert_eq!(message_budget(wire_len), Duration::from_secs(8192));
+    assert_eq!(message_budget(wire_len), WRITER_MAX_BUDGET);
     assert!(message_budget(wire_len) > WRITER_STALL);
 }
