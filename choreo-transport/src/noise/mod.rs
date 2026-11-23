@@ -2,12 +2,14 @@
 //!
 //! [`NoiseStream`] length-prefixes (4-byte big-endian) and fragments plaintext
 //! into AES-256-GCM messages, with an authenticated per-fragment continuation
-//! byte driving reassembly. The stream itself is here — construction, cloning,
-//! the typed send/receive conveniences — while each direction lives in its own
-//! submodule: `send` owns framing, encryption and the outbound write, `recv`
-//! owns reassembly, decryption and the peer-close classification, and `frame`
-//! owns the fragment sizes, the length-prefix codec and the reassembly bound.
-//! `slot` owns the per-direction single-actor right both of them take.
+//! byte driving reassembly. The stream core here is protocol-agnostic — it moves
+//! opaque byte frames — and only construction and cloning live in this module:
+//! the typed `ClientMessage`/`DaemonMessage` conveniences are in `typed`, and
+//! each direction lives in its own submodule: `send` owns framing, encryption and
+//! the outbound write, `recv` owns reassembly, decryption and the peer-close
+//! classification, and `frame` owns the fragment sizes, the length-prefix codec
+//! and the reassembly bound. `slot` owns the per-direction single-actor right both
+//! of them take.
 //!
 //! The `TransportState` is shared through an `Arc<Mutex<…>>` because a
 //! connection has one reader thread and one writer thread over a
@@ -19,15 +21,13 @@ mod frame;
 mod recv;
 mod send;
 mod slot;
+mod typed;
 
 use std::net::TcpStream;
 use std::sync::{Arc, Mutex};
 
-use choreo_proto::{ClientMessage, DaemonMessage, DaemonMessageType, decode_frame, encode_payload};
 use snow::TransportState;
-use zeroize::{Zeroize, Zeroizing};
 
-use crate::error::TransportError;
 use slot::SingleSlot;
 
 /// An encrypted Noise transport stream.
@@ -117,98 +117,11 @@ impl NoiseStream {
         })
     }
 
-    /// Send a typed `ClientMessage` (convenience for clients).
-    ///
-    /// # Errors
-    ///
-    /// Returns any error propagated by [`Self::send_message`] or the payload
-    /// encoding.
-    pub fn send_client_message(&mut self, msg: &ClientMessage) -> Result<(), TransportError> {
-        let payload: Zeroizing<Vec<u8>> = encode_payload(msg)?;
-        self.send_message(&payload)
-    }
-
-    /// Receive a typed `DaemonMessage` (convenience for clients).
-    ///
-    /// The raw frame buffer is wiped after decoding UNLESS the decoded variant
-    /// is one the daemon can only ever send in cleartext-equivalent bulk data
-    /// (see `daemon_message_may_carry_secret`): [`DaemonMessageType::Image`]
-    /// carries raw attachment bytes up to the 64 MiB frame cap, so exempting it
-    /// avoids a pointless 64 MiB memset on the largest payload the daemon sends,
-    /// while every credential-bearing variant (`Credential`, `Keystore`, …) and
-    /// every variant not on the allowlist is still wiped. A decode failure is
-    /// unknown content and is wiped too.
-    ///
-    /// The wipe covers the raw frame buffer ONLY. Once `decode_frame` succeeds,
-    /// the decoded `DaemonMessage` owns its own `String`/`Vec` fields (a
-    /// credential's `String`, for instance), and those are dropped un-erased —
-    /// the exemption/wiping policy here says nothing about them. Closing that gap
-    /// would mean zeroizing the wire types themselves in `choreo-proto`, so the
-    /// decoded value's owned buffers are explicitly out of scope on this path.
-    ///
-    /// # Errors
-    ///
-    /// Returns any error propagated by `recv_message_plain` or the
-    /// payload decoding.
-    pub fn recv_daemon_message(&mut self) -> Result<DaemonMessage, TransportError> {
-        let mut payload = self.recv_message_plain()?;
-        let decoded = decode_frame(&payload);
-        // Wipe the frame unless it decoded to a known non-secret bulk variant;
-        // the guard is an allowlist, so unknown content (a decode error, a
-        // future variant) is wiped rather than skipped.
-        if !matches!(&decoded, Ok(msg) if !daemon_message_may_carry_secret(msg)) {
-            payload.zeroize();
-        }
-        Ok(decoded?)
-    }
-
-    /// Send a typed `DaemonMessage` (convenience for servers).
-    ///
-    /// # Errors
-    ///
-    /// Returns any error propagated by [`Self::send_message`] or the payload
-    /// encoding.
-    pub fn send_daemon_message(&mut self, msg: &DaemonMessage) -> Result<(), TransportError> {
-        let payload: Zeroizing<Vec<u8>> = encode_payload(msg)?;
-        self.send_message(&payload)
-    }
-
-    /// Receive a typed `ClientMessage` (convenience for servers).
-    ///
-    /// # Errors
-    ///
-    /// Returns any error propagated by [`Self::recv_message`] or the payload
-    /// decoding.
-    pub fn recv_client_message(&mut self) -> Result<ClientMessage, TransportError> {
-        let payload = self.recv_message()?;
-        Ok(decode_frame(&payload)?)
-    }
-
     /// Access the underlying `TcpStream` for shutdown etc.
     #[must_use]
     pub fn get_ref(&self) -> &TcpStream {
         &self.tcp
     }
-}
-
-/// Whether an inbound [`DaemonMessage`] may carry credential material, and so
-/// must have its raw frame wiped after decoding.
-///
-/// This is the ONE place the receive path decides to skip the wipe, and it is a
-/// **fail-safe allowlist**: only a variant whose payload is structurally
-/// incapable of holding a secret is listed false, and anything else — including
-/// every future variant and a frame that failed to decode — is treated as
-/// secret and wiped. A missed entry therefore only costs the memset it was
-/// trying to save, never a leaked credential.
-///
-/// [`DaemonMessageType::Image`] is the only exemption: it carries raw attachment
-/// bytes (`Option<Vec<u8>>`) and is the largest payload the daemon sends (up to
-/// the 64 MiB frame cap), so skipping its wipe turns the per-message zeroize
-/// from a 64 MiB memset into nothing for the one bulk, provably non-secret case.
-/// Every credential-bearing variant (`Credential`, `Keystore`, `Unlock`-adjacent
-/// state, …) falls through to `true` and is wiped.
-fn daemon_message_may_carry_secret(msg: &DaemonMessage) -> bool {
-    !matches!(&msg.inner, DaemonMessageType::Image { .. })
 }
 
 #[cfg(test)]

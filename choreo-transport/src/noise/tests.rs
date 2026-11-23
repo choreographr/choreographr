@@ -70,7 +70,7 @@ fn only_image_is_exempt_from_the_post_decode_wipe() {
         data: Some(vec![0u8; 8]),
     });
     assert!(
-        !super::daemon_message_may_carry_secret(&image),
+        !super::typed::daemon_message_may_carry_secret(&image),
         "Image carries raw attachment bytes and is the one exempt bulk variant"
     );
 
@@ -79,12 +79,12 @@ fn only_image_is_exempt_from_the_post_decode_wipe() {
         service: "anthropic".to_string(),
         key: Some("sk-secret".to_string()),
     });
-    assert!(super::daemon_message_may_carry_secret(&credential));
+    assert!(super::typed::daemon_message_may_carry_secret(&credential));
 
     // ...and so is an arbitrary unlisted variant (the fail-safe default).
     let pong = DaemonMessage::broadcast(DaemonMessageType::Pong);
     assert!(
-        super::daemon_message_may_carry_secret(&pong),
+        super::typed::daemon_message_may_carry_secret(&pong),
         "an unlisted variant must default to being wiped"
     );
 }
