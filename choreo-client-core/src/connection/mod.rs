@@ -11,15 +11,17 @@
 //! [`verify_daemon_authorization`], [`own_transport_pubkey`]) let a front-end
 //! establish trust and enrollment before committing to a session.
 //!
-//! The implementation splits by concern: `unix` is the local-domain socket
-//! path, `tcp` the Noise-over-TCP variants and the preflight helpers,
-//! `handshake` the shared Noise handshake plumbing and the established-stream
-//! service loop both TCP modes use, and `inproc` the embedded in-process
-//! channel transport. This module owns the transport-selecting type and the
+//! The implementation splits by concern: `serve` owns the writer/reader/teardown
+//! loop every transport shares plus the writer's time bounds, `unix` is the
+//! local-domain socket path, `tcp` the Noise-over-TCP variants and the preflight
+//! helpers, `handshake` the shared Noise handshake plumbing and the
+//! established-stream source/sink, and `inproc` the embedded in-process channel
+//! transport. This module owns the transport-selecting type and the
 //! [`run_daemon_connection_with_mode`] dispatch that ties them together.
 
 mod handshake;
 mod inproc;
+mod serve;
 mod tcp;
 mod unix;
 
@@ -138,16 +140,13 @@ pub fn run_daemon_connection_with_mode(
         ConnectionMode::InProcess {
             daemon_tx,
             daemon_rx,
-        } => {
-            inproc::run_daemon_connection_in_process(
-                daemon_tx,
-                daemon_rx,
-                handle_daemon_message,
-                from_ui,
-                shutdown_rx,
-            );
-            Ok(())
-        }
+        } => inproc::run_daemon_connection_in_process(
+            daemon_tx,
+            daemon_rx,
+            handle_daemon_message,
+            from_ui,
+            shutdown_rx,
+        ),
     }
 }
 

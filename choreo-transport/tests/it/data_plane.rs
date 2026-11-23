@@ -705,11 +705,11 @@ fn noise_rejects_tampered_length_prefix() {
     );
 }
 
-/// `send_message_by` with a generous deadline round-trips a fragmented message:
-/// the deadline path writes every fragment exactly like `send_message`, and a
-/// follow-up send proves the shared `TransportState` nonces stay in sync across
-/// the deadline-bounded frames (each is re-armed to the time remaining, but
-/// that is a write-policy detail, not a framing one).
+/// `send_message_by` with a generous deadline and stall round-trips a fragmented
+/// message: the bounded path writes every fragment exactly like `send_message`,
+/// and a follow-up send proves the shared `TransportState` nonces stay in sync
+/// across the bounded frames (each write is re-armed to the tighter of the two
+/// bounds, but that is a write-policy detail, not a framing one).
 #[test]
 #[ignore = "integration"]
 fn send_message_by_round_trips_a_fragmented_message() {
@@ -755,14 +755,16 @@ fn send_message_by_round_trips_a_fragmented_message() {
     let stream = TcpStream::connect(addr).expect("connect");
     let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
-    // A budget far larger than the local loopback round trip needs.
+    // A budget far larger than the local loopback round trip needs, and a stall
+    // that no loopback write can approach.
     let deadline = Instant::now() + Duration::from_secs(30);
+    let stall = Duration::from_secs(5);
     let payload = vec![0x5Au8; 65518 + 1];
     client
-        .send_message_by(&payload, deadline)
+        .send_message_by(&payload, deadline, stall)
         .expect("send fragmented payload within the deadline");
     client
-        .send_message_by(b"tail", Instant::now() + Duration::from_secs(30))
+        .send_message_by(b"tail", Instant::now() + Duration::from_secs(30), stall)
         .expect("send tail within the deadline");
 
     let server_result = rx.recv().expect("recv server result");
@@ -773,7 +775,7 @@ fn send_message_by_round_trips_a_fragmented_message() {
     );
 }
 
-/// An already-elapsed deadline must fail immediately, not block: `write_all_by`
+/// An already-elapsed deadline must fail immediately, not block: `write_all_with_stall`
 /// returns `TimedOut` before its first syscall, which surfaces as
 /// `TransportError::Io`. The receiver is left with no bytes and reports the
 /// client's close as a graceful disconnect.
@@ -804,7 +806,7 @@ fn send_message_by_fails_promptly_when_the_deadline_has_elapsed() {
     let stream = TcpStream::connect(addr).expect("connect");
     let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
-    match client.send_message_by(b"never sent", Instant::now()) {
+    match client.send_message_by(b"never sent", Instant::now(), Duration::from_secs(5)) {
         Err(TransportError::Io(e)) => assert_eq!(
             e.kind(),
             std::io::ErrorKind::TimedOut,

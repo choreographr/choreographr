@@ -1,16 +1,22 @@
 //! Tests for the connection dispatch and the in-process transport: reply
 //! ordering, writer drain semantics, shutdown on a dropped signal sender, the
-//! manual `Debug` shapes, and the autostart hook's single-fire contract.
+//! manual `Debug` shapes, the handshake failure classification, and the writer's
+//! message budget.
 //!
-//! Everything here is channel- and join-driven — no sleeps, no sockets. The
-//! live-listener half of the same contracts binds real sockets and lives in
-//! `tests/it/`.
+//! Everything here is channel- and join-driven — no sleeps, no sockets, no
+//! filesystem. The autostart hook's filesystem half and the live-socket contracts
+//! live in `tests/it/`.
 
+use super::handshake::{handshake_error, is_handshake_refusal};
+use super::serve::{WRITER_MIN_RATE_BYTES_PER_SEC, WRITER_STALL, message_budget};
 use super::*;
 use choreo_proto::ClientMessageType;
 use choreo_proto::DaemonMessageType;
 use choreo_proto::SessionSummary;
+use choreo_transport::error::TransportError;
+use std::io;
 use std::thread;
+use std::time::Duration;
 
 /// Bare in-process link — two crossbeam channels, NO real daemon. The
 /// fake-daemon threads below play the daemon side of an `EmbeddedLink`:
@@ -304,36 +310,119 @@ fn debug_output_matches_previous_derive_shapes() {
     drop(daemon_tx);
 }
 
-/// The autostart hook must fire ONLY when the dial finds nothing
-/// listening (`NotFound` here: no socket file at all). The hook deliberately
-/// fails, so a successful run would be impossible — the pinned outcome is
-/// exactly one hook invocation and the hook's error surfacing as the
-/// connection result. (The live-listener half of this contract binds real
-/// sockets, so it lives in `tests/it/connection_autostart.rs` — no filesystem
-/// or IPC boundary in unit tests.)
+/// Every shape a handshake REFUSAL takes — including the EOF an initiator sees
+/// when the responder aborts the exchange — maps to `ConnectionRefused` and
+/// classifies as a refusal.
 #[test]
-fn autostart_hook_invoked_when_nothing_listens() {
-    let path = std::env::temp_dir().join(format!(
-        "choreo-core-autostart-absent-{}-{}",
-        std::process::id(),
-        format!("{:?}", std::thread::current().id()).as_str()
-    ));
-    let _ = std::fs::remove_file(&path); // absent by construction
-    let path = path.to_string_lossy().into_owned();
+fn handshake_refusals_classify_as_refused() {
+    let refusals = [
+        TransportError::AuthFailed,
+        TransportError::Noise(snow::Error::Decrypt),
+        TransportError::HandshakeModeMismatch {
+            expected: 1,
+            got: 2,
+        },
+        TransportError::HandshakeModeUnknown { byte: 0 },
+        TransportError::InvalidFragment("oversized fragment".to_string()),
+        // The initiator's refusal signal: a clean close and an abortive one.
+        TransportError::Io(io::Error::from(io::ErrorKind::UnexpectedEof)),
+        TransportError::Io(io::Error::from(io::ErrorKind::ConnectionReset)),
+    ];
 
-    let mut hook_calls = 0;
-    let mut ensure_daemon = || {
-        hook_calls += 1;
-        Err(ClientError::DaemonStart("test: no daemon".to_string()))
-    };
-    let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
-    drop(from_ui_tx); // the pump's writer thread ends immediately
+    for error in refusals {
+        assert!(
+            is_handshake_refusal(&error),
+            "{error:?} must classify as a handshake refusal"
+        );
+        match handshake_error(error) {
+            ClientError::Io(io) => assert_eq!(
+                io.kind(),
+                io::ErrorKind::ConnectionRefused,
+                "a refusal must keep the ConnectionRefused shape"
+            ),
+            other => panic!("a refusal must map to Io(ConnectionRefused), got {other:?}"),
+        }
+    }
+}
 
-    let error =
-        run_daemon_connection_with_autostart(&path, &mut ensure_daemon, |_| {}, from_ui_rx, None)
-            .expect_err("the failing hook must fail the connection");
+/// A handshake that failed WITHOUT a refusal keeps its own meaning, so the
+/// callers' remediation advice never blames enrollment or the pin for a network
+/// problem.
+#[test]
+fn handshake_non_refusals_keep_their_own_meaning() {
+    let timeout = TransportError::HandshakeTimeout;
+    assert!(!is_handshake_refusal(&timeout));
+    match handshake_error(timeout) {
+        ClientError::Io(io) => assert_eq!(io.kind(), io::ErrorKind::TimedOut),
+        other => panic!("a handshake timeout must map to Io(TimedOut), got {other:?}"),
+    }
 
-    assert!(matches!(error, ClientError::DaemonStart(_)));
-    assert_eq!(hook_calls, 1, "the hook must run exactly once");
-    let _ = std::fs::remove_file(&path);
+    let broken = TransportError::Io(io::Error::from(io::ErrorKind::BrokenPipe));
+    assert!(!is_handshake_refusal(&broken));
+    match handshake_error(broken) {
+        ClientError::Io(io) => assert_eq!(io.kind(), io::ErrorKind::BrokenPipe),
+        other => panic!("a socket failure must pass through, got {other:?}"),
+    }
+
+    let closed = TransportError::ConnectionClosed;
+    assert!(!is_handshake_refusal(&closed));
+    match handshake_error(closed) {
+        ClientError::Io(io) => assert_eq!(io.kind(), io::ErrorKind::ConnectionAborted),
+        other => panic!("a peer close must map to Io(ConnectionAborted), got {other:?}"),
+    }
+
+    let protocol = TransportError::Protocol(choreo_proto::ProtoError::FrameTooLarge);
+    assert!(!is_handshake_refusal(&protocol));
+    assert!(
+        matches!(handshake_error(protocol), ClientError::Proto(_)),
+        "a codec error must keep ClientError::Proto"
+    );
+
+    // A local key-file failure is neither a refusal nor a network problem.
+    let local = TransportError::ConfigDirNotFound;
+    assert!(!is_handshake_refusal(&local));
+    match handshake_error(local) {
+        ClientError::Io(io) => {
+            assert_eq!(io.kind(), io::ErrorKind::Other);
+            assert!(
+                io.to_string().contains("config directory"),
+                "the cause must survive the wrap: {io}"
+            );
+        }
+        other => panic!("a local failure must keep Io(..), got {other:?}"),
+    }
+}
+
+/// A small frame cannot finish in less than the stall, so its budget is exactly
+/// [`WRITER_STALL`].
+#[test]
+fn a_small_frame_budgets_exactly_the_writer_stall() {
+    assert_eq!(message_budget(64), WRITER_STALL);
+    assert_eq!(message_budget(0), WRITER_STALL);
+    // 20 KiB at the floor rate is 2.5 s — still below the stall.
+    assert_eq!(message_budget(20 * 1024), WRITER_STALL);
+}
+
+/// Above the boundary where the rate-derived duration overtakes the stall, the
+/// budget is the rate-derived one: a big frame on a slow link is allowed the
+/// time its size implies.
+#[test]
+fn a_frame_past_the_rate_boundary_gets_the_rate_derived_budget() {
+    // 48 KiB at 8 KiB/s is 6 s, past the 5 s stall.
+    let wire_len = 48 * 1024;
+    let expected = Duration::from_millis(
+        u64::try_from(wire_len).expect("fits u64") * 1000 / WRITER_MIN_RATE_BYTES_PER_SEC,
+    );
+    assert!(expected > WRITER_STALL, "the boundary case must exceed it");
+    assert_eq!(message_budget(wire_len), expected);
+}
+
+/// A 64 MiB frame — the codec's maximum — must not overflow the millisecond
+/// computation, and its budget is far larger than the stall.
+#[test]
+fn a_64_mib_frame_does_not_overflow_and_is_far_above_the_stall() {
+    let wire_len = 64 * 1024 * 1024;
+    // 64 MiB at 8 KiB/s is 8192 s exactly.
+    assert_eq!(message_budget(wire_len), Duration::from_secs(8192));
+    assert!(message_budget(wire_len) > WRITER_STALL);
 }

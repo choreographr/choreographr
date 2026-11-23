@@ -5,13 +5,13 @@
 //! continuation header, the brief `TransportState` lock, the length prefix and
 //! the coalesced write exist exactly once, whether the message is empty, a single
 //! fragment, or many. Two entry points share that body:
-//! [`NoiseStream::send_message`] (no deadline of its own) and
+//! [`NoiseStream::send_message`] (no bound of its own) and
 //! [`NoiseStream::send_message_by`] (the whole message bounded by one absolute
-//! deadline). The single-writer right itself lives in [`super::slot`], shared with
-//! the read direction.
+//! deadline and each write by a per-syscall stall). The single-writer right itself
+//! lives in [`super::slot`], shared with the read direction.
 
 use std::io::Write;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use choreo_proto::MAX_FRAME_SIZE;
 use tracing::trace;
@@ -24,6 +24,21 @@ use super::frame::{
 };
 use crate::buf::{at_mut, slice, slice_mut};
 use crate::error::TransportError;
+
+/// The two bounds [`NoiseStream::send_message_by`] applies to one message: an
+/// absolute deadline for the whole message and a stall for any single write.
+///
+/// Kept as one value so the framing loop threads a single `Option<…>` through
+/// (absent meaning "plain `write_all`, no policy of our own") and cannot thread
+/// one bound while forgetting the other.
+#[derive(Clone, Copy)]
+struct WriteBound {
+    /// When the whole message must be on the wire by.
+    deadline: Instant,
+    /// How long one write may wait for progress before the peer counts as
+    /// wedged.
+    stall: Duration,
+}
 
 impl NoiseStream {
     /// Send an encrypted message.
@@ -50,10 +65,10 @@ impl NoiseStream {
     /// fragment). The staged plaintext in `send_frag` is wiped before this
     /// returns (see the callers of `write_frame`).
     ///
-    /// This entry point carries NO deadline of its own: each fragment's write
-    /// uses `std::io::Write::write_all` under whatever per-syscall write timeout
-    /// the caller armed on the socket. Use [`Self::send_message_by`] when the
-    /// WHOLE message must fit a total budget.
+    /// This entry point carries NO bound of its own: each fragment's write uses
+    /// `std::io::Write::write_all` under whatever per-syscall write timeout the
+    /// caller armed on the socket. Use [`Self::send_message_by`] when the WHOLE
+    /// message must fit a total budget.
     ///
     /// # Errors
     ///
@@ -65,20 +80,28 @@ impl NoiseStream {
         self.send_message_bounded(plaintext, None)
     }
 
-    /// Send one encrypted message with the whole message bounded by `deadline`.
+    /// Send one encrypted message bounded by `deadline` in total and by `stall`
+    /// on any single write.
     ///
-    /// The difference from [`Self::send_message`] is the shape of the bound: the
-    /// deadline covers the ENTIRE message — every fragment's write together —
-    /// not a single syscall. Each fragment's write is re-armed to the time
-    /// remaining until `deadline` before it runs (via
-    /// [`choreo_proto::write_all_by`]), so a large payload split across many
-    /// fragments cannot take `fragments × timeout` to push. The transport holds
-    /// no policy about what the deadline should be; the caller computes it from
-    /// its own total budget.
+    /// The difference from [`Self::send_message`] is the shape of the bounds.
+    /// `deadline` covers the ENTIRE message — every fragment's write together —
+    /// not a single syscall, so a large payload split across many fragments
+    /// cannot take `fragments × timeout` to push. `stall` additionally caps how
+    /// long one write may wait for progress, so a peer that has gone silent is
+    /// noticed after `stall` rather than only when the whole-message budget
+    /// expires.
+    ///
+    /// Both numbers are the CALLER's policy: the transport holds none of its
+    /// own. It only applies what it is handed — via
+    /// [`choreo_proto::write_all_with_stall`], which re-arms the socket's write
+    /// stall to `min(deadline, now + stall) - now` before every syscall. A
+    /// connection writer that sizes its budget by the message it is sending
+    /// therefore decides both how patient to be with a slow link and how fast to
+    /// give up on a wedged one.
     ///
     /// Do not mix the two entry points on one `NoiseStream`.
-    /// [`choreo_proto::write_all_by`] leaves the socket's write stall armed at the
-    /// last value it computed and never clears it, so a later
+    /// [`choreo_proto::write_all_with_stall`] leaves the socket's write stall
+    /// armed at the last value it computed and never clears it, so a later
     /// [`Self::send_message`] would inherit that leftover per-syscall timeout
     /// rather than the policy the caller intended. Pick one entry point for the
     /// life of the stream.
@@ -86,28 +109,29 @@ impl NoiseStream {
     /// # Errors
     ///
     /// As [`Self::send_message`], plus: a deadline that has already elapsed (or
-    /// passes mid-message) makes an armed write return `WouldBlock`/`TimedOut`,
-    /// which converts into [`TransportError::Io`] through the `From<io::Error>`
-    /// impl — a fired deadline is reported as the socket's own error, not a
-    /// bespoke variant.
+    /// passes mid-message) and a write that accepts nothing for `stall` both make
+    /// an armed write return `WouldBlock`/`TimedOut`, which converts into
+    /// [`TransportError::Io`] through the `From<io::Error>` impl — a fired bound
+    /// is reported as the socket's own error, not a bespoke variant.
     pub fn send_message_by(
         &mut self,
         plaintext: &[u8],
         deadline: Instant,
+        stall: Duration,
     ) -> Result<(), TransportError> {
-        self.send_message_bounded(plaintext, Some(deadline))
+        self.send_message_bounded(plaintext, Some(WriteBound { deadline, stall }))
     }
 
     /// The shared entry point: take the single-writer slot, run the framing, and
-    /// wipe `send_frag` on the way out. `deadline` distinguishes the two public
+    /// wipe `send_frag` on the way out. `bound` distinguishes the two public
     /// entry points; everything else is identical between them.
     fn send_message_bounded(
         &mut self,
         plaintext: &[u8],
-        deadline: Option<Instant>,
+        bound: Option<WriteBound>,
     ) -> Result<(), TransportError> {
         let _guard = self.send_slot.acquire()?;
-        match self.send_message_inner(plaintext, deadline) {
+        match self.send_message_inner(plaintext, bound) {
             // Wipe exactly the region this send wrote: the plaintext staging
             // buffer holds a copy of this (possibly secret) message until the
             // next send would overwrite it, so it is cleared on success too.
@@ -139,7 +163,7 @@ impl NoiseStream {
     fn send_message_inner(
         &mut self,
         plaintext: &[u8],
-        deadline: Option<Instant>,
+        bound: Option<WriteBound>,
     ) -> Result<usize, TransportError> {
         // Mirror the receiver's reassembly cap so an over-limit message is
         // rejected at the source instead of by the peer's recv_message.
@@ -173,7 +197,7 @@ impl NoiseStream {
             // Every chunk's plaintext sits at the front of the buffer, so the
             // furthest byte any chunk of this send reached is what the caller
             // has to wipe.
-            used = used.max(self.write_frame(chunk, more, deadline)?);
+            used = used.max(self.write_frame(chunk, more, bound)?);
         }
 
         if used == 0 {
@@ -182,7 +206,7 @@ impl NoiseStream {
             // prefix, so an empty message still needs exactly one wire frame.
             // Emit a single fragment carrying only the cleared continuation
             // header, which `recv_message` returns as an empty message.
-            used = self.write_frame(&[], false, deadline)?;
+            used = self.write_frame(&[], false, bound)?;
         }
         Ok(used)
     }
@@ -203,15 +227,16 @@ impl NoiseStream {
     /// and written outside it, so the reader can always acquire the lock and
     /// drain.
     ///
-    /// `deadline` picks the write policy: `Some` bounds the whole message through
-    /// [`choreo_proto::write_all_by`] (re-arming the socket stall to the time
-    /// remaining before each syscall), while `None` keeps a plain `write_all`
-    /// under whatever per-syscall timeout the caller armed on the socket.
+    /// `bound` picks the write policy: `Some` bounds the whole message through
+    /// [`choreo_proto::write_all_with_stall`] (re-arming the socket stall to the
+    /// tighter of the remaining budget and the per-syscall stall before each
+    /// syscall), while `None` keeps a plain `write_all` under whatever
+    /// per-syscall timeout the caller armed on the socket.
     fn write_frame(
         &mut self,
         payload: &[u8],
         more: bool,
-        deadline: Option<Instant>,
+        bound: Option<WriteBound>,
     ) -> Result<usize, TransportError> {
         let staged = FRAGMENT_HEADER_LEN
             .checked_add(payload.len())
@@ -251,12 +276,18 @@ impl NoiseStream {
         )?
         .copy_from_slice(&prefix);
         let frame = slice(&self.send_buf, ..LEN_PREFIX_LEN + n, "send_buf frame")?;
-        match deadline {
-            // The caller owns a total budget for the whole message, so bound this
-            // syscall to the time still remaining: the fragments together then
-            // fit the deadline, not `fragments × timeout`.
-            Some(d) => choreo_proto::write_all_by(&mut self.tcp, d, frame)?,
-            // No deadline: rely on whatever per-syscall write timeout the caller
+        match bound {
+            // The caller owns both policy numbers for this message: the total
+            // budget (so the fragments together fit it, not `fragments ×
+            // timeout`) and the per-syscall stall (so a silent peer is noticed
+            // long before the total budget of a large frame would expire).
+            Some(bound) => choreo_proto::write_all_with_stall(
+                &mut self.tcp,
+                bound.deadline,
+                bound.stall,
+                frame,
+            )?,
+            // No bound: rely on whatever per-syscall write timeout the caller
             // armed on the socket (`write_all` under SO_SNDTIMEO).
             None => self.tcp.write_all(frame)?,
         }

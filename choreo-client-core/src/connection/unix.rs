@@ -4,15 +4,83 @@
 //! [`pump_connection`]; [`run_daemon_connection_with_autostart`] adds the
 //! "start a daemon if nothing is listening" hook. [`run_daemon_reader`] is the
 //! shared drain loop for a `BufRead` of framed daemon messages.
+//!
+//! Both directions are length-prefixed frames: the reader decodes
+//! [`choreo_proto::read_message`], the writer encodes one whole frame and writes
+//! it under the connection's time bounds. There is no `BufWriter` on the write
+//! side — a frame is handed to the socket in one bounded write, so a buffered
+//! layer would only add a flush that could silently swallow the error it was
+//! meant to report.
 
 use crate::error::ClientError;
 use choreo_proto::{
-    ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix, read_message, write_message,
+    ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix, encode_frame, read_message,
 };
 use crossbeam_channel::Receiver as CrossbeamReceiver;
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::thread;
-use tracing::{debug, error, info, warn};
+use std::io::{BufRead, BufReader};
+use std::net::Shutdown;
+use std::time::Instant;
+
+use super::serve::{
+    CloseHandle, ConnectionSink, ConnectionSource, Inbound, WRITER_STALL, message_budget, serve,
+    serve_source,
+};
+
+/// The inbound half of any length-prefixed message stream.
+///
+/// Generic over the reader so the same classification serves the connection path
+/// (a `BufReader` over a socket) and the public [`run_daemon_reader`] (which
+/// accepts any `BufRead` callers already hold).
+struct FramedReader<R>(R);
+
+impl<R: BufRead> ConnectionSource for FramedReader<R> {
+    fn next_message(&mut self) -> Inbound {
+        match read_message::<_, DaemonMessage>(&mut self.0) {
+            Ok(message) => Inbound::Message(message),
+            // Clean termination: the daemon closed its side of the connection.
+            Err(ProtoError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Inbound::Closed
+            }
+            // Non-EOF I/O errors (broken pipe, connection aborted, etc.) are
+            // fatal — the transport is gone.
+            Err(ProtoError::Io(error)) => Inbound::Fatal(error.into()),
+            // Protocol-level decode errors (Postcard, FrameTooLarge,
+            // TrailingBytes, UnsupportedVersion) are per-message failures.
+            // Because we use length-prefixed framing, a corrupt payload never
+            // desynchronises the stream — log and carry on.
+            Err(error) => {
+                tracing::error!(%error, "skipping corrupt daemon message");
+                Inbound::Skip
+            }
+        }
+    }
+}
+
+impl ConnectionSink for UnixStream {
+    fn send_message(&mut self, msg: &ClientMessage) -> Result<(), String> {
+        // `encode_frame` yields the complete length-prefixed frame, so this is
+        // one bounded write with nothing left to flush afterwards.
+        let frame = encode_frame(msg).map_err(|error| error.to_string())?;
+        let deadline = Instant::now() + message_budget(frame.len());
+        choreo_proto::write_all_with_stall(self, deadline, WRITER_STALL, &frame)
+            .map_err(|error| error.to_string())
+    }
+
+    fn close(&mut self) {
+        let _ = self.shutdown(Shutdown::Both);
+    }
+
+    fn close_handle(&self) -> Option<CloseHandle> {
+        // A duplicate closes the same connection; a failure to clone means the
+        // socket is already unusable, in which case there is nothing to close.
+        self.try_clone().ok().map(CloseHandle::Unix)
+    }
+}
 
 /// Drain a `BufRead` of framed `DaemonMessages` until EOF.
 ///
@@ -25,42 +93,10 @@ use tracing::{debug, error, info, warn};
 /// Returns [`ClientError`] when the stream ends on a non-EOF I/O error (broken
 /// pipe, aborted connection) or a frame fails to decode fatally.
 pub fn run_daemon_reader<R: BufRead>(
-    mut reader: R,
-    mut handle_daemon_message: impl FnMut(DaemonMessage),
+    reader: R,
+    handle_daemon_message: impl FnMut(DaemonMessage),
 ) -> Result<(), ClientError> {
-    loop {
-        debug!("daemon reader waiting for message");
-        match read_message::<_, DaemonMessage>(&mut reader) {
-            Ok(message) => {
-                debug!("received daemon message");
-                handle_daemon_message(message);
-            }
-            // Clean termination: the daemon closed its side of the connection.
-            Err(ProtoError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
-                ) =>
-            {
-                break;
-            }
-            // Non-EOF I/O errors (broken pipe, connection aborted, etc.)
-            // are also fatal — the transport is gone.
-            Err(ProtoError::Io(error)) => {
-                error!(kind = %error.kind(), "daemon reader I/O error");
-                return Err(error.into());
-            }
-            // Protocol-level decode errors (Postcard, FrameTooLarge,
-            // TrailingBytes, UnsupportedVersion) are per-message failures.
-            // Because we use length-prefixed framing, a corrupt payload
-            // never desynchronises the stream — log and carry on.
-            Err(error) => {
-                error!(%error, "skipping corrupt daemon message");
-            }
-        }
-    }
-    info!("daemon reader loop ended normally");
-    Ok(())
+    serve_source(FramedReader(reader), handle_daemon_message)
 }
 
 /// Connect to a daemon over the Unix socket at `socket_path`, then serve the
@@ -68,16 +104,16 @@ pub fn run_daemon_reader<R: BufRead>(
 ///
 /// # Errors
 ///
-/// Returns [`ClientError`] if the unix socket cannot be connected, the
-/// Noise handshake fails, or the connection loop hits an I/O or protocol
-/// error.
+/// Returns [`ClientError`] if the unix socket cannot be connected, the client
+/// end of the connection cannot be cloned, or the connection loop hits an I/O or
+/// protocol error.
 pub fn run_daemon_connection(
     socket_path: &str,
     handle_daemon_message: impl FnMut(DaemonMessage),
     from_ui: CrossbeamReceiver<ClientMessage>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
-    info!("connecting to daemon at {socket_path}");
+    tracing::info!("connecting to daemon at {socket_path}");
     let stream = connect_unix(socket_path)?;
     pump_connection(stream, handle_daemon_message, from_ui, shutdown_rx)
 }
@@ -112,13 +148,13 @@ pub fn run_daemon_connection_with_autostart(
     from_ui: CrossbeamReceiver<ClientMessage>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
-    info!("connecting to daemon at {socket_path}");
+    tracing::info!("connecting to daemon at {socket_path}");
     let stream = match connect_unix(socket_path) {
         Ok(stream) => stream,
         Err(error) if choreo_proto::dial_error_means_no_listener(&error) => {
-            info!(%error, "no daemon listening on the socket; requesting autostart");
+            tracing::info!(%error, "no daemon listening on the socket; requesting autostart");
             ensure_daemon()?;
-            info!("autostart done; retrying connection to daemon at {socket_path}");
+            tracing::info!("autostart done; retrying connection to daemon at {socket_path}");
             connect_unix(socket_path)?
         }
         Err(error) => return Err(error.into()),
@@ -126,68 +162,17 @@ pub fn run_daemon_connection_with_autostart(
     pump_connection(stream, handle_daemon_message, from_ui, shutdown_rx)
 }
 
-/// Drive an ESTABLISHED daemon connection: spawn the writer thread, install
-/// the optional shutdown hook, and block in the reader loop until the daemon
-/// closes the stream. Split out of `run_daemon_connection` so the autostart
-/// variant can hand over a stream it already dialed (the successful first
-/// dial is never discarded).
+/// Drive an ESTABLISHED daemon connection: the reader takes a duplicate of the
+/// stream, the stream itself becomes the connection's outbound sink, and
+/// [`serve`] runs both halves until the connection ends. Split out of
+/// [`run_daemon_connection`] so the autostart variant can hand over a stream it
+/// already dialed (the successful first dial is never discarded).
 fn pump_connection(
     stream: UnixStream,
     handle_daemon_message: impl FnMut(DaemonMessage),
     from_ui: CrossbeamReceiver<ClientMessage>,
     shutdown_rx: Option<CrossbeamReceiver<()>>,
 ) -> Result<(), ClientError> {
-    let reader = BufReader::new(stream.try_clone()?);
-    let mut writer = BufWriter::new(stream);
-
-    // Channel to signal the writer thread to stop when the reader finishes.
-    // `bounded(1)` is a crossbeam control-plane channel (workspace convention):
-    // the reader sends at most one stop signal, so capacity 1 never blocks it.
-    let (writer_shutdown_tx, writer_shutdown_rx) = crossbeam_channel::bounded::<()>(1);
-
-    // This writer thread is the connection's single send site. Every outbound
-    // value is already a framed [`ClientMessage`]: the front-end owns a
-    // [`crate::pending::PendingReplies`] table, allocates the per-connection
-    // request id itself, and forwards the frame here so it can resolve the
-    // reply by that id (the daemon echoes it onto the matching reply).
-    let writer_handle = thread::spawn(move || {
-        loop {
-            // Event-driven wait: block until EITHER a UI message arrives OR the
-            // reader signals shutdown — no polling.  The message arm is FIRST
-            // and the select is BIASED, so a queue that already holds messages
-            // is fully drained before a simultaneous stop signal is honoured,
-            // matching the previous drain-then-stop behaviour exactly.
-            crossbeam_channel::select_biased! {
-                recv(from_ui) -> msg => match msg {
-                    Ok(framed) => {
-                        if let Err(e) = write_message(&mut writer, &framed) {
-                            warn!("writer thread write error: {e}");
-                            break;
-                        }
-                        let _ = writer.flush();
-                    }
-                    // `from_ui` closed: the UI is done sending.
-                    Err(_) => break,
-                },
-                // The reader finished (or dropped its sender): stop the writer.
-                recv(writer_shutdown_rx) -> _ => break,
-            }
-        }
-    });
-
-    if let Some(shutdown_rx) = shutdown_rx {
-        let shutdown_stream = reader.get_ref().try_clone()?;
-        thread::spawn(move || {
-            // Crossbeam `recv()` returns a `Result`; a disconnected sender
-            // still means "shut down", so the value is ignored either way.
-            let _ = shutdown_rx.recv();
-            let _ = shutdown_stream.shutdown(std::net::Shutdown::Both);
-        });
-    }
-
-    let reader_result = run_daemon_reader(reader, handle_daemon_message);
-    // Signal the writer to stop and wait for it to flush pending writes.
-    let _ = writer_shutdown_tx.send(());
-    let _ = writer_handle.join();
-    reader_result
+    let reader = FramedReader(BufReader::new(stream.try_clone()?));
+    serve(reader, stream, handle_daemon_message, from_ui, shutdown_rx)
 }

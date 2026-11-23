@@ -67,6 +67,9 @@ tempfile.workspace = true
 # keypair override from choreo-transport.
 x25519-dalek.workspace = true
 rand.workspace = true
+# The handshake-classification unit tests construct `TransportError::Noise`,
+# whose payload is a `snow::Error`; no handshake runs, only the error value.
+snow.workspace = true
 
 # The known-servers store is opened `O_NOFOLLOW` (read and write) and its
 # owning euid is checked (src/known_servers.rs), both on Unix only — the Windows
