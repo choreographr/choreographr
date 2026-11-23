@@ -662,10 +662,10 @@ pub(crate) fn client_thread(
 /// The writer channel is registered with the daemon by the acceptor BEFORE
 /// this function runs (see `register_client_writer`), so every failure path
 /// here — unknown preamble, silent/garbage peer, rejected handshake — must
-/// unregister via `ClientDisconnected`, exactly as the old inline handshake
-/// failure path in `server/lifecycle.rs` did. This keeps the daemon's
-/// `DaemonState::clients` map honest: a connection that never produced a
-/// working transport must not leave a stale writer entry behind.
+/// unregister via `ClientDisconnected`, exactly as a handshake failure inside
+/// `client_thread` does. This keeps the daemon's `DaemonState::clients` map
+/// honest: a connection that never produced a working transport must not leave
+/// a stale writer entry behind.
 ///
 /// **The preamble byte authorizes nothing, but it is not unchecked either.**
 /// It is a cleartext mode selector read before any keying material exists, so it
@@ -674,10 +674,9 @@ pub(crate) fn client_thread(
 /// parties' static keys via the DH operations, so a man-in-the-middle cannot
 /// impersonate either side (that would require the server's private key), and
 /// the daemon's ACL check runs inside whichever handshake the client picked.
-/// What changed is that a rewrite of the byte is no longer merely irrelevant: the
-/// 1-byte mode is mixed into the Noise prologue on both ends, so a peer that
+/// The 1-byte mode is mixed into the Noise prologue on both ends, so a peer that
 /// picks IK and an intermediary that rewrites the byte to XX produce different
-/// prologues and the handshake FAILS instead of running the other flow. The
+/// prologues and the handshake FAILS instead of running the other flow: the
 /// choice is the client's and nobody else's.
 ///
 /// The delegation is one call into

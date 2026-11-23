@@ -317,10 +317,10 @@ fi
 
 echo "==> daemon pubkey (proves config-dir hermeticity)"
 if "$DAEMON" pubkey >"$TMP/pubkey.out" 2>"$TMP/pubkey.err"; then
-    # tracing writes to stdout, so log events may be mixed in with the value;
-    # the public key is the last line that is not a log event. It must be ONE
-    # line of 44 standard-base64 characters (a 32-byte key).
-    PK_LINE="$(grep -v ' INFO \| WARN \| ERROR ' "$TMP/pubkey.out" | tail -n1)"
+    # `pubkey` writes ONLY the value to stdout (diagnostics travel on stderr
+    # through tracing, which the CLI configures with a stderr console sink), so
+    # the whole stream is one 44-character standard-base64 line.
+    PK_LINE="$(cat "$TMP/pubkey.out")"
     if printf '%s' "$PK_LINE" | grep -Eq '^[A-Za-z0-9+/]{43}=$'; then
         echo "  ok: pubkey from scratch config dir: $PK_LINE"
     else

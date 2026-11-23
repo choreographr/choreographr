@@ -129,14 +129,6 @@ use zeroize::Zeroizing;
 /// answers a candidate model's levels and the effort to pre-select for it
 /// without a provider instance or a network round-trip.
 ///
-/// Also under the same policy, 9's TCP transport binds its handshake mode into
-/// the Noise handshake prologue: the 1-byte mode preamble that selects IK or XX
-/// is now mixed into the prologue together with a fixed domain-separation tag,
-/// so the mode choice is part of the authenticated handshake transcript and
-/// cannot be altered by an intermediary on the path. The preamble byte itself
-/// stays where it is on the wire; only its meaning changed, from a claim the
-/// handshake ignored to one the handshake verifies.
-///
 /// Policy: variants may be added to the **current, unreleased** wire version
 /// without a bump. Mixed-version peers do not exist until a release ships, and
 /// the version gate rejects a mismatch either way, so an in-flight, unreleased
