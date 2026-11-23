@@ -1,11 +1,48 @@
-//! On-disk Noise IK transport keypair management and public-key fingerprints.
+//! On-disk Noise IK transport keypair management, key encoding, and
+//! public-key fingerprints.
 //!
 //! Provides the standard keypair paths under `{config}/choreographr`, the
-//! [`ensure_transport_keypair`] generator (race-safe via an advisory file
-//! lock), and the human-comparable [`fingerprint`] of a 32-byte public key.
+//! [`ensure_transport_keypair`] loader/generator (race-safe via an advisory
+//! file lock), the canonical base64 encoding of a 32-byte key
+//! ([`pubkey_base64`] / [`parse_pubkey_base64`]), and the human-comparable
+//! [`fingerprint`] of a 32-byte public key.
+//!
+//! # On-disk secret key format
+//!
+//! The secret key is stored as **standard-alphabet base64**: exactly 44
+//! characters followed by one `\n`. The file is therefore text, which keeps it
+//! legible, diffable, and pasteable — a binary blob invites copy/paste damage
+//! that looks like a key but is not one.
+//!
+//! Reading accepts **either** form: a file of exactly 32 bytes is a legacy raw
+//! key, anything else is decoded as base64 (surrounding whitespace trimmed, so
+//! the normal trailing newline is fine) and must yield exactly 32 bytes. The
+//! two lengths cannot be confused — 32 bytes of raw key is never valid base64
+//! text of key length, and the base64 form is 44 characters — so the dual read
+//! is unambiguous.
+//!
+//! A secret file that exists with content that decodes to neither form is a
+//! **hard error** ([`TransportError::InvalidSecretKey`]), never a regeneration.
+//! The secret is this instance's long-lived identity: silently minting a new
+//! one on a parse failure would orphan every ACL entry and every pinned server
+//! key, turning a recoverable typo into a fleet-wide re-enrollment. Only an
+//! absent (or zero-length) file means "generate".
+//!
+//! # Public key derivation
+//!
+//! The public half is always **derived** from the secret
+//! (`PublicKey::from(&StaticSecret::from(sk))`), never read back from disk. A
+//! stored copy can be stale or truncated — a crash between the secret's fsync
+//! and the public write leaves exactly that state — and reading it back would
+//! silently load the mismatch, surfacing later as an inexplicable handshake
+//! failure where the peer sees a key the operator's own file does not show.
+//! `transport.pub` is still written as an output artifact; loading ignores it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use base64::Engine as _;
 use tracing::{debug, info};
+use zeroize::Zeroize;
 
 use crate::error::TransportError;
 
@@ -33,8 +70,16 @@ pub fn set_test_config_root(root: Option<PathBuf>) {
 /// A Noise IK transport secret key (32-byte X25519 secret).
 ///
 /// Provides type safety over a raw `[u8; 32]` so the key cannot be
-/// confused with other 32-byte values.
-#[derive(Clone, Copy)]
+/// confused with other 32-byte values, and **zeroizes its bytes on drop**: it
+/// is the instance's long-lived identity, so a stray copy left in freed heap or
+/// stack memory is a copy an attacker who can read this process's memory later
+/// can lift (or that a core dump preserves).
+///
+/// Deliberately **not `Copy`**. A `Copy` struct is duplicated byte-for-byte by
+/// implicit assignment, and those duplicates escape [`Drop`] — they would be
+/// zeroized nowhere, which defeats the point. A caller that genuinely needs a
+/// second owner makes an explicit `clone` whose lifetime is visible.
+#[derive(Clone)]
 pub struct TransportSecretKey(pub(crate) [u8; 32]);
 
 impl TransportSecretKey {
@@ -52,6 +97,21 @@ impl TransportSecretKey {
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+}
+
+impl Zeroize for TransportSecretKey {
+    /// Overwrite the secret bytes with zeros.
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for TransportSecretKey {
+    /// Zeroize on drop, so ownership ending really does erase the key rather
+    /// than merely returning its memory to the allocator.
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -80,6 +140,73 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     (secret.to_bytes(), public.to_bytes())
 }
 
+/// Pair a secret with the public key **derived** from it.
+///
+/// This is the one place a loaded keypair's public half comes from, which is
+/// what makes "the secret and the public half disagree" unrepresentable: there
+/// is no second source to disagree with.
+fn keypair_from_secret(sk: [u8; 32]) -> (TransportSecretKey, [u8; 32]) {
+    let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(sk)).to_bytes();
+    (TransportSecretKey::new(sk), public)
+}
+
+/// Encode a 32-byte key as standard-alphabet base64 (44 characters).
+///
+/// This is the canonical key encoding: the ACL stores pubkeys in exactly this
+/// form and [`fingerprint`] is a regrouping of it, so an operator can compare a
+/// fingerprint against a stored key by eye.
+#[must_use]
+pub fn pubkey_base64(pk: &[u8; 32]) -> String {
+    base64::engine::general_purpose::STANDARD.encode(pk)
+}
+
+/// Parse a base64-encoded 32-byte key, trimming surrounding whitespace.
+///
+/// The inverse of [`pubkey_base64`], and tolerant of the trailing newline the
+/// on-disk form carries.
+///
+/// # Errors
+///
+/// Returns [`TransportError::Io`] (with [`std::io::ErrorKind::InvalidData`])
+/// when the text is not valid base64 or does not decode to exactly 32 bytes —
+/// the same shape [`read_server_pk`] and [`fingerprint_of_file`] use for a key
+/// that is present but malformed.
+pub fn parse_pubkey_base64(text: &str) -> Result<[u8; 32], TransportError> {
+    decode_key_base64(text).map_err(|detail| {
+        TransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid base64 key: {detail}"),
+        ))
+    })
+}
+
+/// Decode standard-alphabet base64 key text into exactly 32 bytes.
+///
+/// The single decode implementation behind both the public key parser and the
+/// secret-file loader. The failure is a message rather than an error type so
+/// each caller wraps it in the error its context calls for (a public key parse
+/// is a plain I/O-shaped error; a secret file names its path and refuses
+/// regeneration). Messages carry lengths and decoder positions only — never the
+/// decoded bytes.
+fn decode_key_base64(text: &str) -> Result<[u8; 32], String> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(text.trim())
+        .map_err(|e| format!("not valid base64: {e}"))?;
+    let len = decoded.len();
+    let key: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| format!("decodes to {len} bytes, expected 32"))?;
+    Ok(key)
+}
+
+/// Encode a secret key for on-disk storage: standard base64 plus a trailing
+/// newline, so the file is a well-formed text file (the loader trims it).
+fn encode_secret(sk: &[u8; 32]) -> String {
+    let mut text = base64::engine::general_purpose::STANDARD.encode(sk);
+    text.push('\n');
+    text
+}
+
 /// Directory that holds the transport keypair files (`<config>/choreographr`).
 ///
 /// Resolved through the shared [`choreo_shared::paths::config_dir`], so the
@@ -99,6 +226,9 @@ fn keypair_dir() -> Result<PathBuf, TransportError> {
 
 /// Path to the Noise IK static secret key (~/.config/choreographr/transport.sec)
 ///
+/// The file holds the base64 secret (see the module docs for the format and its
+/// legacy raw-byte acceptance).
+///
 /// # Errors
 ///
 /// Returns [`TransportError::ConfigDirNotFound`] when no config directory
@@ -108,6 +238,10 @@ pub fn transport_sec_path() -> Result<PathBuf, TransportError> {
 }
 
 /// Path to the Noise IK static public key (~/.config/choreographr/transport.pub)
+///
+/// An output artifact of keypair generation. Loading a keypair does **not** read
+/// it: the public half is derived from the secret, so this file can never
+/// disagree with it.
 ///
 /// # Errors
 ///
@@ -168,8 +302,7 @@ pub fn read_server_pk(path: Option<&str>) -> Result<[u8; 32], TransportError> {
 /// Never fails; infallible by construction.
 #[must_use]
 pub fn fingerprint(pk: &[u8; 32]) -> String {
-    use base64::Engine as _;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(pk);
+    let b64 = pubkey_base64(pk);
     // Cluster the 44-char base64 string into 4-char groups joined by
     // spaces. 44 % 4 == 0, so every group is exactly 4 chars — no ragged
     // tail to special-case. (from_utf8_lossy, not unwrap: the base64
@@ -207,37 +340,88 @@ pub fn fingerprint_of_file(path: &std::path::Path) -> Result<String, TransportEr
     Ok(fingerprint(&pk))
 }
 
+/// Read and decode the secret key file at `path`.
+///
+/// Returns `Ok(None)` when the file is absent — the caller then generates a
+/// keypair — and `Ok(Some(secret))` when a key can be decoded from it.
+///
+/// A file that exists but does not decode is an error, **never** a regenerate:
+/// see the module docs on why a lost identity is unrecoverable. The single
+/// implementation behind both the lock-free fast path and the re-check under
+/// the advisory lock, so the two can never drift into accepting different
+/// things.
+fn load_secret_key(path: &Path) -> Result<Option<[u8; 32]>, TransportError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(TransportError::Io(e)),
+    };
+    if bytes.is_empty() {
+        // A zero-length file holds no identity: it is what
+        // `open_locked_for_write` creates before the key is written (and what
+        // a crash between that create and the write leaves behind). Treating it
+        // as "generate" is the only useful answer — there is nothing to
+        // preserve, and erroring would wedge the instance permanently.
+        return Ok(None);
+    }
+    decode_secret(&bytes)
+        .map(Some)
+        .map_err(|detail| TransportError::InvalidSecretKey {
+            path: path.display().to_string(),
+            detail,
+        })
+}
+
+/// Decode secret key file contents as either the legacy raw 32-byte form or the
+/// current base64 text form.
+///
+/// A file of exactly 32 bytes IS the legacy raw key. The base64 form is 44
+/// characters plus a newline (45 bytes), and a 32-character base64 string would
+/// decode to 24 bytes — so the raw length can never be mistaken for text.
+fn decode_secret(bytes: &[u8]) -> Result<[u8; 32], String> {
+    if bytes.len() == 32 {
+        let mut sk = [0u8; 32];
+        sk.copy_from_slice(bytes);
+        return Ok(sk);
+    }
+    let len = bytes.len();
+    let text = std::str::from_utf8(bytes).map_err(|_| {
+        format!("{len} bytes of non-UTF-8 data, expected 32 raw bytes or base64 text")
+    })?;
+    decode_key_base64(text).map_err(|detail| format!("{len}-byte file: {detail}"))
+}
+
 /// Ensure that a Noise IK transport keypair exists at the standard paths
 /// (~/.config/choreographr/transport.sec and ~/.config/choreographr/transport.pub).
 ///
-/// If both files exist and are valid (32 bytes each), loads and returns them.
-/// Otherwise generates a new X25519 keypair and writes both files.
+/// If the secret file exists and decodes (base64, or a legacy raw 32-byte key),
+/// loads it and returns it paired with the public key **derived** from it.
+/// Otherwise generates a new X25519 keypair and writes both files — the secret
+/// as base64 text, and `transport.pub` as the raw 32-byte public key.
+///
+/// A secret file that exists but does not decode is reported as
+/// [`TransportError::InvalidSecretKey`] and left untouched; it is never
+/// overwritten with a freshly generated key.
 ///
 /// Returns (`secret_key`, `public_key`).
 ///
 /// # Errors
 ///
 /// Returns [`TransportError`] on config-directory resolution, file I/O,
-/// or lock/unlock failures.
+/// lock/unlock failures, or an unparseable secret key file.
 pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), TransportError> {
     // Hoisted to the top of the function per clippy::items_after_statements:
-    // the traits are needed in both the fast path and the write path below.
+    // the traits are needed in the write path below.
     use std::io::{Seek, SeekFrom, Write};
 
     let sec_path = transport_sec_path()?;
     let pub_path = transport_pub_path()?;
 
-    if sec_path.exists() && pub_path.exists() {
-        let secret = std::fs::read(&sec_path)?;
-        let public = std::fs::read(&pub_path)?;
-        if secret.len() == 32 && public.len() == 32 {
-            let mut sk = [0u8; 32];
-            let mut pk = [0u8; 32];
-            sk.copy_from_slice(&secret);
-            pk.copy_from_slice(&public);
-            debug!("loaded existing transport keypair");
-            return Ok((TransportSecretKey(sk), pk));
-        }
+    // Fast path: a loadable secret means the keypair already exists, so this
+    // takes no lock at all on the common start-up path.
+    if let Some(sk) = load_secret_key(&sec_path)? {
+        debug!("loaded existing transport secret key");
+        return Ok(keypair_from_secret(sk));
     }
 
     let (secret, public) = generate_keypair();
@@ -251,32 +435,28 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
     let mut sec_file = open_locked_for_write(&sec_path)?;
 
     // Re-check under the lock: a concurrent process may have written a valid
-    // pair while we waited.
+    // key while we waited, in which case its key wins and ours is discarded —
+    // two instances starting together must converge on ONE identity, or the
+    // second one's ACL entry would never match the key it presents.
     let write_result = (|| -> Result<(TransportSecretKey, [u8; 32]), TransportError> {
-        if sec_path.exists()
-            && pub_path.exists()
-            && let Ok(secret) = std::fs::read(&sec_path)
-            && let Ok(public) = std::fs::read(&pub_path)
-            && secret.len() == 32
-            && public.len() == 32
-        {
-            let mut sk = [0u8; 32];
-            let mut pk = [0u8; 32];
-            sk.copy_from_slice(&secret);
-            pk.copy_from_slice(&public);
-            debug!("loaded existing transport keypair (written concurrently)");
-            return Ok((TransportSecretKey(sk), pk));
+        if let Some(sk) = load_secret_key(&sec_path)? {
+            debug!("loaded existing transport secret key (written concurrently)");
+            return Ok(keypair_from_secret(sk));
         }
+        let encoded = encode_secret(&secret);
         sec_file.set_len(0)?;
         sec_file.seek(SeekFrom::Start(0))?;
-        sec_file.write_all(&secret)?;
+        sec_file.write_all(encoded.as_bytes())?;
         sec_file.sync_all()?;
+        // `transport.pub` is written as an artifact for operators and the
+        // `fingerprint` subcommand; nothing reads it back to reconstruct a
+        // keypair, so a crash between the two writes cannot corrupt anything.
         std::fs::write(&pub_path, public)?;
         info!(
             "generated and wrote new Noise IK transport keypair to {}",
             sec_path.display()
         );
-        Ok((TransportSecretKey(secret), public))
+        Ok((TransportSecretKey::new(secret), public))
     })();
 
     let unlock_result = sec_file.unlock();
@@ -320,7 +500,16 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    // These two tests mutate the shared test-config-root override.
+    /// Install the test config root and return the keypair directory inside it,
+    /// created so a test can plant a secret file before calling the loader.
+    fn install_temp_root(temp: &tempfile::TempDir) -> PathBuf {
+        set_test_config_root(Some(temp.path().to_path_buf()));
+        let dir = temp.path().join("choreographr");
+        std::fs::create_dir_all(&dir).expect("create keypair dir");
+        dir
+    }
+
+    // These tests mutate the shared test-config-root override.
     // Running them in parallel would clobber each other's temp dir
     // mid-flight (one test's restore racing the other's setup), so they are
     // serialized with `#[serial]` to keep them deterministic.
@@ -388,6 +577,171 @@ mod tests {
         // write, and the secret/public halves must not be mismatched.
         assert_eq!(sk_a.as_bytes(), sk_b.as_bytes());
         assert_eq!(pk_a, pk_b);
+    }
+
+    /// The secret is written as standard base64 + newline (44 chars + `\n`),
+    /// and loading that same file round-trips to the identical keypair.
+    #[test]
+    #[serial]
+    fn secret_file_is_base64_and_round_trips() {
+        use base64::Engine as _;
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = install_temp_root(&temp);
+        let sec_path = dir.join("transport.sec");
+
+        let (sk, pk) = ensure_transport_keypair().expect("generate keypair");
+        let raw = std::fs::read(&sec_path).expect("read secret file");
+
+        assert_eq!(raw.len(), 45, "44 base64 chars plus one newline");
+        assert_eq!(raw.last(), Some(&b'\n'), "text file ends with a newline");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&raw[..44])
+            .expect("secret file body is valid base64");
+        assert_eq!(decoded, sk.as_bytes(), "file holds the secret verbatim");
+
+        // Round-trip: the loader reads back the very same keypair, and does not
+        // rewrite the file it just read.
+        let (sk2, pk2) = ensure_transport_keypair().expect("reload keypair");
+        assert_eq!(sk2.as_bytes(), sk.as_bytes());
+        assert_eq!(pk2, pk);
+        assert_eq!(
+            std::fs::read(&sec_path).expect("re-read secret file"),
+            raw,
+            "loading must not rewrite the secret file"
+        );
+
+        set_test_config_root(None);
+    }
+
+    /// The returned public half is the one derived from the returned secret, so
+    /// a stale or corrupt public file can never be loaded.
+    #[test]
+    #[serial]
+    fn public_key_is_derived_from_the_secret() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = install_temp_root(&temp);
+
+        let (sk, pk) = ensure_transport_keypair().expect("generate keypair");
+        let derived =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk.as_bytes()))
+                .to_bytes();
+        assert_eq!(pk, derived, "public key must be derived from the secret");
+
+        // A deliberately WRONG public file must change nothing: the loader
+        // ignores it entirely.
+        std::fs::write(dir.join("transport.pub"), [0xFFu8; 32]).expect("plant bad public file");
+        let (sk2, pk2) = ensure_transport_keypair().expect("reload keypair");
+        assert_eq!(sk2.as_bytes(), sk.as_bytes());
+        assert_eq!(pk2, derived, "the stored public file is never read");
+
+        set_test_config_root(None);
+    }
+
+    /// A legacy 32-raw-byte secret file still loads, unchanged on disk.
+    #[test]
+    #[serial]
+    fn legacy_raw_secret_still_loads() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = install_temp_root(&temp);
+        let sec_path = dir.join("transport.sec");
+
+        let raw_key = [0x42u8; 32];
+        std::fs::write(&sec_path, raw_key).expect("write legacy raw secret");
+
+        let (sk, pk) = ensure_transport_keypair().expect("load legacy raw secret");
+        assert_eq!(sk.as_bytes(), &raw_key);
+        let derived =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(raw_key)).to_bytes();
+        assert_eq!(pk, derived);
+
+        // The loader must not migrate the file underneath the operator.
+        assert_eq!(
+            std::fs::read(&sec_path).expect("re-read secret file"),
+            raw_key,
+            "loading a legacy key must not rewrite it"
+        );
+
+        set_test_config_root(None);
+    }
+
+    /// A base64 secret (with the trailing newline the writer emits) loads.
+    #[test]
+    #[serial]
+    fn base64_secret_loads() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = install_temp_root(&temp);
+        let sec_path = dir.join("transport.sec");
+
+        let key = [0x11u8; 32];
+        std::fs::write(&sec_path, encode_secret(&key)).expect("write base64 secret");
+        assert_eq!(
+            std::fs::read(&sec_path).expect("read back").len(),
+            45,
+            "encoding is 44 base64 chars + newline"
+        );
+
+        let (sk, pk) = ensure_transport_keypair().expect("load base64 secret");
+        assert_eq!(sk.as_bytes(), &key);
+        let derived =
+            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(key)).to_bytes();
+        assert_eq!(pk, derived);
+
+        set_test_config_root(None);
+    }
+
+    /// A present-but-garbage secret file is a hard error AND is left untouched:
+    /// silently regenerating would replace the instance identity and orphan
+    /// every ACL entry and pinned server key.
+    #[test]
+    #[serial]
+    fn unparseable_secret_is_rejected_and_left_untouched() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let dir = install_temp_root(&temp);
+        let sec_path = dir.join("transport.sec");
+
+        let garbage = b"this is not a transport secret key\n".to_vec();
+        std::fs::write(&sec_path, &garbage).expect("write garbage secret");
+
+        let err = ensure_transport_keypair().expect_err("garbage must not load");
+        let TransportError::InvalidSecretKey { path, .. } = &err else {
+            panic!("expected InvalidSecretKey, got {err:?}");
+        };
+        assert!(
+            path.ends_with("transport.sec"),
+            "error names the offending file: {path}"
+        );
+
+        assert_eq!(
+            std::fs::read(&sec_path).expect("re-read secret file"),
+            garbage,
+            "the unparseable file must be left byte-identical"
+        );
+        assert!(
+            !dir.join("transport.pub").exists(),
+            "a rejected secret must not produce a public file"
+        );
+
+        set_test_config_root(None);
+    }
+
+    /// The canonical base64 helpers round-trip and reject malformed input.
+    #[test]
+    fn pubkey_base64_round_trips_and_rejects_malformed_input() {
+        let pk = [0xA5u8; 32];
+        let text = pubkey_base64(&pk);
+        assert_eq!(text.len(), 44);
+        assert_eq!(parse_pubkey_base64(&text).expect("decode"), pk);
+
+        // The on-disk form carries a trailing newline; whitespace is trimmed.
+        assert_eq!(
+            parse_pubkey_base64(&format!("{text}\n")).expect("decode"),
+            pk
+        );
+
+        assert!(parse_pubkey_base64("not base64!!").is_err());
+        // Valid base64 of the wrong length decodes but must not be accepted.
+        assert!(parse_pubkey_base64("AAAA").is_err());
     }
 
     /// A fixed known key: the fingerprint must be deterministic, purely a

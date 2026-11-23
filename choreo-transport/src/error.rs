@@ -39,4 +39,19 @@ pub enum TransportError {
     /// The OS exposed no configuration directory to place the keypair in.
     #[error("could not determine config directory")]
     ConfigDirNotFound,
+    /// The on-disk transport secret key file exists but holds no usable key:
+    /// neither a legacy raw 32-byte key nor base64 that decodes to 32 bytes.
+    ///
+    /// Regeneration is deliberately refused rather than performed, because the
+    /// secret is the instance's long-lived identity — minting a new one would
+    /// orphan every ACL entry and every pinned server key. The `detail` carries
+    /// the decoder's verdict (a byte count or position), never key material.
+    #[error("transport secret key file {path} is not a valid key (regeneration refused): {detail}")]
+    InvalidSecretKey {
+        /// Path of the offending file, rendered for display.
+        path: String,
+        /// Why the contents could not be decoded — lengths and decoder
+        /// positions only, never the file's bytes.
+        detail: String,
+    },
 }
