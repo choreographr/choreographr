@@ -691,6 +691,12 @@ pub(crate) fn tcp_handshake_and_client_thread(
     args: ConnThreadArgs,
     writer_write_timeout: Duration,
 ) -> io::Result<()> {
+    // Disable Nagle before the responder handshake: the accepted socket is
+    // otherwise untouched, and the handshake is a small request/response
+    // sequence that would pay the Nagle + delayed-ACK tax on a high-RTT link.
+    // The data plane re-applies it in `finish` (the intrinsic guarantee).
+    choreo_transport::socket::tune_control_socket(&tcp);
+
     // The preamble read and the handshake share one absolute deadline, so an
     // unauthenticated peer that connects and sends nothing (or dribbles) is cut
     // off instead of holding this thread + FD open. `transport_sk` is owned, not

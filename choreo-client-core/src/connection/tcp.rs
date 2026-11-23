@@ -21,6 +21,20 @@ use super::handshake::{
     serve_noise_connection,
 };
 
+/// Dial a daemon's TCP control plane and apply the control-plane socket policy.
+///
+/// Every TCP connect path in this module dials the same way, so the dial (which
+/// stays its own step — see the callers' trust-guidance notes) and the
+/// `NODELAY` tuning live here instead of being repeated at each site. The
+/// tuning is applied BEFORE the handshake so the handshake's small round trips
+/// are not delayed by Nagle; [`choreo_transport::handshake`]'s `finish` re-applies
+/// it when the socket reaches the data plane.
+fn dial_control_tcp(addr: &str) -> std::io::Result<std::net::TcpStream> {
+    let tcp = std::net::TcpStream::connect(addr)?;
+    choreo_transport::socket::tune_control_socket(&tcp);
+    Ok(tcp)
+}
+
 /// Connect to a daemon via Noise IK over TCP.
 ///
 /// Uses two blocking threads:
@@ -55,7 +69,7 @@ pub fn run_daemon_tcp_connection(
     // HANDSHAKE only — a plain dial failure (daemon down, network down) is
     // reported verbatim and must never suggest re-pairing, and neither must a
     // handshake that merely timed out.
-    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    let tcp = dial_control_tcp(addr).map_err(ClientError::Io)?;
 
     ik_handshake_and_serve(
         tcp,
@@ -107,7 +121,7 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
 
     // Connect TCP, then run Noise XX — the initiator writes the first-contact
     // mode preamble itself, so the declared mode and the flow cannot disagree.
-    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    let tcp = dial_control_tcp(addr).map_err(ClientError::Io)?;
     let (noise, server_pk) =
         handshake_initiator_xx(tcp, client_sk.as_bytes()).map_err(handshake_error)?;
 
@@ -149,7 +163,7 @@ pub fn probe_server_key(addr: &str) -> Result<[u8; 32], ClientError> {
 
     let (client_sk, _client_pk) = client_transport_keypair()?;
 
-    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    let tcp = dial_control_tcp(addr).map_err(ClientError::Io)?;
     // The XX initiator declares the first-contact mode itself (see
     // `handshake_initiator_xx`).
     let (noise, server_pk) =
@@ -253,7 +267,7 @@ pub fn verify_daemon_authorization(addr: &str, server_pk: &[u8; 32]) -> Result<(
 
     // Dial failure = the daemon is down / unreachable — reported as-is so
     // the caller's message can point at the network, not at enrollment.
-    let tcp = std::net::TcpStream::connect(addr).map_err(PreflightError::Unreachable)?;
+    let tcp = dial_control_tcp(addr).map_err(PreflightError::Unreachable)?;
 
     // Only a REFUSAL (wrong server key, or this client not enrolled in the
     // daemon's ACL) is `Rejected`; the caller renders the enrollment
@@ -325,7 +339,7 @@ pub fn run_daemon_tcp_connection_pinned(
 
     // Dial as its own step (plain error, no trust guidance — the daemon
     // being down has nothing to do with the pin).
-    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    let tcp = dial_control_tcp(addr).map_err(ClientError::Io)?;
 
     // The dial already succeeded, so a `ConnectionRefused` coming back from
     // `ik_handshake_and_serve` can only be its handshake-REFUSAL mapping —

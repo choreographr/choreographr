@@ -137,6 +137,15 @@ the same writer the catalog artifacts use) — is documented in-source
 `choreo-client-core`'s `known_servers` and `connection`, `choreo-tui`'s
 `lib`).
 
+The client↔daemon TCP/Noise sockets run with **Nagle disabled**
+(`TCP_NODELAY`) so the interactive, message-oriented traffic — streamed deltas
+and rapid control round trips — is never stalled by the Nagle/delayed-ACK
+interaction. It is applied before the handshake (so the handshake's own round
+trips are not delayed) and re-asserted when the handshake hands the socket to
+the data plane. The Unix local transport (no Nagle) and the HTTP provider
+sockets (already `NODELAY` via `ureq`) are unaffected. The rationale lives in
+`choreo-transport`'s `socket` module docs.
+
 ## Provider Architecture
 
 Provider support is layered across two crates, and the seam between them is

@@ -213,12 +213,22 @@ where
 /// and derives the `TransportState`. The data plane has no timeout by design:
 /// readers block until a message or EOF, and shutdown closes the socket to
 /// unblock them.
+///
+/// The socket is also handed to the data plane with Nagle disabled
+/// (`TCP_NODELAY`): the encrypted stream carries small, interactive messages
+/// (streaming deltas, control traffic), so Nagle would stall each small write on
+/// the peer's delayed ACK. This is the intrinsic guarantee — every IK and XX flow
+/// funnels through here, so a held `NoiseStream` always runs `NODELAY`, whether or
+/// not the caller tuned the raw socket before the handshake.
 pub(super) fn finish(
     stream: TcpStream,
     handshake: HandshakeState,
     mode: HandshakeMode,
     role: Role,
 ) -> Result<NoiseStream, TransportError> {
+    // Idempotent with any pre-handshake tuning the caller applied; see the doc
+    // comment above for why it is set here too.
+    crate::socket::tune_control_socket(&stream);
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
     let transport = handshake.into_transport_mode()?;
