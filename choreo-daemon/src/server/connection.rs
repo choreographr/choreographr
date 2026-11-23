@@ -757,9 +757,9 @@ pub(crate) fn tcp_client_thread(
     // Summary subscription is an explicit client decision on this transport,
     // exactly as on the Unix path: a Noise client opts in via
     // ClientMessageType::SubscribeSessionsSummary (dispatched in
-    // dispatch_client_message). Previously every TCP connection was
-    // auto-registered here, which pushed broadcasts about other clients'
-    // sessions to clients that never asked.
+    // dispatch_client_message). A TCP connection is NOT auto-registered here, so
+    // a client that never asked is never sent broadcasts about other clients'
+    // sessions.
     let mut reader = noise;
     loop {
         match reader.recv_client_message() {
