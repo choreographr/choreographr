@@ -285,7 +285,7 @@ impl SpawnedDaemon {
         // the secret half goes into `run_server` via `TransportSecretKey`.
         let server_sk = x25519_dalek::StaticSecret::random_from_rng(&mut rand::rng());
         let server_pk = x25519_dalek::PublicKey::from(&server_sk).to_bytes();
-        let transport_sk = choreo_transport::key::TransportSecretKey::new(server_sk.to_bytes());
+        let transport_sk = choreo_transport::key::TransportSecretKey::from(server_sk.to_bytes());
 
         // One temp dir holds the socket and the ACL file — keeping them
         // alive for the daemon's whole lifetime (the DB lives in its own

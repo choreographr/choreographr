@@ -1,15 +1,16 @@
 //! The Noise IK and XX handshake state machines over a `TcpStream`.
 //!
-//! The state machines themselves are the stock `snow` patterns
-//! `Noise_IK_25519_AESGCM_SHA256` ([`handshake_initiator`] /
-//! [`handshake_responder`]) and `Noise_XX_25519_AESGCM_SHA256`
-//! ([`handshake_initiator_xx`] / [`handshake_responder_xx`]). Nothing about
-//! those patterns, their key schedule, or the cipher is modified. What this
-//! module adds is application-level framing around the handshake: the 1-byte
-//! mode preamble that names the pattern ([`HandshakeMode`] / [`PREAMBLE_IK`] /
+//! The state machines themselves are the stock `snow` patterns named by
+//! [`HandshakeMode::pattern`]: `Noise_IK_25519_AESGCM_SHA256`
+//! ([`handshake_initiator`] / [`handshake_responder`]) and
+//! `Noise_XX_25519_AESGCM_SHA256` ([`handshake_initiator_xx`] /
+//! [`handshake_responder_xx`]). Nothing about those patterns, their key
+//! schedule, or the cipher is modified. What this module adds is
+//! application-level framing around the handshake: the 1-byte mode preamble
+//! that names the pattern ([`HandshakeMode`] / [`PREAMBLE_IK`] /
 //! [`PREAMBLE_XX`]), the 2-byte big-endian handshake length prefix (see the
-//! `frame` submodule), and — in [`crate::noise`] — the 4-byte data-plane prefix
-//! carrying an authenticated continuation byte.
+//! `frame` submodule), and — in [`crate::noise`] — a 4-byte data-plane prefix
+//! whose ciphertext carries an authenticated continuation byte.
 //!
 //! The mode byte is written and read by the handshake entry points themselves,
 //! not by their callers: an initiator writes the byte for the flow it is about
@@ -37,31 +38,34 @@
 //! `HANDSHAKE_TIMEOUT` by default, or an explicit budget via the `_with_timeout`
 //! variants.
 //!
-//! The flows live in the `ik` and `xx` submodules, one pair of functions each,
-//! and both share the single framing path in `frame` so the length prefix and
-//! the bounded I/O have exactly one implementation.
+//! A flow is a sequence of message steps, not a copy of the framing: the two
+//! message-order differences live in the `ik` and `xx` submodules, while the
+//! mode type and its wire/prologue encoding live in `mode`, the framing and
+//! deadline plumbing in `frame`, and the parts every flow shares — building the
+//! state machine, the ACL check, handing the socket to the data plane — here.
 
 mod frame;
 mod ik;
+mod mode;
 mod xx;
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
+use snow::{Builder, HandshakeState};
+
 use crate::error::TransportError;
+use crate::noise::NoiseStream;
 
 pub use ik::{
     handshake_initiator, handshake_initiator_with_timeout, handshake_responder,
     handshake_responder_with_timeout,
 };
+pub use mode::{HandshakeMode, PREAMBLE_IK, PREAMBLE_XX, PROLOGUE_LEN, PROLOGUE_TAG};
 pub use xx::{
     handshake_initiator_xx, handshake_initiator_xx_with_timeout, handshake_responder_xx,
     handshake_responder_xx_with_timeout,
 };
-
-// The bounds-checked slice helpers are shared with the data plane in
-// `crate::noise`, which reaches them through this module's path.
-pub(crate) use frame::{at, at_mut, slice, slice_mut};
 
 /// Default total-duration budget for a Noise handshake. The
 /// `handshake_*_with_timeout` variants take their own budget; the plain
@@ -85,161 +89,154 @@ pub(crate) use frame::{at, at_mut, slice, slice_mut};
 /// needs (sub-millisecond on loopback, a few ms on a real network).
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Domain-separation tag mixed into every handshake prologue (see
-/// [`HandshakeMode::prologue`]).
+/// Upper bound on any budget a caller may pass to a `_with_timeout` variant
+/// (one day).
 ///
-/// The prologue is hashed into the Noise handshake hash before any handshake
-/// message is processed, so its content is covered by exactly the same
-/// authentication as the key exchange. This tag pins the transcript to THIS
-/// protocol: another use of the same stock pattern and the same static keys
-/// derives a different handshake hash, so the two exchanges can never be
-/// confused for one another. The `-1` suffix leaves room for a future
-/// incompatible prologue without colliding with this one.
-pub const PROLOGUE_TAG: &[u8] = b"choreographr-noise-1";
+/// The unauthenticated phase must never be settable to effectively-infinite,
+/// and an unbounded `Duration` would also overflow the `Instant` arithmetic
+/// that turns a budget into a deadline (`Instant + Duration` panics on
+/// overflow). Clamping here keeps both properties without a panic path.
+const MAX_HANDSHAKE_BUDGET: Duration = Duration::from_hours(24);
 
-/// Which Noise handshake a TCP connection runs, and therefore which 1-byte
-/// preamble its initiator sends first.
-///
-/// The two modes differ only in what the initiator knows up front: IK's
-/// initiator already has the responder's static key (two messages), XX's meets
-/// it for the first time (three messages, the responder's static arriving in
-/// message 2 for out-of-band confirmation). Both authenticate both static keys;
-/// neither is a fallback for the other, so a connection runs exactly the mode
-/// its initiator chose.
-///
-/// This type exists so the choice cannot drift from the flow that implements it:
-/// one value carries the wire byte AND the prologue that binds that byte into
-/// the handshake transcript, so a caller cannot send one mode's byte and run the
-/// other's handshake (see [`handshake_responder_auto`] for the receiving side).
+/// Which half of a handshake a flow is running. Carried only for the
+/// completion log line, so one shared `finish` can report both sides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HandshakeMode {
-    /// Noise IK — the authenticated mode; the initiator already knows the
-    /// responder's static key.
-    Ik,
-    /// Noise XX — first contact; the initiator learns the responder's static key
-    /// from the handshake and verifies it out of band.
-    Xx,
+pub(super) enum Role {
+    /// The dialing side, which writes the mode preamble first.
+    Initiator,
+    /// The accepting side, which reads the mode preamble first.
+    Responder,
 }
 
-impl HandshakeMode {
-    /// The 1-byte preamble this mode puts on the wire before any handshake
-    /// message ([`PREAMBLE_IK`] / [`PREAMBLE_XX`]).
-    #[must_use]
-    pub const fn byte(self) -> u8 {
-        match self {
-            Self::Ik => PREAMBLE_IK,
-            Self::Xx => PREAMBLE_XX,
-        }
-    }
-
-    /// Decode a preamble byte, or `None` when it names no mode this build
-    /// defines (including the reserved `0x00`).
-    #[must_use]
-    pub const fn from_byte(byte: u8) -> Option<Self> {
-        match byte {
-            PREAMBLE_IK => Some(Self::Ik),
-            PREAMBLE_XX => Some(Self::Xx),
-            _ => None,
-        }
-    }
-
-    /// Build the Noise prologue for this mode: [`PROLOGUE_TAG`] followed by the
-    /// mode byte.
-    ///
-    /// Both ends of one handshake pass the SAME mode — the IK initiator and the
-    /// IK responder both use [`HandshakeMode::Ik`], the XX pair both
-    /// [`HandshakeMode::Xx`] — which is what makes the binding meaningful: the
-    /// prologue mismatch that any other choice would produce is a handshake
-    /// failure, so the mode a connection uses is the mode both peers committed
-    /// to inside the transcript. There is no negotiation and no version number,
-    /// so there is nothing for an intermediary to steer the selection with.
-    ///
-    /// Returns the tag and the byte concatenated; the caller keeps the buffer
-    /// alive for as long as the `snow` builder it hands it to, which borrows it.
-    #[must_use]
-    pub fn prologue(self) -> Vec<u8> {
-        // One allocation of exactly the final size: the tag plus the single mode
-        // byte. The buffer is tiny (21 bytes) and lives only for one builder.
-        let mut prologue = Vec::with_capacity(PROLOGUE_TAG.len() + 1);
-        prologue.extend_from_slice(PROLOGUE_TAG);
-        prologue.push(self.byte());
-        prologue
-    }
-}
-
-impl std::fmt::Display for HandshakeMode {
+impl std::fmt::Display for Role {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::Ik => "IK",
-            Self::Xx => "XX",
+            Self::Initiator => "initiator",
+            Self::Responder => "responder",
         })
     }
 }
 
-/// Handshake-mode preamble byte: Noise IK (the existing authenticated
-/// mode — the client knows the server's static key in advance).
-///
-/// Every TCP connection starts with exactly one cleartext mode byte before any
-/// handshake message. The byte is not secret and carries no authentication of
-/// its own — it only selects which pattern to run — but it is not merely
-/// advisory either: both ends mix it into the Noise prologue
-/// ([`HandshakeMode::prologue`]), so the value a peer actually sent is covered
-/// by the handshake hash and cannot be altered on the path. `0x00` is
-/// deliberately reserved (never assigned) so an all-zero garbage fill or a
-/// trailing-NUL bug can never be mistaken for a valid mode.
-pub const PREAMBLE_IK: u8 = 0x01;
-
-/// Handshake-mode preamble byte: Noise XX (first-contact mode — the client does
-/// NOT know the server's static key in advance and learns it from the
-/// handshake; the caller then verifies the key out-of-band before any
-/// protocol traffic flows).
-///
-/// Same wire position and same prologue binding as [`PREAMBLE_IK`].
-pub const PREAMBLE_XX: u8 = 0x02;
-
-/// Read the 1-byte handshake-mode preamble from `stream`, using the default
-/// `HANDSHAKE_TIMEOUT` budget (see [`read_handshake_preamble_with_timeout`]).
-///
-/// The responder entry points already do this as their first step
-/// ([`handshake_responder`] / [`handshake_responder_xx`] /
-/// [`handshake_responder_auto`]); this is the standalone form for a caller that
-/// wants the mode without running a handshake.
-///
-/// # Errors
-///
-/// Returns [`TransportError::HandshakeModeUnknown`] if the byte names no mode
-/// this build defines, [`TransportError::HandshakeTimeout`] if the peer does not
-/// send it within the `HANDSHAKE_TIMEOUT` budget, or any propagated socket I/O
-/// error (EOF before the byte reads as `UnexpectedEof`).
-pub fn read_handshake_preamble(stream: &mut TcpStream) -> Result<HandshakeMode, TransportError> {
-    read_handshake_preamble_with_timeout(stream, HANDSHAKE_TIMEOUT)
+/// Turn a caller's total-duration budget into an absolute deadline, clamped to
+/// [`MAX_HANDSHAKE_BUDGET`] so the addition can never overflow.
+pub(super) fn deadline_from(timeout: Duration) -> Instant {
+    Instant::now() + timeout.min(MAX_HANDSHAKE_BUDGET)
 }
 
-/// [`read_handshake_preamble`] with an explicit total-duration budget.
+/// Build the `snow` handshake state for `mode`.
 ///
-/// # Errors
+/// The one place a handshake state machine is constructed, so the pattern
+/// string, the local static key and the prologue (the domain-separation tag
+/// plus this mode's byte) cannot differ between a flow and its peer: both
+/// halves of a mode call this with the same [`HandshakeMode`], and only the
+/// role and the peer's static key differ.
 ///
-/// As [`read_handshake_preamble`], with the budget given by `timeout`.
-pub fn read_handshake_preamble_with_timeout(
-    stream: &mut TcpStream,
-    timeout: Duration,
-) -> Result<HandshakeMode, TransportError> {
-    read_preamble(stream, Instant::now() + timeout)
+/// * `remote_pk` — the peer's static key, for the flows that know it up front
+///   (IK's initiator). `None` for XX (whose point is learning it) and for every
+///   responder.
+pub(super) fn build(
+    mode: HandshakeMode,
+    static_sk: &[u8; 32],
+    remote_pk: Option<&[u8; 32]>,
+    role: Role,
+) -> Result<HandshakeState, TransportError> {
+    // The prologue binds the domain-separation tag and this flow's mode byte
+    // into the handshake hash; the peer's half derives the identical buffer
+    // from the same HandshakeMode, so a peer that ran a different mode (or an
+    // intermediary that rewrote the preamble byte) cannot complete this
+    // handshake. It lives for the builder's borrow below.
+    let prologue = mode.prologue();
+    let mut builder = Builder::new(mode.pattern().parse()?)
+        .local_private_key(static_sk)?
+        .prologue(&prologue)?;
+    if let Some(remote_pk) = remote_pk {
+        builder = builder.remote_public_key(remote_pk)?;
+    }
+    let handshake = match role {
+        Role::Initiator => builder.build_initiator()?,
+        Role::Responder => builder.build_responder()?,
+    };
+    Ok(handshake)
 }
 
-/// Decode the preamble byte on `stream`, bounded by `deadline`.
+/// Copy a Noise static public key (32 bytes for X25519) out of the handshake
+/// state, as a plain array.
 ///
-/// The single read behind every responder entry point and the public readers, so
-/// the byte's position, its bound and its validation cannot differ between them.
+/// snow hands back the peer's static key as a slice whose length follows the DH
+/// algorithm the pattern names. This crate only ever builds `*_25519_*`
+/// patterns, so 32 bytes is guaranteed — but the copy is checked rather than
+/// `copy_from_slice`'d, because a length mismatch there would panic in a
+/// connection thread while this returns the crate's protocol error.
+pub(super) fn static_key_32(bytes: &[u8], what: &str) -> Result<[u8; 32], TransportError> {
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        TransportError::InvalidFragment(format!(
+            "{what} is {} bytes, expected a 32-byte X25519 key",
+            bytes.len()
+        ))
+    })
+}
+
+/// Run the responder's ACL check against the client static key the handshake
+/// produced — the single implementation both modes share, so IK and XX
+/// authorize identically.
+///
+/// A peer that never sent a static key is refused the same way as one the ACL
+/// rejects: either way there is no client to authorize, and the connection is
+/// closed before a single data-plane byte moves.
+pub(super) fn authorize_client<F>(
+    handshake: &HandshakeState,
+    check_client: F,
+    mode: HandshakeMode,
+) -> Result<(), TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
+    let Some(client_pk) = handshake.get_remote_static() else {
+        tracing::info!(%mode, "noise handshake rejected: client did not send a static key");
+        return Err(TransportError::AuthFailed);
+    };
+    let pk = static_key_32(client_pk, "client static key")?;
+    if !check_client(&pk) {
+        tracing::info!(%mode, "noise handshake rejected: client not in ACL");
+        return Err(TransportError::AuthFailed);
+    }
+    Ok(())
+}
+
+/// Hand a completed handshake's socket to the data plane.
+///
+/// Restores the unbounded I/O the `frame` helpers' deadline machinery replaced
+/// — BOTH socket timeouts, since they armed `SO_RCVTIMEO` and `SO_SNDTIMEO` —
+/// and derives the `TransportState`. The data plane has no timeout by design:
+/// readers block until a message or EOF, and shutdown closes the socket to
+/// unblock them.
+pub(super) fn finish(
+    stream: TcpStream,
+    handshake: HandshakeState,
+    mode: HandshakeMode,
+    role: Role,
+) -> Result<NoiseStream, TransportError> {
+    stream.set_read_timeout(None)?;
+    stream.set_write_timeout(None)?;
+    let transport = handshake.into_transport_mode()?;
+    tracing::debug!(%mode, %role, "noise handshake complete");
+    Ok(NoiseStream::new(stream, transport))
+}
+
+/// Read the 1-byte mode preamble from `stream`, bounded by `deadline`.
+///
+/// The single read behind every responder entry point, so the byte's position,
+/// its bound and its validation cannot differ between them.
 pub(super) fn read_preamble(
     stream: &mut TcpStream,
     deadline: Instant,
 ) -> Result<HandshakeMode, TransportError> {
-    let byte = frame::read_handshake_exact(stream, deadline, 1)?;
-    // The bounded read above returned exactly 1 byte, so the index is in bounds
+    let mut byte = [0u8; 1];
+    frame::read_handshake_exact(stream, deadline, &mut byte)?;
+    // The bounded read above filled exactly one byte, so the index is in bounds
     // by construction; the access is bounds-checked anyway (see the slice
-    // helpers' comment) rather than panicking.
-    let byte = *at(&byte, 0, "preamble byte")?;
+    // helpers) rather than panicking.
+    let byte = *crate::buf::at(&byte, 0, "preamble byte")?;
     HandshakeMode::from_byte(byte).ok_or(TransportError::HandshakeModeUnknown { byte })
 }
 
@@ -256,6 +253,53 @@ pub(super) fn require_mode(
             got: got.byte(),
         })
     }
+}
+
+/// Read the mode preamble and run the responder flow it selects, optionally
+/// requiring a specific mode.
+///
+/// The one dispatch site for the responder side: `expected: Some(mode)` is a
+/// mode-locked responder (which must refuse a peer that asked for the other
+/// flow), `None` is the server entry point that accepts either. The SAME
+/// deadline covers the preamble read and the handshake in both cases.
+fn responder_dispatch<F>(
+    mut stream: TcpStream,
+    static_sk: &[u8; 32],
+    check_client: F,
+    deadline: Instant,
+    expected: Option<HandshakeMode>,
+) -> Result<(NoiseStream, HandshakeMode), TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
+    let mode = read_preamble(&mut stream, deadline)?;
+    if let Some(expected) = expected {
+        require_mode(mode, expected)?;
+    }
+    // Both arms take the stream by value and the identical ACL closure, so XX
+    // is authorized exactly like IK, and both inherit the remaining budget.
+    let noise = match mode {
+        HandshakeMode::Ik => ik::responder(stream, static_sk, check_client, deadline)?,
+        HandshakeMode::Xx => xx::responder(stream, static_sk, check_client, deadline)?,
+    };
+    Ok((noise, mode))
+}
+
+/// The responder behind a mode-locked entry point
+/// ([`handshake_responder`] / [`handshake_responder_xx`]): read the preamble,
+/// require `mode`, run that flow.
+pub(super) fn responder_requiring<F>(
+    stream: TcpStream,
+    static_sk: &[u8; 32],
+    check_client: F,
+    deadline: Instant,
+    mode: HandshakeMode,
+) -> Result<NoiseStream, TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
+    responder_dispatch(stream, static_sk, check_client, deadline, Some(mode))
+        .map(|(noise, _mode)| noise)
 }
 
 /// Perform the Noise handshake the peer asked for as the **responder** (server
@@ -286,7 +330,7 @@ pub fn handshake_responder_auto<F>(
     stream: TcpStream,
     static_sk: &[u8; 32],
     check_client: F,
-) -> Result<(crate::noise::NoiseStream, HandshakeMode), TransportError>
+) -> Result<(NoiseStream, HandshakeMode), TransportError>
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
@@ -296,149 +340,25 @@ where
 /// [`handshake_responder_auto`] with an explicit total-duration budget for the
 /// whole unauthenticated phase (preamble read plus handshake). Exposed so
 /// integration tests can exercise the timeout path in milliseconds instead of
-/// waiting out the 10 s default.
+/// waiting out the 10 s default; a budget beyond one day is clamped.
 ///
 /// # Errors
 ///
 /// As [`handshake_responder_auto`], with the budget given by `timeout`.
 pub fn handshake_responder_auto_with_timeout<F>(
-    mut stream: TcpStream,
+    stream: TcpStream,
     static_sk: &[u8; 32],
     check_client: F,
     timeout: Duration,
-) -> Result<(crate::noise::NoiseStream, HandshakeMode), TransportError>
+) -> Result<(NoiseStream, HandshakeMode), TransportError>
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
-    let deadline = Instant::now() + timeout;
-    let mode = read_preamble(&mut stream, deadline)?;
-    // Dispatch to the flow the peer asked for, handing it the SAME deadline so
-    // the preamble read is not free extra time. Both arms take the stream by
-    // value and the identical ACL closure, so XX is authorized exactly like IK.
-    let noise = match mode {
-        HandshakeMode::Ik => ik::responder(stream, static_sk, check_client, deadline)?,
-        HandshakeMode::Xx => xx::responder(stream, static_sk, check_client, deadline)?,
-    };
-    Ok((noise, mode))
-}
-
-#[cfg(test)]
-mod tests {
-    use snow::Builder;
-
-    use super::{HandshakeMode, PREAMBLE_IK, PREAMBLE_XX, PROLOGUE_TAG};
-    use crate::error::TransportError;
-
-    /// The mode owns its wire byte in both directions: the two modes encode to
-    /// distinct bytes, decode back to themselves, and every other byte —
-    /// including the reserved `0x00` — names no mode.
-    #[test]
-    fn mode_round_trips_through_its_wire_byte() {
-        assert_eq!(HandshakeMode::Ik.byte(), PREAMBLE_IK);
-        assert_eq!(HandshakeMode::Xx.byte(), PREAMBLE_XX);
-        assert_ne!(PREAMBLE_IK, PREAMBLE_XX, "the two modes are distinct");
-
-        assert_eq!(
-            HandshakeMode::from_byte(PREAMBLE_IK),
-            Some(HandshakeMode::Ik)
-        );
-        assert_eq!(
-            HandshakeMode::from_byte(PREAMBLE_XX),
-            Some(HandshakeMode::Xx)
-        );
-        for unknown in [0x00u8, 0x03, 0xFF] {
-            assert_eq!(
-                HandshakeMode::from_byte(unknown),
-                None,
-                "{unknown:#04x} must not name a mode"
-            );
-        }
-        // The display form is what the error messages and the daemon's log use.
-        assert_eq!(HandshakeMode::Ik.to_string(), "IK");
-        assert_eq!(HandshakeMode::Xx.to_string(), "XX");
-    }
-
-    /// The prologue helper lays down the tag and then the mode byte, so the two
-    /// modes produce prologues of the same length that differ only in that last
-    /// byte — the difference that has to reach the handshake hash.
-    #[test]
-    fn prologue_binds_the_tag_and_the_mode() {
-        let ik = HandshakeMode::Ik.prologue();
-        let xx = HandshakeMode::Xx.prologue();
-
-        assert_eq!(ik.len(), PROLOGUE_TAG.len() + 1);
-        assert_eq!(ik.len(), 21, "20-byte tag plus one mode byte");
-        assert!(ik.starts_with(PROLOGUE_TAG));
-        assert_eq!(ik.last().copied(), Some(PREAMBLE_IK));
-        assert_eq!(xx.last().copied(), Some(PREAMBLE_XX));
-        assert_ne!(ik, xx, "the mode byte must change the prologue");
-    }
-
-    /// Run one complete XX exchange in memory and report whether it succeeds.
-    /// Pure crypto: no sockets, no timers, no sleeps. `snow` fails the
-    /// exchange when the two prologues differ, because the prologue is mixed
-    /// into the handshake hash that every AEAD tag in the exchange covers.
-    fn run_xx_exchange(
-        initiator_prologue: &[u8],
-        responder_prologue: &[u8],
-    ) -> Result<(), TransportError> {
-        const PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
-
-        let initiator_sk = [7u8; 32];
-        let responder_sk = [9u8; 32];
-
-        let mut initiator = Builder::new(PATTERN.parse()?)
-            .local_private_key(&initiator_sk)?
-            .prologue(initiator_prologue)?
-            .build_initiator()?;
-        let mut responder = Builder::new(PATTERN.parse()?)
-            .local_private_key(&responder_sk)?
-            .prologue(responder_prologue)?
-            .build_responder()?;
-
-        // The handshake messages for an empty payload are well under a
-        // kilobyte; snow caps every write at 65535, so these buffers are the
-        // same bound the production frame path uses.
-        let mut frame = vec![0u8; 65_535];
-        let mut scratch = vec![0u8; 65_535];
-
-        // Message 1 (-> e): unencrypted, so it is accepted either way.
-        let n = initiator.write_message(&[], &mut frame)?;
-        responder.read_message(&frame[..n], &mut scratch)?;
-
-        // Message 2 (<- e, ee, s, es): the first encrypted message. Its tags
-        // are keyed from the handshake hash, which includes the prologue — a
-        // mismatched prologue fails right here.
-        let n = responder.write_message(&[], &mut frame)?;
-        initiator.read_message(&frame[..n], &mut scratch)?;
-
-        // Message 3 (-> s, es): completes the exchange, proving the two sides
-        // derived the same transport keys.
-        let n = initiator.write_message(&[], &mut frame)?;
-        responder.read_message(&frame[..n], &mut scratch)?;
-
-        Ok(())
-    }
-
-    /// Same mode on both ends: the exchange completes, so the prologue the
-    /// production flows use for one mode is agreed on by both of its halves.
-    #[test]
-    fn matching_prologues_complete_the_handshake() {
-        let prologue = HandshakeMode::Xx.prologue();
-        assert!(
-            run_xx_exchange(&prologue, &prologue).is_ok(),
-            "both sides using the same prologue must complete the handshake"
-        );
-    }
-
-    /// Different modes on the two ends: the exchange fails, which is the whole
-    /// point of binding the mode — an intermediary that rewrites the preamble
-    /// byte cannot make the peers run different modes undetected.
-    #[test]
-    fn mismatched_prologues_fail_the_handshake() {
-        assert!(
-            run_xx_exchange(&HandshakeMode::Ik.prologue(), &HandshakeMode::Xx.prologue()).is_err(),
-            "a prologue mismatch must fail the handshake"
-        );
-    }
+    responder_dispatch(
+        stream,
+        static_sk,
+        check_client,
+        deadline_from(timeout),
+        None,
+    )
 }

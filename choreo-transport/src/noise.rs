@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use zeroize::Zeroize;
 
+use crate::buf::{at, at_mut, slice, slice_mut};
 use crate::error::TransportError;
-use crate::handshake::{at, at_mut, slice, slice_mut};
 use tracing::{debug, trace};
 
 /// AES-256-GCM authentication tag length, appended to every encrypted
@@ -93,10 +93,12 @@ fn read_exact_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<(), Tr
     stream.read_exact(buf).map_err(classify_stream_error)
 }
 
-/// An encrypted Noise IK transport stream.
+/// An encrypted Noise transport stream.
 ///
 /// Wraps a `TcpStream` with a snow `TransportState`. Every message is
-/// length-prefixed (4-byte BE u32) and encrypted with AES-256-GCM.
+/// length-prefixed (4-byte BE u32) and encrypted with AES-256-GCM. The stream
+/// is what a completed handshake produces and does not itself know which
+/// pattern ran — IK and XX both end here (see [`crate::handshake`]).
 ///
 /// The `TransportState` is behind an Arc<Mutex<>> so the stream can be
 /// cloned for concurrent reader/writer threads via `try_clone()`.
@@ -213,21 +215,39 @@ impl NoiseStream {
         }
         let _guard = SendGuard(Arc::clone(&self.sender_active));
         let result = self.send_message_inner(plaintext);
-        // Wipe the reusable plaintext staging buffer: it holds a copy of this
-        // (possibly secret) message until the next send would overwrite it, so
-        // it is zeroized on every exit — success or failure — to close that
-        // window. `zeroize` clears the length; the next call regrows it. The
-        // `Zeroizing` payload a typed caller holds is wiped independently on
-        // its own drop.
-        self.send_frag.zeroize();
-        result
+        match result {
+            // Wipe exactly the region this send wrote: the plaintext staging
+            // buffer holds a copy of this (possibly secret) message until the
+            // next send would overwrite it, so it is cleared on success too.
+            // Wiping only the used prefix (rather than the whole
+            // `FRAG_BUF_LEN` allocation, which `Vec::zeroize` would clear
+            // along with the spare capacity) keeps the guarantee at a
+            // fraction of the cost and leaves the buffer at full length for
+            // the next call. The `Zeroizing` payload a typed caller holds is
+            // wiped independently on its own drop.
+            Ok(used) => {
+                if let Some(written) = self.send_frag.get_mut(..used) {
+                    written.zeroize();
+                }
+                Ok(())
+            }
+            // A failed send may have written part of the payload before the
+            // error (a socket error mid-chunk), so the extent is unknown:
+            // wipe the whole buffer rather than guess.
+            Err(e) => {
+                self.send_frag.zeroize();
+                Err(e)
+            }
+        }
     }
 
-    // The `usize` ciphertext length `n` is snow's plaintext-plus-tag output
-    // and is bounded by the [`MAX_FRAME_SIZE`] check below, far under
+    // Returns how many bytes of `send_frag` this call wrote (its plaintext
+    // varies in length with the payload), so the caller can wipe exactly that
+    // prefix. The `usize` ciphertext length `n` is snow's plaintext-plus-tag
+    // output and is bounded by the [`MAX_FRAME_SIZE`] check below, far under
     // `u32::MAX`; keeping the plain cast preserves exact wire behavior.
     #[expect(clippy::cast_possible_truncation)]
-    fn send_message_inner(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
+    fn send_message_inner(&mut self, plaintext: &[u8]) -> Result<usize, TransportError> {
         // Mirror the receiver's reassembly cap so an over-limit message is
         // rejected at the source instead of by the peer's recv_message.
         if plaintext.len() > MAX_FRAME_SIZE {
@@ -278,7 +298,7 @@ impl NoiseStream {
                 .copy_from_slice(&(n as u32).to_be_bytes());
             self.tcp
                 .write_all(slice(&self.send_buf, ..4 + n, "send_buf frame")?)?;
-            return Ok(());
+            return Ok(FRAGMENT_HEADER_LEN);
         }
 
         // Serializing sends is the writer thread's job (each NoiseStream has a
@@ -290,6 +310,7 @@ impl NoiseStream {
         // chunk is therefore encrypted under a brief lock and written outside
         // it, so the reader can always acquire the lock and drain.
         let mut remaining = plaintext.len();
+        let mut used = 0;
         for chunk in plaintext.chunks(MAX_PLAINTEXT_CHUNK) {
             // This chunk is non-final iff it did not consume all remaining
             // plaintext; a full-size chunk in the middle leaves a remainder,
@@ -305,6 +326,10 @@ impl NoiseStream {
                 "send_frag plaintext",
             )?
             .copy_from_slice(chunk);
+            // Every chunk's plaintext sits at the front of the buffer, so the
+            // furthest byte any chunk of this send reached is what the caller
+            // has to wipe.
+            used = used.max(FRAGMENT_HEADER_LEN + chunk.len());
             let n = {
                 let mut transport = self
                     .transport
@@ -332,7 +357,7 @@ impl NoiseStream {
             self.tcp
                 .write_all(slice(&self.send_buf, ..4 + n, "send_buf frame")?)?;
         }
-        Ok(())
+        Ok(used)
     }
 
     /// Receive a decrypted message.

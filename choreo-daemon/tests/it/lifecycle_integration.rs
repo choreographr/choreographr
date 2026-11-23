@@ -25,7 +25,7 @@ fn remove_stale_socket_refuses_live_listener() {
     // `run_server` start: it must fail before binding (the bind below in the
     // second server would otherwise just overwrite the path).
     let state = common::test_daemon_state();
-    let transport_sk = choreo_transport::key::TransportSecretKey::new([0u8; 32]);
+    let transport_sk = choreo_transport::key::TransportSecretKey::from([0u8; 32]);
     let acl = choreo_daemon::server::acl::SharedAcl::load(std::path::Path::new("/nonexistent"));
     let socket_str = path.to_str().expect("valid socket path").to_string();
 
@@ -63,7 +63,7 @@ fn server_accepts_ping_and_shuts_down_on_signal() {
     let state = common::test_daemon_state();
 
     // Dummy transport key and empty ACL (no TCP listener needed for this test).
-    let transport_sk = choreo_transport::key::TransportSecretKey::new([0u8; 32]);
+    let transport_sk = choreo_transport::key::TransportSecretKey::from([0u8; 32]);
     let acl = choreo_daemon::server::acl::SharedAcl::load(std::path::Path::new("/nonexistent"));
 
     // Run the server in a background thread.

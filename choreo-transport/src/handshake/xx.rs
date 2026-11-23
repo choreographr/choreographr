@@ -1,11 +1,10 @@
 //! The Noise XX handshake flows — initiator and responder.
 //!
 //! XX is the first-contact mode: the initiator does NOT know the responder's
-//! static key in advance, so the key exchange takes three messages (XX's
-//! extra round trip is exactly what transmits that static). Both flows hand
-//! every encoded message to the shared frame plumbing in the sibling `frame`
-//! module, so the length prefix, the bounded read and the coalesced bounded
-//! write have a single implementation shared with the IK flows.
+//! static key in advance, so the key exchange takes three messages (XX's extra
+//! round trip is exactly what transmits that static). Both flows keep only the
+//! message ORDER; the state machine, the ACL check and the hand-off to the data
+//! plane live in `super`, and the framing they call into lives in `super::frame`.
 //!
 //! The public entry points own the mode's 1-byte preamble: the initiator writes
 //! [`HandshakeMode::Xx`]'s byte before its first message, and the responder reads
@@ -13,20 +12,17 @@
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
-use tracing::{debug, info};
 
-use super::frame::{
-    HANDSHAKE_FRAME_BUF_LEN, LEN_PREFIX_LEN, MAX_HANDSHAKE_FRAME, read_handshake_message,
-    slice_mut, write_handshake_frame, write_preamble,
+use super::frame::{Wire, write_preamble};
+use super::{
+    HANDSHAKE_TIMEOUT, HandshakeMode, Role, authorize_client, build, deadline_from,
+    responder_requiring, static_key_32,
 };
-use super::{HANDSHAKE_TIMEOUT, HandshakeMode, read_preamble, require_mode};
 use crate::error::TransportError;
 use crate::noise::NoiseStream;
 
-/// The stock snow pattern string for both XX flows. Shared by the initiator
-/// and the responder so the two halves of one handshake can never drift onto
-/// different patterns.
-const PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
+/// The flow this module implements (see the IK module's counterpart).
+const MODE: HandshakeMode = HandshakeMode::Xx;
 
 /// Perform the Noise XX handshake as the **initiator** (client side, first
 /// contact), using the default `HANDSHAKE_TIMEOUT` budget.
@@ -61,11 +57,12 @@ pub fn handshake_initiator_xx(
 }
 
 /// [`handshake_initiator_xx`] with an explicit total-duration budget for the
-/// WHOLE handshake, preamble write included (see `HANDSHAKE_TIMEOUT`). Reuses
-/// the exact same absolute-deadline plumbing as the IK variants — the shared
-/// frame reader and writer — so the XX timeout semantics are identical: a silent
-/// or dribbling peer is cut off at the deadline with `HandshakeTimeout`, and both
-/// socket timeouts are cleared before the data plane.
+/// WHOLE handshake, preamble write included (see `HANDSHAKE_TIMEOUT`; a budget
+/// beyond one day is clamped). Reuses the exact same absolute-deadline plumbing
+/// as the IK variants — the shared frame reader and writer — so the XX timeout
+/// semantics are identical: a silent or dribbling peer is cut off at the
+/// deadline with `HandshakeTimeout`, and both socket timeouts are cleared
+/// before the data plane.
 ///
 /// # Errors
 ///
@@ -78,7 +75,7 @@ pub fn handshake_initiator_xx_with_timeout(
     static_sk: &[u8; 32],
     timeout: Duration,
 ) -> Result<(NoiseStream, [u8; 32]), TransportError> {
-    initiator(stream, static_sk, Instant::now() + timeout)
+    initiator(stream, static_sk, deadline_from(timeout))
 }
 
 /// The XX initiator under an absolute deadline: preamble write, then the three
@@ -88,80 +85,42 @@ pub(super) fn initiator(
     static_sk: &[u8; 32],
     deadline: Instant,
 ) -> Result<(NoiseStream, [u8; 32]), TransportError> {
-    use snow::Builder;
-
-    // The prologue binds the domain-separation tag and this flow's mode byte
-    // into the handshake hash; the XX responder derives the identical buffer
-    // from the same HandshakeMode::Xx, so the mode is part of the authenticated
-    // transcript rather than a claim the wire makes unchecked.
-    let prologue = HandshakeMode::Xx.prologue();
-
-    // XX initiator: NO `.remote_public_key()` — the server's static key is
-    // unknown until the handshake reveals it (IK hard-codes it here, which
-    // is what makes IK a 2-message pattern instead of XX's 3).
-    let mut handshake = Builder::new(PATTERN.parse()?)
-        .local_private_key(static_sk)?
-        .prologue(&prologue)?
-        .build_initiator()?;
+    // XX's initiator deliberately passes NO remote static key: the server's is
+    // unknown until the handshake reveals it, which is the whole point of this
+    // mode (IK passes Some here, which is what shortens it to two messages).
+    let mut handshake = build(MODE, static_sk, None, Role::Initiator)?;
 
     // Declare the mode before any handshake message (see the IK initiator).
-    write_preamble(&mut stream, deadline, HandshakeMode::Xx)?;
+    write_preamble(&mut stream, deadline, MODE)?;
 
-    // One buffer carries every outbound frame and every decryption output, so
-    // the three messages allocate nothing extra.
-    let mut buf = vec![0u8; HANDSHAKE_FRAME_BUF_LEN];
+    let mut wire = Wire::new();
+    // Message 1 (-> e): the client's ephemeral key only.
+    wire.write(&mut handshake, &mut stream, deadline)?;
+    // Message 2 (<- e, ee, s, es): the server's ephemeral AND static keys, with
+    // the static authenticated by the DH operations. After reading this the
+    // initiator can extract the server's static.
+    wire.read(&mut handshake, &mut stream, deadline)?;
+    // Message 3 (-> s, es): the client's static key, authenticating us to the
+    // server (whose responder-side ACL check consumes it).
+    wire.write(&mut handshake, &mut stream, deadline)?;
 
-    // Message 1 (-> e): the client's ephemeral key only. The write side is
-    // bounded exactly like IK — prefix and body leave as ONE bounded write.
-    let n = handshake.write_message(
-        &[],
-        slice_mut(&mut buf, LEN_PREFIX_LEN.., "handshake frame body")?,
-    )?;
-    write_handshake_frame(&mut stream, deadline, &mut buf, n)?;
-
-    // Message 2 (<- e, ee, s, es): the server's ephemeral AND static keys,
-    // with the static authenticated by the DH operations. After reading this
-    // the initiator can extract the server's static via get_remote_static().
-    read_handshake_message(
-        &mut handshake,
-        &mut stream,
-        deadline,
-        slice_mut(&mut buf, LEN_PREFIX_LEN.., "handshake frame body")?,
-    )?;
-
-    // Message 3 (-> s, es): the client's static key, authenticating us to
-    // the server (the server's responder-side ACL check consumes it).
-    let n = handshake.write_message(
-        &[],
-        slice_mut(&mut buf, LEN_PREFIX_LEN.., "handshake frame body")?,
-    )?;
-    write_handshake_frame(&mut stream, deadline, &mut buf, n)?;
-
-    // Handshake complete — restore the unbounded data-plane I/O (see
-    // `super::ik::initiator`: BOTH timeouts must be cleared, the deadline
-    // helpers armed SO_RCVTIMEO and SO_SNDTIMEO).
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-
-    // Learn the server's static key — the entire reason this mode exists.
-    // XX always transmits `s` in message 2, so an absent value is a protocol
-    // contract violation, not an authentication failure; InvalidFragment is
-    // the closest honest variant (the responder side DOES use AuthFailed for
-    // the analogous check, because there it gates the ACL decision).
-    let server_pk_bytes = handshake
-        .get_remote_static()
-        .ok_or_else(|| {
-            TransportError::InvalidFragment(
+    // Learn the server's static key — the entire reason this mode exists, and
+    // it has to be read BEFORE the state machine becomes a transport. XX always
+    // transmits `s` in message 2, so an absent value is a protocol contract
+    // violation, not an authentication failure; InvalidFragment is the closest
+    // honest variant (the responder side DOES use AuthFailed for the analogous
+    // check, because there it gates the ACL decision).
+    let server_pk = match handshake.get_remote_static() {
+        Some(bytes) => static_key_32(bytes, "XX server static key")?,
+        None => {
+            return Err(TransportError::InvalidFragment(
                 "XX handshake: server did not transmit its static key".to_string(),
-            )
-        })?
-        .to_owned();
-    let mut server_pk = [0u8; 32];
-    server_pk.copy_from_slice(&server_pk_bytes);
+            ));
+        }
+    };
 
-    let transport = handshake.into_transport_mode()?;
-    debug!("Noise XX handshake complete (initiator)");
-    Ok((NoiseStream::new(stream, transport), server_pk))
+    let noise = super::finish(stream, handshake, MODE, Role::Initiator)?;
+    Ok((noise, server_pk))
 }
 
 /// Perform the Noise XX handshake as the **responder** (server side,
@@ -194,9 +153,10 @@ where
 }
 
 /// [`handshake_responder_xx`] with an explicit total-duration budget for the
-/// WHOLE handshake, preamble read included (see `HANDSHAKE_TIMEOUT`). Same
-/// absolute-deadline plumbing as the IK responder — every read AND write is
-/// bounded by the time remaining until the deadline.
+/// WHOLE handshake, preamble read included (see `HANDSHAKE_TIMEOUT`; a budget
+/// beyond one day is clamped). Same absolute-deadline plumbing as the IK
+/// responder — every read AND write is bounded by the time remaining until the
+/// deadline.
 ///
 /// # Errors
 ///
@@ -210,22 +170,13 @@ pub fn handshake_responder_xx_with_timeout<F>(
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
-    responder_with_mode_check(stream, static_sk, check_client, Instant::now() + timeout)
-}
-
-/// Read the preamble under `deadline`, require XX, then run the flow.
-fn responder_with_mode_check<F>(
-    mut stream: TcpStream,
-    static_sk: &[u8; 32],
-    check_client: F,
-    deadline: Instant,
-) -> Result<NoiseStream, TransportError>
-where
-    F: FnOnce(&[u8; 32]) -> bool,
-{
-    let mode = read_preamble(&mut stream, deadline)?;
-    require_mode(mode, HandshakeMode::Xx)?;
-    responder(stream, static_sk, check_client, deadline)
+    responder_requiring(
+        stream,
+        static_sk,
+        check_client,
+        deadline_from(timeout),
+        MODE,
+    )
 }
 
 /// The XX responder's frames, with the preamble already consumed and the mode
@@ -239,69 +190,31 @@ pub(super) fn responder<F>(
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
-    use snow::Builder;
+    let mut handshake = build(MODE, static_sk, None, Role::Responder)?;
 
-    // Same prologue as the XX initiator above — the two halves of the XX flow
-    // must derive an identical handshake hash, so both take HandshakeMode::Xx.
-    let prologue = HandshakeMode::Xx.prologue();
+    let mut wire = Wire::new();
+    // Message 1 (<- e): read the client's ephemeral key. Every read is bounded
+    // by the remaining budget — pre-authentication, exactly like IK.
+    wire.read(&mut handshake, &mut stream, deadline)?;
 
-    let mut handshake = Builder::new(PATTERN.parse()?)
-        .local_private_key(static_sk)?
-        .prologue(&prologue)?
-        .build_responder()?;
+    // Message 2 (-> e, ee, s, es): our ephemeral + static keys. Unlike IK, this
+    // MUST be written before the ACL check — the client's static only arrives
+    // with message 3, and message 2 is what carries the server's static to the
+    // client. This is inherent to XX (the server cannot know who it is talking
+    // to until the client finishes authenticating), and it is not a disclosure
+    // risk: msg2's static is encrypted to the client's ephemeral key, so a
+    // passive observer learns nothing, and an active attacker would have to
+    // complete the key exchange to decrypt it — at which point its own static is
+    // exposed to the ACL check.
+    wire.write(&mut handshake, &mut stream, deadline)?;
 
-    // Snow's decrypted handshake payloads land here — empty for these
-    // patterns, but the buffer is still each read call's output, sized to the
-    // frame cap (the largest body a peer may declare).
-    let mut out_buf = vec![0u8; MAX_HANDSHAKE_FRAME];
+    // Message 3 (-> s, es): the client's static key arrives here — this is the
+    // point where the responder finally learns who it is talking to, and the
+    // shared ACL check runs BEFORE the transport is handed over, so a rejected
+    // client gets a closed socket and can never send or receive a data-plane
+    // byte.
+    wire.read(&mut handshake, &mut stream, deadline)?;
+    authorize_client(&handshake, check_client, MODE)?;
 
-    // Message 1 (<- e): read the client's ephemeral key. Every read is
-    // bounded by the remaining budget — pre-authentication, exactly like IK.
-    read_handshake_message(&mut handshake, &mut stream, deadline, &mut out_buf)?;
-
-    // Message 2 (-> e, ee, s, es): our ephemeral + static keys. Unlike IK,
-    // this MUST be written before the ACL check — the client's static only
-    // arrives with message 3, and message 2 is what carries the server's
-    // static to the client. This is inherent to XX (the server cannot know
-    // who it is talking to until the client finishes authenticating), and it
-    // is not a disclosure risk: msg2's static is encrypted to the client's
-    // ephemeral key, so a passive observer learns nothing, and an active
-    // attacker would have to complete the key exchange to decrypt it — at
-    // which point its own static is exposed to the ACL check.
-    let mut buf = vec![0u8; HANDSHAKE_FRAME_BUF_LEN];
-    let n = handshake.write_message(
-        &[],
-        slice_mut(&mut buf, LEN_PREFIX_LEN.., "handshake frame body")?,
-    )?;
-    write_handshake_frame(&mut stream, deadline, &mut buf, n)?;
-
-    // Message 3 (-> s, es): the client's static key arrives here — this is
-    // the point where the responder finally learns who it is talking to.
-    read_handshake_message(&mut handshake, &mut stream, deadline, &mut out_buf)?;
-
-    // ACL check — the same closure pattern as the IK responder, so XX
-    // connections are authorized identically. The check runs after the key
-    // exchange (see the msg2 comment) but BEFORE the transport is handed
-    // over: a rejected client gets a closed socket and can never send or
-    // receive a single data-plane byte.
-    if let Some(client_pk) = handshake.get_remote_static() {
-        let mut pk = [0u8; 32];
-        pk.copy_from_slice(client_pk);
-        if !check_client(&pk) {
-            info!("Noise XX handshake rejected: client not in ACL");
-            return Err(TransportError::AuthFailed);
-        }
-    } else {
-        info!("Noise XX handshake rejected: client did not send static key");
-        return Err(TransportError::AuthFailed);
-    }
-
-    // Handshake complete — restore the unbounded data-plane I/O (see
-    // `super::ik::responder`).
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
-
-    let transport = handshake.into_transport_mode()?;
-    debug!("Noise XX handshake complete (responder)");
-    Ok(NoiseStream::new(stream, transport))
+    super::finish(stream, handshake, MODE, Role::Responder)
 }

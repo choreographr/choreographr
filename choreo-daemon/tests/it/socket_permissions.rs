@@ -60,7 +60,7 @@ fn bound_socket_is_0600_inside_an_owner_only_directory() {
     let state = common::test_daemon_state();
     // Dummy transport key and an empty ACL: no TCP listener is configured, so
     // nothing here exercises the Noise path.
-    let transport_sk = choreo_transport::key::TransportSecretKey::new([0u8; 32]);
+    let transport_sk = choreo_transport::key::TransportSecretKey::from([0u8; 32]);
     let acl = choreo_daemon::server::acl::SharedAcl::load(&tmp.path().join("no-acl.toml"));
 
     let handle = thread::spawn(move || {

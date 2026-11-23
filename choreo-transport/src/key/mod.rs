@@ -1,10 +1,13 @@
-//! On-disk Noise IK transport keypair management and key encoding.
+//! On-disk Noise transport keypair management.
 //!
-//! Provides the standard keypair paths under `{config}/choreographr`, the
+//! Provides the standard keypair path under `{config}/choreographr`, the
 //! [`ensure_transport_keypair`] loader/generator (race-safe via an advisory
-//! file lock), its read-only counterpart [`load_transport_keypair`], and the
+//! file lock), and its read-only counterpart [`load_transport_keypair`]. The
+//! keypair is one identity per instance and serves both handshake modes — the
+//! daemon presents it as the responder and the client as the initiator. The
 //! canonical base64 encoding of a 32-byte key ([`pubkey_base64`] /
-//! [`parse_pubkey_base64`]) — the ONE textual form of a transport public key.
+//! [`parse_pubkey_base64`]) lives in the `encoding` submodule and is the ONE
+//! textual form of a transport key.
 //!
 //! # On-disk secret key format
 //!
@@ -48,13 +51,17 @@
 //! instead ([`load_transport_keypair`] plus [`pubkey_base64`], the daemon's
 //! `pubkey` subcommand).
 
+mod encoding;
+
 use std::path::{Path, PathBuf};
 
-use base64::Engine as _;
 use tracing::{debug, info};
 use zeroize::Zeroize;
 
 use crate::error::TransportError;
+
+use encoding::{decode_secret, encode_secret};
+pub use encoding::{parse_pubkey_base64, pubkey_base64};
 
 thread_local! {
     /// Test-only override for the keypair directory. When set, `keypair_dir()`
@@ -72,12 +79,19 @@ thread_local! {
 /// of the transport's contract. It is thread-local and resets on drop, so a
 /// production caller could only ever redirect key generation in its own
 /// thread — but it should not be treated as a supported API.
+///
+/// Thread-local, not process-global, because the callers that need it most are
+/// the per-connection threads in the daemon's integration tests: each installs
+/// the override for the keypair its OWN `ensure_transport_keypair` call loads
+/// and clears it when done. A process-global would make one thread's clear
+/// visible to a sibling thread mid-connection, which is exactly the leak
+/// (a keypair written into the real config dir) this seam exists to prevent.
 #[doc(hidden)]
 pub fn set_test_config_root(root: Option<PathBuf>) {
     TEST_CONFIG_ROOT.with(|cell| cell.replace(root));
 }
 
-/// A Noise IK transport secret key (32-byte X25519 secret).
+/// A Noise transport secret key (32-byte X25519 secret).
 ///
 /// Provides type safety over a raw `[u8; 32]` so the key cannot be
 /// confused with other 32-byte values, and **zeroizes its bytes on drop**: it
@@ -93,16 +107,6 @@ pub fn set_test_config_root(root: Option<PathBuf>) {
 pub struct TransportSecretKey(pub(crate) [u8; 32]);
 
 impl TransportSecretKey {
-    /// Wrap a raw 32-byte secret key.
-    ///
-    /// # Errors
-    ///
-    /// Never fails; infallible by construction.
-    #[must_use]
-    pub fn new(bytes: [u8; 32]) -> Self {
-        TransportSecretKey(bytes)
-    }
-
     /// Expose the inner bytes for use in handshake APIs.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -143,7 +147,7 @@ impl AsRef<[u8; 32]> for TransportSecretKey {
     }
 }
 
-/// Generate a new X25519 keypair for Noise IK transport.
+/// Generate a new X25519 keypair for the Noise transport.
 fn generate_keypair() -> ([u8; 32], [u8; 32]) {
     let secret = x25519_dalek::StaticSecret::random_from_rng(&mut rand::rng());
     let public = x25519_dalek::PublicKey::from(&secret);
@@ -157,67 +161,7 @@ fn generate_keypair() -> ([u8; 32], [u8; 32]) {
 /// is no second source to disagree with.
 fn keypair_from_secret(sk: [u8; 32]) -> (TransportSecretKey, [u8; 32]) {
     let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(sk)).to_bytes();
-    (TransportSecretKey::new(sk), public)
-}
-
-/// Encode a 32-byte key as standard-alphabet base64 (44 characters).
-///
-/// This is the canonical — and only — textual form of a transport public key:
-/// the ACL stores pubkeys in exactly this form, and the value an operator reads
-/// out of `choreographr pubkey` is byte-for-byte this string.
-#[must_use]
-pub fn pubkey_base64(pk: &[u8; 32]) -> String {
-    base64::engine::general_purpose::STANDARD.encode(pk)
-}
-
-/// Parse a base64-encoded 32-byte key, trimming surrounding whitespace.
-///
-/// The inverse of [`pubkey_base64`], and tolerant of the trailing newline the
-/// on-disk form carries.
-///
-/// Only the canonical form is accepted: the value must decode to exactly 32
-/// bytes. A space-grouped key is not base64 and is refused with a message that
-/// says so, so an operator who pasted a grouped value is told to send the plain
-/// form rather than silently connecting to nothing.
-///
-/// # Errors
-///
-/// Returns [`TransportError::Io`] (with [`std::io::ErrorKind::InvalidData`])
-/// when the text is not valid base64 or does not decode to exactly 32 bytes.
-pub fn parse_pubkey_base64(text: &str) -> Result<[u8; 32], TransportError> {
-    decode_key_base64(text).map_err(|detail| {
-        TransportError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("invalid base64 key: {detail}"),
-        ))
-    })
-}
-
-/// Decode standard-alphabet base64 key text into exactly 32 bytes.
-///
-/// The single decode implementation behind both the public key parser and the
-/// secret-file loader. The failure is a message rather than an error type so
-/// each caller wraps it in the error its context calls for (a public key parse
-/// is a plain I/O-shaped error; a secret file names its path and refuses
-/// regeneration). Messages carry lengths and decoder positions only — never the
-/// decoded bytes.
-fn decode_key_base64(text: &str) -> Result<[u8; 32], String> {
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(text.trim())
-        .map_err(|e| format!("not valid base64: {e}"))?;
-    let len = decoded.len();
-    let key: [u8; 32] = decoded
-        .try_into()
-        .map_err(|_| format!("decodes to {len} bytes, expected 32"))?;
-    Ok(key)
-}
-
-/// Encode a secret key for on-disk storage: standard base64 plus a trailing
-/// newline, so the file is a well-formed text file (the loader trims it).
-fn encode_secret(sk: &[u8; 32]) -> String {
-    let mut text = base64::engine::general_purpose::STANDARD.encode(sk);
-    text.push('\n');
-    text
+    (TransportSecretKey(sk), public)
 }
 
 /// Directory that holds the transport keypair files (`<config>/choreographr`).
@@ -237,7 +181,7 @@ fn keypair_dir() -> Result<PathBuf, TransportError> {
     choreo_shared::paths::config_dir().map_err(|_| TransportError::ConfigDirNotFound)
 }
 
-/// Path to the Noise IK static secret key (~/.config/choreographr/transport.sec)
+/// Path to the transport static secret key (~/.config/choreographr/transport.sec)
 ///
 /// The file holds the base64 secret (see the module docs for the format and its
 /// legacy raw-byte acceptance).
@@ -282,26 +226,7 @@ fn load_secret_key(path: &Path) -> Result<Option<[u8; 32]>, TransportError> {
         })
 }
 
-/// Decode secret key file contents as either the legacy raw 32-byte form or the
-/// current base64 text form.
-///
-/// A file of exactly 32 bytes IS the legacy raw key. The base64 form is 44
-/// characters plus a newline (45 bytes), and a 32-character base64 string would
-/// decode to 24 bytes — so the raw length can never be mistaken for text.
-fn decode_secret(bytes: &[u8]) -> Result<[u8; 32], String> {
-    if bytes.len() == 32 {
-        let mut sk = [0u8; 32];
-        sk.copy_from_slice(bytes);
-        return Ok(sk);
-    }
-    let len = bytes.len();
-    let text = std::str::from_utf8(bytes).map_err(|_| {
-        format!("{len} bytes of non-UTF-8 data, expected 32 raw bytes or base64 text")
-    })?;
-    decode_key_base64(text).map_err(|detail| format!("{len}-byte file: {detail}"))
-}
-
-/// Ensure that a Noise IK transport keypair exists at the standard path
+/// Ensure that a Noise transport keypair exists at the standard path
 /// (~/.config/choreographr/transport.sec).
 ///
 /// If the secret file exists and decodes (base64, or a legacy raw 32-byte key),
@@ -347,7 +272,9 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
     // Re-check under the lock: a concurrent process may have written a valid
     // key while we waited, in which case its key wins and ours is discarded —
     // two instances starting together must converge on ONE identity, or the
-    // second one's ACL entry would never match the key it presents.
+    // second one's ACL entry would never match the key it presents. The
+    // re-check reads the PATH (not the locked file handle), which is what makes
+    // the lock sufficient even though publishing renames a new inode over it.
     let write_result = (|| -> Result<(TransportSecretKey, [u8; 32]), TransportError> {
         if let Some(sk) = load_secret_key(&sec_path)? {
             debug!("loaded existing transport secret key (written concurrently)");
@@ -362,10 +289,10 @@ pub fn ensure_transport_keypair() -> Result<(TransportSecretKey, [u8; 32]), Tran
         let encoded = encode_secret(&secret);
         choreo_shared::atomic_write::write_private_atomic(&sec_path, encoded.as_bytes())?;
         info!(
-            "generated and wrote new Noise IK transport keypair to {}",
+            "generated and wrote new Noise transport keypair to {}",
             sec_path.display()
         );
-        Ok((TransportSecretKey::new(secret), public))
+        Ok((TransportSecretKey(secret), public))
     })();
 
     let unlock_result = sec_file.unlock();
@@ -449,6 +376,11 @@ mod tests {
         dir
     }
 
+    /// The derived public half of `sk`, computed independently of the loader.
+    fn derived_public(sk: &[u8; 32]) -> [u8; 32] {
+        x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk)).to_bytes()
+    }
+
     // These tests mutate the shared test-config-root override.
     // Running them in parallel would clobber each other's temp dir
     // mid-flight (one test's restore racing the other's setup), so they are
@@ -468,6 +400,7 @@ mod tests {
         let (sk, pk) = result.expect("ensure_transport_keypair should succeed in temp dir");
         assert_eq!(sk.as_bytes().len(), 32);
         assert_eq!(pk.len(), 32);
+        assert_eq!(pk, derived_public(sk.as_bytes()));
 
         assert!(
             temp.path()
@@ -614,9 +547,7 @@ mod tests {
         let dir = install_temp_root(&temp);
 
         let (sk, pk) = ensure_transport_keypair().expect("generate keypair");
-        let derived =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(*sk.as_bytes()))
-                .to_bytes();
+        let derived = derived_public(sk.as_bytes());
         assert_eq!(pk, derived, "public key must be derived from the secret");
 
         // A deliberately WRONG public file must change nothing: the loader
@@ -642,9 +573,7 @@ mod tests {
 
         let (sk, pk) = ensure_transport_keypair().expect("load legacy raw secret");
         assert_eq!(sk.as_bytes(), &raw_key);
-        let derived =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(raw_key)).to_bytes();
-        assert_eq!(pk, derived);
+        assert_eq!(pk, derived_public(&raw_key));
 
         // The loader must not migrate the file underneath the operator.
         assert_eq!(
@@ -674,9 +603,7 @@ mod tests {
 
         let (sk, pk) = ensure_transport_keypair().expect("load base64 secret");
         assert_eq!(sk.as_bytes(), &key);
-        let derived =
-            x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(key)).to_bytes();
-        assert_eq!(pk, derived);
+        assert_eq!(pk, derived_public(&key));
 
         set_test_config_root(None);
     }
@@ -714,63 +641,5 @@ mod tests {
         );
 
         set_test_config_root(None);
-    }
-
-    /// The canonical base64 helpers round-trip and reject malformed input.
-    #[test]
-    fn pubkey_base64_round_trips_and_rejects_malformed_input() {
-        let pk = [0xA5u8; 32];
-        let text = pubkey_base64(&pk);
-        assert_eq!(text.len(), 44);
-        assert_eq!(parse_pubkey_base64(&text).expect("decode"), pk);
-
-        // The on-disk form carries a trailing newline; whitespace is trimmed.
-        assert_eq!(
-            parse_pubkey_base64(&format!("{text}\n")).expect("decode"),
-            pk
-        );
-
-        assert!(parse_pubkey_base64("not base64!!").is_err());
-        // Valid base64 of the wrong length decodes but must not be accepted.
-        // The error must say so (lengths, never bytes) so an operator knows the
-        // value was a well-formed key of the wrong size, not a typo.
-        let short_err = parse_pubkey_base64("AAAA").expect_err("16 bits is not a key");
-        assert!(
-            short_err.to_string().contains("expected 32"),
-            "a wrong-length key must name the expected length: {short_err}"
-        );
-    }
-
-    /// Only the canonical 44-character base64 form parses. A space-grouped
-    /// value (the grouping some tools add for human comparison) is NOT base64
-    /// and is refused — the project has exactly one textual key form, so the
-    /// parser must not paper over a grouped paste.
-    #[test]
-    fn parse_pubkey_base64_rejects_grouped_and_wrong_length_values() {
-        let pk = [0xA5u8; 32];
-        let canonical = pubkey_base64(&pk);
-        assert_eq!(canonical.len(), 44, "a 32-byte key is 44 base64 chars");
-
-        // A group-of-four rendering of the SAME key must be refused, even
-        // though it carries the right characters — the spaces make it invalid
-        // base64, and the parser accepts only the canonical form.
-        let grouped: String = canonical
-            .as_bytes()
-            .chunks(4)
-            .map(|c| String::from_utf8_lossy(c).into_owned())
-            .collect::<Vec<_>>()
-            .join(" ");
-        let grouped_err = parse_pubkey_base64(&grouped).expect_err("grouped is not base64");
-        assert!(
-            grouped_err.to_string().contains("not valid base64"),
-            "a grouped value must be reported as invalid base64: {grouped_err}"
-        );
-
-        // Too few / too many decoded bytes are both refused.
-        assert!(parse_pubkey_base64("AAAA").is_err(), "4 chars is 3 bytes");
-        assert!(
-            parse_pubkey_base64(&format!("{canonical}AAAA")).is_err(),
-            "48 chars is more than 32 bytes"
-        );
     }
 }

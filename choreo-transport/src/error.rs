@@ -20,12 +20,13 @@ pub enum TransportError {
     /// The stream is unusable after this error.
     #[error("invalid transport fragment: {0}")]
     InvalidFragment(String),
-    /// The Noise IK handshake did not complete within its total budget. The
-    /// budget bounds the WHOLE handshake, not just a single read: a peer that
-    /// dribbles bytes to keep resetting the per-read socket timeout is still
-    /// cut off (see `handshake::frame::read_handshake_exact`). On the responder
-    /// side one budget covers the mode-preamble read AND the handshake, so
-    /// stalling before the preamble buys no extra time.
+    /// The Noise handshake did not complete within its total budget. The
+    /// budget bounds the WHOLE unauthenticated phase, not just a single read: a
+    /// peer that dribbles bytes to keep resetting the per-read socket timeout is
+    /// still cut off (see `handshake::frame::read_handshake_exact`). On the
+    /// responder side one budget covers the mode-preamble read AND the
+    /// handshake, so stalling before the preamble buys no extra time. Both
+    /// modes (IK and XX) raise it.
     #[error("Noise handshake timed out")]
     HandshakeTimeout,
     /// The peer opened a TCP connection with a preamble byte that names no
