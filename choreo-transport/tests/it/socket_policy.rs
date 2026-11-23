@@ -1,6 +1,6 @@
-//! The control-plane socket policy: Nagle (`TCP_NODELAY`) is disabled on the
-//! client↔daemon TCP sockets — by the standalone helper, and by the handshake
-//! that hands the socket to the data plane.
+//! The control-plane socket policy: Nagle (`TCP_NODELAY`) is disabled and TCP
+//! keepalive is armed on the client↔daemon TCP sockets — by the standalone
+//! helper, and by the handshake that hands the socket to the data plane.
 
 use choreo_transport::handshake::{handshake_initiator, handshake_responder};
 use choreo_transport::socket::tune_control_socket;
@@ -8,7 +8,26 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::mpsc;
 use std::thread;
 
+#[cfg(unix)]
+use std::os::fd::AsFd;
+
 use crate::common::noise_test_pair;
+
+/// Whether `SO_KEEPALIVE` is set on a connected TCP socket.
+///
+/// Unix-only: the option has no stable std accessor, and the Windows path needs
+/// Winsock FFI the test has no business carrying (the production setter,
+/// `choreo_sockreg::SocketTuning`, already covers both platforms and has its own
+/// cross-platform suite).
+///
+/// A query failure reads as `false` rather than panicking — this is a module-level
+/// helper, not a `#[test]` function, so the workspace's in-tests `expect` allowance
+/// does not reach it (and a false negative simply fails the assertion it feeds).
+#[cfg(unix)]
+fn keepalive_enabled(stream: &TcpStream) -> bool {
+    nix::sys::socket::getsockopt(&stream.as_fd(), nix::sys::socket::sockopt::KeepAlive)
+        .unwrap_or(false)
+}
 
 /// The helper flips `TCP_NODELAY` on each socket independently (the option is
 /// per-socket), which is what the client dial and daemon accept rely on to keep
@@ -34,6 +53,38 @@ fn tune_control_socket_enables_nodelay_on_both_ends() {
     assert!(
         server.join().expect("server thread"),
         "the server socket must run with Nagle disabled"
+    );
+}
+
+/// The same helper arms keepalive, which is the connection's **liveness** bound:
+/// it is what reaps a peer that vanished without closing (a phone that slept, a
+/// network that changed) and so what releases the daemon's connection slot. It is
+/// not an activity timeout — probes only fire on an idle connection, so a
+/// slow-but-alive transfer is never affected.
+#[test]
+#[ignore = "integration"]
+#[cfg(unix)]
+fn tune_control_socket_arms_keepalive_on_both_ends() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        tune_control_socket(&stream);
+        keepalive_enabled(&stream)
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    // Untuned sockets do not carry the option, so the assertion below is proving
+    // the helper's effect rather than a platform default.
+    tune_control_socket(&stream);
+    assert!(
+        keepalive_enabled(&stream),
+        "the client socket must have SO_KEEPALIVE armed"
+    );
+    assert!(
+        server.join().expect("server thread"),
+        "the server socket must have SO_KEEPALIVE armed"
     );
 }
 

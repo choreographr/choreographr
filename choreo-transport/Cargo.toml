@@ -24,6 +24,10 @@ zeroize.workspace = true
 # shared by the public key an ACL entry enrolls, the `known_servers.toml` pin and
 # the on-disk secret.
 base64.workspace = true
+# The control-plane socket policy (`socket::tune_control_socket`) applies
+# `SocketTuning`'s cross-platform TCP keepalive options, so the same tuning the
+# provider sockets already use is stated once for every socket in the workspace.
+choreo-sockreg.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

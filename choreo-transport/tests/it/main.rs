@@ -16,11 +16,11 @@
 //!
 //! The modules split by subject: `handshake` (the exchange, the mode dispatch
 //! and the deadline), `data_plane` (framing, fragmentation and the caps),
-//! `nodelay` (the control-plane `TCP_NODELAY` policy), and `common` — the shared
+//! `socket_policy` (the control-plane `TCP_NODELAY` + keepalive policy), and `common` — the shared
 //! keypair/listener harness and the raw handshake halves a test needs to put
 //! bytes on the wire the public API cannot express.
 
 mod common;
 mod data_plane;
 mod handshake;
-mod nodelay;
+mod socket_policy;
