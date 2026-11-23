@@ -1,9 +1,8 @@
 use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{
-    PREAMBLE_IK, handshake_initiator, handshake_initiator_xx, handshake_responder,
+    HandshakeMode, handshake_initiator, handshake_initiator_xx, handshake_responder,
     handshake_responder_with_timeout, handshake_responder_xx, handshake_responder_xx_with_timeout,
-    noise_prologue,
 };
 use choreo_transport::noise::NoiseStream;
 use snow::Builder;
@@ -749,9 +748,9 @@ fn noise_rejects_oversized_fragment_prefix() {
 }
 
 /// Responder half of the Noise IK handshake with the production wire format
-/// (2-byte BE length-prefixed handshake messages), returning the raw
-/// `TcpStream` and the derived `TransportState`. Byte-for-byte what
-/// [`handshake_responder`] does — including the IK prologue — but keeps the
+/// (1-byte mode preamble, then 2-byte BE length-prefixed handshake messages),
+/// returning the raw `TcpStream` and the derived `TransportState`. Byte-for-byte
+/// what [`handshake_responder`] does — the IK preamble included — but keeps the
 /// raw pieces so a test can write frames the public API cannot express (e.g. a
 /// tampered length prefix).
 fn raw_handshake_responder(
@@ -759,7 +758,20 @@ fn raw_handshake_responder(
     server_sk: &[u8; 32],
     expected_client_pk: &[u8; 32],
 ) -> Result<(TcpStream, snow::TransportState), String> {
-    let prologue = noise_prologue(PREAMBLE_IK);
+    // The mode byte the production responder reads and validates first.
+    let mut preamble = [0u8; 1];
+    stream
+        .read_exact(&mut preamble)
+        .map_err(|e| format!("read preamble failed: {e}"))?;
+    if preamble[0] != HandshakeMode::Ik.byte() {
+        return Err(format!(
+            "expected the IK preamble {:#04x}, got {:#04x}",
+            HandshakeMode::Ik.byte(),
+            preamble[0]
+        ));
+    }
+
+    let prologue = HandshakeMode::Ik.prologue();
     let mut handshake = Builder::new(
         "Noise_IK_25519_AESGCM_SHA256"
             .parse()
@@ -824,7 +836,12 @@ fn raw_handshake_initiator(
     client_sk: &[u8; 32],
     server_pk: &[u8; 32],
 ) -> Result<(TcpStream, snow::TransportState), String> {
-    let prologue = noise_prologue(PREAMBLE_IK);
+    // The mode byte the production initiator writes first.
+    stream
+        .write_all(&[HandshakeMode::Ik.byte()])
+        .map_err(|e| format!("write preamble failed: {e}"))?;
+
+    let prologue = HandshakeMode::Ik.prologue();
     let mut handshake = Builder::new(
         "Noise_IK_25519_AESGCM_SHA256"
             .parse()
@@ -1055,6 +1072,12 @@ fn noise_handshake_times_out_against_dribbling_peer() {
     });
 
     let mut stream = TcpStream::connect(addr).expect("connect");
+    // The responder reads the mode preamble before the frame stream, so send it
+    // first — the dribbling starts where the slow-loris attack would: the
+    // handshake's length prefix.
+    stream
+        .write_all(&[HandshakeMode::Ik.byte()])
+        .expect("write preamble");
     // A real IK msg1 is ~80-96 bytes; claim 96 with the 2-byte prefix...
     stream
         .write_all(&(96u16).to_be_bytes())
@@ -1137,6 +1160,153 @@ fn noise_xx_handshake_round_trip() {
     assert_eq!(
         client.recv_daemon_message().expect("recv Pong"),
         DaemonMessage::broadcast(DaemonMessageType::Pong)
+    );
+}
+
+/// The responder entry point a server actually uses —
+/// [`handshake_responder_auto`] — dispatches on the peer's mode byte and reports
+/// which flow it ran: IK clients get IK, XX clients get XX, and neither has to
+/// tell the server which one it wanted out of band.
+#[test]
+#[ignore = "integration"]
+fn noise_responder_auto_dispatches_on_the_mode_byte() {
+    for expected in [HandshakeMode::Ik, HandshakeMode::Xx] {
+        let (listener, server_sk, server_pk, client_sk, client_pk) =
+            noise_test_pair().expect("noise test listener bind");
+        let addr = listener.local_addr().expect("local addr");
+
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accept");
+            let result =
+                choreo_transport::handshake::handshake_responder_auto(stream, &server_sk, |pk| {
+                    *pk == client_pk
+                });
+            tx.send(result.map(|(_, mode)| mode)).expect("send result");
+        });
+
+        let stream = TcpStream::connect(addr).expect("connect");
+        let client = match expected {
+            HandshakeMode::Ik => handshake_initiator(stream, &client_sk, &server_pk).map(|_| ()),
+            HandshakeMode::Xx => handshake_initiator_xx(stream, &client_sk).map(|_| ()),
+        };
+        client.expect("client handshake");
+
+        assert_eq!(
+            rx.recv()
+                .expect("recv server result")
+                .expect("server handshake"),
+            expected,
+            "the responder must run (and report) the mode the client declared"
+        );
+    }
+}
+
+/// A preamble byte that names no mode is refused BEFORE any handshake runs, and
+/// a mode-specific responder refuses a peer that asked for the other mode. Both
+/// are protocol refusals, not authentication failures — and both fail fast, which
+/// is what stops a garbage first byte from costing a handshake's worth of work.
+#[test]
+#[ignore = "integration"]
+fn noise_responder_rejects_unknown_and_mismatched_modes() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_sk_bytes = server_sk.to_bytes();
+
+    // Unknown byte: 0x00 is reserved precisely so a NUL fill can never look
+    // like a mode. The responder must error without waiting for more bytes.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result =
+            choreo_transport::handshake::handshake_responder_auto(stream, &server_sk_bytes, |_| {
+                true
+            });
+        tx.send(result.map(|_| ())).expect("send server result");
+    });
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.write_all(&[0x00]).expect("write reserved byte");
+    match rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("responder must return instead of waiting for a handshake")
+    {
+        Err(TransportError::HandshakeModeUnknown { byte: 0x00 }) => {}
+        other => panic!("a reserved preamble must be refused as unknown, got {other:?}"),
+    }
+
+    // Mismatched: the IK responder is asked for XX. The mode byte and the flow
+    // must agree, so this is a refusal rather than a handshake attempt.
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = handshake_responder(stream, &server_sk_bytes, |_| true);
+        tx.send(result.map(|_| ())).expect("send server result");
+    });
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .write_all(&[HandshakeMode::Xx.byte()])
+        .expect("write XX preamble");
+    match rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("responder must return")
+    {
+        Err(TransportError::HandshakeModeMismatch { expected, got }) => {
+            assert_eq!(expected, HandshakeMode::Ik.byte());
+            assert_eq!(got, HandshakeMode::Xx.byte());
+        }
+        other => panic!("a cross-mode request must be refused, got {other:?}"),
+    }
+}
+
+/// The responder's budget covers the preamble read AND the handshake: a peer
+/// that sends the mode byte immediately and then stalls is cut off at ONE
+/// `timeout`, not two. With a separate budget per phase the elapsed time would be
+/// roughly double, so the bound below distinguishes the two designs.
+#[test]
+#[ignore = "integration"]
+fn noise_handshake_budget_covers_preamble_and_handshake() {
+    let server_sk = StaticSecret::random_from_rng(&mut rand::rng());
+    let server_sk_bytes = server_sk.to_bytes();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local addr");
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let started = std::time::Instant::now();
+        let result = choreo_transport::handshake::handshake_responder_auto_with_timeout(
+            stream,
+            &server_sk_bytes,
+            |_| true,
+            Duration::from_millis(300),
+        );
+        tx.send((result.map(|_| ()), started.elapsed()))
+            .expect("send server result");
+    });
+
+    // Send the mode byte (so the preamble read succeeds) and then nothing: the
+    // stall lands inside the handshake, on the remaining part of the same budget.
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream
+        .write_all(&[HandshakeMode::Ik.byte()])
+        .expect("write preamble");
+
+    let (result, elapsed) = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("responder must return");
+    match result {
+        Err(TransportError::HandshakeTimeout) => {}
+        other => panic!("a stalled handshake must time out, got {other:?}"),
+    }
+    // Two independent 300 ms budgets would take >= 600 ms; one shared budget
+    // finishes near 300 ms. A generous ceiling keeps this immune to scheduler
+    // slop while still failing the double-budget behaviour.
+    assert!(
+        elapsed < Duration::from_millis(550),
+        "one budget must cover both phases, took {elapsed:?}"
     );
 }
 
@@ -1262,6 +1432,12 @@ fn noise_xx_handshake_times_out_against_dribbling_peer() {
     });
 
     let mut stream = TcpStream::connect(addr).expect("connect");
+    // The XX preamble goes first (the responder reads it before the frame
+    // stream), so the dribble happens where the attack targets: the handshake's
+    // length prefix.
+    stream
+        .write_all(&[HandshakeMode::Xx.byte()])
+        .expect("write preamble");
     // An XX msg1 is 48 bytes on the wire; claim 48 with the 2-byte prefix...
     stream
         .write_all(&(48u16).to_be_bytes())

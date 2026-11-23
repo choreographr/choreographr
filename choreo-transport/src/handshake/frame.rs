@@ -202,7 +202,7 @@ pub(super) fn read_handshake_exact(
 /// peer that stops reading mid-handshake cannot hold the writer past the
 /// deadline (in practice handshake messages are a few hundred bytes and fit
 /// the socket buffer, so this bound is a backstop, not the normal path).
-fn write_handshake_all(
+pub(super) fn write_handshake_all(
     stream: &mut TcpStream,
     deadline: Instant,
     data: &[u8],
@@ -234,6 +234,22 @@ fn write_handshake_all(
         }
     }
     Ok(())
+}
+
+/// Write the 1-byte handshake-mode preamble, bounded by `deadline`.
+///
+/// The initiators call this as their first step, so the byte that selects a
+/// flow and the flow itself come from one [`super::HandshakeMode`] value — a
+/// client cannot announce one mode and then run the other. The write goes
+/// through the same bounded writer as the handshake frames, so a peer that stops
+/// reading cannot hold the writer: a single byte fits any socket buffer in
+/// practice, making this a backstop rather than the normal path.
+pub(super) fn write_preamble(
+    stream: &mut TcpStream,
+    deadline: Instant,
+    mode: super::HandshakeMode,
+) -> Result<(), TransportError> {
+    write_handshake_all(stream, deadline, &[mode.byte()])
 }
 
 /// Read one complete handshake frame body: the 2-byte big-endian length

@@ -16,9 +16,7 @@ use choreo_proto::{
     ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix, read_message, write_message,
 };
 use choreo_transport::error::TransportError;
-use choreo_transport::handshake::{
-    PREAMBLE_IK, PREAMBLE_XX, handshake_initiator, handshake_initiator_xx,
-};
+use choreo_transport::handshake::{handshake_initiator, handshake_initiator_xx};
 use choreo_transport::key::ensure_transport_keypair;
 // In-process transport: raw channel ends from an `choreo_daemon::embedded::EmbeddedLink`.
 // Pure values — client-core never depends on choreo-daemon; the GUI creates
@@ -322,31 +320,25 @@ pub fn run_daemon_tcp_connection(
     )
 }
 
-/// The 1-byte handshake-mode preamble (TCP wire v5) goes out BEFORE any
-/// handshake message, then the Noise IK handshake runs. Returns the raw
-/// `TransportError` so callers can classify the failure (the
-/// `ConnectionRefused` wrapping lives one layer up, in
+/// The Noise IK handshake over an already-dialed TCP stream — the initiator
+/// writes the 1-byte mode preamble as its first step (see
+/// [`handshake_initiator`]). Returns the raw `TransportError` so callers can
+/// classify the failure (the `ConnectionRefused` wrapping lives one layer up, in
 /// [`ik_handshake_and_serve`]). Shared by the session-opening path and the
 /// [`verify_daemon_authorization`] preflight so both exercise the exact
 /// same wire sequence the daemon will judge.
 fn ik_handshake_raw(
-    mut tcp: std::net::TcpStream,
+    tcp: std::net::TcpStream,
     client_sk: &[u8; 32],
     server_pk: &[u8; 32],
 ) -> Result<choreo_transport::noise::NoiseStream, TransportError> {
-    // The preamble is unauthenticated by design — the daemon uses it
-    // only to pick which equally-authenticated handshake to run; the IK
-    // handshake itself authenticates both static keys and gates the ACL.
-    // A single-byte write to a fresh blocking socket cannot meaningfully
-    // block (it fits any socket buffer), so no timeout is armed for it.
-    tcp.write_all(&[PREAMBLE_IK])?;
     handshake_initiator(tcp, client_sk, server_pk)
 }
 
-/// Preamble + Noise IK handshake over an ALREADY-DIALED TCP stream, then
+/// Noise IK handshake over an ALREADY-DIALED TCP stream, then
 /// the encrypted session loop. Shared by [`run_daemon_tcp_connection`] and
 /// [`run_daemon_tcp_connection_pinned`] so both paths run the identical
-/// preamble+handshake sequence. A handshake failure surfaces as
+/// handshake sequence. A handshake failure surfaces as
 /// `ConnectionRefused` (the pre-existing wire convention) — which is why
 /// the caller must dial separately: only then does a `ConnectionRefused`
 /// returned from here unambiguously mean the HANDSHAKE failed, not the
@@ -407,12 +399,9 @@ pub fn run_daemon_tcp_connection_xx_first_contact(
     let (client_sk, _client_pk) =
         ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
 
-    // Connect TCP, declare first-contact mode, run Noise XX.
-    let mut tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
-    // Same preamble reasoning as the IK path: unauthenticated mode selector,
-    // authenticated by nothing, needed for nothing — the handshake that
-    // follows carries all the cryptographic guarantees.
-    tcp.write_all(&[PREAMBLE_XX]).map_err(ClientError::Io)?;
+    // Connect TCP, then run Noise XX — the initiator writes the first-contact
+    // mode preamble itself, so the declared mode and the flow cannot disagree.
+    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
     let (noise, server_pk) = handshake_initiator_xx(tcp, client_sk.as_bytes()).map_err(|e| {
         ClientError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
@@ -531,8 +520,9 @@ fn serve_noise_connection(
 
 /// Probe a daemon's static public key without establishing a session.
 ///
-/// Performs the XX first-contact handshake ONLY: connect, preamble, the
-/// three handshake messages, extract the learned server key, and DROP the
+/// Performs the XX first-contact handshake ONLY: connect (the initiator writes
+/// the mode preamble itself), the three handshake messages, extract the learned
+/// server key, and DROP the
 /// stream — no data-plane message is ever sent or received. This is the
 /// building block UIs use to implement the trust flow synchronously (in a
 /// normal-mode terminal, before any TUI/GUI starts): learn the key, show
@@ -554,9 +544,9 @@ pub fn probe_server_key(addr: &str) -> Result<[u8; 32], ClientError> {
     let (client_sk, _client_pk) =
         ensure_transport_keypair().map_err(|e| ClientError::Io(std::io::Error::other(e)))?;
 
-    let mut tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
-    // Same preamble contract as the session-opening XX path.
-    tcp.write_all(&[PREAMBLE_XX]).map_err(ClientError::Io)?;
+    let tcp = std::net::TcpStream::connect(addr).map_err(ClientError::Io)?;
+    // The XX initiator declares the first-contact mode itself (see
+    // `handshake_initiator_xx`).
     let (noise, server_pk) = handshake_initiator_xx(tcp, client_sk.as_bytes()).map_err(|e| {
         ClientError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,

@@ -5,16 +5,22 @@
 //! Both flows hand every encoded message to the shared frame plumbing in the
 //! sibling `frame` module, so the length prefix, the bounded read and the
 //! coalesced bounded write have a single implementation.
+//!
+//! The public entry points own the mode's 1-byte preamble: the initiator writes
+//! [`HandshakeMode::Ik`]'s byte before its first message, and the responder reads
+//! it back and rejects a peer that asked for the other mode. The
+//! `initiator`/`responder` functions below are the frame-level flows the entry
+//! points and [`super::handshake_responder_auto`] share.
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
-use super::HANDSHAKE_TIMEOUT;
 use super::frame::{
     HANDSHAKE_FRAME_BUF_LEN, LEN_PREFIX_LEN, MAX_HANDSHAKE_FRAME, read_handshake_message,
-    slice_mut, write_handshake_frame,
+    slice_mut, write_handshake_frame, write_preamble,
 };
+use super::{HANDSHAKE_TIMEOUT, HandshakeMode, read_preamble, require_mode};
 use crate::error::TransportError;
 use crate::noise::NoiseStream;
 
@@ -31,7 +37,8 @@ const PATTERN: &str = "Noise_IK_25519_AESGCM_SHA256";
 /// * `server_pk` — the server's transport public key (32-byte X25519 key, as
 ///   printed by `choreographr pubkey` on the server).
 ///
-/// On success returns a `NoiseStream` ready for encrypted message I/O.
+/// Writes the IK mode preamble first, so the caller only has to dial and call
+/// this. On success returns a `NoiseStream` ready for encrypted message I/O.
 ///
 /// # Errors
 ///
@@ -43,13 +50,13 @@ pub fn handshake_initiator(
     static_sk: &[u8; 32],
     server_pk: &[u8; 32],
 ) -> Result<NoiseStream, TransportError> {
-    handshake_initiator_impl(stream, static_sk, server_pk, HANDSHAKE_TIMEOUT)
+    handshake_initiator_with_timeout(stream, static_sk, server_pk, HANDSHAKE_TIMEOUT)
 }
 
 /// [`handshake_initiator`] with an explicit total-duration budget for the
-/// WHOLE handshake (see `HANDSHAKE_TIMEOUT` for why the budget is absolute,
-/// not per-read). Exposed so integration tests can exercise the timeout path
-/// in milliseconds instead of waiting out the 10 s default.
+/// WHOLE handshake, preamble write included (see `HANDSHAKE_TIMEOUT` for why the
+/// budget is absolute, not per-read). Exposed so integration tests can exercise
+/// the timeout path in milliseconds instead of waiting out the 10 s default.
 ///
 /// # Errors
 ///
@@ -62,33 +69,35 @@ pub fn handshake_initiator_with_timeout(
     server_pk: &[u8; 32],
     timeout: Duration,
 ) -> Result<NoiseStream, TransportError> {
-    handshake_initiator_impl(stream, static_sk, server_pk, timeout)
+    initiator(stream, static_sk, server_pk, Instant::now() + timeout)
 }
 
-/// The single IK-initiator implementation; the two public entry points differ
-/// only in the budget they hand it.
-fn handshake_initiator_impl(
+/// The IK initiator under an absolute deadline: preamble write, then the two
+/// handshake messages.
+pub(super) fn initiator(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
     server_pk: &[u8; 32],
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<NoiseStream, TransportError> {
     use snow::Builder;
 
-    let deadline = Instant::now() + timeout;
-
     // The prologue binds the domain-separation tag and this flow's mode byte
     // into the handshake hash; the IK responder derives the identical buffer
-    // from the same PREAMBLE_IK, so a peer that ran a different mode (or an
+    // from the same HandshakeMode::Ik, so a peer that ran a different mode (or an
     // intermediary that rewrote the preamble byte) cannot complete this
     // handshake.
-    let prologue = super::noise_prologue(super::PREAMBLE_IK);
+    let prologue = HandshakeMode::Ik.prologue();
 
     let mut handshake = Builder::new(PATTERN.parse()?)
         .local_private_key(static_sk)?
         .remote_public_key(server_pk)?
         .prologue(&prologue)?
         .build_initiator()?;
+
+    // Declare the mode before any handshake message: the responder dispatches on
+    // this byte, and both ends bind it into the prologue above.
+    write_preamble(&mut stream, deadline, HandshakeMode::Ik)?;
 
     // Message 1 (-> e, es, s, ss): the ephemeral key plus the client's static,
     // encrypted to the server. It leaves through the shared frame writer, so
@@ -127,6 +136,10 @@ fn handshake_initiator_impl(
 /// Perform the Noise IK handshake as the **responder** (server side), using
 /// the default `HANDSHAKE_TIMEOUT` budget.
 ///
+/// Reads the IK mode preamble first and rejects a peer that asked for another
+/// mode; a caller that does not know which mode the client will request wants
+/// [`super::handshake_responder_auto`] instead, which dispatches on the byte.
+///
 /// * `stream` — the accepted TCP stream from the listener.
 /// * `static_sk` — the server's transport.sec (32-byte X25519 secret key).
 /// * `check_client` — a closure that receives the client's 32-byte static
@@ -138,9 +151,10 @@ fn handshake_initiator_impl(
 ///
 /// # Errors
 ///
-/// Returns [`TransportError::AuthFailed`] if the client is not authorized
-/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
-/// the exchange exceeds the `HANDSHAKE_TIMEOUT` budget, or the snow/
+/// Returns [`TransportError::HandshakeModeMismatch`] if the peer requested a
+/// different mode, [`TransportError::AuthFailed`] if the client is not
+/// authorized or never sent its static key, [`TransportError::HandshakeTimeout`]
+/// if the exchange exceeds the `HANDSHAKE_TIMEOUT` budget, or the snow/
 /// `TransportError` I/O and protocol errors raised by the exchange itself.
 pub fn handshake_responder<F>(
     stream: TcpStream,
@@ -150,20 +164,17 @@ pub fn handshake_responder<F>(
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
-    handshake_responder_impl(stream, static_sk, check_client, HANDSHAKE_TIMEOUT)
+    handshake_responder_with_timeout(stream, static_sk, check_client, HANDSHAKE_TIMEOUT)
 }
 
-/// [`handshake_responder`] with an explicit total-duration budget for the
-/// WHOLE handshake (see `HANDSHAKE_TIMEOUT`). Exposed so integration tests
-/// can exercise the timeout path in milliseconds instead of waiting out the
-/// 10 s default.
+/// [`handshake_responder`] with an explicit total-duration budget for the WHOLE
+/// handshake, preamble read included (see `HANDSHAKE_TIMEOUT`). Exposed so
+/// integration tests can exercise the timeout path in milliseconds instead of
+/// waiting out the 10 s default.
 ///
 /// # Errors
 ///
-/// Returns [`TransportError::AuthFailed`] if the client is not authorized
-/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
-/// the exchange exceeds `timeout`, or the snow/`TransportError` I/O and
-/// protocol errors raised by the exchange itself.
+/// As [`handshake_responder`], with the budget given by `timeout`.
 pub fn handshake_responder_with_timeout<F>(
     stream: TcpStream,
     static_sk: &[u8; 32],
@@ -173,27 +184,40 @@ pub fn handshake_responder_with_timeout<F>(
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
-    handshake_responder_impl(stream, static_sk, check_client, timeout)
+    responder_with_mode_check(stream, static_sk, check_client, Instant::now() + timeout)
 }
 
-/// The single IK-responder implementation; the two public entry points differ
-/// only in the budget they hand it.
-fn handshake_responder_impl<F>(
+/// Read the preamble under `deadline`, require IK, then run the flow.
+fn responder_with_mode_check<F>(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
     check_client: F,
-    timeout: Duration,
+    deadline: Instant,
+) -> Result<NoiseStream, TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
+    let mode = read_preamble(&mut stream, deadline)?;
+    require_mode(mode, HandshakeMode::Ik)?;
+    responder(stream, static_sk, check_client, deadline)
+}
+
+/// The IK responder's frames, with the preamble already consumed and the mode
+/// already validated by the caller.
+pub(super) fn responder<F>(
+    mut stream: TcpStream,
+    static_sk: &[u8; 32],
+    check_client: F,
+    deadline: Instant,
 ) -> Result<NoiseStream, TransportError>
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
     use snow::Builder;
 
-    let deadline = Instant::now() + timeout;
-
     // Same prologue as the IK initiator above — the two halves of the IK flow
-    // must derive an identical handshake hash, so both take PREAMBLE_IK.
-    let prologue = super::noise_prologue(super::PREAMBLE_IK);
+    // must derive an identical handshake hash, so both take HandshakeMode::Ik.
+    let prologue = HandshakeMode::Ik.prologue();
 
     let mut handshake = Builder::new(PATTERN.parse()?)
         .local_private_key(static_sk)?
@@ -235,7 +259,7 @@ where
     write_handshake_frame(&mut stream, deadline, &mut buf, n)?;
 
     // Handshake complete — restore the unbounded data-plane I/O: clear BOTH
-    // timeouts (see handshake_initiator_impl).
+    // timeouts (see `initiator`).
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
 

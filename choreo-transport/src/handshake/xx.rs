@@ -6,16 +6,20 @@
 //! every encoded message to the shared frame plumbing in the sibling `frame`
 //! module, so the length prefix, the bounded read and the coalesced bounded
 //! write have a single implementation shared with the IK flows.
+//!
+//! The public entry points own the mode's 1-byte preamble: the initiator writes
+//! [`HandshakeMode::Xx`]'s byte before its first message, and the responder reads
+//! it back and rejects a peer that asked for the other mode.
 
 use std::net::TcpStream;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
-use super::HANDSHAKE_TIMEOUT;
 use super::frame::{
     HANDSHAKE_FRAME_BUF_LEN, LEN_PREFIX_LEN, MAX_HANDSHAKE_FRAME, read_handshake_message,
-    slice_mut, write_handshake_frame,
+    slice_mut, write_handshake_frame, write_preamble,
 };
+use super::{HANDSHAKE_TIMEOUT, HandshakeMode, read_preamble, require_mode};
 use crate::error::TransportError;
 use crate::noise::NoiseStream;
 
@@ -34,11 +38,11 @@ const PATTERN: &str = "Noise_XX_25519_AESGCM_SHA256";
 /// so the caller can verify it out-of-band (base64 confirmation) BEFORE any
 /// encrypted protocol traffic other than the handshake itself flows.
 ///
-/// * `stream` — the already-connected TCP stream (the handshake-mode
-///   preamble byte has already been sent by the caller).
+/// * `stream` — the already-connected TCP stream.
 /// * `static_sk` — the client's transport.sec (32-byte X25519 secret key).
 ///
-/// On success returns `(NoiseStream, [u8; 32])` — the encrypted transport
+/// Writes the XX mode preamble first, so the caller only has to dial and call
+/// this. On success returns `(NoiseStream, [u8; 32])` — the encrypted transport
 /// and the server's static public key learned from the handshake. Fails if
 /// the server never transmitted its static key (an XX protocol-contract
 /// violation, surfaced as `InvalidFragment`).
@@ -53,15 +57,15 @@ pub fn handshake_initiator_xx(
     stream: TcpStream,
     static_sk: &[u8; 32],
 ) -> Result<(NoiseStream, [u8; 32]), TransportError> {
-    handshake_initiator_xx_impl(stream, static_sk, HANDSHAKE_TIMEOUT)
+    handshake_initiator_xx_with_timeout(stream, static_sk, HANDSHAKE_TIMEOUT)
 }
 
 /// [`handshake_initiator_xx`] with an explicit total-duration budget for the
-/// WHOLE handshake (see `HANDSHAKE_TIMEOUT`). Reuses the exact same
-/// absolute-deadline plumbing as the IK variants — the shared frame reader and
-/// writer — so the XX timeout semantics are identical: a silent or dribbling
-/// peer is cut off at the deadline with `HandshakeTimeout`, and both socket
-/// timeouts are cleared before the data plane.
+/// WHOLE handshake, preamble write included (see `HANDSHAKE_TIMEOUT`). Reuses
+/// the exact same absolute-deadline plumbing as the IK variants — the shared
+/// frame reader and writer — so the XX timeout semantics are identical: a silent
+/// or dribbling peer is cut off at the deadline with `HandshakeTimeout`, and both
+/// socket timeouts are cleared before the data plane.
 ///
 /// # Errors
 ///
@@ -74,25 +78,23 @@ pub fn handshake_initiator_xx_with_timeout(
     static_sk: &[u8; 32],
     timeout: Duration,
 ) -> Result<(NoiseStream, [u8; 32]), TransportError> {
-    handshake_initiator_xx_impl(stream, static_sk, timeout)
+    initiator(stream, static_sk, Instant::now() + timeout)
 }
 
-/// The single XX-initiator implementation; the two public entry points differ
-/// only in the budget they hand it.
-fn handshake_initiator_xx_impl(
+/// The XX initiator under an absolute deadline: preamble write, then the three
+/// handshake messages.
+pub(super) fn initiator(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
-    timeout: Duration,
+    deadline: Instant,
 ) -> Result<(NoiseStream, [u8; 32]), TransportError> {
     use snow::Builder;
 
-    let deadline = Instant::now() + timeout;
-
     // The prologue binds the domain-separation tag and this flow's mode byte
     // into the handshake hash; the XX responder derives the identical buffer
-    // from the same PREAMBLE_XX, so the mode is part of the authenticated
+    // from the same HandshakeMode::Xx, so the mode is part of the authenticated
     // transcript rather than a claim the wire makes unchecked.
-    let prologue = super::noise_prologue(super::PREAMBLE_XX);
+    let prologue = HandshakeMode::Xx.prologue();
 
     // XX initiator: NO `.remote_public_key()` — the server's static key is
     // unknown until the handshake reveals it (IK hard-codes it here, which
@@ -101,6 +103,9 @@ fn handshake_initiator_xx_impl(
         .local_private_key(static_sk)?
         .prologue(&prologue)?
         .build_initiator()?;
+
+    // Declare the mode before any handshake message (see the IK initiator).
+    write_preamble(&mut stream, deadline, HandshakeMode::Xx)?;
 
     // One buffer carries every outbound frame and every decryption output, so
     // the three messages allocate nothing extra.
@@ -133,7 +138,7 @@ fn handshake_initiator_xx_impl(
     write_handshake_frame(&mut stream, deadline, &mut buf, n)?;
 
     // Handshake complete — restore the unbounded data-plane I/O (see
-    // handshake_initiator_impl: BOTH timeouts must be cleared, the deadline
+    // `super::ik::initiator`: BOTH timeouts must be cleared, the deadline
     // helpers armed SO_RCVTIMEO and SO_SNDTIMEO).
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
@@ -165,14 +170,17 @@ fn handshake_initiator_xx_impl(
 /// Mirrors [`super::handshake_responder`] (Noise IK) except for the message
 /// flow: XX is 3 messages instead of IK's 2, and the client's static key
 /// arrives with message 3 (not message 1), so the `check_client` ACL closure
-/// runs AFTER the full key exchange — see the comment at the check below for
-/// why that is still safe.
+/// runs AFTER the full key exchange — see the comment at the check below for why
+/// that is still safe. Reads the XX mode preamble first and rejects a peer that
+/// asked for another mode; [`super::handshake_responder_auto`] is the entry point
+/// that dispatches on the byte instead.
 ///
 /// # Errors
 ///
-/// Returns [`TransportError::AuthFailed`] if the client is not authorized
-/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
-/// the exchange exceeds the `HANDSHAKE_TIMEOUT` budget, or the snow/
+/// Returns [`TransportError::HandshakeModeMismatch`] if the peer requested a
+/// different mode, [`TransportError::AuthFailed`] if the client is not
+/// authorized or never sent its static key, [`TransportError::HandshakeTimeout`]
+/// if the exchange exceeds the `HANDSHAKE_TIMEOUT` budget, or the snow/
 /// `TransportError` I/O and protocol errors raised by the exchange itself.
 pub fn handshake_responder_xx<F>(
     stream: TcpStream,
@@ -182,20 +190,17 @@ pub fn handshake_responder_xx<F>(
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
-    handshake_responder_xx_impl(stream, static_sk, check_client, HANDSHAKE_TIMEOUT)
+    handshake_responder_xx_with_timeout(stream, static_sk, check_client, HANDSHAKE_TIMEOUT)
 }
 
 /// [`handshake_responder_xx`] with an explicit total-duration budget for the
-/// WHOLE handshake (see `HANDSHAKE_TIMEOUT`). Same absolute-deadline
-/// plumbing as the IK responder — every read AND write is bounded by the
-/// time remaining until the deadline.
+/// WHOLE handshake, preamble read included (see `HANDSHAKE_TIMEOUT`). Same
+/// absolute-deadline plumbing as the IK responder — every read AND write is
+/// bounded by the time remaining until the deadline.
 ///
 /// # Errors
 ///
-/// Returns [`TransportError::AuthFailed`] if the client is not authorized
-/// or never sent its static key, [`TransportError::HandshakeTimeout`] if
-/// the exchange exceeds `timeout`, or the snow/`TransportError` I/O and
-/// protocol errors raised by the exchange itself.
+/// As [`handshake_responder_xx`], with the budget given by `timeout`.
 pub fn handshake_responder_xx_with_timeout<F>(
     stream: TcpStream,
     static_sk: &[u8; 32],
@@ -205,27 +210,40 @@ pub fn handshake_responder_xx_with_timeout<F>(
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
-    handshake_responder_xx_impl(stream, static_sk, check_client, timeout)
+    responder_with_mode_check(stream, static_sk, check_client, Instant::now() + timeout)
 }
 
-/// The single XX-responder implementation; the two public entry points differ
-/// only in the budget they hand it.
-fn handshake_responder_xx_impl<F>(
+/// Read the preamble under `deadline`, require XX, then run the flow.
+fn responder_with_mode_check<F>(
     mut stream: TcpStream,
     static_sk: &[u8; 32],
     check_client: F,
-    timeout: Duration,
+    deadline: Instant,
+) -> Result<NoiseStream, TransportError>
+where
+    F: FnOnce(&[u8; 32]) -> bool,
+{
+    let mode = read_preamble(&mut stream, deadline)?;
+    require_mode(mode, HandshakeMode::Xx)?;
+    responder(stream, static_sk, check_client, deadline)
+}
+
+/// The XX responder's frames, with the preamble already consumed and the mode
+/// already validated by the caller.
+pub(super) fn responder<F>(
+    mut stream: TcpStream,
+    static_sk: &[u8; 32],
+    check_client: F,
+    deadline: Instant,
 ) -> Result<NoiseStream, TransportError>
 where
     F: FnOnce(&[u8; 32]) -> bool,
 {
     use snow::Builder;
 
-    let deadline = Instant::now() + timeout;
-
     // Same prologue as the XX initiator above — the two halves of the XX flow
-    // must derive an identical handshake hash, so both take PREAMBLE_XX.
-    let prologue = super::noise_prologue(super::PREAMBLE_XX);
+    // must derive an identical handshake hash, so both take HandshakeMode::Xx.
+    let prologue = HandshakeMode::Xx.prologue();
 
     let mut handshake = Builder::new(PATTERN.parse()?)
         .local_private_key(static_sk)?
@@ -279,7 +297,7 @@ where
     }
 
     // Handshake complete — restore the unbounded data-plane I/O (see
-    // handshake_responder_impl).
+    // `super::ik::responder`).
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(None)?;
 

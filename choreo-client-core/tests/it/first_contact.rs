@@ -8,7 +8,7 @@
 //! (`choreo_client_core::probe_server_key`, `run_daemon_connection_with_mode`
 //! with `ConnectionMode::TcpPinned`) against hand-rolled responder threads
 //! built on the real `choreo_transport` handshakes — the same shape the
-//! daemon's accept path uses (preamble read → responder → ACL closure). No
+//! daemon's accept path uses (mode-byte dispatch → responder → ACL closure). No
 //! full daemon is needed here because the behavior under test is entirely
 //! client-side: the probe contract, the pinned-mode error guidance, and the
 //! pin-driven IK connection.
@@ -20,7 +20,6 @@
 //! [`spawn_connection_thread`] — the same discipline as choreo-daemon's
 //! `daemon_client_noise.rs`).
 
-use std::io::Read;
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -131,19 +130,19 @@ fn probe_server_key_learns_server_static() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local addr").to_string();
 
-    // Responder: preamble + XX responder authorizing this test's client key.
+    // Responder: the dispatching entry point reads the mode byte and runs the
+    // flow the client asked for, authorizing this test's client key.
     let client_pk = roots.client_pk;
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut preamble = [0u8; 1];
-        stream.read_exact(&mut preamble).expect("read preamble");
-        assert_eq!(preamble[0], choreo_transport::handshake::PREAMBLE_XX);
+        let (stream, _) = listener.accept().expect("accept");
         let result =
-            choreo_transport::handshake::handshake_responder_xx(stream, &server.sk, |pk| {
+            choreo_transport::handshake::handshake_responder_auto(stream, &server.sk, |pk| {
                 pk == &client_pk
             })
-            .map(|_| ());
+            .map(|(_, mode)| {
+                assert_eq!(mode, choreo_transport::handshake::HandshakeMode::Xx);
+            });
         let _ = result_tx.send(result);
     });
 
@@ -160,8 +159,8 @@ fn probe_server_key_learns_server_static() {
 }
 
 /// THE enrollment preflight, accepted side: `verify_daemon_authorization`
-/// against a responder that authorizes this client (the daemon's shape:
-/// preamble + IK responder with an ACL closure) must succeed without any
+/// against a responder that authorizes this client (the daemon's shape: the
+/// dispatching responder with an ACL closure) must succeed without any
 /// protocol message being exchanged — the preflight drops the transport.
 #[test]
 #[ignore = "integration"]
@@ -176,14 +175,14 @@ fn verify_daemon_authorization_accepts_enrolled_client() {
     let client_pk = roots.client_pk;
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut preamble = [0u8; 1];
-        stream.read_exact(&mut preamble).expect("read preamble");
-        assert_eq!(preamble[0], choreo_transport::handshake::PREAMBLE_IK);
-        let result = choreo_transport::handshake::handshake_responder(stream, &server.sk, |pk| {
-            pk == &client_pk
-        })
-        .map(|_| ());
+        let (stream, _) = listener.accept().expect("accept");
+        let result =
+            choreo_transport::handshake::handshake_responder_auto(stream, &server.sk, |pk| {
+                pk == &client_pk
+            })
+            .map(|(_, mode)| {
+                assert_eq!(mode, choreo_transport::handshake::HandshakeMode::Ik);
+            });
         let _ = result_tx.send(result);
     });
 
@@ -219,12 +218,9 @@ fn verify_daemon_authorization_rejects_unenrolled_client() {
     // enrolled.
     let (result_tx, result_rx) = mpsc::channel();
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut preamble = [0u8; 1];
-        stream.read_exact(&mut preamble).expect("read preamble");
-        assert_eq!(preamble[0], choreo_transport::handshake::PREAMBLE_IK);
+        let (stream, _) = listener.accept().expect("accept");
         let result =
-            choreo_transport::handshake::handshake_responder(stream, &server.sk, |_| false)
+            choreo_transport::handshake::handshake_responder_auto(stream, &server.sk, |_| false)
                 .map(|_| ());
         let _ = result_tx.send(result);
     });
@@ -263,16 +259,13 @@ fn pinned_mode_connects_and_round_trips() {
         known.pin(&addr, &server.pk).expect("pin");
     }
 
-    // Responder half: preamble + IK responder with the same ACL shape the
+    // Responder half: the same dispatching entry point and ACL shape the
     // daemon uses (authorize this test's client key), serving one round trip.
     let client_pk = roots.client_pk;
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut preamble = [0u8; 1];
-        stream.read_exact(&mut preamble).expect("read preamble");
-        assert_eq!(preamble[0], choreo_transport::handshake::PREAMBLE_IK);
-        let mut server_stream =
-            choreo_transport::handshake::handshake_responder(stream, &server.sk, |pk| {
+        let (stream, _) = listener.accept().expect("accept");
+        let (mut server_stream, _mode) =
+            choreo_transport::handshake::handshake_responder_auto(stream, &server.sk, |pk| {
                 pk == &client_pk
             })
             .expect("IK responder");
@@ -331,15 +324,22 @@ fn pinned_mode_key_change_fails_loud() {
 
     let client_pk = roots.client_pk;
     thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("accept");
-        let mut preamble = [0u8; 1];
-        stream.read_exact(&mut preamble).expect("read preamble");
-        // The client still speaks IK (it has a pin) — the changed server
-        // simply cannot complete the handshake and closes the socket.
-        assert_eq!(preamble[0], choreo_transport::handshake::PREAMBLE_IK);
-        let _ = choreo_transport::handshake::handshake_responder(stream, &key_b.sk, |pk| {
+        let (stream, _) = listener.accept().expect("accept");
+        // The client still speaks IK (it has a pin) — the changed server simply
+        // cannot complete the handshake and closes the socket. A client speaking
+        // XX instead would be refused as a MODE mismatch before any Noise message
+        // is processed, so the ABSENCE of that error is what pins the declared
+        // mode here.
+        let result = choreo_transport::handshake::handshake_responder(stream, &key_b.sk, |pk| {
             pk == &client_pk
         });
+        assert!(
+            !matches!(
+                result,
+                Err(choreo_transport::error::TransportError::HandshakeModeMismatch { .. })
+            ),
+            "the client must still declare IK, got a mode mismatch"
+        );
     });
 
     let (from_ui, to_daemon) = crossbeam_channel::unbounded::<ClientMessage>();

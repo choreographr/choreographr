@@ -633,7 +633,11 @@ pub fn run_server(
                         // auto-exit is off — an unused-but-captured clone is
                         // cheaper than branching the spawn plumbing).
                         let auto_exit_tx = if auto_exit { Some(tx.clone()) } else { None };
-                        let sk_bytes = *transport_sk.as_bytes();
+                        // A clone, not a byte copy: `TransportSecretKey` zeroizes
+                        // on drop, so this connection thread's copy of the instance
+                        // identity is erased when the thread ends instead of
+                        // lingering in its stack frame (see the type's docs).
+                        let transport_sk = transport_sk.clone();
                         let acl = Arc::clone(&acl);
                         let global_lag = Arc::clone(&global_lag_tcp);
                         // Each TCP connection thread reads images from its own
@@ -648,17 +652,17 @@ pub fn run_server(
                         let (client_id, writer_tx, writer_rx) =
                             crate::server::connection::register_client_writer(&tx);
                         let handle = thread::spawn(move || {
-                            // Held through the preamble + handshake AND the
-                            // connection thread: released when this thread
-                            // exits (handshake failure or connection end),
-                            // even on panic.
+                            // Held through the handshake AND the connection
+                            // thread: released when this thread exits
+                            // (handshake failure or connection end), even on
+                            // panic.
                             let conn_slot = slot;
-                            // The preamble read + handshake-mode dispatch +
-                            // responder handshake all live in
-                            // tcp_handshake_and_client_thread (server/connection.rs)
-                            // so the accept thread stays a pure spawn loop; it
-                            // also unregisters the writer channel on every
-                            // pre-transport failure path.
+                            // The responder handshake — which reads the mode
+                            // byte, dispatches on it, and runs IK or XX — lives
+                            // in tcp_handshake_and_client_thread
+                            // (server/connection.rs) so the accept thread stays a
+                            // pure spawn loop; it also unregisters the writer
+                            // channel on every pre-transport failure path.
                             let conn_args = crate::server::connection::ConnThreadArgs {
                                 daemon_tx: tx,
                                 db,
@@ -672,7 +676,7 @@ pub fn run_server(
                             if let Err(e) =
                                 crate::server::connection::tcp_handshake_and_client_thread(
                                     tcp,
-                                    sk_bytes,
+                                    transport_sk,
                                     &acl,
                                     conn_args,
                                     writer_write_timeout,

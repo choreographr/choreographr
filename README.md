@@ -1450,7 +1450,9 @@ binding; the next connect auto-binds a fresh key.
   key — the handshake reveals it, the client verifies its base64 public key
   out-of-band before any protocol traffic (in particular the `Unlock` that
   carries the daemon's private key) is sent, and IK is used for every
-  connection after that.
+  connection after that. The mode byte is cleartext, but the handshake binds it
+  into the Noise prologue, so the flow a connection runs is the one its client
+  chose: a rewritten byte fails both ends' handshakes instead of switching modes.
 - The client-side trust flow (SSH `known_hosts` model): the daemon's key is
   learned on first contact via the XX probe and confirmed by comparing its
   base64 public key with the daemon operator, then pinned to

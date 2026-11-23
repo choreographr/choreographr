@@ -23,9 +23,36 @@ pub enum TransportError {
     /// The Noise IK handshake did not complete within its total budget. The
     /// budget bounds the WHOLE handshake, not just a single read: a peer that
     /// dribbles bytes to keep resetting the per-read socket timeout is still
-    /// cut off (see `handshake::frame::read_handshake_exact`).
+    /// cut off (see `handshake::frame::read_handshake_exact`). On the responder
+    /// side one budget covers the mode-preamble read AND the handshake, so
+    /// stalling before the preamble buys no extra time.
     #[error("Noise handshake timed out")]
     HandshakeTimeout,
+    /// The peer opened a TCP connection with a preamble byte that names no
+    /// handshake mode this build defines (including the reserved `0x00`).
+    ///
+    /// The byte is the first thing on the wire, before any handshake message, so
+    /// this is a protocol-level refusal rather than an authentication failure:
+    /// the connection closes without running any handshake.
+    #[error("unknown handshake-mode byte {byte:#04x}")]
+    HandshakeModeUnknown {
+        /// The byte as it arrived, for the operator's diagnosis.
+        byte: u8,
+    },
+    /// A mode-specific responder was asked to run one Noise handshake but the
+    /// peer requested the other. The mode-selecting byte and the flow that
+    /// follows it must agree, so this is a protocol violation, not an
+    /// authorization failure; a server that accepts either mode dispatches on
+    /// the byte instead (`handshake::handshake_responder_auto`).
+    #[error(
+        "peer requested handshake-mode byte {got:#04x} but this responder runs {expected:#04x}"
+    )]
+    HandshakeModeMismatch {
+        /// The byte the responder was built for.
+        expected: u8,
+        /// The byte the peer actually sent.
+        got: u8,
+    },
     /// The peer presented credentials that the ACL check rejected.
     #[error("Authentication failed")]
     AuthFailed,
