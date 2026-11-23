@@ -52,10 +52,7 @@ impl SingleSlot {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            return Err(TransportError::InvalidFragment(format!(
-                "concurrent {} on one NoiseStream",
-                self.what
-            )));
+            return Err(TransportError::ConcurrentAccess { what: self.what });
         }
         Ok(SlotGuard(Arc::clone(&self.held)))
     }

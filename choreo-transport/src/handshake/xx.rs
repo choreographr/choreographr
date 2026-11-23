@@ -113,9 +113,7 @@ pub(super) fn initiator(
     let server_pk = match handshake.get_remote_static() {
         Some(bytes) => static_key_32(bytes, "XX server static key")?,
         None => {
-            return Err(TransportError::InvalidFragment(
-                "XX handshake: server did not transmit its static key".to_string(),
-            ));
+            return Err(TransportError::HandshakeStaticMissing);
         }
     };
 

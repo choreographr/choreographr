@@ -14,13 +14,33 @@ pub enum TransportError {
     /// A wire-protocol error from the shared codec.
     #[error("Protocol error: {0}")]
     Protocol(#[from] choreo_proto::ProtoError),
-    /// The peer (or this stream's usage) violated the transport framing
-    /// contract: an oversized fragment length, a reassembly that would exceed
-    /// the codec's message cap or the per-message fragment-count bound, or a
-    /// concurrent second sender OR second reader on one stream (each direction
-    /// has its own single-actor slot). The stream is unusable after this error.
+    /// The peer violated the transport framing contract: an oversized fragment
+    /// length, a reassembly that would exceed the codec's message cap or the
+    /// per-message fragment-count bound, a fragment too short to carry its
+    /// authenticated continuation header, or a broken internal buffer-size
+    /// invariant. A wire-level violation leaves the stream unusable, because the
+    /// framing it relied on is no longer trustworthy.
+    ///
+    /// A concurrent second sender or reader on one stream is deliberately NOT
+    /// this: it is a caller misuse that leaves the stream intact, and it is
+    /// reported as [`Self::ConcurrentAccess`] instead.
     #[error("invalid transport fragment: {0}")]
     InvalidFragment(String),
+    /// A second sender or reader used one [`crate::noise::NoiseStream`] while
+    /// another call still held that direction.
+    ///
+    /// Each direction has exactly one single-actor slot; a second actor would
+    /// interleave two logical messages' fragments on the wire (two senders) or
+    /// splice two logical messages together (two readers), neither raising an
+    /// error. This is a caller bug, not a wire violation, so — unlike
+    /// [`Self::InvalidFragment`] — the stream itself stays usable once the
+    /// current holder returns.
+    #[error("concurrent {what} on one NoiseStream")]
+    ConcurrentAccess {
+        /// The entry point that was already in use (`send_message` /
+        /// `recv_message`), so an operator can tell which direction collided.
+        what: &'static str,
+    },
     /// The Noise handshake did not complete within its total budget. The
     /// budget bounds the WHOLE unauthenticated phase, not just a single read: a
     /// peer that dribbles bytes to keep resetting the per-read socket timeout is
@@ -55,6 +75,13 @@ pub enum TransportError {
         /// The byte the peer actually sent.
         got: u8,
     },
+    /// The XX responder never transmitted its static key.
+    ///
+    /// XX always sends the responder's static in message 2, so its absence is a
+    /// protocol-contract violation, not an authorization refusal: the caller
+    /// must not present it as enrollment remediation (unlike [`Self::AuthFailed`]).
+    #[error("XX handshake: server did not transmit its static key")]
+    HandshakeStaticMissing,
     /// The peer presented credentials that the ACL check rejected.
     #[error("Authentication failed")]
     AuthFailed,
