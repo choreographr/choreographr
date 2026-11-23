@@ -15,8 +15,9 @@ mod types;
 pub use error::ProtoError;
 pub use frame::{MAX_FRAME_SIZE, PROTOCOL_VERSION, decode_frame, encode_frame, encode_payload};
 pub use io::{
-    SOCKET_PATH_ENV, UnixStream, connect_unix, default_socket_path, dial_error_means_no_listener,
-    read_message, read_payload, socket_listening, socket_path, write_message,
+    SOCKET_PATH_ENV, TimedWrite, UnixStream, connect_unix, default_socket_path,
+    dial_error_means_no_listener, read_message, read_payload, socket_listening, socket_path,
+    write_all_by, write_message,
 };
 pub use types::{
     AccountInfo, AssistantToolCallRecord, CHAT_REASONING_WIRE_KEYS, CatalogProvider,
