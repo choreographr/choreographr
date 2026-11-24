@@ -791,11 +791,16 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
             Ok(db)
         }
         // redb file-format bump: the file is a valid redb database but in a
-        // newer file format than this binary can read. Hard error with
-        // recovery guidance — recreating would destroy the data.
+        // newer file format than this binary can read — the file was written by
+        // a newer choreographr and this one is the downgrade. Hard error with
+        // recovery guidance that names only paths that actually exist:
+        // recreating would destroy the data, and the two real options are a
+        // newer binary or a pre-upgrade snapshot.
         Err(redb::DatabaseError::UpgradeRequired(actual)) => Err(io::Error::other(format!(
-            "database file format version {actual} is not supported by this binary; \
-             restore a backup (state.redb.bak-v*) or use the documented dump/restore path"
+            "database file format version {actual} is newer than this binary supports; \
+             upgrade choreographr before continuing, or restore a .bak-v* snapshot from \
+             before that upgrade, kept beside {} (deleting the file loses every session)",
+            path.display()
         ))),
         // Any other open failure (corruption, permissions, lock contention…)
         // is also a hard error: the old "trying to recreate" catch-all could
