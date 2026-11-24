@@ -6,7 +6,7 @@ use super::{
     ActiveRequest, ChildResult, DaemonCommand, DaemonMessageType, HashMap, ReplyTarget,
     RequestContext, RequestWorkerArgs, SessionEvent, SessionMetadata, SessionRecord,
     SessionSnapshot, SessionState, SessionStatus, TimestampMs, broadcast, debug, fail_request,
-    info, io, run_request_worker, warn, write_session_retry, write_turn_retry,
+    info, io, run_request_worker, warn, write_session, write_turn,
 };
 
 /// Process a user input: validate, resolve provider, spawn a request worker.
@@ -283,7 +283,7 @@ pub(in crate::sessions) fn handle_request_finished(
     // Persist the updated session config (accumulated usage, context_window, etc.)
     // so resolved values survive daemon restarts.
     let record = SessionRecord::from(&*state);
-    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+    if let Err(e) = write_session(&ctx.db, ctx.session_id, &record) {
         warn!(error = %e, "failed to persist session config after request");
     }
 
@@ -315,7 +315,7 @@ pub(in crate::sessions) fn handle_request_finished(
         }
         // The turn was already broadcast during the agent loop, so only the
         // durable write remains.
-        if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, turn_id, turn) {
+        if let Err(e) = write_turn(&ctx.db, ctx.session_id, turn_id, turn) {
             if already_present {
                 tracing::warn!(turn_id, error = %e, "failed to persist updated turn");
             } else {

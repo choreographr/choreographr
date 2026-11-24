@@ -182,7 +182,7 @@ fn session_config_tools_mutate_authoritative_state_and_persist() {
     assert_eq!(summary.working_dir.as_deref(), Some("/tmp/new-wd"));
     assert!(summary.active_tool_groups.contains(&"x".to_string()));
 
-    // Shut down cleanly; the handlers persist via write_session_retry so the
+    // Shut down cleanly; the handlers persist via write_session so the
     // record survives a daemon restart.
     session_tx.send(SessionCommand::Shutdown).unwrap();
     drop(session_tx);

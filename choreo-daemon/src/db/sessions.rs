@@ -640,32 +640,6 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     Ok(turns)
 }
 
-/// Retry a `write_turn` on transient storage errors (e.g. I/O contention)
-/// with up to 3 retries and a 1ms backoff.
-///
-/// # Errors
-///
-/// Returns Err if [`write_turn`] fails on every attempt (the last error is
-/// propagated).
-pub fn write_turn_retry(
-    db: &redb::Database,
-    session_id: u64,
-    turn_id: u32,
-    turn: &Turn,
-) -> io::Result<()> {
-    let mut attempts = 0;
-    loop {
-        match write_turn(db, session_id, turn_id, turn) {
-            Ok(()) => return Ok(()),
-            Err(_e) if attempts < 3 => {
-                attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
 /// Delete all turns of a session and its attachment rows.
 ///
 /// # Errors
@@ -711,49 +685,4 @@ pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<
         .commit()
         .map_err(|e| db_err(format!("redb commit delete turns: {e}")))?;
     Ok(())
-}
-
-/// Retry `delete_session_turns` on transient storage errors with up to 3
-/// retries and a 1ms backoff.
-///
-/// # Errors
-///
-/// Returns Err if [`delete_session_turns`] fails on every attempt (the
-/// last error is propagated).
-pub fn delete_session_turns_retry(db: &redb::Database, session_id: u64) -> io::Result<()> {
-    let mut attempts = 0;
-    loop {
-        match delete_session_turns(db, session_id) {
-            Ok(()) => return Ok(()),
-            Err(_e) if attempts < 3 => {
-                attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-
-/// Retry a `write_session` on transient storage errors with up to 3 retries.
-///
-/// # Errors
-///
-/// Returns Err if [`write_session`] fails on every attempt (the last error
-/// is propagated).
-pub fn write_session_retry(
-    db: &redb::Database,
-    session_id: u64,
-    record: &SessionRecord,
-) -> io::Result<()> {
-    let mut attempts = 0;
-    loop {
-        match write_session(db, session_id, record) {
-            Ok(()) => return Ok(()),
-            Err(_e) if attempts < 3 => {
-                attempts += 1;
-                std::thread::sleep(std::time::Duration::from_millis(1));
-            }
-            Err(e) => return Err(e),
-        }
-    }
 }

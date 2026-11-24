@@ -3,8 +3,7 @@
 
 use super::{
     DaemonMessageType, ReplyTarget, RequestContext, SessionEvent, SessionRecord, SessionState,
-    broadcast, broadcast_token_state, debug, info, turn_for_client, write_session_retry,
-    write_turn_retry,
+    broadcast, broadcast_token_state, debug, info, turn_for_client, write_session, write_turn,
 };
 
 /// Refuse an undo/redo while the session is not idle.
@@ -87,14 +86,14 @@ pub(in crate::sessions) fn handle_undo(
         // behavior unchanged: `last_modified` is not bumped, so the sessions
         // list does not reorder.
         let record = SessionRecord::from(&*state);
-        if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+        if let Err(e) = write_session(&ctx.db, ctx.session_id, &record) {
             tracing::warn!(error = %e, "failed to persist session record after Undo");
         }
     }
     // Persist the updated turns.
     for &id in &turn_ids {
         if let Some(turn) = state.turns.get(&id)
-            && let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, id, turn)
+            && let Err(e) = write_turn(&ctx.db, ctx.session_id, id, turn)
         {
             tracing::warn!(turn_id = id, error = %e, "failed to persist undone turn");
         }
@@ -145,7 +144,7 @@ pub(in crate::sessions) fn handle_redo(
         "redo: restored previously-undone turns",
     );
     for (&id, turn) in &turns {
-        if let Err(e) = write_turn_retry(&ctx.db, ctx.session_id, id, turn) {
+        if let Err(e) = write_turn(&ctx.db, ctx.session_id, id, turn) {
             tracing::warn!(turn_id = id, error = %e, "failed to persist redone turn");
         }
     }

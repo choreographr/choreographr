@@ -18,7 +18,7 @@ use crate::broadcast::{ClientId, LagLimits, ReplyTarget, SubscriberSink, fan_out
 use crate::cache_warm::WarmPolicy;
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::{DaemonCommand, ResolvedAccount};
-use crate::db::{self, SessionRecord, write_session_retry, write_turn_retry};
+use crate::db::{self, SessionRecord, write_session, write_turn};
 use crate::mcp::{ProjectToolSet, SessionMcpOverlay};
 use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;
@@ -262,7 +262,7 @@ fn persist_session_metadata(state: &mut SessionState, ctx: &RequestContext, labe
         metadata: SessionMetadata::from(&*state),
     });
     let record = SessionRecord::from(&*state);
-    if let Err(e) = write_session_retry(&ctx.db, ctx.session_id, &record) {
+    if let Err(e) = write_session(&ctx.db, ctx.session_id, &record) {
         warn!(error = %e, "failed to persist session record after {label}");
     }
 }

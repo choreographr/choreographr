@@ -4,7 +4,7 @@
 use super::{
     ChildResult, DaemonCommand, DaemonMessageType, InferenceProvider, RequestContext,
     SessionCommand, SessionEvent, SessionRecord, SessionState, debug, error, info, io, mpsc,
-    run_agent_loop, write_session_retry,
+    run_agent_loop, write_session,
 };
 
 /// Inputs for [`run_request_worker`], grouped so the worker entry point takes
@@ -158,7 +158,7 @@ pub(super) fn persist_and_exit(
     daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
 ) {
     let record: SessionRecord = SessionRecord::from(state);
-    if let Err(e) = write_session_retry(db, session_id, &record) {
+    if let Err(e) = write_session(db, session_id, &record) {
         error!(
             "persist_and_exit: failed to persist session {}: {e}",
             session_id

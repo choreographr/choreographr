@@ -12,7 +12,7 @@ use super::{
     ProjectToolSet, ReasoningArtifact, ReasoningProducer, RequestContext, ResolvedAccount,
     SessionCommand, SessionConfig, SessionEvent, SessionSnapshot, SkillMeta, SubscriberSink,
     TimestampMs, TokenUsage, ToolOutput, ToolResultRecord, Turn, WarmPolicy, broadcast, debug, io,
-    model_reasoning_capability, write_turn_retry,
+    model_reasoning_capability, write_turn,
 };
 
 pub(crate) struct ActiveRequest {
@@ -517,7 +517,7 @@ impl SessionState {
     /// crash-safety checkpoint) for a tool-use turn, or through
     /// `finalize_and_broadcast_turn` for the terminal turn. A turn written this
     /// way is then also re-written by the session thread's `RequestFinished`
-    /// merge (`write_turn_retry`); both writes are idempotent, so re-writing an
+    /// merge (`write_turn`); both writes are idempotent, so re-writing an
     /// unchanged turn costs one transaction and changes nothing — the callers
     /// record the id in [`SessionState::persisted_turns`] so the merge can skip
     /// that redundant rewrite when the turn is unchanged.
@@ -536,7 +536,7 @@ impl SessionState {
         turn_id: u32,
     ) -> io::Result<()> {
         if let Some(turn) = self.turns.get(&turn_id) {
-            write_turn_retry(db, session_id, turn_id, turn)
+            write_turn(db, session_id, turn_id, turn)
                 .map_err(|e| io::Error::other(format!("failed to persist turn {turn_id}: {e}")))?;
         }
         Ok(())

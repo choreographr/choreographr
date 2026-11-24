@@ -53,16 +53,15 @@ use codec::{ZSTD_FRAME_MAGIC, zstd_encode};
 mod attachments;
 pub use attachments::{read_attachment, write_attachment};
 // The session-record and turn CRUD lives in its own module: the session
-// record, its deletion tombstones, and the turn read/write/retry wrappers are
-// one cohesive unit, so this file keeps the schema, tables, migrations, and the
+// record, its deletion tombstones, and the turn read/write path are one
+// cohesive unit, so this file keeps the schema, tables, migrations, and the
 // credential/catalog/KV plumbing. The moved items are re-exported below so
 // existing `db::…` call sites keep resolving unchanged.
 mod sessions;
 pub use sessions::{
     SessionRecord, clear_session_tombstone, delete_session, delete_session_turns,
-    delete_session_turns_retry, mark_session_deleted, purge_tombstoned_sessions, read_all_sessions,
-    read_session, read_turns, update_session_flags, write_session, write_session_retry, write_turn,
-    write_turn_retry,
+    mark_session_deleted, purge_tombstoned_sessions, read_all_sessions, read_session, read_turns,
+    update_session_flags, write_session, write_turn,
 };
 // `session_range_end` is a private range-bound helper shared by this module's
 // KV range helpers and the `sessions`/`attachments` children; re-import it so
@@ -74,6 +73,12 @@ use sessions::session_range_end;
 // clock, and this file keeps the schema, tables, and migrations.
 mod compact;
 pub(crate) use compact::maybe_compact;
+// Detection of a `redb` handle that latched a permanent I/O failure, and the
+// escalation to a daemon shutdown when one is. It rides `db_err` below rather
+// than each call site, so every storage failure — read or write — is covered by
+// one hook.
+mod poison;
+pub(crate) use poison::install as install_poison_escalation;
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
 const SESSION_TURNS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("session_turns");
@@ -120,6 +125,10 @@ type KvRangeIter<'a> = Box<
 >;
 
 fn db_err(msg: String) -> io::Error {
+    // Every storage failure in this module is converted here, so this is the one
+    // place that can notice a `redb` handle latching itself unusable (see
+    // `poison`). Cheap when it has not: the probe is a flag read plus one atomic.
+    poison::observe(&msg);
     io::Error::other(msg)
 }
 

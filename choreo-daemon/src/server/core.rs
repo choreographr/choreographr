@@ -256,6 +256,23 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
     #[cfg(feature = "mcp")]
     crate::mcp::oauth::install(daemon_tx.clone());
 
+    // Route a store handle that latches a permanent I/O failure to a shutdown.
+    // `redb` rejects every later operation on a latched handle and only a
+    // close-and-reopen clears it, but every session thread holds a clone of this
+    // one, so it cannot be re-opened in place. Announcing and stopping is the
+    // honest response: nothing can be persisted any more, and the next launch
+    // re-opens (and repairs) the store. Same sequence as the SIGINT drain — the
+    // broadcast first so each client observes `ShuttingDown` rather than a bare
+    // EOF, then the stop — and the handler in `db::poison` guarantees it fires at
+    // most once however many sessions trip over the latched handle.
+    crate::db::install_poison_escalation(Arc::downgrade(&state.db), {
+        let daemon_tx = daemon_tx.clone();
+        move || {
+            let _ = daemon_tx.send(DaemonCommand::BroadcastShuttingDown);
+            let _ = daemon_tx.send(DaemonCommand::Shutdown);
+        }
+    });
+
     // Pump the MCP servers' list-changed events into the command loop. The
     // servers' `subscriptions/listen` streams feed one shared channel (see
     // `McpManager::take_list_change_rx`); a dedicated forwarder thread
