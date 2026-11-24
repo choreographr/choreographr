@@ -3,8 +3,29 @@
 # individual lints behave.
 #
 # Test allowances: AGENTS.md's error-handling rules permit unwrap()/expect()/
-# panic!()/slicing in #[cfg(test)] modules and tests/ directories — clippy
-# honors these keys so the deny set below only bites production code.
+# panic!() and slicing in test code, so these four keys keep the matching denies
+# off it. Two properties of their reach are easy to get wrong:
+#
+# 1. The keys cover only the lints they name, plus `string_slice`, which rides
+#    `allow-indexing-slicing-in-tests` (it has no key of its own). Every other
+#    denied lint applies to test code exactly as it does to production code.
+#
+# 2. "In test code" is narrower than "in a test target". Clippy's check is
+#    attribute-based, so what it covers is a `#[test]` function's body and
+#    anything under a `#[cfg(test)]` module. An integration-test target
+#    (`tests/`) is compiled with `cfg(test)` set but carries no `#[cfg(test)]`
+#    ATTRIBUTE, so a plain helper fn in one is NOT covered and the deny set bites
+#    it. A harness helper that must panic therefore has two sanctioned shapes
+#    (AGENTS.md → Test Discipline → "Lint allowances in test code"): stay
+#    panic-free, which is preferred because the `#[test]` caller can assert with
+#    the full context of what failed, or put a file-level
+#    `#![expect(clippy::unwrap_used, clippy::expect_used, clippy::panic,
+#    clippy::indexing_slicing)]` on the harness module with a comment saying why.
+#
+# The attribute form must stay FULFILLED: `#[expect]` warns when its lint never
+# fires, and the gate's `-D warnings` turns that into a hard failure — so delete
+# it in the change that removes its last use, and never add a lint to it
+# speculatively.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

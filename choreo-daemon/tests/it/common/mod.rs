@@ -15,8 +15,13 @@
 //! `daemon_client_*` tests land) would otherwise trip `dead_code`. The harness
 //! is intentionally a superset of what any single test module uses.
 // AGENTS.md permits unwrap/expect/panic in tests/ files, but clippy's
-// allow-*-in-tests config only recognizes #[test]-annotated functions —
-// helper fns in this file need this file-level allowance.
+// allow-*-in-tests config is ATTRIBUTE-based: it covers a `#[test]` function's
+// body and anything under a `#[cfg(test)]` module, and an integration-test module
+// has neither (the target is compiled with `cfg(test)` set but carries no such
+// attribute) — so this file's helper fns need a file-level allowance. It must
+// stay FULFILLED: `#[expect]` warns when a listed lint never fires, which the
+// gate's `-D warnings` makes fatal, so drop a name here in the change that
+// removes its last use.
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 #![allow(dead_code)]
 

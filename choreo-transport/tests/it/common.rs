@@ -5,6 +5,13 @@
 //! test put bytes on the wire the public API cannot express (a tampered length
 //! prefix). Declared once at the crate root and reached from each test module as
 //! `crate::common`.
+//!
+//! Every helper reports a failure as a `Result` instead of panicking. Clippy's
+//! test allowances are attribute-based and do not reach a `tests/` module's plain
+//! helper fns (see AGENTS.md → Test Discipline → "Lint allowances in test code"),
+//! and a `Result` both satisfies that without a file-level `#![expect]` and keeps
+//! the failure message with the `#[test]` caller, which is the only place that
+//! knows what the helper was being used for.
 
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{HandshakeMode, MAX_HANDSHAKE_FRAME};

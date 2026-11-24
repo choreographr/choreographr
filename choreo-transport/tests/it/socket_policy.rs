@@ -20,13 +20,15 @@ use crate::common::noise_test_pair;
 /// `choreo_sockreg::SocketTuning`, already covers both platforms and has its own
 /// cross-platform suite).
 ///
-/// A query failure reads as `false` rather than panicking — this is a module-level
-/// helper, not a `#[test]` function, so the workspace's in-tests `expect` allowance
-/// does not reach it (and a false negative simply fails the assertion it feeds).
+/// The query's own error is returned rather than folded into `false`: a plain
+/// helper in a `tests/` module is outside clippy's test allowances (see AGENTS.md
+/// → Test Discipline), so it must not panic, and a `Result` additionally keeps a
+/// failed `getsockopt` distinguishable from an option that is genuinely off — the
+/// `#[test]` caller is where the assertion belongs.
 #[cfg(unix)]
-fn keepalive_enabled(stream: &TcpStream) -> bool {
+fn keepalive_enabled(stream: &TcpStream) -> Result<bool, String> {
     nix::sys::socket::getsockopt(&stream.as_fd(), nix::sys::socket::sockopt::KeepAlive)
-        .unwrap_or(false)
+        .map_err(|e| format!("query SO_KEEPALIVE: {e}"))
 }
 
 /// The helper flips `TCP_NODELAY` on each socket independently (the option is
@@ -79,11 +81,14 @@ fn tune_control_socket_arms_keepalive_on_both_ends() {
     // the helper's effect rather than a platform default.
     tune_control_socket(&stream);
     assert!(
-        keepalive_enabled(&stream),
+        keepalive_enabled(&stream).expect("query client SO_KEEPALIVE"),
         "the client socket must have SO_KEEPALIVE armed"
     );
     assert!(
-        server.join().expect("server thread"),
+        server
+            .join()
+            .expect("server thread")
+            .expect("query server SO_KEEPALIVE"),
         "the server socket must have SO_KEEPALIVE armed"
     );
 }
