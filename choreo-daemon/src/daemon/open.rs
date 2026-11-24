@@ -117,7 +117,7 @@ impl DaemonState {
         // (migration_backup_version returns Some exactly when run_migrations_at
         // would back up), copy the backup from the unlocked file → reopen →
         // migrate. The in-runner backup step is a no-op then (skip-if-exists).
-        let db = Arc::new({
+        let mut db = {
             let opened = db::open_db_at(&opts.db_path)?;
             match db::migration_backup_version(&opened)? {
                 Some(version) => {
@@ -133,11 +133,30 @@ impl DaemonState {
                 // handle.
                 None => opened,
             }
-        });
+        };
 
         // Bring the database up to the current schema version before any table
         // access (same invariant as the CLI; see db::run_migrations).
         db::run_migrations_at(&db, &opts.db_path)?;
+
+        // Reclaim the space deleted sessions left behind, now that the
+        // pre-migration backup has been closed and the schema is current.
+        // Ordering is load-bearing in both directions: running before the
+        // backup would overwrite the rollback point with a rewritten file, and
+        // running after the `Arc` below is impossible — `compact()` needs
+        // `&mut Database`. Startup is also the one moment the store provably
+        // has no live read or write transactions of ours.
+        //
+        // A failure is not fatal: compaction is an optimisation, so a daemon
+        // that cannot shrink its file keeps running at its current size.
+        if let Err(e) = db::maybe_compact(&mut db, &opts.db_path) {
+            warn!(error = %e, "failed to compact the database; continuing at its current size");
+        }
+
+        // Share the handle for the daemon's lifetime: `redb::Database` is safe
+        // for concurrent readers, so every connection thread and request worker
+        // reads through this one `Arc`.
+        let db = Arc::new(db);
 
         // Purge any sessions that were deleted while their still-shutting-down
         // thread was alive and re-created the record before the daemon

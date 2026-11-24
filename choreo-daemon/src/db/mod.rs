@@ -69,6 +69,11 @@ pub use sessions::{
 // the existing call sites here (and `super::session_range_end` in
 // `attachments`) keep resolving.
 use sessions::session_range_end;
+// Startup space reclamation lives in its own module: the decision is a pure
+// function of a measured footprint, so it is testable with no database and no
+// clock, and this file keeps the schema, tables, and migrations.
+mod compact;
+pub(crate) use compact::maybe_compact;
 
 const SESSIONS: TableDefinition<u64, &[u8]> = TableDefinition::new("sessions");
 const SESSION_TURNS: TableDefinition<(u64, u32), &[u8]> = TableDefinition::new("session_turns");
