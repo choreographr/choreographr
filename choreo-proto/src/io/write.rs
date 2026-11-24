@@ -3,9 +3,10 @@
 //!
 //! A blocking `write` under a single armed `SO_SNDTIMEO` bounds only that one
 //! syscall; a caller that needs the WHOLE write bounded (a message, a handshake
-//! frame) re-arms the stall to the time remaining on each iteration. That loop,
-//! the [`TimedWrite`] capability that arms it, and the two bounds it honours
-//! live here once so the handshake and the data plane cannot drift apart.
+//! frame) re-arms the stall to the time remaining on each iteration. That loop
+//! and the [`TimedWrite`] capability that arms it live here once so the handshake
+//! and the data plane cannot drift apart; the numbers they are armed with are
+//! [`super::policy`]'s, so both directions of a connection share them.
 //!
 //! The read direction's counterpart is [`super::read`], which states the same
 //! re-arm rule for a fixed-length buffer; the two sit beside each other so
@@ -15,6 +16,7 @@ use std::io::Write;
 use std::time::{Duration, Instant};
 
 use super::UnixStream;
+use super::policy::{MIN_SOCKET_STALL, message_budget};
 
 /// A socket that can bound how long a single blocking write syscall may take.
 ///
@@ -74,82 +76,6 @@ fn write_stall_elapsed(pending: usize) -> std::io::Error {
         std::io::ErrorKind::TimedOut,
         format!("write stall elapsed with {pending} byte(s) still to send"),
     )
-}
-
-// ── per-message writer budget ──
-//
-// A long-lived connection writer needs two numbers for every outbound message,
-// and both callers — the client's connection sink and the daemon's Noise writer
-// — must agree on them, so they live here beside the bounded-write loop rather
-// than in either caller:
-//
-// - [`CONNECTION_STALL`] is the per-syscall **detection latency**: a peer that
-//   accepts nothing for this long has stopped reading, so the write fails and the
-//   connection tears down.
-// - [`message_budget`] is the whole-message **total** budget, scaled by the
-//   message's size so a large frame on a slow-but-alive link still finishes. It has
-//   no ceiling: the floor rate below is what bounds how slow a link may be.
-
-/// How long a socket syscall may wait for progress before the peer is treated as
-/// wedged.
-///
-/// This is the **detection latency** bound of a connection, in both directions:
-/// it is handed to [`write_all_with_stall`] for a write and to the bounded read
-/// helper (see [`crate::read_exact_by`]'s module) for a read. A peer that accepts
-/// (or supplies) nothing for this long has stopped, so the call fails, the caller
-/// closes the transport, and the connection tears down. It is deliberately
-/// independent of the message size — a silent peer is noticed in five seconds
-/// whether the message is one kilobyte or one mebibyte — and independent of the
-/// link speed, because a slow-but-alive peer is always making *some* progress.
-///
-/// The forward-looking name (`CONNECTION_`, not `WRITER_`) is deliberate: the
-/// rate-derived budget below is a writer-only concept (a reader cannot know a
-/// message's total size until it has all of it), but the stall is not.
-pub const CONNECTION_STALL: Duration = Duration::from_secs(5);
-
-/// Floor throughput a writer must sustain to a peer for a message to be worth
-/// finishing, in bytes per second.
-///
-/// A slow-but-alive link is allowed to take longer for a bigger message, so the
-/// per-message budget scales with the frame size at this rate instead of being
-/// one fixed number that would false-kill a large legitimate frame.
-pub const WRITER_MIN_RATE_BYTES_PER_SEC: u64 = 8 * 1024;
-
-/// The absolute budget for writing one message of `wire_len` bytes: the message's
-/// own size divided by the floor rate, floored at [`CONNECTION_STALL`] and
-/// **never capped**.
-///
-/// The size-scaled part is what lets a large frame finish on a link that is merely
-/// slow. The [`CONNECTION_STALL`] floor is a jitter allowance, not a throughput
-/// bound: a small message on a link that is slow but alive still completes each
-/// syscall promptly, and the floor is what absorbs a retransmit or a scheduling gap
-/// without failing the write. A silent peer is caught by the stall instead,
-/// regardless of size.
-///
-/// There is deliberately no upper bound. A time ceiling and "support the slowest
-/// link we accept for the largest message we can send" are contradictory: 64 MiB at
-/// [`WRITER_MIN_RATE_BYTES_PER_SEC`] legitimately takes 8192 s, so a ceiling below
-/// that silently re-imposes a much higher minimum link speed (a 120 s cap demands
-/// ~4.4 Mbps for the same frame) and a ceiling above it never fires. The bound a
-/// peer is actually held to is the floor rate; one that cannot sustain it trips the
-/// per-syscall stall instead. The cost is that a large transfer on an absurdly slow
-/// link can hold its writer, and its socket, for hours — which the connection's
-/// teardown tolerates by detaching the writer rather than joining it unboundedly.
-///
-/// Integer arithmetic throughout, with saturating operations: a 64 MiB frame
-/// must not overflow the millisecond computation, and no input may panic.
-#[must_use]
-pub fn message_budget(wire_len: usize) -> Duration {
-    // `usize` is 64-bit on every target we ship, but converting rather than
-    // casting keeps a 128-bit-`usize` future (or a narrower one) from silently
-    // truncating; saturation is unreachable in practice and cannot panic.
-    let bytes = u64::try_from(wire_len).unwrap_or(u64::MAX);
-    // bytes / rate seconds, in milli-seconds, so a sub-second frame keeps its
-    // precision instead of rounding down to zero.
-    let millis = bytes
-        .saturating_mul(1000)
-        .saturating_div(WRITER_MIN_RATE_BYTES_PER_SEC);
-    Duration::from_millis(millis).max(CONNECTION_STALL)
 }
 
 /// Write all of `data`, with the whole write bounded by `deadline`.
@@ -218,6 +144,12 @@ pub fn write_all_by<W: TimedWrite>(
 ///
 /// An empty `data` slice returns `Ok(())` without arming or writing anything.
 ///
+/// `stall` is floored at [`MIN_SOCKET_STALL`] before it is armed. The floor is
+/// silent: [`super::effective_stall`] is the seam that WARNS about a configured
+/// value this low, and this is the backstop for a caller that never passes
+/// through it. `deadline` is deliberately NOT floored — loosening an absolute
+/// budget to some minimum would stop it being the caller's budget.
+///
 /// # Socket state
 ///
 /// As [`write_all_by`], the socket's write stall is left armed at the last value
@@ -238,7 +170,42 @@ pub fn write_all_with_stall<W: TimedWrite>(
     stall: Duration,
     data: &[u8],
 ) -> std::io::Result<()> {
-    write_bounded(writer, deadline, Some(stall), data)
+    // A socket rejects a zero timeout instead of treating it as unbounded, so a
+    // stall that arrives here below the floor is raised rather than armed as-is.
+    write_bounded(writer, deadline, Some(stall.max(MIN_SOCKET_STALL)), data)
+}
+
+/// Write one complete, already-framed message under the connection's policy: the
+/// whole-message budget derived from `data`'s own length, plus `stall` per
+/// syscall.
+///
+/// This is the composition every connection writer would otherwise spell out for
+/// itself — `Instant::now() + message_budget(data.len())` handed to
+/// [`write_all_with_stall`] — so both Unix-socket writers (the daemon's and the
+/// client's) derive the budget from the frame they already hold rather than
+/// keeping their own copy of the arithmetic. The budget is a function of
+/// `data.len()`, not of a caller-supplied figure, because the length IS the
+/// message's total size on the wire.
+///
+/// # Socket state
+///
+/// As [`write_all_with_stall`]: the socket's write stall is left armed at the last
+/// value computed and never cleared.
+///
+/// # Errors
+///
+/// As [`write_all_with_stall`].
+pub fn write_frame_bounded<W: TimedWrite>(
+    writer: &mut W,
+    stall: Duration,
+    data: &[u8],
+) -> std::io::Result<()> {
+    write_all_with_stall(
+        writer,
+        Instant::now() + message_budget(data.len()),
+        stall,
+        data,
+    )
 }
 
 /// The single write loop behind [`write_all_by`] and [`write_all_with_stall`],
@@ -312,14 +279,16 @@ fn write_bounded<W: TimedWrite>(
             {
                 tracing::debug!(
                     pending = pending.len(),
-                    "armed write stall fired before the message was complete"
+                    "armed write bound fired before the message was complete"
                 );
-                // Which bound burnt: with the whole-message budget still open,
-                // the per-syscall stall is the one that fired (the writer
-                // accepted nothing for `stall`). Once the deadline has passed
-                // the two coincide, and the deadline is the honest name.
-                let deadline_open = !deadline.saturating_duration_since(Instant::now()).is_zero();
-                return Err(if stall.is_some() && deadline_open {
+                // Which bound burnt: the arm was `remaining.min(stall)`, so the
+                // stall is the one that fired only when it was the tighter of the
+                // two at arm time. Otherwise the armed value WAS the remaining
+                // whole-message budget, and the deadline is the honest name — a
+                // stall longer than the remaining budget can never fire at all.
+                let remaining_now = deadline.saturating_duration_since(Instant::now());
+                let stall_fired = stall.is_some_and(|stall| stall < remaining_now);
+                return Err(if stall_fired {
                     write_stall_elapsed(pending.len())
                 } else {
                     write_deadline_elapsed(pending.len())
@@ -333,10 +302,8 @@ fn write_bounded<W: TimedWrite>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CONNECTION_STALL, TimedWrite, WRITER_MIN_RATE_BYTES_PER_SEC, message_budget, write_all_by,
-        write_all_with_stall,
-    };
+    use super::{TimedWrite, write_all_by, write_all_with_stall, write_frame_bounded};
+    use crate::io::policy::{CONNECTION_STALL, MIN_SOCKET_STALL, message_budget};
     use std::cell::RefCell;
     use std::io::{self, Write};
     use std::time::{Duration, Instant};
@@ -663,52 +630,87 @@ mod tests {
         assert_eq!(writer.calls(), 0);
     }
 
-    /// A small frame cannot finish in less than the stall, so its budget is
-    /// exactly [`CONNECTION_STALL`].
     #[test]
-    fn a_small_frame_budgets_exactly_the_writer_stall() {
-        assert_eq!(message_budget(64), CONNECTION_STALL);
-        assert_eq!(message_budget(0), CONNECTION_STALL);
-        // 20 KiB at the floor rate is 2.5 s — still below the stall.
-        assert_eq!(message_budget(20 * 1024), CONNECTION_STALL);
-    }
+    fn a_stall_longer_than_the_remaining_budget_is_named_as_a_deadline() {
+        // The arm is `remaining.min(stall)`, so with a 30 s stall against a 1 s
+        // budget the armed value IS the remaining budget: the deadline is the
+        // bound that fired, and naming the stall would blame one that could not
+        // fire at all.
+        let mut writer = FakeWriter::new(Behaviour::AlwaysError(io::ErrorKind::WouldBlock));
 
-    /// Above the boundary where the rate-derived duration overtakes the stall,
-    /// the budget is the rate-derived one: a big frame on a slow link is allowed
-    /// the time its size implies.
-    #[test]
-    fn a_frame_past_the_rate_boundary_gets_the_rate_derived_budget() {
-        // 48 KiB at 8 KiB/s is 6 s, past the 5 s stall.
-        let wire_len = 48 * 1024;
-        let expected = Duration::from_millis(
-            u64::try_from(wire_len).expect("fits u64") * 1000 / WRITER_MIN_RATE_BYTES_PER_SEC,
+        let error = write_all_with_stall(
+            &mut writer,
+            Instant::now() + Duration::from_secs(1),
+            Duration::from_secs(30),
+            b"payload",
+        )
+        .expect_err("timed out");
+
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(
+            error.to_string().contains("write deadline elapsed"),
+            "the tighter bound is the deadline: {error}"
         );
         assert!(
-            expected > CONNECTION_STALL,
-            "the boundary case must exceed it"
+            !error.to_string().contains("stall elapsed"),
+            "a stall the message never reached must not be blamed: {error}"
         );
-        assert_eq!(message_budget(wire_len), expected);
     }
 
-    /// A 64 MiB frame — the codec's maximum — must not overflow the millisecond
-    /// computation, and gets the full rate-derived budget rather than a clamped
-    /// one: supporting the largest message on the slowest link we accept is exactly
-    /// what the floor rate means, so there is no ceiling to hit.
     #[test]
-    fn a_64_mib_frame_gets_the_full_rate_derived_budget() {
-        let wire_len = 64 * 1024 * 1024;
-        let expected = Duration::from_millis(
-            u64::try_from(wire_len).expect("fits u64") * 1000 / WRITER_MIN_RATE_BYTES_PER_SEC,
-        );
+    fn a_zero_stall_is_floored_before_it_reaches_the_socket() {
+        // `set_write_timeout(Some(Duration::ZERO))` is `InvalidInput`, not
+        // "unbounded": the entry point raises it rather than letting the first
+        // syscall tear the connection down.
+        let mut writer = FakeWriter::new(Behaviour::AcceptAll);
+
+        write_all_with_stall(&mut writer, future_deadline(), Duration::ZERO, b"payload")
+            .expect("the floor leaves a usable bound");
+
+        assert_eq!(writer.written(), b"payload".to_vec());
+        let stalls = writer.stalls.borrow();
+        assert_eq!(stalls.len(), 1);
         assert_eq!(
-            expected,
-            Duration::from_secs(8192),
-            "64 MiB at the 8 KiB/s floor is 2.3 hours"
+            stalls.first().copied().flatten(),
+            Some(MIN_SOCKET_STALL),
+            "a zero stall must be raised to the socket minimum"
         );
-        assert_eq!(message_budget(wire_len), expected);
+    }
+
+    /// The whole-message budget `write_frame_bounded` arms comes from the frame's
+    /// own length, so a frame past the rate boundary gets more than the jitter
+    /// floor — and a small one gets exactly the floor.
+    #[test]
+    fn write_frame_bounded_derives_the_deadline_from_the_frames_length() {
+        // 48 KiB at the 8 KiB/s floor is 6 s: past the 5 s stall, so an
+        // implementation that passed the stall as the deadline would arm ~5 s
+        // and fail the bound below. A long stall leaves the budget as the arm.
+        let large = vec![0_u8; 48 * 1024];
+        let mut writer = FakeWriter::new(Behaviour::AcceptAll);
+        write_frame_bounded(&mut writer, Duration::from_secs(30), &large).expect("write");
+
+        assert_eq!(writer.written().len(), large.len());
+        let stalls = writer.stalls.borrow();
+        assert_eq!(stalls.len(), 1, "one syscall accepts the whole frame");
+        let armed = stalls.first().copied().flatten().expect("an armed stall");
         assert!(
-            message_budget(wire_len) > CONNECTION_STALL,
-            "a large frame's budget must dominate the jitter floor"
+            armed > CONNECTION_STALL,
+            "armed {armed:?} is the jitter floor, not the frame's own budget"
+        );
+        assert!(
+            armed <= message_budget(large.len()),
+            "armed {armed:?} exceeds the {large_len}-byte frame's budget",
+            large_len = large.len()
+        );
+
+        // A frame below the rate boundary budgets exactly the jitter floor.
+        let mut writer = FakeWriter::new(Behaviour::AcceptAll);
+        write_frame_bounded(&mut writer, Duration::from_secs(30), b"tiny").expect("write");
+        let stalls = writer.stalls.borrow();
+        let armed = stalls.first().copied().flatten().expect("an armed stall");
+        assert!(
+            armed <= CONNECTION_STALL,
+            "armed {armed:?} for a 4-byte frame must not exceed the jitter floor"
         );
     }
 }

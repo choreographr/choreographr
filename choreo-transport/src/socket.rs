@@ -66,8 +66,15 @@ use choreo_sockreg::SocketTuning;
 /// before the Noise handshake on both sides (so the handshake's own small round
 /// trips are not delayed and keepalive is armed for its whole life), and again
 /// when the handshake hands the socket to the data plane (the intrinsic
-/// guarantee — see [`crate::handshake`]'s `finish`). Re-applying an already-set
-/// option is idempotent and costs one syscall.
+/// guarantee — see [`crate::handshake`]'s `finish`).
+///
+/// Re-applying is idempotent but is **not** one syscall: `NODELAY`, the four
+/// keepalive sockopts (`SO_KEEPALIVE`, its three timings, and the Linux user
+/// timeout) and the verification `getsockopt` all run again. That duplicate cost
+/// is deliberate — a handful of `setsockopt`s on a once-per-connection path is
+/// cheaper than a second, Nagle-only entry point that could drift out of step
+/// with this one, and keepalive has to be armed by the caller anyway for it to
+/// cover the handshake.
 ///
 /// Failure is non-fatal on either count: it is logged at `warn` and the
 /// connection continues.

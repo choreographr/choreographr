@@ -10,7 +10,6 @@ use std::sync::{Arc, LazyLock, mpsc};
 use crate::daemon::DaemonCommand;
 use crate::sessions::SessionCommand;
 use std::io;
-use std::time::Duration;
 
 /// Test-only shorthand for a raw client id.
 fn cid(n: u32) -> ClientId {
@@ -1987,33 +1986,4 @@ fn the_join_grace_outlasts_the_writer_stall() {
         WRITER_JOIN_GRACE > PEER_STALL,
         "join grace {WRITER_JOIN_GRACE:?} must exceed the stall {PEER_STALL:?}"
     );
-}
-
-/// A zero (or sub-millisecond) stall never reaches a socket timeout: `std` rejects
-/// `Some(Duration::ZERO)` with `InvalidInput` rather than reading it as
-/// "unbounded", so without the floor the very first write would fail and tear the
-/// connection down. The floor keeps a mistake a slow bound instead of a dead
-/// connection.
-#[test]
-fn a_zero_writer_stall_is_floored() {
-    for configured in [
-        Duration::ZERO,
-        Duration::from_nanos(1),
-        Duration::from_micros(500),
-        Duration::from_millis(1) - Duration::from_nanos(1),
-    ] {
-        assert_eq!(
-            peer_stall(configured),
-            Duration::from_millis(1),
-            "{configured:?} must floor to the one-millisecond minimum"
-        );
-    }
-    // At or above the floor the configured value is used verbatim, which is what
-    // lets the wedged-writer integration tests substitute their own tiny-but-legal
-    // value instead of waiting out the production default.
-    assert_eq!(
-        peer_stall(Duration::from_millis(200)),
-        Duration::from_millis(200)
-    );
-    assert_eq!(peer_stall(PEER_STALL), PEER_STALL);
 }

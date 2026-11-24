@@ -2,13 +2,15 @@
 //! sinks, and the one thread that drains a connection's queue.
 //!
 //! Every transport's writer is bounded by the SAME policy, stated once in
-//! `choreo-proto`: an absolute per-message budget scaled by the frame size
-//! ([`choreo_proto::message_budget`]) plus a per-syscall stall
-//! ([`PEER_STALL`]). A large frame to a slow-but-alive client is allowed
-//! the time its size implies, while a client that has stopped reading is noticed
-//! promptly — whichever transport carried it. Before this policy was shared, the
-//! Noise writer had it and the Unix writer had only a socket-level timeout armed
-//! once at accept, so the same constant meant two different things.
+//! `choreo-proto` ([`choreo_proto::CONNECTION_STALL`], the floor rate behind
+//! [`choreo_proto::message_budget`]): an absolute per-message budget scaled by the
+//! number of wire bytes the message occupies, plus a per-syscall stall
+//! ([`PEER_STALL`]). The Unix sink derives both from the frame it hands over; the
+//! Noise sink leaves them to the transport, which sizes the budget from its own
+//! framing (the length-prefixed ciphertext it writes, not the plaintext payload it
+//! is given). A large message to a slow-but-alive client is allowed the time its
+//! size implies, while a client that has stopped reading is noticed promptly —
+//! whichever transport carried it.
 //!
 //! The stall is the mechanism that makes LAG EVICTION work without the daemon
 //! holding a force-close handle on the connection (no retained socket clone, no
@@ -23,11 +25,11 @@
 use std::net::Shutdown;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use choreo_proto::{
-    CONNECTION_STALL, DaemonMessage, DaemonMessageType, UnixStream, encode_frame, encode_payload,
-    message_budget, write_all_with_stall,
+    CONNECTION_STALL, DaemonMessage, DaemonMessageType, UnixStream, effective_stall, encode_frame,
+    encode_payload, write_frame_bounded,
 };
 use tracing::warn;
 
@@ -49,6 +51,10 @@ use crate::daemon::DaemonCommand;
 /// effect on a small message: the effective wait is
 /// `min(stall, message_budget(len))`, and the budget's floor IS that constant.
 /// Lowering it (the only direction a test needs) is fully effective.
+///
+/// A value below the socket floor is raised by [`choreo_proto::effective_stall`]
+/// on its way to either writer sink, because `std` rejects a zero timeout rather
+/// than reading it as "unbounded".
 pub(crate) const PEER_STALL: Duration = CONNECTION_STALL;
 
 /// Bound for joining a connection's writer thread during cleanup.
@@ -68,35 +74,6 @@ const _: () = assert!(
     WRITER_JOIN_GRACE.as_nanos() > PEER_STALL.as_nanos(),
     "WRITER_JOIN_GRACE must outlast the writer stall it waits out"
 );
-
-/// Smallest stall a socket will accept.
-///
-/// `std` rejects a zero duration outright (`ErrorKind::InvalidInput`, "cannot set
-/// a 0 duration timeout") rather than reading it as "no timeout", which is the
-/// opposite of what a `setsockopt`-era reader expects from `SO_SNDTIMEO = 0`. A
-/// zero reaching a writer would therefore fail the very first write and tear the
-/// connection down; the floor turns that into a one-millisecond bound instead. One
-/// millisecond is the smallest value the kernel reliably honours (a smaller
-/// timeout rounds up to it anyway).
-const MIN_PEER_STALL: Duration = Duration::from_millis(1);
-
-/// Validate a configured writer stall, flooring it at [`MIN_PEER_STALL`].
-///
-/// The single seam every stall passes through on its way to a socket timeout, so
-/// neither sink can arm a zero. A config that resolves to zero is a mistake rather
-/// than a request to disable the bound — the bound is what reaps a wedged writer —
-/// so it is floored and warned about rather than propagated.
-pub(crate) fn peer_stall(configured: Duration) -> Duration {
-    if configured < MIN_PEER_STALL {
-        warn!(
-            configured = ?configured,
-            floor = ?MIN_PEER_STALL,
-            "writer stall is below the socket's minimum; flooring it (a zero timeout is rejected by the kernel, not read as unbounded)"
-        );
-        return MIN_PEER_STALL;
-    }
-    configured
-}
 
 /// A per-connection message sink implementing the single-writer contract.
 ///
@@ -122,16 +99,17 @@ pub(crate) trait ConnectionWriter {
 /// must be the socket that is written to.
 pub(crate) struct UnixConnectionWriter {
     stream: UnixStream,
-    /// Per-syscall stall, already through [`peer_stall`].
+    /// Per-syscall stall, already through [`choreo_proto::effective_stall`].
     stall: Duration,
 }
 
 impl UnixConnectionWriter {
-    /// Wrap `stream`, validating the stall through [`peer_stall`].
+    /// Wrap `stream`, validating the stall through
+    /// [`choreo_proto::effective_stall`].
     pub(crate) fn new(stream: UnixStream, stall: Duration) -> Self {
         Self {
             stream,
-            stall: peer_stall(stall),
+            stall: effective_stall(stall),
         }
     }
 }
@@ -139,11 +117,10 @@ impl UnixConnectionWriter {
 impl ConnectionWriter for UnixConnectionWriter {
     fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
         // `encode_frame` yields the complete length-prefixed frame, so this is one
-        // bounded write with nothing left to flush afterwards.
+        // bounded write with nothing left to flush afterwards; the helper derives
+        // the whole-message budget from the frame's own length.
         let frame = encode_frame(msg).map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + message_budget(frame.len());
-        write_all_with_stall(&mut self.stream, deadline, self.stall, &frame)
-            .map_err(|e| e.to_string())
+        write_frame_bounded(&mut self.stream, self.stall, &frame).map_err(|e| e.to_string())
     }
     fn shutdown(&mut self) {
         let _ = self.stream.shutdown(Shutdown::Both);
@@ -152,38 +129,37 @@ impl ConnectionWriter for UnixConnectionWriter {
 
 /// The Noise transport's writer sink.
 ///
-/// Every outbound message is bounded exactly like the Unix sink's, and like the
-/// client's: one absolute per-message budget scaled by the frame size (a large
-/// `Image` reply is allowed the time its size implies on a slow-but-alive link)
-/// plus a per-syscall stall (a peer that stops reading entirely is noticed
-/// promptly). Without the whole-message budget, a large frame to a wedged peer
-/// could occupy the writer — and the teardown that joins it — for far longer than
-/// the stall alone suggests.
+/// This sink applies no write policy of its own: it encodes one payload and hands
+/// it to the stream, whose transport owns the connection's bounds in both
+/// directions — a whole-message budget derived from the bytes its own framing will
+/// put on the wire, plus the per-syscall stall the stream carries. Deriving the
+/// budget from the transport's framing rather than from the payload here is what
+/// keeps the floor rate describing the bytes that actually cross the link.
+///
+/// The result is the same contract as the Unix sink's: a large message to a
+/// slow-but-alive peer is allowed the time its size implies, while a peer that
+/// stops reading entirely is noticed promptly. Without the whole-message budget, a
+/// large message to a wedged peer could occupy the writer — and the teardown that
+/// joins it — for far longer than the stall alone suggests.
 pub(crate) struct NoiseConnectionWriter {
     stream: choreo_transport::noise::NoiseStream,
-    /// Per-syscall stall, already through [`peer_stall`].
-    stall: Duration,
 }
 
 impl NoiseConnectionWriter {
-    /// Wrap `stream`, validating the stall through [`peer_stall`].
-    pub(crate) fn new(stream: choreo_transport::noise::NoiseStream, stall: Duration) -> Self {
-        Self {
-            stream,
-            stall: peer_stall(stall),
-        }
+    /// Wrap `stream`, which already carries the connection's stall (see
+    /// [`choreo_transport::noise::NoiseStream::set_stall`]).
+    pub(crate) fn new(stream: choreo_transport::noise::NoiseStream) -> Self {
+        Self { stream }
     }
 }
 
 impl ConnectionWriter for NoiseConnectionWriter {
     fn send_message(&mut self, msg: &DaemonMessage) -> Result<(), String> {
-        // Encode the payload once, then hand it to the deadline-bounded send: the
-        // whole-message budget lets a large frame finish on a slow-but-alive link
-        // while the stall notices a peer that stops reading entirely.
+        // The frame is the payload: `send_message` fragments, encrypts and
+        // length-prefixes it, and bounds every write under the connection policy.
         let payload = encode_payload(msg).map_err(|e| e.to_string())?;
-        let deadline = Instant::now() + message_budget(payload.len());
         self.stream
-            .send_message_by(&payload, deadline, self.stall)
+            .send_message(&payload)
             .map_err(|e| e.to_string())
     }
     fn shutdown(&mut self) {

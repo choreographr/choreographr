@@ -28,6 +28,7 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use super::UnixStream;
+use super::policy::MIN_SOCKET_STALL;
 
 /// A socket that can bound how long a single blocking read syscall may take.
 ///
@@ -106,10 +107,15 @@ fn read_stall_elapsed(pending: usize) -> std::io::Error {
 ///
 /// # Socket state
 ///
-/// The function never clears the timeout: on return it stays armed at the last
-/// value computed. A caller that later wants an unbounded read on the same socket
-/// must clear or re-arm it itself (the data plane does exactly that between
-/// messages — see `choreo-transport`'s receive loop).
+/// This never clears the timeout: on return it stays armed at the last value
+/// computed. A caller that later wants an unbounded read on the same socket must
+/// clear or re-arm it itself (the data plane does exactly that between messages —
+/// see `choreo-transport`'s receive loop).
+///
+/// `SO_RCVTIMEO` is sticky, so a syscall that would arm the value already armed
+/// skips the `setsockopt`. A deadline pieces its bound out of the remaining time,
+/// so it shrinks and re-arms essentially every iteration; only a bound that is
+/// constant — [`read_exact_with_stall`]'s — collapses to a single arm.
 ///
 /// # Errors
 ///
@@ -125,7 +131,7 @@ pub fn read_exact_by<R: TimedRead>(
     deadline: Instant,
     buf: &mut [u8],
 ) -> io::Result<()> {
-    read_exact_bounded(reader, Some(deadline), None, buf)
+    read_exact_bounded(reader, ReadBound::Deadline(deadline), buf)
 }
 
 /// Fill `buf` completely, failing if any single read syscall goes `stall` without
@@ -144,12 +150,19 @@ pub fn read_exact_by<R: TimedRead>(
 /// *total* time as well uses [`read_exact_by`], and why the data plane pairs it
 /// with TCP keepalive (a liveness check) rather than a clock.
 ///
+/// `stall` is floored at [`super::MIN_SOCKET_STALL`] before it is armed. The floor
+/// is silent: [`super::effective_stall`] is the seam that WARNS about a configured
+/// value this low, and this is the backstop for a caller that never passes through
+/// it.
+///
 /// Mirrors [`Read::read_exact`]'s contract otherwise, including an empty `buf`
 /// completing without arming anything.
 ///
 /// # Socket state
 ///
-/// As [`read_exact_by`], the timeout is left armed at the last value computed.
+/// As [`read_exact_by`], the timeout is left armed at the last value computed. The
+/// bound here is constant, so it is armed ONCE for the whole call rather than
+/// before every syscall — `SO_RCVTIMEO` keeps applying to each subsequent read.
 ///
 /// # Errors
 ///
@@ -162,62 +175,67 @@ pub fn read_exact_with_stall<R: TimedRead>(
     stall: Duration,
     buf: &mut [u8],
 ) -> io::Result<()> {
-    read_exact_bounded(reader, None, Some(stall), buf)
+    // A socket rejects a zero timeout instead of treating it as unbounded, so a
+    // stall that arrives here below the floor is raised rather than armed as-is.
+    read_exact_bounded(reader, ReadBound::Stall(stall.max(MIN_SOCKET_STALL)), buf)
+}
+
+/// The one time bound a fixed-length read runs under.
+///
+/// One variant, never both: a caller either knows a total deadline for the whole
+/// buffer or cannot know it and bounds each syscall instead. Encoding that as one
+/// value rather than two independent `Option`s means "no bound at all" — an
+/// unbounded read, the resource leak these helpers exist to prevent — is not
+/// expressible, and the error a fired bound produces cannot name the wrong one.
+#[derive(Clone, Copy)]
+enum ReadBound {
+    /// The whole buffer must complete before this instant.
+    Deadline(Instant),
+    /// Each syscall may wait at most this long for progress.
+    Stall(Duration),
 }
 
 /// The single bounded-read loop behind [`read_exact_by`] and
 /// [`read_exact_with_stall`], so the arming arithmetic cannot drift into two
 /// copies.
 ///
-/// Each syscall is armed to the tighter of whatever bounds are present. A
-/// deadline-only call re-arms to the shrinking remaining time (a total-time bound);
-/// a stall-only call re-arms to the constant stall (a no-progress bound). Neither
-/// bound present is a caller bug — it would be an unbounded read, which is the
-/// resource leak these helpers exist to prevent — so it is refused rather than
-/// silently allowed.
+/// Which bound is in force is the [`ReadBound`] the caller handed over: a
+/// `Deadline` re-arms to the shrinking remaining time (a total-time bound), a
+/// `Stall` re-arms to the constant stall (a no-progress bound).
 fn read_exact_bounded<R: TimedRead>(
     reader: &mut R,
-    deadline: Option<Instant>,
-    stall: Option<Duration>,
+    bound: ReadBound,
     buf: &mut [u8],
 ) -> io::Result<()> {
-    if deadline.is_none() && stall.is_none() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a bounded read needs a deadline or a stall",
-        ));
-    }
     // `filled` is the length of the satisfied prefix of `buf`; growing it is what
     // advances the read without ever indexing (which could panic on a bogus
     // cursor) — the tail is taken through a checked `get_mut`.
     let mut filled = 0;
+    // The value last armed on the socket, so an unchanged bound skips a redundant
+    // `setsockopt`: `SO_RCVTIMEO` is sticky, so it already applies to the next
+    // syscall. Only a constant bound (a stall) makes that a single arm; a deadline
+    // recomputes to a smaller value and re-arms.
+    let mut armed_now: Option<Duration> = None;
     while filled < buf.len() {
-        let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
-        if remaining.is_some_and(|remaining| remaining.is_zero()) {
-            tracing::debug!(
-                pending = buf.len() - filled,
-                "read deadline already elapsed; refusing to start another syscall"
-            );
-            return Err(read_deadline_elapsed(buf.len() - filled));
-        }
-
-        let armed = match (remaining, stall) {
-            (Some(remaining), Some(stall)) => remaining.min(stall),
-            (Some(remaining), None) => remaining,
-            // `deadline.is_none() && stall.is_none()` was refused above, so this
-            // arm is reachable and arms the constant no-progress bound.
-            (None, Some(stall)) => stall,
-            // Unreachable given the guard above; arming nothing would be an
-            // unbounded read, so fall back to revoking the bound rather than
-            // risking it.
-            (None, None) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "a bounded read needs a deadline or a stall",
-                ));
+        let pending = buf.len() - filled;
+        let to_arm = match bound {
+            ReadBound::Deadline(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    tracing::debug!(
+                        pending,
+                        "read deadline already elapsed; refusing to start another syscall"
+                    );
+                    return Err(read_deadline_elapsed(pending));
+                }
+                remaining
             }
+            ReadBound::Stall(stall) => stall,
         };
-        reader.set_read_stall(Some(armed))?;
+        if armed_now != Some(to_arm) {
+            reader.set_read_stall(Some(to_arm))?;
+            armed_now = Some(to_arm);
+        }
 
         let Some(tail) = buf.get_mut(filled..) else {
             // Unreachable: the loop condition keeps `filled < buf.len()`, so the
@@ -246,21 +264,12 @@ fn read_exact_bounded<R: TimedRead>(
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                tracing::debug!(
-                    pending = buf.len() - filled,
-                    "armed read bound fired before the buffer was full"
-                );
-                // Which bound burnt: with no deadline, the stall is the only one
-                // there is. With the whole-buffer deadline still open, the
-                // per-syscall stall is the one that fired (the reader accepted
-                // nothing for `stall`). Once the deadline has passed the two
-                // coincide, and the deadline is the honest name.
-                let stall_fired =
-                    stall.is_some() && remaining.is_none_or(|remaining| !remaining.is_zero());
-                return Err(if stall_fired {
-                    read_stall_elapsed(buf.len() - filled)
-                } else {
-                    read_deadline_elapsed(buf.len() - filled)
+                tracing::debug!(pending, "armed read bound fired before the buffer was full");
+                // The bound IS the attribution: exactly one of the two is armed,
+                // so exactly one can have fired.
+                return Err(match bound {
+                    ReadBound::Deadline(_) => read_deadline_elapsed(pending),
+                    ReadBound::Stall(_) => read_stall_elapsed(pending),
                 });
             }
             Err(error) => return Err(error),
@@ -272,6 +281,7 @@ fn read_exact_bounded<R: TimedRead>(
 #[cfg(test)]
 mod tests {
     use super::{TimedRead, read_exact_by, read_exact_with_stall};
+    use crate::io::policy::MIN_SOCKET_STALL;
     use std::cell::RefCell;
     use std::io::{self, Read};
     use std::time::{Duration, Instant};
@@ -386,10 +396,11 @@ mod tests {
         assert!(reader.stalls.borrow().is_empty());
     }
 
-    /// One byte per syscall makes the re-arming observable: a "arm once"
-    /// implementation would record a single stall, and one that re-armed the
-    /// caller's whole budget each time would record values equal to the budget
-    /// rather than shrinking ones.
+    /// One byte per syscall makes the re-arming observable: the arms must be
+    /// shrinking budgets, not the caller's original one repeated. The EXACT count
+    /// is not pinned, because consecutive `Instant::now()` reads may return the same
+    /// value and an unchanged bound is deliberately not re-armed (`SO_RCVTIMEO` is
+    /// sticky); the properties below are what the test exists for.
     #[test]
     fn each_syscall_is_rearmed_to_the_time_remaining() {
         let mut reader = FakeReader::new(Behaviour::AcceptOneByte);
@@ -400,7 +411,11 @@ mod tests {
 
         assert_eq!(buf, [0x5A; 5]);
         let stalls = reader.stalls.borrow();
-        assert_eq!(stalls.len(), 5, "one stall armed per read syscall");
+        assert!(
+            (1..=5).contains(&stalls.len()),
+            "at most one arm per read syscall, at least one for the call: {}",
+            stalls.len()
+        );
 
         // Every pause spent here only shrinks what a correct implementation may
         // arm, which is what the lower bound below pins down.
@@ -482,7 +497,13 @@ mod tests {
 
         assert_eq!(buf, [0x5A; 4]);
         assert_eq!(reader.calls(), 2, "the interrupted syscall is retried once");
-        assert_eq!(reader.stalls.borrow().len(), 2, "the retry is re-armed");
+        // The retry re-arms to the FRESHLY computed budget, which for a deadline
+        // bound need not differ from the previous one — see
+        // `each_syscall_is_rearmed_to_the_time_remaining`.
+        assert!(
+            (1..=2).contains(&reader.stalls.borrow().len()),
+            "the retry is armed at least once"
+        );
     }
 
     #[test]
@@ -496,25 +517,49 @@ mod tests {
 
     // ── the stall-only bound ──
 
-    /// Every syscall is armed to the constant stall, and never to a shrinking
+    /// Every syscall runs under the constant stall, and never under a shrinking
     /// deadline — there is no deadline to shrink. This is the bound the data plane
-    /// runs under, where a legitimate transfer may take arbitrarily long.
+    /// runs under, where a legitimate transfer may take arbitrarily long. Because
+    /// the bound never changes, it is armed exactly ONCE for the call and
+    /// `SO_RCVTIMEO` carries it to every later syscall.
     #[test]
-    fn the_stall_bound_arms_the_same_value_every_syscall() {
+    fn a_constant_stall_bound_is_armed_once() {
         let mut reader = FakeReader::new(Behaviour::AcceptOneByte);
         let mut buf = [0u8; 4];
         read_exact_with_stall(&mut reader, STALL, &mut buf).expect("read");
 
         assert_eq!(buf, [0x5A; 4]);
+        assert_eq!(reader.calls(), 4, "one read syscall per byte");
         let stalls = reader.stalls.borrow();
-        assert_eq!(stalls.len(), 4, "one stall armed per read syscall");
-        for armed in stalls.iter() {
-            assert_eq!(
-                armed.expect("every read arms a stall"),
-                STALL,
-                "the stall bound must arm the caller's constant"
-            );
-        }
+        assert_eq!(
+            stalls.len(),
+            1,
+            "a constant bound is armed once, not per byte"
+        );
+        assert_eq!(
+            stalls.first().copied().flatten(),
+            Some(STALL),
+            "the single arm is the caller's stall"
+        );
+    }
+
+    /// A zero stall is raised before it reaches the socket: `std` rejects
+    /// `Some(Duration::ZERO)` with `InvalidInput` rather than reading it as
+    /// "unbounded", so passing one straight through would fail the first syscall.
+    #[test]
+    fn a_zero_stall_is_floored_before_it_reaches_the_socket() {
+        let mut reader = FakeReader::new(Behaviour::AcceptOneByte);
+        let mut buf = [0u8; 2];
+        read_exact_with_stall(&mut reader, Duration::ZERO, &mut buf)
+            .expect("the floor leaves a usable bound");
+
+        assert_eq!(buf, [0x5A; 2]);
+        let stalls = reader.stalls.borrow();
+        assert_eq!(
+            stalls.first().copied().flatten(),
+            Some(MIN_SOCKET_STALL),
+            "a zero stall must be raised to the socket minimum"
+        );
     }
 
     /// A peer that accepts nothing for the stall fails the read, and the error
@@ -541,12 +586,13 @@ mod tests {
 
     /// Progress resets the clock: a peer that fills one byte per syscall passes
     /// however small the stall is, because each syscall completes. That is the
-    /// property that lets an arbitrarily slow link finish.
+    /// property that lets an arbitrarily slow link finish. The stall used is the
+    /// smallest a socket accepts, so this is also the tightest legal bound.
     #[test]
     fn a_slow_but_progressing_read_passes_a_tiny_stall() {
         let mut reader = FakeReader::new(Behaviour::AcceptOneByte);
         let mut buf = [0u8; 8];
-        read_exact_with_stall(&mut reader, Duration::from_nanos(1), &mut buf)
+        read_exact_with_stall(&mut reader, MIN_SOCKET_STALL, &mut buf)
             .expect("every syscall makes progress, so the stall never fires");
 
         assert_eq!(buf, [0x5A; 8]);

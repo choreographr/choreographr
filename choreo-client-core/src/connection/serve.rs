@@ -1,6 +1,6 @@
 //! The serve loop every transport runs: one writer thread draining the UI's
 //! outgoing channel, the reader loop on the calling thread, and the teardown
-//! that joins them.
+//! that stops the writer and waits for it under a bound.
 //!
 //! A client connection is one long-lived exchange in two directions, and every
 //! transport needs the same four parts: an outbound [sink](ConnectionSink), an
@@ -23,20 +23,49 @@
 //! 4. The close handle is taken and the writer-stop sender cloned BEFORE the
 //!    sink moves into the writer thread and before the reader tail keeps its own
 //!    end, so neither is borrowed from the thread that owns it.
+//! 5. The teardown's wait for the writer is BOUNDED. The writer announces its
+//!    completion over its own one-shot channel, and the reader waits for that
+//!    signal under [`WRITER_JOIN_GRACE`], so a writer wedged inside a send is
+//!    detached rather than joined unboundedly. The grace is strictly greater than
+//!    [`CONNECTION_STALL`], and that ordering is load-bearing: the wait covers a
+//!    writer that may be mid-syscall for up to the stall, so an equal grace would
+//!    expire in exactly the worst case the wait exists to cover and detach a
+//!    writer that was about to exit cleanly.
 //!
 //! The writer's two time bounds (`CONNECTION_STALL` and `message_budget`) are one
-//! policy shared with the daemon's writers, so they live in `choreo-proto` beside
-//! the bounded-write loop; the connection applies them, the transport only
-//! carries the bytes. The stall is the connection's — the reader applies it too —
-//! while the rate-derived budget is writer-only, because a reader cannot know a
-//! message's total size until it has all of it.
+//! policy shared with the daemon's writers, so they live in `choreo-proto`'s I/O
+//! policy module rather than beside either loop; the connection applies them, the
+//! transport only carries the bytes. The stall is the connection's — the reader
+//! applies it too — while the rate-derived budget is writer-only, because a reader
+//! cannot know a message's total size until it has all of it. That budget has no
+//! ceiling, so invariant 5 is what keeps a large frame on a slow-but-alive link
+//! from holding a reader that has already finished.
 
 use crate::error::ClientError;
-use choreo_proto::{ClientMessage, DaemonMessage, UnixStream};
-use crossbeam_channel::Receiver;
+use choreo_proto::{CONNECTION_STALL, ClientMessage, DaemonMessage, UnixStream};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
 use std::net::{Shutdown, TcpStream};
 use std::thread;
+use std::time::Duration;
 use tracing::{error, warn};
+
+/// Bound for joining the connection's writer thread during teardown.
+///
+/// Strictly greater than [`CONNECTION_STALL`], and that ordering is load-bearing:
+/// teardown waits for a writer that may be mid-syscall for up to the stall, so an
+/// equal grace would run out in exactly the worst case the join exists to cover
+/// and detach a writer that was about to exit cleanly. A healthy writer exits
+/// immediately once its stop signal arrives (or its queue closes), so the grace
+/// only ever matters for a wedged one.
+const WRITER_JOIN_GRACE: Duration = CONNECTION_STALL.saturating_add(Duration::from_secs(1));
+
+// Compile-time, because nothing about the relationship is conditional: a smaller
+// grace is a defect, and it must not be possible to introduce one by editing
+// either constant.
+const _: () = assert!(
+    WRITER_JOIN_GRACE.as_nanos() > CONNECTION_STALL.as_nanos(),
+    "WRITER_JOIN_GRACE must outlast the writer stall it waits out"
+);
 
 /// A handle that can close this connection from another thread.
 ///
@@ -157,7 +186,8 @@ pub(super) fn writer_loop<W: ConnectionSink>(
 
 /// Serve an established connection: spawn the writer thread, install the
 /// optional shutdown hook, run the reader loop on the calling thread, then stop
-/// and join the writer.
+/// the writer and wait for it under [`WRITER_JOIN_GRACE`] — bounded, so a writer
+/// wedged inside a send is detached instead of waited on indefinitely.
 ///
 /// Returns the reader's result — `Ok(())` on a clean EOF, the reader's error
 /// when the stream broke. The writer never contributes an error of its own: a
@@ -168,6 +198,32 @@ pub(super) fn serve<S, W>(
     handle: impl FnMut(DaemonMessage),
     from_ui: Receiver<ClientMessage>,
     shutdown_rx: Option<Receiver<()>>,
+) -> Result<(), ClientError>
+where
+    S: ConnectionSource,
+    W: ConnectionSink + Send + 'static,
+{
+    serve_with_grace(
+        source,
+        writer,
+        handle,
+        from_ui,
+        shutdown_rx,
+        WRITER_JOIN_GRACE,
+    )
+}
+
+/// [`serve`] with the teardown's writer wait exposed as a parameter.
+///
+/// The same loop in every other respect; the grace is injectable so a test can
+/// shrink it to a few milliseconds instead of waiting out [`WRITER_JOIN_GRACE`].
+fn serve_with_grace<S, W>(
+    source: S,
+    writer: W,
+    handle: impl FnMut(DaemonMessage),
+    from_ui: Receiver<ClientMessage>,
+    shutdown_rx: Option<Receiver<()>>,
+    grace: Duration,
 ) -> Result<(), ClientError>
 where
     S: ConnectionSource,
@@ -185,6 +241,10 @@ where
     // crossbeam control-plane channel: the reader sends at most one stop signal,
     // so capacity 1 never blocks it.
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
+    // A one-shot "the writer thread finished" signal. Kept separate from `done_tx`
+    // below: that one exists to end the shutdown watcher, and a writer signal on
+    // it would end the watcher while the reader is still running.
+    let (writer_done_tx, writer_done_rx) = crossbeam_channel::bounded::<()>(1);
     // A one-shot "the connection finished" signal, so the shutdown watcher below
     // exits — and drops its cloned socket fd — when the reader ends WITHOUT an
     // external shutdown ever firing. Without it the watcher thread and its fd
@@ -195,7 +255,14 @@ where
     // value is already a framed `ClientMessage`: the front-end owns a
     // `PendingReplies` table, allocates the per-connection request id itself, and
     // forwards the frame here so it can resolve the reply by that id.
-    let writer_handle = thread::spawn(move || writer_loop(writer, &from_ui, &stop_rx));
+    let writer_handle = thread::spawn(move || {
+        writer_loop(writer, &from_ui, &stop_rx);
+        // Announce completion so the reader's teardown can bound its wait instead
+        // of blocking on a writer that may be inside a size-scaled socket write. A
+        // panic drops this sender instead, which disconnects the receiver and
+        // reads as "finished" there too.
+        let _ = writer_done_tx.send(());
+    });
 
     if let Some(shutdown_rx) = shutdown_rx {
         if let Some(close_handle) = close_handle {
@@ -232,10 +299,37 @@ where
     }
 
     let result = serve_source(source, handle);
-    // Signal the writer to stop and wait for it, so no send is in flight when
-    // this returns.
+    // Signal the writer to stop, then wait for it, so no send is in flight when
+    // this returns — but only for the grace. The wait is a channel event, not a
+    // poll: the writer sends its completion on every exit path, and a panic drops
+    // the sender, which surfaces as `Disconnected`.
     let _ = stop_tx.send(());
-    let _ = writer_handle.join();
+    match writer_done_rx.recv_timeout(grace) {
+        // The writer finished: the join returns immediately, and taking it reaps
+        // the thread rather than leaving a finished handle behind.
+        Ok(()) => {
+            let _ = writer_handle.join();
+        }
+        // Still inside a send after the whole grace. Detach: dropping the handle
+        // lets the thread finish (and exit) on its own. The connection is over
+        // either way, and the writer's own stall reaps a wedged peer within
+        // `CONNECTION_STALL`; only a SLOW-BUT-ALIVE peer reaches this arm — which
+        // is exactly the transfer the uncapped per-message budget exists to allow,
+        // so waiting it out here would hold this caller for as long as the message
+        // takes.
+        Err(RecvTimeoutError::Timeout) => {
+            warn!(
+                grace = ?grace,
+                "writer thread is still sending after the teardown grace; detaching it"
+            );
+            drop(writer_handle);
+        }
+        // The writer thread panicked, so no completion was ever sent: join anyway
+        // so the panic is not silently swallowed.
+        Err(RecvTimeoutError::Disconnected) => {
+            let _ = writer_handle.join();
+        }
+    }
     // Let the shutdown watcher (if any) exit now that the connection is over. A
     // panicking reader drops `done_tx` instead, which disconnects `done_rx` and
     // wakes the watcher just the same.
@@ -265,4 +359,159 @@ pub(super) fn serve_source<S: ConnectionSource>(
     }
     tracing::info!("daemon reader loop ended normally");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CloseHandle, ConnectionSink, ConnectionSource, Inbound, WRITER_JOIN_GRACE, serve_with_grace,
+    };
+    use choreo_proto::{ClientMessage, ClientMessageType};
+    use crossbeam_channel::Receiver;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Grace for the DETACH test: short enough that the pinned writer is abandoned
+    /// promptly. The joined-writer test uses the production grace instead — it must
+    /// never be the grace, rather than the join, that decides its outcome.
+    const TEST_GRACE: Duration = Duration::from_millis(20);
+
+    /// A reader that ends on its very first poll.
+    ///
+    /// The teardown is the subject here, so the reader contributes no timing of
+    /// its own: `Inbound::Closed` ends `serve_source` immediately and puts the
+    /// calling thread straight into the writer wait.
+    struct EndedSource;
+
+    impl ConnectionSource for EndedSource {
+        fn next_message(&mut self) -> Inbound {
+            Inbound::Closed
+        }
+    }
+
+    /// A sink that records its own destruction.
+    ///
+    /// The writer thread owns the sink, so the flag can only be set by that
+    /// thread running to its end — which is exactly what "joined" means. It is a
+    /// single bit with no payload, in the spirit of the workspace's lock-free
+    /// single-bit flags.
+    struct DropWatchedSink {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl ConnectionSink for DropWatchedSink {
+        fn send_message(&mut self, _message: &ClientMessage) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn close_handle(&self) -> Option<CloseHandle> {
+            // A fake sink has no socket to duplicate.
+            None
+        }
+    }
+
+    impl Drop for DropWatchedSink {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A sink whose send does not return until the test releases it, which parks
+    /// the writer thread inside `send_message` — the one state the bounded wait
+    /// exists to cover.
+    struct WedgedSink {
+        release: Receiver<()>,
+    }
+
+    impl ConnectionSink for WedgedSink {
+        fn send_message(&mut self, _message: &ClientMessage) -> Result<(), String> {
+            // Pairs with the test's send; returns immediately on disconnect, so a
+            // test that has already finished cannot hang the writer here.
+            let _ = self.release.recv();
+            Ok(())
+        }
+
+        fn close(&mut self) {}
+
+        fn close_handle(&self) -> Option<CloseHandle> {
+            None
+        }
+    }
+
+    /// A writer that has finished is joined before `serve_with_grace` returns.
+    ///
+    /// The queue stays open for the whole call, so the writer is alive and parked
+    /// in its `select_biased!` when the reader ends: nothing but the join can have
+    /// dropped the sink by the time the call returns. The grace is the production
+    /// one — a healthy writer signals completion immediately, so it costs nothing
+    /// here and a loaded scheduler cannot turn the run into a spurious detach.
+    #[test]
+    fn a_finished_writer_is_joined_before_serve_returns() {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (_from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+
+        let result = serve_with_grace(
+            EndedSource,
+            DropWatchedSink {
+                dropped: Arc::clone(&dropped),
+            },
+            |_| {},
+            from_ui_rx,
+            None,
+            WRITER_JOIN_GRACE,
+        );
+
+        assert!(
+            result.is_ok(),
+            "a clean reader EOF is success, got {result:?}"
+        );
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the writer thread must have been joined, so its sink must already be dropped"
+        );
+    }
+
+    /// A writer still inside a send when the reader ends is detached once the
+    /// grace expires.
+    ///
+    /// The assertion IS that the call returns: an unbounded join would park here
+    /// until the release below, which the test only sends afterwards.
+    #[test]
+    fn a_writer_stuck_in_a_send_is_detached_when_the_grace_expires() {
+        let (from_ui_tx, from_ui_rx) = crossbeam_channel::unbounded::<ClientMessage>();
+        // One queued message, so the writer is inside `send_message` — not parked
+        // on an empty queue — when the reader ends and the wait begins. The biased
+        // select takes the message arm first, so the stop signal cannot preempt it.
+        from_ui_tx
+            .send(ClientMessage::request(0, ClientMessageType::Ping))
+            .expect("the queue is open");
+
+        // Zero capacity: the send pairs with the writer's blocked receive, so the
+        // release below is what lets the detached thread finish.
+        let (release_tx, release_rx) = crossbeam_channel::bounded::<()>(0);
+        let result = serve_with_grace(
+            EndedSource,
+            WedgedSink {
+                release: release_rx,
+            },
+            |_| {},
+            from_ui_rx,
+            None,
+            TEST_GRACE,
+        );
+        assert!(
+            result.is_ok(),
+            "a clean reader EOF is success, got {result:?}"
+        );
+
+        // Let the pinned writer go so the detached thread exits here rather than
+        // outliving the test.
+        let _ = release_tx.send(());
+        // Closing the queue as well means the writer's next loop iteration ends
+        // whichever arm it takes.
+        drop(from_ui_tx);
+    }
 }

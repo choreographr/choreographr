@@ -62,12 +62,31 @@ pub(super) const FRAGMENT_CONTINUATION: u8 = 0x01;
 /// bytes of length-prefix headroom + the largest single Noise message's
 /// ciphertext ([`MAX_CIPHERTEXT_LEN`]). The ciphertext is encrypted into
 /// `send_buf[LEN_PREFIX_LEN..]`, the prefix is written into that headroom, and
-/// one `write_all` sends the whole frame.
+/// one bounded write sends the whole frame.
 pub(super) const FRAME_BUF_LEN: usize = LEN_PREFIX_LEN + MAX_CIPHERTEXT_LEN;
 
 /// Size of the reused per-fragment plaintext buffer: one authenticated
 /// continuation header byte + the largest payload chunk.
 pub(super) const FRAG_BUF_LEN: usize = FRAGMENT_HEADER_LEN + MAX_PLAINTEXT_CHUNK;
+
+/// Wire bytes one message of `plaintext_len` occupies: every fragment charges its
+/// 4-byte length prefix plus the GCM tag and authenticated continuation header on
+/// top of the payload it carries.
+///
+/// The writer budget is derived from THIS rather than from the plaintext length, so
+/// the floor rate describes the bytes that actually cross the link — a 64 MiB
+/// message carries ~21 KiB of framing, which is a measurable share of its budget at
+/// that rate.
+pub(super) fn wire_len(plaintext_len: usize) -> usize {
+    // An empty message still costs one header-only frame (`send_message` emits
+    // exactly one rather than nothing, because the peer's receive blocks on a
+    // length prefix), so `.max(1)` makes "no chunks" pay the same single
+    // fragment's framing as every other message pays for its last one.
+    let fragments = plaintext_len.div_ceil(MAX_PLAINTEXT_CHUNK).max(1);
+    plaintext_len.saturating_add(
+        fragments.saturating_mul(LEN_PREFIX_LEN + GCM_TAG_LEN + FRAGMENT_HEADER_LEN),
+    )
+}
 
 /// Encode a ciphertext length as its 4-byte big-endian prefix, refusing a
 /// length this implementation cannot put on the wire.
@@ -188,5 +207,36 @@ mod tests {
     fn buffer_sizes_derive_from_the_frame_cap() {
         assert_eq!(FRAG_BUF_LEN + GCM_TAG_LEN, MAX_CIPHERTEXT_LEN);
         assert_eq!(FRAME_BUF_LEN, LEN_PREFIX_LEN + FRAG_BUF_LEN + GCM_TAG_LEN);
+    }
+
+    /// The writer budget is sized from the bytes that actually cross the link, so
+    /// the wire length is the plaintext plus one 21-byte overhead per fragment
+    /// (4-byte length prefix + 16-byte GCM tag + 1-byte continuation header).
+    #[test]
+    fn wire_len_charges_every_fragment_its_framing() {
+        const PER_FRAGMENT: usize = LEN_PREFIX_LEN + GCM_TAG_LEN + FRAGMENT_HEADER_LEN;
+
+        // An empty message still emits one header-only frame, so it is not zero
+        // bytes on the wire: the peer blocks on its length prefix otherwise.
+        assert_eq!(wire_len(0), 21);
+        assert_eq!(wire_len(0), PER_FRAGMENT);
+
+        // Exactly one full fragment, then one byte past it — the fragment COUNT
+        // is what the arithmetic turns on, not the payload rounding.
+        assert_eq!(
+            wire_len(MAX_PLAINTEXT_CHUNK),
+            MAX_PLAINTEXT_CHUNK + PER_FRAGMENT
+        );
+        assert_eq!(
+            wire_len(MAX_PLAINTEXT_CHUNK + 1),
+            MAX_PLAINTEXT_CHUNK + 1 + 2 * PER_FRAGMENT
+        );
+
+        // The largest message a caller may send spans every fragment the peer
+        // will allow, so the framing charge is exactly that many headers.
+        assert_eq!(
+            wire_len(choreo_proto::MAX_FRAME_SIZE),
+            choreo_proto::MAX_FRAME_SIZE + MAX_FRAGMENTS_PER_MESSAGE * PER_FRAGMENT
+        );
     }
 }

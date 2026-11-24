@@ -15,12 +15,11 @@
 use crate::error::ClientError;
 use choreo_proto::{
     CONNECTION_STALL, ClientMessage, DaemonMessage, ProtoError, UnixStream, connect_unix,
-    encode_frame, message_budget, read_message,
+    encode_frame, read_message, write_frame_bounded,
 };
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use std::io::{BufRead, BufReader};
 use std::net::Shutdown;
-use std::time::Instant;
 
 use super::serve::{CloseHandle, ConnectionSink, ConnectionSource, Inbound, serve, serve_source};
 
@@ -61,12 +60,11 @@ impl<R: BufRead> ConnectionSource for FramedReader<R> {
 
 impl ConnectionSink for UnixStream {
     fn send_message(&mut self, msg: &ClientMessage) -> Result<(), String> {
-        // `encode_frame` yields the complete length-prefixed frame, so this is
-        // one bounded write with nothing left to flush afterwards.
+        // `encode_frame` yields the complete length-prefixed frame, so this is one
+        // bounded write with nothing left to flush afterwards; the helper derives
+        // the whole-message budget from the frame's own length.
         let frame = encode_frame(msg).map_err(|error| error.to_string())?;
-        let deadline = Instant::now() + message_budget(frame.len());
-        choreo_proto::write_all_with_stall(self, deadline, CONNECTION_STALL, &frame)
-            .map_err(|error| error.to_string())
+        write_frame_bounded(self, CONNECTION_STALL, &frame).map_err(|error| error.to_string())
     }
 
     fn close(&mut self) {

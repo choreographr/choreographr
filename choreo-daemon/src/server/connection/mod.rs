@@ -40,7 +40,7 @@ pub(super) use reply::ReplyHandle;
 // their owning modules.
 #[cfg(test)]
 pub(super) use writer::{
-    ChannelConnectionWriter, ConnectionWriter, WRITER_JOIN_GRACE, peer_stall, writer_thread,
+    ChannelConnectionWriter, ConnectionWriter, WRITER_JOIN_GRACE, writer_thread,
 };
 
 #[cfg(test)]

@@ -45,17 +45,17 @@ fn classify_stream_error(e: io::Error) -> TransportError {
 /// arrives, not before it. Bounding this read is exactly the bug that would kill
 /// every idle connection.
 ///
-/// It exists as its own step because the socket's read timeout is sticky (`std` has
-/// no way to clear it other than setting another), so "unbounded from here until the
-/// first byte" cannot be expressed by passing a deadline to the bounded helper.
+/// It exists as its own step because the socket's read timeout is a socket-wide,
+/// sticky option: "unbounded only until the first byte" cannot be expressed by
+/// handing a bound to the bounded helper, so the option has to be cleared before
+/// the wait and re-armed after it — which is exactly what the caller does.
 ///
 /// `0` bytes means the peer closed cleanly between messages, reported as
-/// [`TransportError::ConnectionClosed`]. The caller must pass a non-empty buffer.
-fn read_some_or_closed(stream: &mut TcpStream, buf: &mut [u8]) -> Result<usize, TransportError> {
-    debug_assert!(
-        !buf.is_empty(),
-        "the unbounded first read needs a byte to read into"
-    );
+/// [`TransportError::ConnectionClosed`].
+fn read_some_or_closed(
+    stream: &mut TcpStream,
+    buf: &mut [u8; LEN_PREFIX_LEN],
+) -> Result<usize, TransportError> {
     loop {
         match stream.read(buf) {
             Ok(0) => {
@@ -102,7 +102,7 @@ impl NoiseStream {
     ///    with no bound at all. A vanished peer is caught by the connection's TCP
     ///    keepalive, not here.
     /// 2. **A message in flight is bounded by a per-syscall stall** (see
-    ///    [`NoiseStream::read_stall`]): every read after that first byte fails if it
+    ///    [`NoiseStream::stall`]): every read after that first byte fails if it
     ///    makes no progress for the stall. There is deliberately no wall clock on the
     ///    whole message: a large payload on a slow link legitimately takes minutes,
     ///    and a bound on total time would kill exactly the client the transport is
@@ -147,14 +147,15 @@ impl NoiseStream {
         // sticky, so it must be cleared before the wait for the next message or this
         // "idle" read would inherit a five-second bound and tear down a healthy idle
         // connection. This is the receive-side counterpart of the send path's rule
-        // that one entry point owns the socket's bounds.
+        // that every frame arms its own bound: each side re-establishes its own
+        // policy rather than trusting a leftover socket option.
         self.tcp.set_read_timeout(None)?;
         let mut len_buf = [0u8; LEN_PREFIX_LEN];
         // The one read with no bound: whatever arrives next starts a message. `0`
         // bytes here is the peer closing between messages.
         let mut prefix_filled = read_some_or_closed(&mut self.tcp, &mut len_buf)?;
 
-        // Phase 2 — bounded by the stall from here on.
+        // Phase 2 — bounded by the connection's stall from here on.
         let mut assembly = Reassembly::new();
         loop {
             // Read the raw frame bytes WITHOUT holding the TransportState
@@ -170,7 +171,7 @@ impl NoiseStream {
             // unbounded read above; later fragments read their whole prefix here.
             choreo_proto::read_exact_with_stall(
                 &mut self.tcp,
-                self.read_stall,
+                self.stall,
                 slice_mut(&mut len_buf, prefix_filled.., "length prefix tail")?,
             )
             .map_err(classify_stream_error)?;
@@ -190,12 +191,8 @@ impl NoiseStream {
             // the length (growing if this fragment is the largest seen), so
             // capacity carries across messages — no per-fragment allocation.
             self.recv_ct_buf.resize(ct_len, 0);
-            choreo_proto::read_exact_with_stall(
-                &mut self.tcp,
-                self.read_stall,
-                &mut self.recv_ct_buf,
-            )
-            .map_err(classify_stream_error)?;
+            choreo_proto::read_exact_with_stall(&mut self.tcp, self.stall, &mut self.recv_ct_buf)
+                .map_err(classify_stream_error)?;
 
             // Take the lock briefly to decrypt this one fragment, then
             // release it before the next blocking read (see above).

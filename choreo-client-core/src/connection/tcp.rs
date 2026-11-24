@@ -43,7 +43,7 @@ pub(super) fn dial_control_tcp(addr: &str) -> std::io::Result<std::net::TcpStrea
 /// The reader thread puts no clock on an *idle* connection — it blocks until a
 /// message arrives or the connection is closed — but it does bound a message that
 /// has started arriving and then stops, at the same per-syscall stall the writer
-/// uses (see `NoiseStream::set_read_stall`). The writer thread blocks until a real
+/// uses (see `NoiseStream::set_stall`). The writer thread blocks until a real
 /// message or the internal stop signal arrives (no polling).
 ///
 /// # Errors

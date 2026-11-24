@@ -818,14 +818,17 @@ command loop or a session thread, with memory bounded by lag-based eviction
 instead of drops. The policy, `LagLimits`, the counter-balance invariant, and
 the solicited-`Image` carve-out are that module's docs.
 
-Three facts cross layer lines. **A stalled peer is bounded in every direction,
-an idle one in none**: both ends bound an outbound write by a per-message budget
-scaled by the size plus a per-syscall stall, and bound an inbound message by that
-same stall once it has started arriving — while a connection with nothing in
-flight is idle, not broken, so no clock may touch it. A peer that vanished is the
-third case, and the socket's TCP keepalive answers it. The daemon also bounds
-outbound memory, which the client has no equivalent for: lag eviction caps each
-connection's outbound queue by the bytes in flight. **Eviction needs no
+Three facts cross layer lines. **On the network transport a stalled peer is
+bounded in every direction, an idle one in none**: both ends bound an outbound
+write by a per-message budget scaled by the size plus a per-syscall stall, and
+bound an inbound message by that same one stall once it has started arriving —
+while a connection with nothing in flight is idle, not broken, so no clock may
+touch it. A peer that vanished is the third case, and the socket's TCP keepalive
+answers it. The local-domain path is the deliberate exception: no slow link can
+carry `AF_UNIX`, and a dead peer's process takes its socket with it, so neither
+local reader carries a clock at all and only the writers are bounded. The daemon
+also bounds outbound memory, which the client has no equivalent for: lag eviction
+caps each connection's outbound queue by the bytes in flight. **Eviction needs no
 daemon-held socket handle**: the writer's own bounds fail the wedged write, the
 writer shuts the socket down itself, and the reader's blocking read unblocks into
 the normal teardown. And **evictions are not silent**: each increments

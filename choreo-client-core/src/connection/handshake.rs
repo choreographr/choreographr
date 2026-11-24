@@ -3,16 +3,13 @@
 //! service loop both TCP connection modes run.
 
 use crate::error::ClientError;
-use choreo_proto::{
-    CONNECTION_STALL, ClientMessage, DaemonMessage, encode_payload, message_budget,
-};
+use choreo_proto::{ClientMessage, DaemonMessage, encode_payload};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::handshake_initiator;
 use choreo_transport::key::ensure_transport_keypair;
 use choreo_transport::noise::NoiseStream;
 use crossbeam_channel::Receiver as CrossbeamReceiver;
 use std::net::Shutdown;
-use std::time::Instant;
 
 use super::serve::{CloseHandle, ConnectionSink, ConnectionSource, Inbound, serve};
 
@@ -146,9 +143,10 @@ pub(super) fn ik_handshake_and_serve(
 /// - Reader (the calling thread): blocks on `recv_daemon_message`; a clean peer
 ///   close ends the loop, any other transport error is fatal.
 /// - Writer thread: `select_biased!` on `from_ui` (drained first) and the
-///   internal stop channel, each message written under [`CONNECTION_STALL`] and the
-///   size-scaled [`message_budget`]. A failed write shuts the socket down, which
-///   unblocks the reader.
+///   internal stop channel, each message written under the stream's connection
+///   policy — a whole-message budget derived from the bytes it frames plus the
+///   per-syscall stall ([`choreo_proto::CONNECTION_STALL`] by default). A failed
+///   write shuts the socket down, which unblocks the reader.
 /// - Shutdown: blocks on `shutdown_rx.recv()`, then shuts the TCP stream down.
 ///
 /// Extracted so [`super::run_daemon_tcp_connection`] (IK) and
@@ -187,12 +185,12 @@ impl ConnectionSource for NoiseStream {
 impl ConnectionSink for NoiseStream {
     fn send_message(&mut self, message: &ClientMessage) -> Result<(), String> {
         // The encrypted stream writes its own length-prefixed fragments, so it
-        // takes the payload rather than a pre-framed message. Both time bounds
-        // are the connection's: a silent peer is noticed after `CONNECTION_STALL`,
-        // while a large frame is allowed the time its size implies.
+        // takes the payload rather than a pre-framed message. The transport then
+        // applies the connection's write policy to it — a whole-message budget
+        // derived from the bytes its own framing produces, plus the per-syscall
+        // stall — so this sink carries no budget arithmetic of its own.
         let payload = encode_payload(message).map_err(|error| error.to_string())?;
-        let deadline = Instant::now() + message_budget(payload.len());
-        self.send_message_by(&payload, deadline, CONNECTION_STALL)
+        self.send_message(&payload)
             .map_err(|error| error.to_string())
     }
 

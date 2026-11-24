@@ -90,23 +90,26 @@ pub(crate) fn tcp_handshake_and_client_thread(
 /// The encrypted read loop over an established
 /// [`choreo_transport::noise::NoiseStream`].
 ///
-/// The writer thread blocks on `writer_rx` and sends through the bounded Noise
-/// sink: each message is bounded by its own whole-message budget plus a
-/// per-syscall stall, so a large frame to a wedged client cannot occupy the
-/// writer for the whole message's worth of per-syscall stalls.
+/// The writer thread blocks on `writer_rx` and sends through the Noise sink: each
+/// message is bounded by the transport's own connection policy — a whole-message
+/// budget derived from the wire bytes it frames plus the stream's per-syscall
+/// stall — so a large message to a wedged client cannot occupy the writer for the
+/// whole message's worth of per-syscall stalls.
 pub(crate) fn tcp_client_thread(
     noise: choreo_transport::noise::NoiseStream,
     args: ConnThreadArgs,
     peer_stall: Duration,
 ) -> io::Result<()> {
     let mut reader = noise;
-    // Both directions of this connection give up on a peer that stops making
-    // progress at the same rate: the writer sink takes `peer_stall`, and so does
-    // the reader's mid-message bound. The reader's wait *between* messages stays
-    // unbounded — an idle client is not a wedged one — and a client that vanished
-    // outright is caught by the socket's keepalive.
-    reader.set_read_stall(peer_stall);
-    let writer_buf = NoiseConnectionWriter::new(reader.try_clone()?, peer_stall);
+    // ONE stall per connection, in both directions: it is set on the stream before
+    // the writer clone is made, so the clone inherits it and the read loop, the
+    // writer thread and every later clone all give up on a peer that stops making
+    // progress at the same latency. `set_stall` floors it through
+    // `effective_stall`. The reader's wait *between* messages stays unbounded — an
+    // idle client is not a wedged one — and a client that vanished outright is
+    // caught by the socket's keepalive.
+    reader.set_stall(peer_stall);
+    let writer_buf = NoiseConnectionWriter::new(reader.try_clone()?);
 
     let client_id = args.client_id;
     let mut conn = ClientConn::new(args, writer_buf);
