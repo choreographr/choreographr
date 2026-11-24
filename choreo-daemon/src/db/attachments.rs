@@ -86,7 +86,7 @@ pub(super) fn delete_session_attachments(
         .open_table(SESSION_ATTACHMENTS)
         .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
     let att_keys: Vec<(u64, u32, String)> = att_table
-        .range::<(u64, u32, String)>(
+        .range(
             (session_id, 0u32, String::new())..(session_range_end(session_id), 0u32, String::new()),
         )
         .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
@@ -122,7 +122,7 @@ fn delete_turn_attachments(
     // `turn_id == u32::MAX` the bound equals the start, so the range is empty
     // (removes nothing) instead of overflowing in debug / wrapping in release.
     let att_keys: Vec<(u64, u32, String)> = att_table
-        .range::<(u64, u32, String)>(
+        .range(
             (session_id, turn_id, String::new())
                 ..(session_id, turn_id.saturating_add(1), String::new()),
         )

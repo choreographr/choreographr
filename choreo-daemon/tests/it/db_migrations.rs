@@ -9,6 +9,9 @@
 
 use choreo_daemon::db;
 use redb::ReadableDatabase;
+// `ReadOnlyTable`'s `get` is the `ReadableTable` trait method; there is no
+// inherent one to fall back on.
+use redb::ReadableTable;
 
 /// Mirrors the daemon's production `meta` table definition so the test can
 /// read the stamped schema version directly.

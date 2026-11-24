@@ -488,7 +488,7 @@ dirs = "7"
 # log-file opener in `choreo-shared::logging` (O_NOFOLLOW + euid check).
 # `event`/`fs`/`process`: the daemon adds `event`, the opener needs `fs`+`process`.
 rustix = { version = "1.1.6", features = ["fs", "process"] }
-redb = "4"
+redb = "5"
 # Raster image codecs. Trimmed from default (which would pull the AVIF
 # *encoder* `ravif` — dead weight, since we only ever re-encode to PNG/JPEG).
 # `avif-native` (dav1d decode) is NOT enabled here: it is gated behind the

@@ -16,6 +16,16 @@
 //! committed row has been fsynced and a crash loses only what was never
 //! committed.
 //!
+//! Range queries go through `redb`'s `KeyRange` abstraction, whose key type is
+//! fixed by the `TableDefinition` the table was opened with: the call is
+//! `table.range(start..end)`, with **no** key-type turbofish (a turbofish does
+//! not compile). Every key and value type here is a `redb` built-in whose
+//! encoding is unchanged from `redb` 4, so an existing `state.redb` opens as-is
+//! — no `Legacy` wrapper and no migration entry — because the only encodings
+//! `redb` 5 changed are the `Option<&str>`/`Option<String>`/`Option<bool>`/
+//! `Option<char>` ones, and this schema stores every record as opaque bytes
+//! (`&[u8]` / `Vec<u8>`) rather than as a `redb`-encoded `Option`.
+//!
 //! The store holds plaintext transcripts and tool output, so its filesystem
 //! permissions are part of the access control: [`open_db_at`] keeps the data
 //! directory owner-only and forces the database file (and every pre-migration
@@ -1146,13 +1156,13 @@ pub fn kv_delete_range(
             let range_start = (session_id, start.to_string());
             let range_end = (session_id, end.to_string());
             table
-                .range::<(u64, String)>((range_start)..(range_end))
+                .range((range_start)..(range_end))
                 .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
         } else {
             let range_start = (session_id, start.to_string());
             let range_end = (session_range_end(session_id), String::new());
             table
-                .range::<(u64, String)>((range_start)..(range_end))
+                .range((range_start)..(range_end))
                 .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
         };
         let keys: Vec<(u64, String)> = range
@@ -1201,13 +1211,13 @@ pub fn kv_get_range(
         let range_start = (session_id, start.to_string());
         let range_end = (session_id, end.to_string());
         table
-            .range::<(u64, String)>((range_start)..(range_end))
+            .range((range_start)..(range_end))
             .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
     } else {
         let range_start = (session_id, start.to_string());
         let range_end = (session_range_end(session_id), String::new());
         table
-            .range::<(u64, String)>((range_start)..(range_end))
+            .range((range_start)..(range_end))
             .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
     };
     let mut results = Vec::new();
@@ -1245,7 +1255,7 @@ pub fn kv_list(
             let range_end = (session_id, end.to_string());
             Box::new(
                 table
-                    .range::<(u64, String)>((range_start)..(range_end))
+                    .range((range_start)..(range_end))
                     .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
             )
         }
@@ -1254,7 +1264,7 @@ pub fn kv_list(
             let range_end = (session_range_end(session_id), String::new());
             Box::new(
                 table
-                    .range::<(u64, String)>((range_start)..(range_end))
+                    .range((range_start)..(range_end))
                     .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
             )
         }
@@ -1263,7 +1273,7 @@ pub fn kv_list(
             let range_end = (session_id, end.to_string());
             Box::new(
                 table
-                    .range::<(u64, String)>((range_start)..(range_end))
+                    .range((range_start)..(range_end))
                     .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
             )
         }
@@ -1272,7 +1282,7 @@ pub fn kv_list(
             let range_end = (session_range_end(session_id), String::new());
             Box::new(
                 table
-                    .range::<(u64, String)>((range_start)..(range_end))
+                    .range((range_start)..(range_end))
                     .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
             )
         }
@@ -1315,13 +1325,13 @@ pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> i
         let range_end_str = String::from_utf8_lossy_owned(end_bytes);
         let range_end = (session_id, range_end_str);
         table
-            .range::<(u64, String)>((range_start)..(range_end))
+            .range((range_start)..(range_end))
             .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
     } else {
         let range_start = (session_id, String::new());
         let range_end = (session_range_end(session_id), String::new());
         table
-            .range::<(u64, String)>((range_start)..(range_end))
+            .range((range_start)..(range_end))
             .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
     };
     let mut count: u64 = 0;

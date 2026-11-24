@@ -366,7 +366,7 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
         // iterating the whole table (the old full-table scan made each delete
         // O(total turns) — costly for the largest sessions).
         let keys_to_remove: Vec<(u64, u32)> = turns
-            .range::<(u64, u32)>((session_id, 0u32)..(session_range_end(session_id), 0u32))
+            .range((session_id, 0u32)..(session_range_end(session_id), 0u32))
             .map_err(|e| db_err(format!("redb range turns: {e}")))?
             .filter_map(std::result::Result::ok)
             .map(|(key, _)| key.value())
@@ -382,9 +382,7 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
             .open_table(SESSION_KV)
             .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
         let kv_keys: Vec<(u64, String)> = kv_table
-            .range::<(u64, String)>(
-                (session_id, String::new())..(session_range_end(session_id), String::new()),
-            )
+            .range((session_id, String::new())..(session_range_end(session_id), String::new()))
             .map_err(|e| db_err(format!("redb range session_kv: {e}")))?
             .filter_map(std::result::Result::ok)
             .map(|(k, _)| k.value())
@@ -610,7 +608,7 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     // session — the old full-table scan made each read O(total turns) and
     // wasted zstd decode cycles on unrelated sessions' blobs.
     let iter = table
-        .range::<(u64, u32)>((session_id, 0u32)..(session_range_end(session_id), 0u32))
+        .range((session_id, 0u32)..(session_range_end(session_id), 0u32))
         .map_err(|e| db_err(format!("redb range turns: {e}")))?;
     for result in iter {
         let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
