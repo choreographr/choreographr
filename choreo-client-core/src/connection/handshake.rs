@@ -57,6 +57,10 @@ pub(super) fn client_transport_keypair()
 /// [`TransportError::HandshakeStaticMissing`] (the XX responder broke its own
 /// contract), [`TransportError::ConcurrentAccess`] (a caller bug: two actors in
 /// one direction on one stream) — plus the local key-file variants.
+///
+/// [`TransportError::StreamUnusable`] is not a refusal either: it reports that a
+/// transfer already failed on a connection that got as far as the data plane, so
+/// the remediation is a reconnect, never re-enrollment or re-pairing.
 pub(super) fn is_handshake_refusal(error: &TransportError) -> bool {
     match error {
         TransportError::AuthFailed

@@ -391,6 +391,15 @@ fn handshake_non_refusals_keep_their_own_meaning() {
     };
     assert!(!is_handshake_refusal(&concurrent));
 
+    // A stream poisoned by a failed transfer got as far as the data plane, so a
+    // reconnect — never re-enrollment — is the remediation.
+    let unusable = TransportError::StreamUnusable;
+    assert!(!is_handshake_refusal(&unusable));
+    match handshake_error(unusable) {
+        ClientError::Io(io) => assert_eq!(io.kind(), io::ErrorKind::Other),
+        other => panic!("a desynced stream must keep Io(..), got {other:?}"),
+    }
+
     // A local buffer-invariant break is a bug in this build, never a peer
     // refusal: it must not surface as enrollment or re-pair remediation.
     let internal = TransportError::InternalInvariant("handshake frame body".to_string());

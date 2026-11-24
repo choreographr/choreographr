@@ -57,24 +57,6 @@ use crate::daemon::DaemonCommand;
 /// than reading it as "unbounded".
 pub(crate) const PEER_STALL: Duration = CONNECTION_STALL;
 
-/// Bound for joining a connection's writer thread during cleanup.
-///
-/// Strictly greater than [`PEER_STALL`], and that ordering is
-/// load-bearing: cleanup waits for a writer that may be mid-syscall for up to the
-/// stall, so equal values would run out the join window in exactly the worst case
-/// the join exists to cover and detach a writer that was about to exit cleanly. A
-/// healthy writer exits immediately on channel disconnect (dropping the sink
-/// disconnects its receiver), so the grace only ever matters for the wedged case.
-pub(crate) const WRITER_JOIN_GRACE: Duration = PEER_STALL.saturating_add(Duration::from_secs(1));
-
-// Compile-time, because nothing about the relationship is conditional: a smaller
-// grace is a defect, and it must not be possible to introduce one by editing
-// either constant.
-const _: () = assert!(
-    WRITER_JOIN_GRACE.as_nanos() > PEER_STALL.as_nanos(),
-    "WRITER_JOIN_GRACE must outlast the writer stall it waits out"
-);
-
 /// A per-connection message sink implementing the single-writer contract.
 ///
 /// Both transports (Unix socket and TCP/Noise) implement this so the writer
@@ -95,8 +77,10 @@ pub(crate) trait ConnectionWriter {
 /// One bounded write per frame, with nothing buffered in between: a `BufWriter`
 /// here would only add a memcpy (the frame is handed over whole and flushed
 /// immediately) and, worse, would put the syscall that matters behind a hop the
-/// per-syscall re-arm cannot see — `write_all_with_stall` arms the socket, so it
-/// must be the socket that is written to.
+/// per-syscall bound cannot reach — `write_all_with_stall` re-evaluates the
+/// socket's write timeout before every syscall, so the socket itself must be what
+/// is written to, whereas a buffered write returns without blocking and leaves the
+/// real syscall (and the bound armed for it) to a later flush.
 pub(crate) struct UnixConnectionWriter {
     stream: UnixStream,
     /// Per-syscall stall, already through [`choreo_proto::effective_stall`].

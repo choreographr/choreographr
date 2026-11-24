@@ -1,6 +1,6 @@
 //! The connection's ONE time policy, applied in both directions.
 //!
-//! Three numbers decide when a connection gives up on its peer, and every
+//! These numbers decide when a connection gives up on its peer, and every
 //! party — the daemon and the client, the reader and the writer — must agree on
 //! them, so they live here rather than beside either bounded-I/O loop or in
 //! either caller:
@@ -20,6 +20,9 @@
 //!   against (through [`effective_stall`]), so a zero can never disable either
 //!   bound: `std` rejects a zero socket timeout rather than reading it as
 //!   "unbounded", which would break the first syscall instead of unbounding it.
+//! * [`writer_join_grace`] derives how long a teardown waits for a connection's
+//!   writer thread: the stall **plus** [`WRITER_JOIN_GRACE_MARGIN`], so the wait
+//!   outlasts the one blocking syscall the writer may be sitting inside.
 //!
 //! This module is numbers and arithmetic only — it performs no I/O. The loops
 //! that apply the policy are [`super::read`] and [`super::write`]; taking the
@@ -93,6 +96,46 @@ pub fn message_budget(wire_len: usize) -> Duration {
     Duration::from_millis(millis).max(CONNECTION_STALL)
 }
 
+/// Margin a writer-teardown grace adds on top of the connection's stall.
+///
+/// The stall bounds a single socket syscall, so a grace has to exceed it to leave
+/// the writer any room to finish exiting once that syscall returns; one second is
+/// the headroom, and a larger margin would only lengthen the teardown of a
+/// genuinely wedged writer.
+pub const WRITER_JOIN_GRACE_MARGIN: Duration = Duration::from_secs(1);
+
+/// How long a teardown waits for a connection's writer thread before detaching it:
+/// `stall` plus [`WRITER_JOIN_GRACE_MARGIN`].
+///
+/// The grace must outlast the stall, never merely match it, and that ordering is
+/// load-bearing rather than cautious: the wait covers a writer that may be inside a
+/// blocking syscall for up to `stall`, so a grace equal to the stall would expire in
+/// exactly the worst case the wait exists to cover, detaching a writer that was
+/// about to exit cleanly. A healthy writer exits at once on its stop signal (or when
+/// its channel closes), so the grace is only ever spent on a wedged one.
+///
+/// The wait has to cover the stall **in force**, which is why this is a function of
+/// the stall rather than one constant: a caller running its connection under a
+/// smaller stall derives a correspondingly smaller grace, where a hard-coded
+/// default would wait out a stall that connection never had. [`WRITER_JOIN_GRACE`]
+/// is the default-stall form of it.
+///
+/// Saturating, so no caller can panic by passing a huge stall: a stall within
+/// [`WRITER_JOIN_GRACE_MARGIN`] of [`Duration::MAX`] yields [`Duration::MAX`], which
+/// is already the longest wait a `Duration` can express.
+#[must_use]
+pub const fn writer_join_grace(stall: Duration) -> Duration {
+    stall.saturating_add(WRITER_JOIN_GRACE_MARGIN)
+}
+
+/// The grace for a connection running the default stall: [`writer_join_grace`]
+/// applied to [`CONNECTION_STALL`].
+///
+/// This is what a teardown joins its writer under when it has no stall of its own
+/// to derive from — both ends of a connection bound the wait with it rather than
+/// each computing the relation again.
+pub const WRITER_JOIN_GRACE: Duration = writer_join_grace(CONNECTION_STALL);
+
 /// Smallest stall a socket accepts.
 ///
 /// `std` rejects a zero duration outright (`ErrorKind::InvalidInput`, "cannot set
@@ -127,8 +170,8 @@ pub fn effective_stall(configured: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        CONNECTION_STALL, MIN_SOCKET_STALL, WRITER_MIN_RATE_BYTES_PER_SEC, effective_stall,
-        message_budget,
+        CONNECTION_STALL, MIN_SOCKET_STALL, WRITER_JOIN_GRACE, WRITER_MIN_RATE_BYTES_PER_SEC,
+        effective_stall, message_budget, writer_join_grace,
     };
     use std::time::Duration;
 
@@ -219,5 +262,48 @@ mod tests {
     #[test]
     fn the_connection_stall_survives_the_floor() {
         assert_eq!(effective_stall(CONNECTION_STALL), CONNECTION_STALL);
+    }
+
+    /// The grace a teardown joins its writer under is derived from the stall it has
+    /// to outlast, so for every stall a connection can actually run under the grace
+    /// is STRICTLY greater — the property an equal grace would break in exactly the
+    /// worst case the wait exists to cover.
+    #[test]
+    fn the_writer_join_grace_outlasts_the_stall_it_is_derived_from() {
+        for stall in [
+            MIN_SOCKET_STALL,
+            CONNECTION_STALL,
+            Duration::from_secs(3600),
+        ] {
+            assert!(
+                writer_join_grace(stall) > stall,
+                "the grace for {stall:?} must outlast it, not merely match it"
+            );
+        }
+    }
+
+    /// A stall with no room left for the margin saturates to the longest wait a
+    /// `Duration` can express rather than panicking or wrapping: there is nothing
+    /// longer to return, and no input may crash a teardown.
+    #[test]
+    fn a_stall_at_the_top_of_the_range_saturates_instead_of_panicking() {
+        assert_eq!(writer_join_grace(Duration::MAX), Duration::MAX);
+        assert_eq!(
+            writer_join_grace(Duration::MAX.saturating_sub(Duration::from_nanos(1))),
+            Duration::MAX,
+            "a stall one nanosecond under the ceiling still saturates"
+        );
+    }
+
+    /// The exported default is exactly the helper applied to the default stall, so
+    /// a caller that hard-codes nothing and a caller that derives from
+    /// [`CONNECTION_STALL`] cannot disagree.
+    #[test]
+    fn the_default_grace_is_the_helper_applied_to_the_default_stall() {
+        assert_eq!(WRITER_JOIN_GRACE, writer_join_grace(CONNECTION_STALL));
+        assert!(
+            WRITER_JOIN_GRACE > CONNECTION_STALL,
+            "the default grace must outlast the default stall"
+        );
     }
 }

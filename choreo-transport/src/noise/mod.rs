@@ -9,9 +9,11 @@
 //! the outbound write, `recv` owns reassembly, decryption and the peer-close
 //! classification, `frame` owns the fragment sizes and the length-prefix codec,
 //! and `reassembly` owns the message-level byte and fragment-count bounds.
-//! `slot` owns the per-direction single-actor right both directions take.
+//! `slot` owns the per-direction single-actor right both directions take, and
+//! [`wire`] publishes the data plane's fragment sizes and framing overhead as a
+//! wire contract for anything that frames a message itself.
 //!
-//! The two directions share ONE stall — [`NoiseStream`]'s per-syscall detection
+//! The two directions share ONE stall — the connection's per-syscall detection
 //! latency, applied to every write and to every read of a message already in
 //! flight — and neither bounds an idle connection. A send additionally derives a
 //! whole-message budget from the wire bytes it is about to write; a receive clears
@@ -20,11 +22,21 @@
 //! to everything after it. Neither puts a wall clock on a legitimate slow transfer,
 //! and a peer that vanished has its own bound in the socket's TCP keepalive.
 //!
-//! The `TransportState` is shared through an `Arc<Mutex<…>>` because a
-//! connection has one reader thread and one writer thread over a
-//! `try_clone`d socket (see AGENTS.md's sanctioned shared-state exception for
-//! the transport), and per-direction exclusivity is a single-bit `AtomicBool` in
-//! the spirit of the cancellation-flag exception.
+//! The stall, the snow `TransportState` and the post-failure `unusable` flag are
+//! all connection-scoped, so they live in ONE `Shared` record behind one
+//! `Arc<Mutex<…>>`: a connection has one reader thread and one writer thread over
+//! a `try_clone`d socket (see AGENTS.md's sanctioned shared-state exception for
+//! the transport — the `unusable` flag rides inside that already-sanctioned
+//! record rather than adding an exception of its own), and per-direction
+//! exclusivity is a single-bit `AtomicBool` in the spirit of the cancellation-flag
+//! exception.
+//!
+//! A transfer that fails part-way leaves the encrypted byte stream at an unknown
+//! offset, so the failure poisons the connection: every later send and receive is
+//! refused with [`crate::error::TransportError::StreamUnusable`] rather than
+//! silently desyncing the peer. The check sits after each direction's slot and
+//! before its first socket call, so only a failed transfer poisons — never a
+//! caller-side refusal that leaves the wire untouched.
 
 mod frame;
 mod reassembly;
@@ -41,6 +53,59 @@ use snow::TransportState;
 
 use slot::SingleSlot;
 
+/// The data plane's wire figures: fragment sizes, framing overhead, and the
+/// authenticated continuation bit.
+///
+/// Public because they are a wire contract, not an implementation detail: a test
+/// harness (or a peer implementation) that drives `snow` directly must chunk at
+/// [`MAX_PLAINTEXT_CHUNK`](wire::MAX_PLAINTEXT_CHUNK) and budget for
+/// [`GCM_TAG_LEN`](wire::GCM_TAG_LEN) plus
+/// [`FRAGMENT_HEADER_LEN`](wire::FRAGMENT_HEADER_LEN) using THESE values, never a
+/// local copy that could drift from what the crate actually puts on the wire —
+/// the same reason [`crate::handshake::MAX_HANDSHAKE_FRAME`] is public.
+pub mod wire {
+    pub use super::frame::{
+        FRAGMENT_CONTINUATION, FRAGMENT_HEADER_LEN, GCM_TAG_LEN, LEN_PREFIX_LEN,
+        MAX_CIPHERTEXT_LEN, MAX_FRAGMENTS_PER_MESSAGE, MAX_PLAINTEXT_CHUNK,
+    };
+}
+
+/// The state every clone of one connection shares: the snow transport, the
+/// connection's one stall, and whether a failed transfer has made the stream
+/// unusable.
+///
+/// One record rather than three fields on [`NoiseStream`], so the three cannot
+/// drift apart across a `try_clone`: a stall set through any handle is the stall
+/// every handle reads on its next message, and a failure in either direction
+/// poisons the whole connection — the wire is ONE byte stream, so a half-written
+/// or half-read frame leaves both directions at an unknown offset.
+struct Shared {
+    /// The snow transport. The lock is held only around a single encrypt or
+    /// decrypt call, never across a blocking socket operation (see
+    /// `send::write_frame` and `recv::recv_message_body`).
+    transport: TransportState,
+    /// The connection's per-syscall detection latency in **both directions**: a
+    /// read applies it once a message is in flight, a write applies it to every
+    /// syscall. Defaults to [`choreo_proto::CONNECTION_STALL`] and is settable at
+    /// any time through [`NoiseStream::set_stall`].
+    ///
+    /// A **stall**, not a whole-message deadline, and deliberately so on both
+    /// sides. On the receive side a message's total size is unknown until its last
+    /// fragment arrives, so there is no figure to scale a whole-message budget
+    /// from. On the send side there is (the wire length sizes one), but the stall
+    /// still is not a deadline: a peer that keeps making progress passes however
+    /// long the transfer legitimately takes, and one that stops is caught here
+    /// instead of only when a large frame's minutes-long budget runs out. The idle
+    /// wait *between* messages is unbounded and lives outside this bound (see
+    /// `recv::recv_message_plain`).
+    stall: Duration,
+    /// Set once a send or receive fails, so the connection's byte stream is at an
+    /// unknown offset. Every later transfer is refused with
+    /// [`crate::error::TransportError::StreamUnusable`] instead of silently
+    /// desyncing the peer.
+    unusable: bool,
+}
+
 /// An encrypted Noise transport stream.
 ///
 /// Wraps a `TcpStream` with a snow `TransportState`. Every message is
@@ -48,11 +113,13 @@ use slot::SingleSlot;
 /// is what a completed handshake produces and does not itself know which
 /// pattern ran — IK and XX both end here (see [`crate::handshake`]).
 ///
-/// The `TransportState` is behind an `Arc<Mutex<>>` so the stream can be
-/// cloned for concurrent reader/writer threads via [`Self::try_clone`].
+/// Everything connection-scoped — the `TransportState`, the one stall and the
+/// `unusable` flag — is behind one `Arc<Mutex<>>` (see the `Shared` record) so the
+/// stream can be cloned for concurrent reader/writer threads via
+/// [`Self::try_clone`] without any of the three being copied per handle.
 pub struct NoiseStream {
     tcp: TcpStream,
-    transport: Arc<Mutex<TransportState>>,
+    shared: Arc<Mutex<Shared>>,
     /// The outbound single-writer slot, shared across clones: a concurrent
     /// second `send_message` on one stream would interleave fragments of
     /// different logical messages on the wire (silent corruption). The slot
@@ -82,30 +149,21 @@ pub struct NoiseStream {
     /// writer clone's copy stays empty). Wiped after every fragment is copied
     /// out.
     recv_pt_buf: Vec<u8>,
-    /// The connection's per-syscall detection latency in **both directions**: a
-    /// read applies it once a message is in flight, a write applies it to every
-    /// syscall. Defaults to [`choreo_proto::CONNECTION_STALL`] and is settable
-    /// through [`Self::set_stall`].
-    ///
-    /// A **stall**, not a whole-message deadline, and deliberately so on both
-    /// sides. On the receive side a message's total size is unknown until its last
-    /// fragment arrives, so there is no figure to scale a whole-message budget
-    /// from. On the send side there is (the wire length sizes one), but the stall
-    /// still is not a deadline: a peer that keeps making progress passes however
-    /// long the transfer legitimately takes, and one that stops is caught here
-    /// instead of only when a large frame's minutes-long budget runs out. The idle
-    /// wait *between* messages is unbounded and lives outside this bound (see
-    /// `recv::recv_message_plain`).
-    stall: Duration,
 }
 
 impl NoiseStream {
     /// Create a new `NoiseStream` wrapping a `TcpStream` and `TransportState`.
+    ///
+    /// The connection starts at [`choreo_proto::CONNECTION_STALL`] and usable.
     pub fn new(tcp: TcpStream, transport: TransportState) -> Self {
         tracing::trace!("NoiseStream created");
         NoiseStream {
             tcp,
-            transport: Arc::new(Mutex::new(transport)),
+            shared: Arc::new(Mutex::new(Shared {
+                transport,
+                stall: choreo_proto::CONNECTION_STALL,
+                unusable: false,
+            })),
             send_slot: SingleSlot::new("send_message"),
             recv_slot: SingleSlot::new("recv_message"),
             // All four reusable buffers start empty; send_message/recv_message
@@ -115,19 +173,18 @@ impl NoiseStream {
             send_frag: Vec::new(),
             recv_ct_buf: Vec::new(),
             recv_pt_buf: Vec::new(),
-            stall: choreo_proto::CONNECTION_STALL,
         }
     }
 
     /// Clone the stream for concurrent reader/writer threads.
-    /// The underlying `TcpStream` is cloned; the `TransportState` and both
-    /// single-actor slots are shared, so encrypt/decrypt calls are serialized
-    /// and two clones still cannot send (or receive) at once.
     ///
-    /// The connection's stall is copied, so both halves of one connection give up
-    /// on a wedged peer at the same latency. A caller must therefore set it (see
-    /// [`Self::set_stall`]) BEFORE cloning: a clone carries the value that was in
-    /// force when it was made.
+    /// Only the underlying `TcpStream` is cloned. Everything connection-scoped is
+    /// SHARED with the original, never copied: the `TransportState` (so
+    /// encrypt/decrypt calls are serialized), both single-actor slots (so two
+    /// clones still cannot send, or receive, at once), the connection's one stall
+    /// and the `unusable` flag. Both halves of one connection therefore give up on
+    /// a wedged peer at the same latency, and a failure in either direction
+    /// refuses later transfers on every handle.
     ///
     /// # Errors
     ///
@@ -135,7 +192,7 @@ impl NoiseStream {
     pub fn try_clone(&self) -> std::io::Result<Self> {
         Ok(NoiseStream {
             tcp: self.tcp.try_clone()?,
-            transport: Arc::clone(&self.transport),
+            shared: Arc::clone(&self.shared),
             send_slot: self.send_slot.clone(),
             recv_slot: self.recv_slot.clone(),
             // Buffer reuse is per-direction: a reader clone never sends and a
@@ -146,12 +203,6 @@ impl NoiseStream {
             send_frag: Vec::new(),
             recv_ct_buf: Vec::new(),
             recv_pt_buf: Vec::new(),
-            // The stall is a property of the connection rather than of one
-            // direction's buffer, so a clone inherits it — which is also why a
-            // caller must set it BEFORE `try_clone`: a clone made first keeps the
-            // value it was made with, and setting it on one half afterwards leaves
-            // the other at the old latency.
-            stall: self.stall,
         })
     }
 
@@ -166,10 +217,58 @@ impl NoiseStream {
     /// socket timeout is rejected by the kernel, not read as "unbounded" (see
     /// [`choreo_proto::effective_stall`]).
     ///
-    /// Set it BEFORE [`Self::try_clone`] so both halves of the connection share it
-    /// (see that method's note).
-    pub fn set_stall(&mut self, stall: Duration) {
-        self.stall = choreo_proto::effective_stall(stall);
+    /// There is ONE stall per connection, held in the connection's shared record,
+    /// so it may be set before or after [`Self::try_clone`] and every handle reads
+    /// the same value on its next message. That is also why this takes `&self`: the
+    /// write goes through the shared record, not through this handle.
+    pub fn set_stall(&self, stall: Duration) {
+        // A brief write to the shared record — the same record the encrypt and
+        // decrypt sites lock per chunk — so it is never held across I/O: a reader
+        // waiting on this lock would stop draining the socket.
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stall = choreo_proto::effective_stall(stall);
+    }
+
+    /// The connection's per-syscall stall.
+    ///
+    /// Read ONCE at the entry point of a message and threaded down to the framing
+    /// loop, so the shared record is locked once per message rather than once per
+    /// syscall, and never inside the encrypt/decrypt scope (where the lock must be
+    /// released before any blocking socket call).
+    fn stall(&self) -> Duration {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stall
+    }
+
+    /// Whether a failed transfer has already made this connection's byte stream
+    /// unusable.
+    fn is_unusable(&self) -> bool {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unusable
+    }
+
+    /// Record that a transfer failed, refusing every later send and receive on
+    /// this connection.
+    ///
+    /// Deliberately conservative: the rule is "a failed transfer makes the stream
+    /// unusable", including a failure that happened before any byte moved (an
+    /// already-elapsed deadline). No error in either direction proves where the
+    /// byte stream stands, and a caller that ignored a desynced stream would have
+    /// its next frame silently misparsed by the peer. Callers already close the
+    /// connection on any transport error, so the only cost of poisoning a
+    /// harmless failure is a reconnect that was happening anyway.
+    fn mark_unusable(&self) {
+        // Same brief-lock rule as `stall`: one flag write, never across I/O.
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unusable = true;
     }
 
     /// Access the underlying `TcpStream` for shutdown etc.

@@ -1,12 +1,15 @@
 //! The caps, deadlines and stalls that bound a message: the refusals a hostile
-//! or corrupted wire prefix earns, the deadline-bounded send path, and the
-//! idle-versus-stalled distinction on receive. The cumulative reassembly cap is
-//! a unit test of its arithmetic in `noise::frame` instead — reaching it end to
-//! end would mean pushing `MAX_FRAME_SIZE` of ciphertext through the socket.
+//! or corrupted wire prefix earns, the deadline-bounded send path, the
+//! idle-versus-stalled distinction on receive, and the post-failure poisoning that
+//! refuses a stream whose byte offset is no longer known. The cumulative
+//! reassembly cap is a unit test of its arithmetic in `noise::frame` instead —
+//! reaching it end to end would mean pushing `MAX_FRAME_SIZE` of ciphertext
+//! through the socket.
 
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{handshake_initiator, handshake_responder};
 use choreo_transport::noise::NoiseStream;
+use choreo_transport::noise::wire::{LEN_PREFIX_LEN, MAX_PLAINTEXT_CHUNK};
 use std::io::Write;
 use std::net::TcpStream;
 use std::sync::mpsc;
@@ -18,10 +21,11 @@ use crate::common::{noise_test_pair, raw_handshake_initiator, raw_handshake_resp
 /// Test that a hostile or corrupted length prefix cannot make the receiver
 /// allocate a huge buffer or hang: the 4-byte data-plane prefix is NOT
 /// authenticated (it precedes the GCM ciphertext), so a peer can send any
-/// value. `recv_message` must reject a fragment longer than snow's 65535-byte
-/// ciphertext cap BEFORE allocating or reading that many bytes — a receiver
-/// that trusted the prefix would allocate (and then block in `read_exact`
-/// waiting for) the declared `0x7FFF_FFFF` bytes, roughly 2 GiB.
+/// value. `recv_message` must reject a fragment longer than the
+/// `MAX_CIPHERTEXT_LEN`-byte ciphertext cap BEFORE allocating or reading that
+/// many bytes — a receiver that trusted the prefix would allocate (and then
+/// block in `read_exact` waiting for) the declared `0x7FFF_FFFF` bytes, roughly
+/// 2 GiB.
 ///
 /// (The prefix carries only the ciphertext length: the continuation decision
 /// lives in the authenticated plaintext, so the raw value here is just a huge
@@ -52,7 +56,7 @@ fn noise_rejects_oversized_fragment_prefix() {
     let client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // Raw write of a length prefix claiming 0x7FFF_FFFF ciphertext bytes
-    // (far above the 65535-byte Noise cap), bypassing send_message so the
+    // (far above the MAX_CIPHERTEXT_LEN-byte cap), bypassing send_message so the
     // wire carries a genuinely invalid frame.
     client
         .get_ref()
@@ -99,7 +103,7 @@ fn noise_rejects_tampered_length_prefix() {
             let payload = server
                 .recv_message()
                 .map_err(|e| format!("control recv failed: {e:?}"))?;
-            let expected = vec![0xABu8; 65518 + 100];
+            let expected = vec![0xABu8; MAX_PLAINTEXT_CHUNK + 100];
             if payload.as_slice() != expected.as_slice() {
                 return Err(format!(
                     "control payload mismatch: got {} bytes, want {} bytes of 0xAB",
@@ -131,7 +135,7 @@ fn noise_rejects_tampered_length_prefix() {
 
     // Control message: intact prefixes, two fragments — the same framing the
     // transport itself writes, so the receiver must reassemble it.
-    let payload = vec![0xABu8; 65518 + 100];
+    let payload = vec![0xABu8; MAX_PLAINTEXT_CHUNK + 100];
     for frame in super::wire_frames(&mut ts, &payload) {
         stream.write_all(&frame).expect("write control frame");
     }
@@ -142,19 +146,19 @@ fn noise_rejects_tampered_length_prefix() {
     let second = frames
         .get_mut(1)
         .expect("the payload spans two fragments, so a second frame exists");
-    let mut prefix = [0u8; 4];
+    let mut prefix = [0u8; LEN_PREFIX_LEN];
     prefix.copy_from_slice(
         second
-            .get(..4)
-            .expect("a frame opens with its 4-byte length prefix"),
+            .get(..LEN_PREFIX_LEN)
+            .expect("a frame opens with its length prefix"),
     );
     // Decrement (never increment): a larger prefix would make the receiver
     // block waiting for bytes we never send, hanging the test. A smaller one
     // trips the GCM authentication instead.
     let tampered = (u32::from_be_bytes(prefix) - 1).to_be_bytes();
     second
-        .get_mut(..4)
-        .expect("a frame opens with its 4-byte length prefix")
+        .get_mut(..LEN_PREFIX_LEN)
+        .expect("a frame opens with its length prefix")
         .copy_from_slice(&tampered);
     for frame in frames {
         stream.write_all(&frame).expect("write tampered frame");
@@ -191,7 +195,7 @@ fn send_message_by_round_trips_a_fragmented_message() {
 
             // One byte past the single-fragment capacity: the sender splits this
             // into two fragments, and the receiver glues them back.
-            let expected = vec![0x5Au8; 65518 + 1];
+            let expected = vec![0x5Au8; MAX_PLAINTEXT_CHUNK + 1];
             let payload = server
                 .recv_message()
                 .map_err(|e| format!("recv fragmented message failed: {e:?}"))?;
@@ -220,12 +224,12 @@ fn send_message_by_round_trips_a_fragmented_message() {
     let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // A budget far larger than the local loopback round trip needs, and a
-    // connection stall that no loopback write can approach — armed on the STREAM,
-    // so it covers every fragment of every message for the connection's lifetime
-    // rather than one call.
+    // connection stall that no loopback write can approach — one value on the
+    // connection's shared record, so it covers every fragment of every message in
+    // both directions rather than one call.
     let deadline = Instant::now() + Duration::from_secs(30);
     client.set_stall(Duration::from_secs(5));
-    let payload = vec![0x5Au8; 65518 + 1];
+    let payload = vec![0x5Au8; MAX_PLAINTEXT_CHUNK + 1];
     client
         .send_message_by(&payload, deadline)
         .expect("send fragmented payload within the deadline");
@@ -243,8 +247,10 @@ fn send_message_by_round_trips_a_fragmented_message() {
 
 /// An already-elapsed deadline must fail immediately, not block: `write_all_with_stall`
 /// returns `TimedOut` before its first syscall, which surfaces as
-/// `TransportError::Io`. The receiver is left with no bytes and reports the
-/// client's close as a graceful disconnect.
+/// `TransportError::Io`. That failure also poisons the connection — a failed
+/// transfer may have left part of a frame on the wire — so the next send is
+/// refused with `StreamUnusable` before it touches the socket. The receiver is left
+/// with no bytes and reports the client's close as a graceful disconnect.
 #[test]
 #[ignore = "integration"]
 fn send_message_by_fails_promptly_when_the_deadline_has_elapsed() {
@@ -281,6 +287,15 @@ fn send_message_by_fails_promptly_when_the_deadline_has_elapsed() {
         other => panic!("expected Io(TimedOut) from an elapsed deadline, got {other:?}"),
     }
 
+    // The connection is refused from here on rather than allowed to desync the
+    // peer. The refusal happens at the entry point, before the socket is touched,
+    // so it is immediate and writes nothing — which is also why the server still
+    // sees a graceful close rather than a partial frame.
+    match client.send_message(b"after the failure") {
+        Err(TransportError::StreamUnusable) => {}
+        other => panic!("a failed transfer must poison the stream, got {other:?}"),
+    }
+
     // Close our end so the server's blocking recv returns instead of hanging.
     drop(client);
     let server_result = rx
@@ -297,7 +312,8 @@ fn send_message_by_fails_promptly_when_the_deadline_has_elapsed() {
 /// is refused at the source as `InternalInvariant` — never `InvalidFragment`,
 /// which `choreo-client-core` classifies as a handshake refusal and renders as
 /// enrollment remediation. The check runs before any fragment is staged, so
-/// nothing reaches the wire: the peer only sees the connection close.
+/// nothing reaches the wire — which also means it must NOT poison the connection:
+/// a normal message sent afterwards is received intact.
 #[test]
 #[ignore = "integration"]
 fn an_oversize_outgoing_message_is_an_internal_invariant() {
@@ -312,11 +328,18 @@ fn an_oversize_outgoing_message_is_an_internal_invariant() {
         let result = (|| -> Result<(), String> {
             let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
-            // The client wrote nothing, so this is its close.
-            match server.recv_message() {
-                Err(TransportError::ConnectionClosed) | Ok(_) => Ok(()),
-                Err(e) => Err(format!("unexpected recv error: {e:?}")),
+            // The refused oversize never reached the wire, so the FIRST thing the
+            // server reads is the normal message that followed it.
+            let message = server
+                .recv_message()
+                .map_err(|e| format!("a normal message must follow a refused oversize: {e:?}"))?;
+            if message.as_slice() != b"still usable" {
+                return Err(format!(
+                    "expected b\"still usable\", got {:?}",
+                    String::from_utf8_lossy(&message)
+                ));
             }
+            Ok(())
         })();
         tx.send(result).expect("send server result");
     });
@@ -337,15 +360,87 @@ fn an_oversize_outgoing_message_is_an_internal_invariant() {
         "the refusal must name the cap it broke: {error}"
     );
 
-    drop(client);
+    // A local refusal never touched the wire, so the stream stays usable.
+    client
+        .send_message(b"still usable")
+        .expect("a caller-side refusal must leave the connection usable");
+
     let server_result = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("server must return instead of hanging");
     assert!(
         server_result.is_ok(),
-        "server side should report the client's graceful close: {:?}",
+        "the message after the refusal must arrive intact: {:?}",
         server_result.err()
     );
+    drop(client);
+}
+
+/// A failed receive leaves the encrypted byte stream at an unknown offset, so the
+/// stream must refuse every later read rather than reassemble whatever happens to
+/// be there. An over-cap length prefix is the cheapest way to fail a read after the
+/// handshake: the first `recv_message` returns `InvalidFragment`, and the second
+/// must return `StreamUnusable` WITHOUT touching the socket — the peer sends
+/// nothing further, so a receiver that tried to read would block until this test's
+/// own timeout fired instead.
+#[test]
+#[ignore = "integration"]
+fn a_failed_receive_poisons_the_stream() {
+    let (listener, server_sk, server_pk, client_sk, client_pk) =
+        noise_test_pair().expect("noise test listener bind");
+    let addr = listener.local_addr().expect("local addr");
+
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        let (stream, _) = listener.accept().expect("accept");
+        let result = (|| -> Result<(), String> {
+            let (stream, ts) = raw_handshake_responder(stream, &server_sk, &client_pk)?;
+            let mut server = NoiseStream::new(stream, ts);
+
+            match server.recv_message() {
+                Err(TransportError::InvalidFragment(_)) => {}
+                other => {
+                    return Err(format!(
+                        "an over-cap fragment prefix must be refused as InvalidFragment, got {other:?}"
+                    ));
+                }
+            }
+
+            // The peer writes nothing more, so this can only return because the
+            // entry point refuses a poisoned stream before the socket is touched.
+            match server.recv_message() {
+                Err(TransportError::StreamUnusable) => Ok(()),
+                other => Err(format!(
+                    "a failed receive must poison the stream, got {other:?}"
+                )),
+            }
+        })();
+        tx.send(result).expect("send server result");
+    });
+
+    let stream = TcpStream::connect(addr).expect("connect");
+    let (mut stream, _ts) =
+        raw_handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
+
+    // Raw write of a length prefix claiming 0x7FFF_FFFF ciphertext bytes (far
+    // above the MAX_CIPHERTEXT_LEN-byte cap), bypassing send_message so the wire
+    // carries a genuinely invalid frame.
+    stream
+        .write_all(&0x7FFF_FFFFu32.to_be_bytes())
+        .expect("write bogus prefix");
+
+    let server_result = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server must return instead of hanging");
+    assert!(
+        server_result.is_ok(),
+        "a failed receive must poison the stream: {:?}",
+        server_result.err()
+    );
+    // Closed only after the assertion: while the socket stays open the server's
+    // second read can be refused by the poisoning alone, not by our EOF.
+    drop(stream);
 }
 
 /// A connection with nothing in flight is **idle, not broken**: the receive path

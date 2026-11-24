@@ -24,6 +24,11 @@ mod reply;
 mod threads;
 mod writer;
 
+// The daemon joins its writer under `choreo-proto`'s definition: the margin is
+// stated once, beside the stall it derives from, so no connection end re-derives
+// it.
+pub(crate) use choreo_proto::WRITER_JOIN_GRACE;
+
 // The accept paths and the daemon's state wiring reach these from outside the
 // module; nothing else in the crate needs the rest.
 pub(crate) use conn::ConnThreadArgs;
@@ -39,9 +44,7 @@ pub(super) use reply::ReplyHandle;
 // Only the unit tests name these: the connection itself reaches them through
 // their owning modules.
 #[cfg(test)]
-pub(super) use writer::{
-    ChannelConnectionWriter, ConnectionWriter, WRITER_JOIN_GRACE, writer_thread,
-};
+pub(super) use writer::{ChannelConnectionWriter, ConnectionWriter, writer_thread};
 
 #[cfg(test)]
 mod tests;

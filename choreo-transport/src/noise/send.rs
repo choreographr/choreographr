@@ -6,14 +6,20 @@
 //! the coalesced write exist exactly once, whether the message is empty, a single
 //! fragment, or many. Two entry points share that body:
 //! [`NoiseStream::send_message`] (the connection's own policy: a whole-message
-//! budget derived from the wire bytes the message will occupy, plus the stream's
-//! stall) and [`NoiseStream::send_message_by`] (the same stall, with the caller's
-//! absolute deadline replacing the derived budget). The single-writer right itself
-//! lives in [`super::slot`], shared with the read direction.
+//! budget derived from the wire bytes the message will occupy, plus the
+//! connection's stall) and [`NoiseStream::send_message_by`] (the same stall, with
+//! the caller's absolute deadline replacing the derived budget). The single-writer
+//! right itself lives in [`super::slot`], shared with the read direction.
 //!
 //! Neither entry point ever writes a frame unbounded: every frame is handed to
 //! [`choreo_proto::write_all_with_stall`], so no send path can leave the socket
 //! under a policy other than the one it just armed.
+//!
+//! The connection's stall is read ONCE per message, at the shared entry point, and
+//! threaded down to the framing loop — so the shared record is locked once per
+//! message rather than once per syscall, and never while a write is in progress.
+//! The same entry point is where a connection already poisoned by a failed transfer
+//! is refused, before any byte reaches the socket.
 
 use std::time::{Duration, Instant};
 
@@ -71,7 +77,7 @@ impl NoiseStream {
     /// The write is bounded by the connection's policy in both directions: a
     /// whole-message budget derived from the bytes this message will occupy on the
     /// wire (see `frame::wire_len`) through [`choreo_proto::message_budget`], plus
-    /// the stream's per-syscall stall ([`Self::set_stall`]). A peer that stops
+    /// the connection's per-syscall stall ([`Self::set_stall`]). A peer that stops
     /// accepting bytes is therefore noticed after the stall, while a slow-but-alive
     /// link gets the time the message's own size implies.
     ///
@@ -81,12 +87,14 @@ impl NoiseStream {
     /// # Errors
     ///
     /// Returns [`TransportError::ConcurrentAccess`] if another thread is
-    /// concurrently sending on this stream, [`TransportError::InternalInvariant`]
+    /// concurrently sending on this stream, [`TransportError::StreamUnusable`] if a
+    /// previous transfer failed on this connection, [`TransportError::InternalInvariant`]
     /// if the plaintext exceeds [`MAX_FRAME_SIZE`] (a caller asking for more than
     /// the codec's message cap — never a peer's doing, so it is kept out of
     /// [`TransportError::InvalidFragment`]),
     /// [`TransportError::ConnectionClosed`]/I/O errors from the socket, or snow
-    /// errors from encryption.
+    /// errors from encryption. Every error except the three pre-flight refusals
+    /// leaves the connection unusable.
     pub fn send_message(&mut self, plaintext: &[u8]) -> Result<(), TransportError> {
         self.send_message_bounded(plaintext, None)
     }
@@ -115,6 +123,8 @@ impl NoiseStream {
     /// connection's stall both make an armed write return `WouldBlock`/`TimedOut`,
     /// which converts into [`TransportError::Io`] through the `From<io::Error>` impl
     /// — a fired bound is reported as the socket's own error, not a bespoke variant.
+    /// A fired bound also poisons the connection: an elapsed deadline fails before
+    /// its first syscall, and no error proves where the byte stream stands.
     pub fn send_message_by(
         &mut self,
         plaintext: &[u8],
@@ -123,17 +133,48 @@ impl NoiseStream {
         self.send_message_bounded(plaintext, Some(deadline))
     }
 
-    /// The shared entry point: take the single-writer slot, run the framing, and
-    /// wipe `send_frag` on the way out. `deadline` distinguishes the two public
-    /// entry points (`None` means "derive the budget from the wire length");
-    /// everything else is identical between them.
+    /// The shared entry point: take the single-writer slot, apply the two local
+    /// pre-flight refusals, run the framing, and wipe `send_frag` on the way out.
+    /// `deadline` distinguishes the two public entry points (`None` means "derive
+    /// the budget from the wire length"); everything else is identical between
+    /// them.
     fn send_message_bounded(
         &mut self,
         plaintext: &[u8],
         deadline: Option<Instant>,
     ) -> Result<(), TransportError> {
         let _guard = self.send_slot.acquire()?;
-        match self.send_message_inner(plaintext, deadline) {
+
+        // Mirror the receiver's reassembly cap so an over-limit message is
+        // rejected at the source instead of by the peer's recv_message. This is a
+        // LOCAL policy violation (a caller handed us more than this transport can
+        // frame), so it is `InternalInvariant`, not `InvalidFragment`: the peer did
+        // nothing, and a caller that reads it as a wire violation would be
+        // misdiagnosing its own bug as the remote end's. It runs before any budget
+        // arithmetic, so an over-limit caller never earns a budget for a message
+        // that cannot be framed — and before the unusable check below, so a
+        // caller-side limit breach never poisons a connection whose wire was never
+        // touched.
+        if plaintext.len() > MAX_FRAME_SIZE {
+            return Err(TransportError::InternalInvariant(format!(
+                "outgoing message of {} bytes exceeds the {MAX_FRAME_SIZE}-byte cap",
+                plaintext.len()
+            )));
+        }
+
+        // A previous failed transfer left the byte stream at an unknown offset, so
+        // nothing more may be written: this returns before the socket is touched,
+        // which is also why it cannot re-poison (the flag is already set) and why
+        // the `ConcurrentAccess` refusal above poisons nothing either (the slot is
+        // taken before any byte moves).
+        if self.is_unusable() {
+            return Err(TransportError::StreamUnusable);
+        }
+
+        // ONE read of the connection's stall per message, threaded down to the
+        // framing loop rather than re-locking the shared record per frame.
+        let stall = self.stall();
+        match self.send_message_inner(plaintext, deadline, stall) {
             // Wipe exactly the region this send wrote: the plaintext staging
             // buffer holds a copy of this (possibly secret) message until the
             // next send would overwrite it, so it is cleared on success too.
@@ -163,6 +204,11 @@ impl NoiseStream {
             // the whole buffer rather than guess.
             Err(e) => {
                 self.send_frag.zeroize();
+                // ONE place per direction poisons the connection: every error the
+                // framing body can return means the frame it was writing may be
+                // partly on the wire, so the byte stream is at an unknown offset and
+                // no later send or receive may use it.
+                self.mark_unusable();
                 Err(e)
             }
         }
@@ -171,25 +217,15 @@ impl NoiseStream {
     /// The send body, returning how many bytes of `send_frag` the last frame
     /// staged (its plaintext varies in length with the payload) so the caller
     /// can wipe exactly that prefix.
+    ///
+    /// `stall` is the connection's per-syscall stall, read once by the caller so
+    /// this loop never re-locks the shared record.
     fn send_message_inner(
         &mut self,
         plaintext: &[u8],
         deadline: Option<Instant>,
+        stall: Duration,
     ) -> Result<usize, TransportError> {
-        // Mirror the receiver's reassembly cap so an over-limit message is
-        // rejected at the source instead of by the peer's recv_message. This is a
-        // LOCAL policy violation (a caller handed us more than this transport can
-        // frame), so it is `InternalInvariant`, not `InvalidFragment`: the peer did
-        // nothing, and a caller that reads it as a wire violation would be
-        // misdiagnosing its own bug as the remote end's. It runs before any budget
-        // arithmetic, so an over-limit caller never earns a budget for a message
-        // that cannot be framed.
-        if plaintext.len() > MAX_FRAME_SIZE {
-            return Err(TransportError::InternalInvariant(format!(
-                "outgoing message of {} bytes exceeds the {MAX_FRAME_SIZE}-byte cap",
-                plaintext.len()
-            )));
-        }
         trace!(plaintext_len = plaintext.len(), "sending Noise message");
 
         // ONE policy value for the whole message, built here so every fragment is
@@ -201,7 +237,7 @@ impl NoiseStream {
         let bound = WriteBound {
             deadline: deadline
                 .unwrap_or_else(|| Instant::now() + message_budget(wire_len(plaintext.len()))),
-            stall: self.stall,
+            stall,
         };
 
         // Guarantee the reused per-stream buffers are big enough for the
@@ -282,11 +318,11 @@ impl NoiseStream {
         .copy_from_slice(payload);
 
         let n = {
-            let mut transport = self
-                .transport
+            let mut shared = self
+                .shared
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            transport.write_message(
+            shared.transport.write_message(
                 slice(&self.send_frag, ..staged, "send_frag header+chunk")?,
                 // Ciphertext goes AFTER the length-prefix headroom; the prefix
                 // is laid into that headroom afterwards — encrypting over the

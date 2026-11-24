@@ -2,7 +2,9 @@
 //!
 //! A frame is a 4-byte big-endian payload length followed by that many
 //! `MessagePack` bytes (see [`crate::frame`], which owns the encoding and the
-//! [`crate::MAX_FRAME_SIZE`] policy). These three functions are the read and write
+//! [`crate::MAX_FRAME_SIZE`] policy). The prefix itself is produced and validated
+//! by [`super::len_prefix`], so its arithmetic is the same one the transport's two
+//! Noise framing paths use. These three functions are the read and write
 //! of one such frame over any `Read`/`Write` — the deadline-bounded variants a
 //! long-lived connection uses live in [`super::read`] and [`super::write`], and a
 //! transport that supplies its own framing (the Noise control plane) uses
@@ -12,6 +14,8 @@ use crate::ProtoError;
 use crate::frame::{MAX_FRAME_SIZE, decode_frame, encode_frame};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
+
+use super::len_prefix;
 
 /// Encode `message` and write the framed payload to `writer`.
 ///
@@ -56,10 +60,11 @@ where
 {
     let mut len_buf = [0_u8; 4];
     reader.read_exact(&mut len_buf)?;
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_FRAME_SIZE {
-        return Err(ProtoError::FrameTooLarge);
-    }
+    // The header is exactly four bytes, so `ShortPrefix` is unreachable and the
+    // only arm a peer can trigger is `AboveCap`; every arm therefore folds into
+    // the one oversized-frame verdict.
+    let len =
+        len_prefix::decode::<4>(&len_buf, MAX_FRAME_SIZE).map_err(|_| ProtoError::FrameTooLarge)?;
 
     let mut payload = vec![0_u8; len];
     reader.read_exact(&mut payload)?;

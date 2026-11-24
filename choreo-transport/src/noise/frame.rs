@@ -10,32 +10,39 @@
 //! module, because they are the other half of this same accounting: the
 //! per-frame sizes here bound one fragment, and `Reassembly` bounds the message
 //! those fragments make up.
+//!
+//! The wire figures on this page — the fragment sizes, the framing overhead and
+//! the authenticated continuation bit — are re-exported at
+//! [`crate::noise::wire`], so a harness or a peer implementation frames by the
+//! values this crate actually writes rather than a local copy that could drift.
+//! The codec below stays crate-internal: it is framing machinery, not a figure a
+//! peer has to agree on.
 
 use crate::error::TransportError;
 
 /// AES-256-GCM authentication tag length, appended to every encrypted
 /// message (snow's `MAXMSGLEN` counts the tag).
-pub(super) const GCM_TAG_LEN: usize = 16;
+pub const GCM_TAG_LEN: usize = 16;
 
 /// Length of the authenticated per-fragment continuation header: one byte at
 /// the START of each fragment's plaintext, so the AES-GCM tag covers it (see
 /// [`FRAGMENT_CONTINUATION`]).
-pub(super) const FRAGMENT_HEADER_LEN: usize = 1;
+pub const FRAGMENT_HEADER_LEN: usize = 1;
 
 /// Size of the big-endian ciphertext length prefix that precedes every
 /// data-plane frame.
-pub(super) const LEN_PREFIX_LEN: usize = 4;
+pub const LEN_PREFIX_LEN: usize = 4;
 
 /// Largest ciphertext a single frame may carry: snow's per-message cap, which
 /// is both what the sender can produce and what a peer may declare.
-pub(super) const MAX_CIPHERTEXT_LEN: usize = 65535;
+pub const MAX_CIPHERTEXT_LEN: usize = 65535;
 
 /// Maximum payload bytes in a single Noise fragment. snow caps one message's
-/// ciphertext at 65535 bytes (MAXMSGLEN); the 16-byte GCM tag and the 1-byte
-/// authenticated continuation header leave 65518 bytes of payload per
+/// ciphertext at [`MAX_CIPHERTEXT_LEN`] bytes (MAXMSGLEN); the
+/// [`GCM_TAG_LEN`]-byte tag and the [`FRAGMENT_HEADER_LEN`]-byte authenticated
+/// continuation header come out of that, leaving 65518 bytes of payload per
 /// fragment.
-pub(super) const MAX_PLAINTEXT_CHUNK: usize =
-    MAX_CIPHERTEXT_LEN - GCM_TAG_LEN - FRAGMENT_HEADER_LEN;
+pub const MAX_PLAINTEXT_CHUNK: usize = MAX_CIPHERTEXT_LEN - GCM_TAG_LEN - FRAGMENT_HEADER_LEN;
 
 /// Most fragments a legitimate sender produces for one message.
 ///
@@ -48,15 +55,14 @@ pub(super) const MAX_PLAINTEXT_CHUNK: usize =
 /// carrying NO payload: each contributes zero bytes, so the byte cap never
 /// trips while the receive loop runs forever at roughly one wire frame per
 /// iteration. This count is what bounds that stream.
-pub(super) const MAX_FRAGMENTS_PER_MESSAGE: usize =
-    choreo_proto::MAX_FRAME_SIZE / MAX_PLAINTEXT_CHUNK + 1;
+pub const MAX_FRAGMENTS_PER_MESSAGE: usize = choreo_proto::MAX_FRAME_SIZE / MAX_PLAINTEXT_CHUNK + 1;
 
 /// Bit 0 of a fragment's first plaintext byte: 1 = more fragments of the same
 /// logical message follow, 0 = this fragment terminates it. Because the byte
 /// lives INSIDE the plaintext, the AES-GCM tag authenticates it — the wire
 /// length prefix that precedes the ciphertext is NOT authenticated, so the
 /// reassembly decision must not be trusted from there.
-pub(super) const FRAGMENT_CONTINUATION: u8 = 0x01;
+pub const FRAGMENT_CONTINUATION: u8 = 0x01;
 
 /// Size of the reused outbound ciphertext frame buffer: [`LEN_PREFIX_LEN`]
 /// bytes of length-prefix headroom + the largest single Noise message's
@@ -93,11 +99,13 @@ pub(super) fn wire_len(plaintext_len: usize) -> usize {
 ///
 /// The bound is the SAME cap [`decode_len`] enforces on a peer, stated from one
 /// constant, so the sender can never produce a frame the receiver would refuse.
-/// The encode/decode arithmetic itself lives in the shared [`crate::len_prefix`]
-/// codec, so the data plane's 4-byte prefix and the handshake's 2-byte prefix
-/// are one implementation parameterised by width and cap.
+/// The encode/decode arithmetic itself lives in the shared
+/// [`choreo_proto::len_prefix`] codec, so the data plane's 4-byte prefix and the
+/// handshake's 2-byte prefix are one implementation parameterised by width and
+/// cap.
 pub(super) fn encode_len(n: usize) -> Result<[u8; LEN_PREFIX_LEN], TransportError> {
-    crate::len_prefix::encode(n, MAX_CIPHERTEXT_LEN, "encrypted frame length")
+    choreo_proto::len_prefix::encode::<LEN_PREFIX_LEN>(n, MAX_CIPHERTEXT_LEN)
+        .map_err(|error| TransportError::len_prefix_encode("encrypted frame length", error))
 }
 
 /// Decode a peer's length prefix and validate it against snow's per-message
@@ -117,15 +125,14 @@ pub(super) fn encode_len(n: usize) -> Result<[u8; LEN_PREFIX_LEN], TransportErro
 /// minimum an explicit bound instead of relying on `read_message` to fail on an
 /// undersized buffer.
 pub(super) fn decode_len(prefix: &[u8]) -> Result<usize, TransportError> {
-    let declared = crate::len_prefix::decode::<LEN_PREFIX_LEN>(
-        prefix,
-        MAX_CIPHERTEXT_LEN,
-        "fragment ciphertext length",
-    )?;
+    // Named once so both refusals below say which length they mean.
+    const WHAT: &str = "fragment ciphertext length";
+    let declared = choreo_proto::len_prefix::decode::<LEN_PREFIX_LEN>(prefix, MAX_CIPHERTEXT_LEN)
+        .map_err(|error| TransportError::len_prefix_decode(WHAT, error))?;
     let minimum = GCM_TAG_LEN + FRAGMENT_HEADER_LEN;
     if declared < minimum {
         return Err(TransportError::InvalidFragment(format!(
-            "fragment ciphertext length {declared} is below the {minimum}-byte minimum (tag + continuation header)"
+            "{WHAT} {declared} is below the {minimum}-byte minimum (tag + continuation header)"
         )));
     }
     Ok(declared)
@@ -138,8 +145,10 @@ mod tests {
     /// The data plane wires the shared codec with a 4-byte prefix and snow's
     /// ciphertext cap: a length at the cap round-trips, the high byte comes
     /// first, and one past the cap is refused on both sides by naming the cap.
-    /// The codec arithmetic itself is pinned in `crate::len_prefix`; this keeps
-    /// only the wiring — width and cap — the data plane chooses.
+    /// The codec arithmetic itself is pinned in `choreo_proto::len_prefix`; this
+    /// pins the wiring — width and cap — and the map from the codec's neutral
+    /// refusal onto the transport's own verdicts (an over-cap declaration is a
+    /// peer violation, an over-cap encode a local one).
     #[test]
     fn length_prefix_uses_the_u32_width_and_the_frame_cap() {
         // A frame must carry at least the tag plus the continuation header, so

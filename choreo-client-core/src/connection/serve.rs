@@ -27,10 +27,12 @@
 //!    completion over its own one-shot channel, and the reader waits for that
 //!    signal under [`WRITER_JOIN_GRACE`], so a writer wedged inside a send is
 //!    detached rather than joined unboundedly. The grace is strictly greater than
-//!    [`CONNECTION_STALL`], and that ordering is load-bearing: the wait covers a
-//!    writer that may be mid-syscall for up to the stall, so an equal grace would
-//!    expire in exactly the worst case the wait exists to cover and detach a
-//!    writer that was about to exit cleanly.
+//!    [`choreo_proto::CONNECTION_STALL`], and that ordering is load-bearing: the
+//!    wait covers a writer that may be mid-syscall for up to the stall, so an equal
+//!    grace would expire in exactly the worst case the wait exists to cover and
+//!    detach a writer that was about to exit cleanly. The margin itself lives in
+//!    `choreo-proto`'s I/O policy beside the stall it derives from, so neither end
+//!    of a connection restates the relation.
 //!
 //! The writer's two time bounds (`CONNECTION_STALL` and `message_budget`) are one
 //! policy shared with the daemon's writers, so they live in `choreo-proto`'s I/O
@@ -42,30 +44,12 @@
 //! from holding a reader that has already finished.
 
 use crate::error::ClientError;
-use choreo_proto::{CONNECTION_STALL, ClientMessage, DaemonMessage, UnixStream};
+use choreo_proto::{ClientMessage, DaemonMessage, UnixStream, WRITER_JOIN_GRACE};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use std::net::{Shutdown, TcpStream};
 use std::thread;
 use std::time::Duration;
 use tracing::{error, warn};
-
-/// Bound for joining the connection's writer thread during teardown.
-///
-/// Strictly greater than [`CONNECTION_STALL`], and that ordering is load-bearing:
-/// teardown waits for a writer that may be mid-syscall for up to the stall, so an
-/// equal grace would run out in exactly the worst case the join exists to cover
-/// and detach a writer that was about to exit cleanly. A healthy writer exits
-/// immediately once its stop signal arrives (or its queue closes), so the grace
-/// only ever matters for a wedged one.
-const WRITER_JOIN_GRACE: Duration = CONNECTION_STALL.saturating_add(Duration::from_secs(1));
-
-// Compile-time, because nothing about the relationship is conditional: a smaller
-// grace is a defect, and it must not be possible to introduce one by editing
-// either constant.
-const _: () = assert!(
-    WRITER_JOIN_GRACE.as_nanos() > CONNECTION_STALL.as_nanos(),
-    "WRITER_JOIN_GRACE must outlast the writer stall it waits out"
-);
 
 /// A handle that can close this connection from another thread.
 ///
@@ -363,10 +347,8 @@ pub(super) fn serve_source<S: ConnectionSource>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CloseHandle, ConnectionSink, ConnectionSource, Inbound, WRITER_JOIN_GRACE, serve_with_grace,
-    };
-    use choreo_proto::{ClientMessage, ClientMessageType};
+    use super::{CloseHandle, ConnectionSink, ConnectionSource, Inbound, serve_with_grace};
+    use choreo_proto::{ClientMessage, ClientMessageType, WRITER_JOIN_GRACE};
     use crossbeam_channel::Receiver;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};

@@ -15,8 +15,9 @@ use std::time::Instant;
 
 use choreo_proto::{DaemonMessage, DaemonMessageType, MessageKind};
 
+use super::WRITER_JOIN_GRACE;
 use super::reply::ReplyHandle;
-use super::writer::{ConnectionWriter, WRITER_JOIN_GRACE, writer_thread};
+use super::writer::{ConnectionWriter, writer_thread};
 use crate::broadcast::{ReplyTarget, SubscriberSink};
 use crate::daemon::DaemonCommand;
 use crate::sessions::SessionCommand;
@@ -120,7 +121,9 @@ pub(crate) fn cleanup_client(
     // that forever; the daemon shutdown drain is the backstop, and the
     // concurrent-connection cap bounds how many wedged writers can accumulate.
     // A writer that times out is detached — it keeps its socket until the
-    // client goes away, then exits on its own.
+    // client goes away, then exits on its own. The grace is `choreo-proto`'s,
+    // derived beside the stall it has to outlast, so no connection end keeps its
+    // own copy of the relation.
     crate::server::lifecycle::join_thread_bounded(
         writer_handle,
         Instant::now() + WRITER_JOIN_GRACE,

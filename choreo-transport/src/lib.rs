@@ -7,8 +7,8 @@
 //! state machines and their absolute-deadline budgeting, [`key`] the on-disk
 //! transport keypair and its base64 encoding, and [`noise`] the encrypted stream
 //! itself. The private `buf` module holds the bounds-checked slice helpers the
-//! two framing paths share, and `len_prefix` holds the one big-endian
-//! length-prefix codec both of them use.
+//! two framing paths share, and [`choreo_proto::len_prefix`] holds the one
+//! big-endian length-prefix codec both of them use.
 
 // Part of the ARCHITECTURE.md → rustdoc migration (see AGENTS.md → Documentation):
 // every public item carries docs, enforced as a hard error by clippy-strict's
@@ -16,7 +16,6 @@
 #![warn(missing_docs)]
 
 mod buf;
-mod len_prefix;
 
 pub mod error;
 pub mod handshake;

@@ -92,7 +92,7 @@ pub(crate) fn tcp_handshake_and_client_thread(
 ///
 /// The writer thread blocks on `writer_rx` and sends through the Noise sink: each
 /// message is bounded by the transport's own connection policy — a whole-message
-/// budget derived from the wire bytes it frames plus the stream's per-syscall
+/// budget derived from the wire bytes it frames plus the connection's per-syscall
 /// stall — so a large message to a wedged client cannot occupy the writer for the
 /// whole message's worth of per-syscall stalls.
 pub(crate) fn tcp_client_thread(
@@ -101,10 +101,10 @@ pub(crate) fn tcp_client_thread(
     peer_stall: Duration,
 ) -> io::Result<()> {
     let mut reader = noise;
-    // ONE stall per connection, in both directions: it is set on the stream before
-    // the writer clone is made, so the clone inherits it and the read loop, the
-    // writer thread and every later clone all give up on a peer that stops making
-    // progress at the same latency. `set_stall` floors it through
+    // ONE stall per connection, in both directions: it lives in the stream's shared
+    // connection record, so the value set here is the one the read loop, the writer
+    // thread and every later clone read on their next message — it is settable at any
+    // time, before or after the writer clone is made. `set_stall` floors it through
     // `effective_stall`. The reader's wait *between* messages stays unbounded — an
     // idle client is not a wedged one — and a client that vanished outright is
     // caught by the socket's keepalive.

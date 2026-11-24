@@ -10,6 +10,8 @@
 //! unrepresentable — there is no second place for the wire, the pattern and
 //! the prologue to disagree.
 
+use crate::error::TransportError;
+
 /// Domain-separation tag mixed into every handshake prologue (see
 /// [`HandshakeMode::prologue`]).
 ///
@@ -148,11 +150,28 @@ pub const PREAMBLE_IK: u8 = 0x01;
 /// Same wire position and same prologue binding as [`PREAMBLE_IK`].
 pub const PREAMBLE_XX: u8 = 0x02;
 
+/// Reject a peer that asked for a mode other than `expected`.
+pub(super) fn require_mode(
+    got: HandshakeMode,
+    expected: HandshakeMode,
+) -> Result<(), TransportError> {
+    if got == expected {
+        Ok(())
+    } else {
+        Err(TransportError::HandshakeModeMismatch {
+            expected: expected.byte(),
+            got: got.byte(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use snow::Builder;
 
-    use super::{HandshakeMode, PREAMBLE_IK, PREAMBLE_XX, PROLOGUE_LEN, PROLOGUE_TAG};
+    use super::{
+        HandshakeMode, PREAMBLE_IK, PREAMBLE_XX, PROLOGUE_LEN, PROLOGUE_TAG, require_mode,
+    };
     use crate::error::TransportError;
 
     /// The mode owns its wire byte in both directions: the two modes encode to
@@ -276,5 +295,45 @@ mod tests {
             run_xx_exchange(&HandshakeMode::Ik.prologue(), &HandshakeMode::Xx.prologue()).is_err(),
             "a prologue mismatch must fail the handshake"
         );
+    }
+
+    /// [`require_mode`] accepts the mode the caller asked for and, when it does
+    /// not, reports BOTH bytes: the one this responder runs and the one the peer
+    /// sent. An operator reading the log can then tell which side asked for
+    /// what, without guessing from a bare failure.
+    #[test]
+    fn require_mode_names_the_mode_it_runs_and_the_one_it_got() {
+        assert!(
+            require_mode(HandshakeMode::Ik, HandshakeMode::Ik).is_ok(),
+            "a mode matching the requirement must be accepted"
+        );
+        assert!(
+            require_mode(HandshakeMode::Xx, HandshakeMode::Xx).is_ok(),
+            "a mode matching the requirement must be accepted"
+        );
+
+        // A peer that asked for IK at an entry point that runs only XX.
+        let refused = require_mode(HandshakeMode::Ik, HandshakeMode::Xx)
+            .expect_err("an IK peer must be refused where XX is required");
+        let TransportError::HandshakeModeMismatch { expected, got } = refused else {
+            panic!("a mode mismatch must be its own error, got {refused:?}");
+        };
+        assert_eq!(
+            expected, PREAMBLE_XX,
+            "the error names the responder's mode"
+        );
+        assert_eq!(got, PREAMBLE_IK, "the error names the peer's mode");
+
+        // The mirror image: a peer that asked for XX where IK is required.
+        let refused = require_mode(HandshakeMode::Xx, HandshakeMode::Ik)
+            .expect_err("an XX peer must be refused where IK is required");
+        let TransportError::HandshakeModeMismatch { expected, got } = refused else {
+            panic!("a mode mismatch must be its own error, got {refused:?}");
+        };
+        assert_eq!(
+            expected, PREAMBLE_IK,
+            "the error names the responder's mode"
+        );
+        assert_eq!(got, PREAMBLE_XX, "the error names the peer's mode");
     }
 }

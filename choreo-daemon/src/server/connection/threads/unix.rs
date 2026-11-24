@@ -72,8 +72,10 @@ pub(crate) fn client_thread(
     // The writer gets the accepted socket and the reader a duplicate of it. The
     // writer sink bounds every frame itself (one per-message budget plus a
     // per-syscall stall), so no socket-level write timeout is armed here — the
-    // stall is re-armed per syscall inside `write_all_with_stall`, which is what
-    // makes a partly-accepted frame fail instead of waiting out a whole message.
+    // stall is re-evaluated before every syscall inside `write_all_with_stall`
+    // (re-armed whenever the value changes, since `SO_SNDTIMEO` is sticky), which
+    // is what makes a partly-accepted frame fail instead of waiting out a whole
+    // message.
     let reader = BufReader::new(stream.try_clone()?);
     let writer = UnixConnectionWriter::new(stream, peer_stall);
 

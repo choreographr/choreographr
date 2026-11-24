@@ -7,6 +7,7 @@
 use choreo_proto::{ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType};
 use choreo_transport::error::TransportError;
 use choreo_transport::handshake::{handshake_initiator, handshake_responder};
+use choreo_transport::noise::wire::MAX_PLAINTEXT_CHUNK;
 use std::net::TcpStream;
 use std::sync::mpsc;
 use std::thread;
@@ -102,14 +103,15 @@ fn noise_encrypted_message_round_trip() {
 /// the handshake path can never carry and proves the length prefix +
 /// ciphertext are reassembled exactly by the peer's `read_exact`.
 ///
-/// The payload is 65518 bytes (65535 − 16-byte GCM tag − 1-byte authenticated
-/// continuation header), which is the *largest payload a single Noise fragment
-/// can carry*: the Noise spec caps messages at 65535 bytes ciphertext, and
-/// snow 0.10 enforces this via a hard `MAXMSGLEN` constant with no builder
-/// knob to raise it. proto's 64 MiB `MAX_FRAME_SIZE` governs only the typed
-/// codec layer above the cipher; this test pins the single-fragment wire
+/// The payload is `MAX_PLAINTEXT_CHUNK` bytes — `MAX_CIPHERTEXT_LEN` less the
+/// `GCM_TAG_LEN`-byte tag and the `FRAGMENT_HEADER_LEN`-byte authenticated
+/// continuation header — which is the *largest payload a single Noise fragment
+/// can carry*: the Noise spec caps messages at `MAX_CIPHERTEXT_LEN` bytes of
+/// ciphertext, and snow 0.10 enforces this via a hard `MAXMSGLEN` constant with
+/// no builder knob to raise it. proto's 64 MiB `MAX_FRAME_SIZE` governs only the
+/// typed codec layer above the cipher; this test pins the single-fragment wire
 /// format, while `noise_fragmented_message_round_trip` covers payloads past
-/// this cap (which the transport now splits and reassembles transparently).
+/// this cap (which the transport splits and reassembles transparently).
 #[test]
 #[ignore = "integration"]
 fn noise_large_message_round_trip() {
@@ -128,7 +130,7 @@ fn noise_large_message_round_trip() {
             // The client sends raw bytes (not a typed message) — the point
             // is byte-exact framing, so compare against the expected 0xAB
             // pattern rather than decoding a proto frame.
-            let expected = vec![0xABu8; 65535 - 16 - 1];
+            let expected = vec![0xABu8; MAX_PLAINTEXT_CHUNK];
             let payload = server
                 .recv_message()
                 .map_err(|e| format!("recv large message failed: {e:?}"))?;
@@ -147,11 +149,12 @@ fn noise_large_message_round_trip() {
     let stream = TcpStream::connect(addr).expect("connect");
     let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
-    // 65518 bytes of a single byte pattern — the largest payload a single
-    // fragment can carry (65535 MAXMSGLEN minus the 16-byte GCM tag and the
-    // 1-byte continuation header), well beyond the 2-byte handshake framing's
-    // u16 range, so the u32 data-plane framing is what gets exercised.
-    let payload = vec![0xABu8; 65535 - 16 - 1];
+    // A `MAX_PLAINTEXT_CHUNK`-byte pattern — the largest payload a single
+    // fragment can carry (MAXMSGLEN less the `GCM_TAG_LEN`-byte tag and the
+    // `FRAGMENT_HEADER_LEN`-byte continuation header), well beyond the 2-byte
+    // handshake framing's u16 range, so the u32 data-plane framing is what gets
+    // exercised.
+    let payload = vec![0xABu8; MAX_PLAINTEXT_CHUNK];
     client
         .send_message(&payload)
         .expect("client send large payload");
@@ -165,13 +168,14 @@ fn noise_large_message_round_trip() {
 }
 
 /// Test that payloads larger than a single fragment's capacity fragment on
-/// the wire and reassemble transparently. 65519 bytes is exactly one past the
-/// 65518-byte single-fragment maximum, so it must split into two fragments;
-/// 1024 * 1024 bytes spans 17 fragments (16 full 65518-byte chunks plus a
-/// 288-byte remainder). The final small echo round trip proves the shared
-/// `TransportState` keeps working across fragment boundaries — send and recv
-/// nonces stay in sync after a multi-fragment exchange, and the transport
-/// still carries ordinary single-frame messages afterwards.
+/// the wire and reassemble transparently. `MAX_PLAINTEXT_CHUNK + 1` bytes is
+/// exactly one past the single-fragment maximum, so it must split into two
+/// fragments; 1024 * 1024 bytes spans 17 fragments (16 full
+/// `MAX_PLAINTEXT_CHUNK`-byte chunks plus a 288-byte remainder). The final small
+/// echo round trip proves the shared `TransportState` keeps working across
+/// fragment boundaries — send and recv nonces stay in sync after a
+/// multi-fragment exchange, and the transport still carries ordinary
+/// single-frame messages afterwards.
 #[test]
 #[ignore = "integration"]
 fn noise_fragmented_message_round_trip() {
@@ -191,8 +195,8 @@ fn noise_fragmented_message_round_trip() {
             let mut server = handshake_responder(stream, &server_sk, |pk| *pk == client_pk)
                 .map_err(|e| format!("server handshake failed: {e:?}"))?;
 
-            // 65519 bytes = 65518 + 1: exactly two fragments.
-            let expected_two = vec![0x11u8; 65518 + 1];
+            // One byte past the single-fragment capacity: exactly two fragments.
+            let expected_two = vec![0x11u8; MAX_PLAINTEXT_CHUNK + 1];
             let payload_two = server
                 .recv_message()
                 .map_err(|e| format!("recv 2-fragment message failed: {e:?}"))?;
@@ -204,8 +208,9 @@ fn noise_fragmented_message_round_trip() {
                 ));
             }
 
-            // 1024 * 1024 bytes = 16 full chunks + a 288-byte remainder:
-            // 17 fragments in total, exercising sustained reassembly.
+            // 1024 * 1024 bytes = 16 full MAX_PLAINTEXT_CHUNK chunks + a
+            // 288-byte remainder: 17 fragments in total, exercising sustained
+            // reassembly.
             let expected_mib = vec![0x22u8; 1024 * 1024];
             let payload_mib = server
                 .recv_message()
@@ -238,8 +243,9 @@ fn noise_fragmented_message_round_trip() {
     let mut client = handshake_initiator(stream, &client_sk, &server_pk).expect("client handshake");
 
     // One byte past the single-fragment capacity: the sender must split this
-    // into two fragments (65518 + 1), and the receiver must glue them back.
-    let payload_two = vec![0x11u8; 65518 + 1];
+    // into two fragments (MAX_PLAINTEXT_CHUNK + 1), and the receiver must glue
+    // them back.
+    let payload_two = vec![0x11u8; MAX_PLAINTEXT_CHUNK + 1];
     client
         .send_message(&payload_two)
         .expect("client send 2-fragment payload");

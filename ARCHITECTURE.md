@@ -137,14 +137,20 @@ the same writer the catalog artifacts use) — is documented in-source
 `choreo-client-core`'s `known_servers` and `connection`, `choreo-tui`'s
 `lib`).
 
-The client↔daemon TCP/Noise sockets run with **Nagle disabled**
-(`TCP_NODELAY`) so the interactive, message-oriented traffic — streamed deltas
-and rapid control round trips — is never stalled by the Nagle/delayed-ACK
-interaction. It is applied before the handshake (so the handshake's own round
-trips are not delayed) and re-asserted when the handshake hands the socket to
-the data plane. The Unix local transport (no Nagle) and the HTTP provider
-sockets (already `NODELAY` via `ureq`) are unaffected. The rationale lives in
-`choreo-transport`'s `socket` module docs.
+The client↔daemon TCP/Noise sockets carry one socket policy, applied at both
+ends: **Nagle disabled** (`TCP_NODELAY`) so the interactive, message-oriented
+traffic — streamed deltas and rapid control round trips — is never stalled by
+the Nagle/delayed-ACK interaction, plus **TCP keepalive** as the liveness bound
+for a peer that has vanished without closing (a phone that slept, a network
+that changed): a probe only fires on a connection idle in both directions, so a
+slow-but-alive transfer is never judged dead, while a dead peer is reaped and
+its connection slot released. The policy is applied before the handshake (so
+the handshake's own round trips are not delayed) and re-asserted when the
+handshake hands the socket to the data plane. The Unix local transport (no
+Nagle, and a dead peer's exit closes its socket) and the HTTP provider sockets
+(already `NODELAY` via `ureq`) are unaffected. The rationale and the timing
+numbers live in `choreo-transport`'s `socket` module docs and
+`choreo-sockreg`'s `SocketTuning`.
 
 ## Provider Architecture
 

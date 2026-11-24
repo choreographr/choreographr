@@ -44,9 +44,9 @@
 //! mode type and its wire/prologue encoding live in `mode`, the framing in
 //! `frame`, the deadline-bound socket I/O in `deadline`, and the spine every flow
 //! shares — the budget, the state-machine builder, the ACL check, the hand-off to
-//! the data plane — in `support`. What stays here is the module's public facade
-//! and the two wire-level helpers a responder entry point composes: the preamble
-//! read and the mode requirement.
+//! the data plane — in `support`. This module is the facade only: it re-exports
+//! the four flows and the mode type, while every wire, deadline, framing and
+//! spine concern lives in its own submodule.
 
 mod deadline;
 mod entry;
@@ -55,11 +55,6 @@ mod ik;
 mod mode;
 mod support;
 mod xx;
-
-use std::net::TcpStream;
-use std::time::Instant;
-
-use crate::error::TransportError;
 
 pub use entry::{handshake_responder_auto, handshake_responder_auto_with_timeout};
 pub use frame::MAX_HANDSHAKE_FRAME;
@@ -79,35 +74,3 @@ pub use xx::{
 // reachable inside `support`.
 #[cfg(test)]
 pub(crate) use support::{Role, build};
-
-/// Read the 1-byte mode preamble from `stream`, bounded by `deadline`.
-///
-/// The single read behind every responder entry point, so the byte's position,
-/// its bound and its validation cannot differ between them.
-pub(super) fn read_preamble(
-    stream: &mut TcpStream,
-    deadline: Instant,
-) -> Result<HandshakeMode, TransportError> {
-    let mut byte = [0u8; 1];
-    deadline::read_handshake_exact(stream, deadline, &mut byte)?;
-    // The bounded read above filled exactly one byte, so the index is in bounds
-    // by construction; the access is bounds-checked anyway (see the slice
-    // helpers) rather than panicking.
-    let byte = *crate::buf::at(&byte, 0, "preamble byte")?;
-    HandshakeMode::from_byte(byte).ok_or(TransportError::HandshakeModeUnknown { byte })
-}
-
-/// Reject a peer that asked for a mode other than `expected`.
-pub(super) fn require_mode(
-    got: HandshakeMode,
-    expected: HandshakeMode,
-) -> Result<(), TransportError> {
-    if got == expected {
-        Ok(())
-    } else {
-        Err(TransportError::HandshakeModeMismatch {
-            expected: expected.byte(),
-            got: got.byte(),
-        })
-    }
-}

@@ -1974,16 +1974,3 @@ fn the_writer_stall_is_the_shared_protocol_constant() {
         "the daemon's stall must BE choreo-proto's, not a copy of its value"
     );
 }
-
-/// `cleanup_client`'s bounded join must outlast the stall it is waiting out: a
-/// writer may sit in one syscall for up to the stall, so an equal grace would run
-/// out in exactly the worst case the join exists to cover and detach a writer
-/// that was about to exit cleanly. A `const` assertion in `writer` pins it too;
-/// this states the property where a reader of the constants will look.
-#[test]
-fn the_join_grace_outlasts_the_writer_stall() {
-    assert!(
-        WRITER_JOIN_GRACE > PEER_STALL,
-        "join grace {WRITER_JOIN_GRACE:?} must exceed the stall {PEER_STALL:?}"
-    );
-}

@@ -1,13 +1,18 @@
-//! The handshake's wire framing: the lengths, the 2-byte prefix and the
-//! scratch buffers.
+//! The handshake's wire framing: the lengths, the 2-byte prefix, the 1-byte mode
+//! preamble and the scratch buffers.
 //!
 //! One read path and one write path serve all four Noise flows in the sibling
 //! `ik` and `xx` modules, so the framed read and the coalesced framed write
 //! exist exactly once. The 2-byte big-endian length prefix is produced and
-//! validated through the shared [`crate::len_prefix`] codec, so the width/cap
-//! arithmetic is not restated here. [`Wire`] packages the scratch buffers those
-//! paths need, so a flow reads as a sequence of `wire.read(..)` /
+//! validated through the shared [`choreo_proto::len_prefix`] codec, so the
+//! width/cap arithmetic is not restated here. [`Wire`] packages the scratch
+//! buffers those paths need, so a flow reads as a sequence of `wire.read(..)` /
 //! `wire.write(..)` steps and allocates nothing.
+//!
+//! Both halves of the mode preamble are framed here as well: an initiator sends
+//! the byte through [`write_preamble`] and a responder reads it through
+//! [`read_preamble`], so the byte that selects a flow is produced and consumed at
+//! one position, under one bound and with one validation rule.
 //!
 //! The deadline those reads and writes are bounded by lives one module over, in
 //! [`super::deadline`]: framing decides WHAT bytes go on the wire, the deadline
@@ -18,9 +23,10 @@ use std::time::Instant;
 
 use snow::HandshakeState;
 
-use crate::buf::slice_mut;
+use crate::buf::{at, slice_mut};
 use crate::error::TransportError;
 
+use super::HandshakeMode;
 use super::deadline::{read_handshake_exact, write_handshake_all};
 
 /// Largest handshake frame body accepted from (or sent to) a peer, in bytes.
@@ -58,14 +64,11 @@ pub(super) const HANDSHAKE_FRAME_BUF_LEN: usize = LEN_PREFIX_LEN + MAX_HANDSHAKE
 /// that declares a frame above the cap is rejected with
 /// [`TransportError::InvalidFragment`] instead of making the responder read
 /// and hand an arbitrary buffer to snow. The 2-byte big-endian arithmetic lives
-/// in the shared [`crate::len_prefix`] codec, so this path and the data plane's
-/// 4-byte prefix are one implementation parameterised by width and cap.
+/// in the shared [`choreo_proto::len_prefix`] codec, so this path and the data
+/// plane's 4-byte prefix are one implementation parameterised by width and cap.
 fn declared_frame_len(len_buf: &[u8]) -> Result<usize, TransportError> {
-    crate::len_prefix::decode::<LEN_PREFIX_LEN>(
-        len_buf,
-        MAX_HANDSHAKE_FRAME,
-        "handshake frame length",
-    )
+    choreo_proto::len_prefix::decode::<LEN_PREFIX_LEN>(len_buf, MAX_HANDSHAKE_FRAME)
+        .map_err(|error| TransportError::len_prefix_decode("handshake frame length", error))
 }
 
 /// Encode a body length as its 2-byte big-endian prefix, refusing a body this
@@ -76,7 +79,8 @@ fn declared_frame_len(len_buf: &[u8]) -> Result<usize, TransportError> {
 /// than a cast plus a later slice failure) means an over-long message is
 /// reported as what it is instead of as a broken internal invariant.
 fn encode_frame_len(n: usize) -> Result<[u8; LEN_PREFIX_LEN], TransportError> {
-    crate::len_prefix::encode(n, MAX_HANDSHAKE_FRAME, "handshake frame length")
+    choreo_proto::len_prefix::encode::<LEN_PREFIX_LEN>(n, MAX_HANDSHAKE_FRAME)
+        .map_err(|error| TransportError::len_prefix_encode("handshake frame length", error))
 }
 
 /// Write the 1-byte handshake-mode preamble, bounded by `deadline`.
@@ -90,9 +94,26 @@ fn encode_frame_len(n: usize) -> Result<[u8; LEN_PREFIX_LEN], TransportError> {
 pub(super) fn write_preamble(
     stream: &mut TcpStream,
     deadline: Instant,
-    mode: super::HandshakeMode,
+    mode: HandshakeMode,
 ) -> Result<(), TransportError> {
     write_handshake_all(stream, deadline, &[mode.byte()])
+}
+
+/// Read the 1-byte mode preamble from `stream`, bounded by `deadline`.
+///
+/// The single read behind every responder entry point, so the byte's position,
+/// its bound and its validation cannot differ between them.
+pub(super) fn read_preamble(
+    stream: &mut TcpStream,
+    deadline: Instant,
+) -> Result<HandshakeMode, TransportError> {
+    let mut byte = [0u8; 1];
+    read_handshake_exact(stream, deadline, &mut byte)?;
+    // The bounded read above filled exactly one byte, so the index is in bounds
+    // by construction; the access is bounds-checked anyway (see the slice
+    // helpers) rather than panicking.
+    let byte = *at(&byte, 0, "preamble byte")?;
+    HandshakeMode::from_byte(byte).ok_or(TransportError::HandshakeModeUnknown { byte })
 }
 
 /// Read one complete handshake frame body into `body`: the 2-byte big-endian
@@ -224,10 +245,12 @@ mod tests {
     }
 
     /// A declared body length inside the cap is accepted and one above it is
-    /// rejected — the pre-authentication bound. A *declared* length above the cap
-    /// is a peer violation (`InvalidFragment`); an *encoded* length above it is a
-    /// local bug (`InternalInvariant`), and this test pins both. Calls the
-    /// validation paths directly, so no socket and no allocation is involved.
+    /// rejected — the pre-authentication bound. This pins the transport's map
+    /// from the shared codec's neutral refusal onto its own verdicts: a
+    /// *declared* length above the cap is a peer violation (`InvalidFragment`);
+    /// an *encoded* length above it is a local bug (`InternalInvariant`). Calls
+    /// the validation paths directly, so no socket and no allocation is
+    /// involved.
     #[test]
     fn declared_length_above_cap_is_rejected() {
         let at_cap = encode_frame_len(MAX_HANDSHAKE_FRAME).expect("at the cap encodes");
@@ -254,9 +277,9 @@ mod tests {
         );
     }
 
-    /// The outbound side enforces the same cap as the inbound side, and reports
-    /// an over-long message as the local invariant break it is rather than as a
-    /// peer violation — the sender is the one at fault.
+    /// The outbound side enforces the same cap as the inbound side, and pins the
+    /// map that turns the shared codec's refusals into the local invariant break
+    /// they are rather than a peer violation — the sender is the one at fault.
     #[test]
     fn encoding_above_the_cap_is_refused() {
         let over = encode_frame_len(MAX_HANDSHAKE_FRAME + 1).expect_err("over the cap");

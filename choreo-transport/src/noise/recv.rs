@@ -1,9 +1,16 @@
 //! The data plane's receive direction: reading length-prefixed fragments,
 //! decrypting them, and reassembling the logical message from the
 //! AUTHENTICATED continuation headers.
+//!
+//! The connection's stall is read ONCE per message, at the entry point, and
+//! threaded down to the read loop — so the shared record is locked once per
+//! message rather than once per fragment, and never while a read is in progress.
+//! The same entry point is where a connection already poisoned by a failed transfer
+//! is refused, before the socket is touched.
 
 use std::io::{self, Read};
 use std::net::TcpStream;
+use std::time::Duration;
 
 use tracing::{debug, trace};
 use zeroize::{Zeroize, Zeroizing};
@@ -102,7 +109,7 @@ impl NoiseStream {
     ///    with no bound at all. A vanished peer is caught by the connection's TCP
     ///    keepalive, not here.
     /// 2. **A message in flight is bounded by a per-syscall stall** (see
-    ///    [`NoiseStream::stall`]): every read after that first byte fails if it
+    ///    [`NoiseStream::set_stall`]): every read after that first byte fails if it
     ///    makes no progress for the stall. There is deliberately no wall clock on the
     ///    whole message: a large payload on a slow link legitimately takes minutes,
     ///    and a bound on total time would kill exactly the client the transport is
@@ -128,13 +135,15 @@ impl NoiseStream {
     /// # Errors
     ///
     /// Returns [`TransportError::ConcurrentAccess`] if another thread is
-    /// concurrently receiving on this stream, [`TransportError::ConnectionClosed`]
+    /// concurrently receiving on this stream, [`TransportError::StreamUnusable`] if a
+    /// previous transfer failed on this connection, [`TransportError::ConnectionClosed`]
     /// on EOF before a complete message, [`TransportError::Io`] (a `TimedOut`) when
     /// the peer stalls mid-message for longer than the stall, and
     /// [`TransportError::InvalidFragment`] on a
     /// frame exceeding the per-frame cap or below the tag-plus-header minimum, the
     /// per-message byte cap or the fragment-count bound, or a continuation-header
-    /// violation, plus any other I/O or snow errors.
+    /// violation, plus any other I/O or snow errors. Every error except the two
+    /// pre-flight refusals leaves the connection unusable.
     pub(super) fn recv_message_plain(&mut self) -> Result<Vec<u8>, TransportError> {
         // The inbound single-reader right: two concurrent receives on one
         // connection would splice two logical messages together with no error
@@ -142,6 +151,34 @@ impl NoiseStream {
         // mirror of what `send_message` takes for the outbound direction.
         let _guard = self.recv_slot.acquire()?;
 
+        // A previous failed transfer left the byte stream at an unknown offset, so a
+        // read now would reassemble whatever happens to be there. Refusing here —
+        // before the socket is touched — also keeps this refusal from re-poisoning
+        // (the flag is already set) and keeps the `ConcurrentAccess` refusal above
+        // from poisoning at all (the slot is taken before any byte moves).
+        if self.is_unusable() {
+            return Err(TransportError::StreamUnusable);
+        }
+
+        // ONE read of the connection's stall per message, threaded down to the read
+        // loop rather than re-locking the shared record per fragment.
+        let stall = self.stall();
+        match self.recv_message_body(stall) {
+            Ok(plaintext) => Ok(plaintext),
+            Err(e) => {
+                // ONE place per direction poisons the connection: every error the
+                // read body can return leaves the byte stream at an unknown offset —
+                // a partial frame may have been consumed — so no later send or
+                // receive may use it.
+                self.mark_unusable();
+                Err(e)
+            }
+        }
+    }
+
+    /// The read body: wait for the next message and reassemble it under `stall`,
+    /// the connection's per-syscall stall read once by the caller.
+    fn recv_message_body(&mut self, stall: Duration) -> Result<Vec<u8>, TransportError> {
         // Phase 1 — unbounded. The previous message left the socket's read timeout
         // armed at the last stall the bounded reads computed, and that option is
         // sticky, so it must be cleared before the wait for the next message or this
@@ -171,7 +208,7 @@ impl NoiseStream {
             // unbounded read above; later fragments read their whole prefix here.
             choreo_proto::read_exact_with_stall(
                 &mut self.tcp,
-                self.stall,
+                stall,
                 slice_mut(&mut len_buf, prefix_filled.., "length prefix tail")?,
             )
             .map_err(classify_stream_error)?;
@@ -191,17 +228,21 @@ impl NoiseStream {
             // the length (growing if this fragment is the largest seen), so
             // capacity carries across messages — no per-fragment allocation.
             self.recv_ct_buf.resize(ct_len, 0);
-            choreo_proto::read_exact_with_stall(&mut self.tcp, self.stall, &mut self.recv_ct_buf)
+            choreo_proto::read_exact_with_stall(&mut self.tcp, stall, &mut self.recv_ct_buf)
                 .map_err(classify_stream_error)?;
 
             // Take the lock briefly to decrypt this one fragment, then
             // release it before the next blocking read (see above).
             self.recv_pt_buf.resize(ct_len, 0);
-            let n = self
-                .transport
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .read_message(&self.recv_ct_buf, &mut self.recv_pt_buf)?;
+            let n = {
+                let mut shared = self
+                    .shared
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                shared
+                    .transport
+                    .read_message(&self.recv_ct_buf, &mut self.recv_pt_buf)?
+            };
             // Every fragment from this implementation carries the 1-byte
             // continuation header, so a zero-length plaintext is impossible from
             // a legitimate peer; `decode_len` already refuses a ciphertext below

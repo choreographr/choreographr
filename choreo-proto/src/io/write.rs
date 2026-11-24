@@ -155,11 +155,19 @@ pub fn write_all_by<W: TimedWrite>(
 /// As [`write_all_by`], the socket's write stall is left armed at the last value
 /// computed and never cleared.
 ///
+/// `SO_SNDTIMEO` is sticky, so an iteration that would arm the value already armed
+/// skips the `setsockopt`. A deadline pieces its bound out of the remaining time,
+/// so it shrinks and re-arms essentially every iteration; only an arm that repeats
+/// exactly — the stall, when it is the tighter bound each time it is evaluated —
+/// collapses to a single arm.
+///
 /// # Errors
 ///
 /// - [`std::io::ErrorKind::TimedOut`] when `deadline` has already passed
-///   (nothing is written), when an armed syscall returns `WouldBlock`/
-///   `TimedOut` — the message names whether the `stall` or the `deadline` fired.
+///   (nothing is written), or when an armed syscall returns `WouldBlock`/
+///   `TimedOut`. The message names the bound that syscall was **armed** to —
+///   decided from the two durations the arm was computed from, not inferred from
+///   the clock once the error surfaces.
 /// - [`std::io::ErrorKind::WriteZero`] when the writer accepts no bytes, which
 ///   mirrors [`Write::write_all`]'s treatment of a zero-length write.
 /// - Any other error from the writer, propagated unchanged, as is the error
@@ -208,6 +216,49 @@ pub fn write_frame_bounded<W: TimedWrite>(
     )
 }
 
+/// Which of the two bounds a single syscall's arm stands for, fixed **before**
+/// that syscall runs.
+///
+/// The arm is one `Duration` — `min(remaining, stall)` — so the value alone cannot
+/// say which bound it came from once the syscall has returned: the wall clock spent
+/// inside the syscall shrinks `remaining` too, which can leave a stall that was the
+/// tighter bound at arm time looking looser by the time the error surfaces. Deciding
+/// here, from the arm's own inputs, keeps the error naming the bound that expired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmedBound {
+    /// The arm was the whole-message budget, so an expiry names the deadline.
+    Deadline,
+    /// The arm was the per-syscall stall, so an expiry names the stall.
+    Stall,
+}
+
+impl ArmedBound {
+    /// The payload-free tag a log line carries.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::Stall => "stall",
+        }
+    }
+}
+
+/// Decide which bound an arm of `remaining.min(stall)` represents.
+///
+/// Pure and total: both inputs are the figures the arm was computed from, so the
+/// answer does not depend on how long the syscall then takes. Only a stall
+/// **strictly** tighter than `remaining` is named as the stall, because a stall at
+/// or above `remaining` is not what the arm was set to — the whole-message budget
+/// is.
+fn armed_bound(remaining: Duration, stall: Option<Duration>) -> ArmedBound {
+    // A tie (`remaining == stall`) expires both bounds at the same instant, so
+    // either name is honest; the deadline is the one named because it is the
+    // caller's outer contract and the write cannot continue past it at all.
+    match stall {
+        Some(stall) if stall < remaining => ArmedBound::Stall,
+        _ => ArmedBound::Deadline,
+    }
+}
+
 /// The single write loop behind [`write_all_by`] and [`write_all_with_stall`],
 /// so the two-bounds policy cannot drift into two copies.
 ///
@@ -224,6 +275,10 @@ fn write_bounded<W: TimedWrite>(
     // accepted byte count is what advances the write without ever indexing
     // (which could panic on a bogus return value).
     let mut pending = data;
+    // The value last armed on the socket, so an unchanged arm skips a redundant
+    // `setsockopt`: `SO_SNDTIMEO` is sticky, so it already applies to the next
+    // syscall. A shrinking deadline changes the value and re-arms.
+    let mut armed_now: Option<Duration> = None;
     while !pending.is_empty() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -240,7 +295,15 @@ fn write_bounded<W: TimedWrite>(
         // is what keeps the total bounded by `deadline` — the arm shrinks as
         // bytes are accepted.
         let armed = stall.map_or(remaining, |stall| remaining.min(stall));
-        writer.set_write_stall(Some(armed))?;
+        // Which bound that arm stands for is fixed HERE, from the same two
+        // durations the arm came from. Re-reading the clock after the syscall
+        // would attribute the error to whichever bound merely looks tighter by
+        // then, which need not be the one this syscall was armed to.
+        let bound = armed_bound(remaining, stall);
+        if armed_now != Some(armed) {
+            writer.set_write_stall(Some(armed))?;
+            armed_now = Some(armed);
+        }
 
         match writer.write(pending) {
             // `Ok(0)` from a non-empty buffer means no forward progress is
@@ -269,8 +332,8 @@ fn write_bounded<W: TimedWrite>(
             // A signal interrupting the syscall says nothing about the
             // deadline, so retry the same write with a freshly computed budget.
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            // The socket is blocking and its stall was just armed to the
-            // remaining budget, so either kind means that budget ran out.
+            // The socket is blocking and armed to this syscall's bound, so either
+            // kind means that bound ran out.
             Err(error)
                 if matches!(
                     error.kind(),
@@ -279,19 +342,15 @@ fn write_bounded<W: TimedWrite>(
             {
                 tracing::debug!(
                     pending = pending.len(),
+                    bound = bound.as_str(),
                     "armed write bound fired before the message was complete"
                 );
-                // Which bound burnt: the arm was `remaining.min(stall)`, so the
-                // stall is the one that fired only when it was the tighter of the
-                // two at arm time. Otherwise the armed value WAS the remaining
-                // whole-message budget, and the deadline is the honest name — a
-                // stall longer than the remaining budget can never fire at all.
-                let remaining_now = deadline.saturating_duration_since(Instant::now());
-                let stall_fired = stall.is_some_and(|stall| stall < remaining_now);
-                return Err(if stall_fired {
-                    write_stall_elapsed(pending.len())
-                } else {
-                    write_deadline_elapsed(pending.len())
+                // The attribution is the arm-time decision, not a fresh
+                // comparison: the socket was armed to `remaining.min(stall)`, so
+                // whichever of the two produced that arm is the bound that expired.
+                return Err(match bound {
+                    ArmedBound::Stall => write_stall_elapsed(pending.len()),
+                    ArmedBound::Deadline => write_deadline_elapsed(pending.len()),
                 });
             }
             Err(error) => return Err(error),
@@ -302,7 +361,10 @@ fn write_bounded<W: TimedWrite>(
 
 #[cfg(test)]
 mod tests {
-    use super::{TimedWrite, write_all_by, write_all_with_stall, write_frame_bounded};
+    use super::{
+        ArmedBound, TimedWrite, armed_bound, write_all_by, write_all_with_stall,
+        write_frame_bounded,
+    };
     use crate::io::policy::{CONNECTION_STALL, MIN_SOCKET_STALL, message_budget};
     use std::cell::RefCell;
     use std::io::{self, Write};
@@ -426,10 +488,10 @@ mod tests {
 
     #[test]
     fn each_syscall_is_rearmed_to_the_time_remaining() {
-        // One byte per syscall makes the re-arming observable: a "arm once"
-        // implementation would record a single stall, and one that re-armed
-        // the caller's whole budget every time would record values equal to
-        // the budget rather than shrinking ones.
+        // One byte per syscall makes the re-arming observable: an "arm once"
+        // implementation would record a single stall, and one that re-armed the
+        // caller's whole budget every time would record values equal to the
+        // budget rather than shrinking ones.
         let mut writer = FakeWriter::new(Behaviour::AcceptOneByte);
         let start = Instant::now();
         let budget = Duration::from_secs(30);
@@ -437,7 +499,14 @@ mod tests {
 
         assert_eq!(writer.written(), b"abcde".to_vec());
         let stalls = writer.stalls.borrow();
-        assert_eq!(stalls.len(), 5, "one stall armed per write syscall");
+        // The EXACT count is not pinned: consecutive `Instant::now()` readings can
+        // return the same value, and an unchanged arm is deliberately not re-armed
+        // (`SO_SNDTIMEO` is sticky). The properties below are what the test is for.
+        assert!(
+            (1..=5).contains(&stalls.len()),
+            "at most one arm per write syscall, at least one for the call: {}",
+            stalls.len()
+        );
 
         // Every pause spent here only shrinks what a correct implementation
         // may arm, which is what the lower bound below pins down.
@@ -518,7 +587,13 @@ mod tests {
 
         assert_eq!(writer.written(), b"payload".to_vec());
         assert_eq!(writer.calls(), 2, "the interrupted syscall is retried once");
-        assert_eq!(writer.stalls.borrow().len(), 2, "the retry is re-armed");
+        // The retry re-arms to the FRESHLY computed budget, which for a deadline
+        // bound need not differ from the previous one — see
+        // `each_syscall_is_rearmed_to_the_time_remaining`.
+        assert!(
+            (1..=2).contains(&writer.stalls.borrow().len()),
+            "the retry is armed at least once"
+        );
     }
 
     #[test]
@@ -543,7 +618,11 @@ mod tests {
 
         assert_eq!(writer.written(), b"abcde".to_vec());
         let stalls = writer.stalls.borrow();
-        assert_eq!(stalls.len(), 5, "one stall armed per write syscall");
+        // The stall never changes, so the arm never changes either and the sticky
+        // `SO_SNDTIMEO` makes a repeat redundant: the value may be armed once for
+        // the whole call instead of once per syscall. What must hold either way is
+        // that no syscall was given more than the stall.
+        assert!(!stalls.is_empty(), "the call arms the stall at least once");
         for stall_armed in stalls.iter() {
             let armed = stall_armed.expect("every write arms a stall");
             assert!(!armed.is_zero(), "an armed stall must leave a budget");
@@ -568,7 +647,14 @@ mod tests {
 
         assert_eq!(writer.written(), b"abcde".to_vec());
         let stalls = writer.stalls.borrow();
-        assert_eq!(stalls.len(), 5, "one stall armed per write syscall");
+        // The arm shrinks with the deadline, so the count is not pinned: two
+        // consecutive clock readings may coincide and an unchanged value is not
+        // re-armed.
+        assert!(
+            (1..=5).contains(&stalls.len()),
+            "at most one arm per write syscall, at least one for the call: {}",
+            stalls.len()
+        );
         let mut previous: Option<Duration> = None;
         for stall_armed in stalls.iter() {
             let armed = stall_armed.expect("every write arms a stall");
@@ -654,6 +740,42 @@ mod tests {
         assert!(
             !error.to_string().contains("stall elapsed"),
             "a stall the message never reached must not be blamed: {error}"
+        );
+    }
+
+    /// The arm-time attribution is a total function of the two durations the arm
+    /// was computed from, so it is pinned here directly: explicit inputs, no clock,
+    /// no fake writer and no wait. That boundary is out of reach for the
+    /// end-to-end tests above, because their fake writer returns instantly — the
+    /// wall clock a real syscall consumes is precisely what makes an
+    /// after-the-fact comparison misname the bound.
+    #[test]
+    fn the_armed_bound_is_decided_from_the_arm_times_two_durations() {
+        // A stall tighter than the remaining budget IS the arm, so it is named.
+        assert_eq!(
+            armed_bound(Duration::from_millis(100), Some(Duration::from_millis(50))),
+            ArmedBound::Stall,
+            "50 ms is tighter than the 100 ms left: the stall fired"
+        );
+        // A stall looser than the remaining budget arms the budget itself, so the
+        // stall can never fire first and must not be named.
+        assert_eq!(
+            armed_bound(Duration::from_secs(1), Some(Duration::from_secs(5))),
+            ArmedBound::Deadline,
+            "5 s cannot fire inside the 1 s left: the deadline fired"
+        );
+        // No stall at all: the whole-message budget is the only bound there is.
+        assert_eq!(
+            armed_bound(Duration::from_secs(1), None),
+            ArmedBound::Deadline,
+            "an unarmed stall never fired"
+        );
+        // A tie names the deadline, deterministically — the documented tie-break.
+        let equal = Duration::from_millis(500);
+        assert_eq!(
+            armed_bound(equal, Some(equal)),
+            ArmedBound::Deadline,
+            "equal bounds expire together and name the outer contract"
         );
     }
 

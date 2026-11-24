@@ -1,5 +1,6 @@
 //! The shared transport error type.
 
+use choreo_proto::len_prefix::LenPrefixError;
 use thiserror::Error;
 
 /// Errors surfaced by the transport: handshake, framing, and socket failures.
@@ -55,6 +56,25 @@ pub enum TransportError {
         /// `recv_message`), so an operator can tell which direction collided.
         what: &'static str,
     },
+    /// A previous send or receive on this stream failed, so the encrypted byte
+    /// stream is at an unknown offset and cannot be resumed. Callers already close
+    /// the connection on any transport error; this makes that obligation visible
+    /// rather than leaving a desynced stream usable.
+    ///
+    /// Deliberately conservative: the rule is "a failed transfer makes the stream
+    /// unusable", including a failure that happened before any byte moved (an
+    /// already-elapsed deadline). No error in either direction proves where the
+    /// byte stream stands, and a caller that kept going on a desynced stream would
+    /// have its next frame silently misparsed by the peer. Callers already close on
+    /// any error, so the only cost is a reconnect that was happening anyway.
+    ///
+    /// Raised only at a direction's entry point, before the socket is touched, so
+    /// it never re-poisons a stream that is already refused. It is NOT a handshake
+    /// refusal — a transfer that failed after the handshake proves nothing about
+    /// the peer's enrollment or the pinned key (see `choreo-client-core`'s
+    /// `is_handshake_refusal`).
+    #[error("Noise stream unusable after a failed transfer")]
+    StreamUnusable,
     /// The Noise handshake did not complete within its total budget. The
     /// budget bounds the WHOLE unauthenticated phase, not just a single read: a
     /// peer that dribbles bytes to keep resetting the per-read socket timeout is
@@ -143,4 +163,36 @@ pub enum TransportError {
     /// never carries key bytes.
     #[error("invalid transport public key: {0}")]
     InvalidPublicKey(String),
+}
+
+impl TransportError {
+    /// Fold an outgoing length-prefix failure from [`choreo_proto::len_prefix`]
+    /// into this crate's taxonomy.
+    ///
+    /// Every encode variant is a local fault: only this build produces an
+    /// outgoing prefix, so a length it cannot express is a bug here rather than
+    /// anything the peer did. `what` is the caller's framing context and stays in
+    /// front of the codec's own message, so an operator still sees which path and
+    /// which numbers.
+    pub(crate) fn len_prefix_encode(what: &str, error: LenPrefixError) -> Self {
+        Self::InternalInvariant(format!("{what} {error}"))
+    }
+
+    /// Fold a length prefix the shared codec rejected into this crate's
+    /// taxonomy.
+    ///
+    /// An `AboveCap` declaration is a wire violation, so it keeps that verdict
+    /// and the caller's context prefix. The other variants cannot be a peer's
+    /// doing — every call site hands the codec an exactly `N`-byte head read from
+    /// its own fixed buffer, and a length the prefix width can carry is a `usize`
+    /// on every target this workspace builds for — so they are reported as a
+    /// broken internal buffer invariant instead.
+    pub(crate) fn len_prefix_decode(what: &str, error: LenPrefixError) -> Self {
+        match error {
+            LenPrefixError::AboveCap { .. } => Self::InvalidFragment(format!("{what} {error}")),
+            LenPrefixError::TooWide { .. }
+            | LenPrefixError::ShortPrefix { .. }
+            | LenPrefixError::NotRepresentable => crate::buf::invalid_slice(what),
+        }
+    }
 }

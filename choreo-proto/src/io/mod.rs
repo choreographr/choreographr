@@ -1,17 +1,20 @@
 //! The socket- and frame-level I/O the wire protocol runs over.
 //!
-//! Five concerns, one per submodule, so a caller names the one it needs instead
+//! Six concerns, one per submodule, so a caller names the one it needs instead
 //! of reaching into a single grab-bag:
 //!
 //! * [`path`] — where the daemon's unix-domain socket lives, and the
 //!   cross-platform dial ([`UnixStream`], [`connect_unix`], [`socket_path`]) plus
 //!   the "nothing is listening" classification.
+//! * [`len_prefix`] — the big-endian length-prefix codec, parameterised by
+//!   prefix width and cap, that [`framing`]'s 4-byte header and the transport's
+//!   two Noise framing paths all share.
 //! * [`framing`] — the 4-byte length-prefixed [`write_message`] /
 //!   [`read_message`] of one message.
 //! * [`policy`] — the connection's time policy in both directions: the
 //!   per-syscall detection latency, the floor throughput that sizes a
-//!   whole-message write budget, and the floor that keeps a zero from disabling
-//!   either.
+//!   whole-message write budget, the floor that keeps a zero from disabling
+//!   either, and the grace a writer teardown derives from the stall.
 //! * [`write`] — the deadline- and stall-bounded blocking write machinery that
 //!   applies the policy.
 //! * [`read`] — the deadline- and stall-bounded blocking read machinery.
@@ -22,6 +25,7 @@
 //! same figures rather than carrying their own copies.
 
 mod framing;
+pub mod len_prefix;
 mod path;
 mod policy;
 mod read;
@@ -33,8 +37,8 @@ pub use path::{
     socket_listening, socket_path,
 };
 pub use policy::{
-    CONNECTION_STALL, MIN_SOCKET_STALL, WRITER_MIN_RATE_BYTES_PER_SEC, effective_stall,
-    message_budget,
+    CONNECTION_STALL, MIN_SOCKET_STALL, WRITER_JOIN_GRACE, WRITER_JOIN_GRACE_MARGIN,
+    WRITER_MIN_RATE_BYTES_PER_SEC, effective_stall, message_budget, writer_join_grace,
 };
 pub use read::{TimedRead, read_exact_by, read_exact_with_stall};
 pub use write::{TimedWrite, write_all_by, write_all_with_stall, write_frame_bounded};
