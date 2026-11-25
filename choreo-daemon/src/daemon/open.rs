@@ -93,8 +93,8 @@ fn base_registry(policy: ToolPolicy, bridge: Option<&Arc<dyn IosToolBridge>>) ->
 impl DaemonState {
     /// Open daemon state from explicit paths: database (with the same
     /// Windows-safe open → version → drop → backup → reopen → migrate
-    /// sequence the CLI ran), tombstone purge, session index load, accounts,
-    /// and the tool registry under `tool_policy`.
+    /// sequence the CLI ran), tombstone purge, space compaction, session index
+    /// load, accounts, and the tool registry under `tool_policy`.
     ///
     /// Returns `io::Result` (not anyhow) so an embedder without the CLI's
     /// error-reporting stack can consume it directly; every failure carries
@@ -103,9 +103,10 @@ impl DaemonState {
     /// # Errors
     ///
     /// Returns Err if the database cannot be opened or backed up, the
-    /// schema version cannot be read, tombstone purge or session index
-    /// load fails, accounts cannot be loaded, or tool registration under
-    /// `tool_policy` fails.
+    /// schema version cannot be read, compaction latched a permanent I/O
+    /// failure on the store, tombstone purge or session index load fails,
+    /// accounts cannot be loaded, or tool registration under `tool_policy`
+    /// fails.
     pub fn open(opts: OpenOptions) -> io::Result<Self> {
         // Windows-safe startup sequence (verbatim from the CLI): redb holds a
         // whole-file exclusive lock on the database for as long as a
@@ -139,29 +140,12 @@ impl DaemonState {
         // access (same invariant as the CLI; see db::run_migrations).
         db::run_migrations_at(&db, &opts.db_path)?;
 
-        // Reclaim the space deleted sessions left behind, now that the
-        // pre-migration backup has been closed and the schema is current.
-        // Ordering is load-bearing in both directions: running before the
-        // backup would overwrite the rollback point with a rewritten file, and
-        // running after the `Arc` below is impossible — `compact()` needs
-        // `&mut Database`. Startup is also the one moment the store provably
-        // has no live read or write transactions of ours.
-        //
-        // A failure is not fatal: compaction is an optimisation, so a daemon
-        // that cannot shrink its file keeps running at its current size.
-        if let Err(e) = db::maybe_compact(&mut db, &opts.db_path) {
-            warn!(error = %e, "failed to compact the database; continuing at its current size");
-        }
-
-        // Share the handle for the daemon's lifetime: `redb::Database` is safe
-        // for concurrent readers, so every connection thread and request worker
-        // reads through this one `Arc`.
-        let db = Arc::new(db);
-
         // Purge any sessions that were deleted while their still-shutting-down
         // thread was alive and re-created the record before the daemon
         // crashed. Runs before the session index is loaded so the record never
-        // surfaces. Warn-and-continue, exactly as the CLI did.
+        // surfaces, and AHEAD of the compaction below so the rows it deletes are
+        // reclaimed by that same pass instead of waiting for the next launch.
+        // Warn-and-continue, exactly as the CLI did.
         match db::purge_tombstoned_sessions(&db) {
             Ok(n) if n > 0 => warn!(
                 purged = n,
@@ -170,6 +154,30 @@ impl DaemonState {
             Ok(_) => {}
             Err(e) => warn!(error = %e, "failed to purge tombstoned sessions; continuing"),
         }
+
+        // Reclaim the space deleted sessions left behind — including the rows the
+        // purge just removed — in one pass. Both orderings are load-bearing:
+        //
+        // - **After the pre-migration backup and the migrations.** That snapshot
+        //   exists to roll a failed migration back, so it must image the
+        //   pre-migration store; running first would put a rewritten file where
+        //   the rollback point should be. The migrations also rewrite rows, and
+        //   their slack is reclaimed by this same pass.
+        // - **Before the `Arc` below.** `compact()` needs `&mut`, which the
+        //   shared handle cannot give it. Startup is also the one moment the
+        //   store provably has no live read or write transaction of ours.
+        //
+        // The error propagates: `compact_at_startup` returns Err only when the
+        // handle latched a permanent I/O failure behind it, and such a store
+        // refuses every later read and write — failing startup is the point, so
+        // the next launch re-opens (and repairs) the file rather than this
+        // daemon running on while silently losing everything it is told.
+        db::compact_at_startup(&mut db, &opts.db_path)?;
+
+        // Share the handle for the daemon's lifetime: `redb::Database` is safe
+        // for concurrent readers, so every connection thread and request worker
+        // reads through this one `Arc`.
+        let db = Arc::new(db);
 
         let mut session_metadata = HashMap::new();
         match db::read_all_sessions(&db) {

@@ -63,10 +63,13 @@ pub use catalog::{
 // are the only callers.
 mod codec;
 
-// Startup space reclamation: the decision is a pure function of a measured
-// footprint, so it is testable with no database and no clock.
+// Startup space reclamation: one unconditional pass with `Maximum` before the
+// store is shared, plus the test-only seam the integration suite drives it
+// through (see the module docs for why there is no gate).
 mod compact;
-pub(crate) use compact::maybe_compact;
+pub(crate) use compact::compact_at_startup;
+#[cfg(any(test, feature = "test-utils"))]
+pub use compact::compact_at_startup_for_test;
 
 // The daemon's stored secrets: the encrypted credential blobs and the keystore
 // binding adopted on first contact.

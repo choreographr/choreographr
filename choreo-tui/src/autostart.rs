@@ -24,10 +24,15 @@ use std::time::{Duration, Instant};
 /// to spin.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Total budget for waiting for the daemon's socket to appear. Generous
-/// enough for a cold start on slow disks; past this the spawn is considered
-/// failed and the child is killed.
-pub const START_BUDGET: Duration = Duration::from_secs(5);
+/// Total budget for waiting for the daemon's socket to appear. A daemon that
+/// has not bound within a minute is broken, not slow; the budget is wide
+/// because the daemon opens the store (migrations and a full space compaction)
+/// BEFORE it binds, and a legitimately large pass on a big, heavily deleted
+/// store over slow storage must not be mistaken for a failed start — killing
+/// that child would leave the store as large as before and every relaunch would
+/// pay the same cost again. Past this the spawn is considered failed and the
+/// child is killed.
+pub const START_BUDGET: Duration = Duration::from_secs(60);
 
 /// Path of the sibling `choreographr` daemon binary: same directory as the
 /// running TUI executable, `.exe`-suffixed on Windows. Factored over the exe

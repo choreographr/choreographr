@@ -26,6 +26,7 @@ mod config_watch;
 mod ctrlc_after_connection;
 mod daemon_client_noise;
 mod daemon_client_unix;
+mod db_compaction;
 mod db_migrations;
 mod edit_file_integration;
 mod embedded;
