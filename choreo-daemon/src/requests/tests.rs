@@ -13,6 +13,7 @@
 // the AGENTS.md test allowances are spelled out here instead.
 #![expect(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 use super::*;
+use crate::db::Store;
 // Test-only handles into the recovery unit: the loop itself reads these
 // constants through the recovery module, so they are not re-exported from
 // `requests` — the budget tests assert against the exact numbers the recovery
@@ -316,7 +317,7 @@ fn ok_output(result_json: Option<serde_json::Value>) -> ToolOutput {
 struct AgentLoopHarness {
     ctx: RequestContext,
     session: SessionState,
-    db: Arc<redb::Database>,
+    db: Arc<Store>,
     cmd_rx: crossbeam_channel::Receiver<SessionCommand>,
     _daemon_rx: crossbeam_channel::Receiver<DaemonCommand>,
     _dir: tempfile::TempDir,
@@ -328,7 +329,9 @@ fn agent_loop_harness(registry: ToolRegistry) -> AgentLoopHarness {
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let db = Arc::new(Store::from_db(
+        redb::Database::create(dir.path().join("test.redb")).unwrap(),
+    ));
     let ctx = RequestContext {
         cmd_tx,
         session_id: 1,
@@ -528,7 +531,8 @@ fn run_exec_tool(
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = redb::Database::create(dir.path().join("test.redb")).expect("Database");
+    let db =
+        Store::from_db(redb::Database::create(dir.path().join("test.redb")).expect("Database"));
 
     let mut session = SessionState::empty();
 
@@ -633,7 +637,9 @@ fn spawn_test_ctx() -> (ToolContext, crossbeam_channel::Sender<SessionCommand>) 
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     drop(daemon_rx);
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).expect("Database"));
+    let db = Arc::new(Store::from_db(
+        redb::Database::create(dir.path().join("test.redb")).expect("Database"),
+    ));
     let ctx = ToolContext {
         session_id: 1,
         db,

@@ -707,6 +707,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::db::{SessionRecord, write_session, write_turn};
     use crate::tools::context::ToolContext;
     use choreo_proto::{AssistantToolCallRecord, ReasoningProducer, TimestampMs, Turn};
@@ -722,7 +723,9 @@ mod tests {
         turns: Vec<(u32, Turn)>,
     ) -> (tempfile::TempDir, ToolContext) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let now = TimestampMs::now().as_millis();
         let record = SessionRecord {
             title: Some("t".into()),

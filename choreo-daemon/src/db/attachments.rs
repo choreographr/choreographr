@@ -18,8 +18,8 @@ use std::io;
 use choreo_proto::{ImageKey, Turn};
 use redb::{ReadOnlyTable, ReadableDatabase, ReadableTable, TableDefinition};
 
-use super::db_err;
 use super::schema::session_range_end;
+use super::store::Store;
 
 /// Raw, uncompressed image/attachment bytes for a turn, keyed by
 /// (`session_id`, `turn_id`, slot). Images (display + vision) are kept OUT of the
@@ -79,25 +79,31 @@ type ReadOnlyAttachments<'a> = ReadOnlyTable<(u64, u32, String), &'a [u8]>;
 /// slot)` using the same `(session_id, 0, "")..(session_range_end(session_id),
 /// 0, "")` bound the turns/KV deletes use, so the whole session's attachments
 /// go in one pass.
+///
+/// Takes the store as well as the transaction the caller already opened: the
+/// transaction carries every failure this helper can hit, and building those
+/// errors through `Store::err` is what lets a latched
+/// handle be noticed on this path too.
 pub(super) fn delete_session_attachments(
+    db: &Store,
     write_txn: &redb::WriteTransaction,
     session_id: u64,
 ) -> io::Result<()> {
     let mut att_table = write_txn
         .open_table(SESSION_ATTACHMENTS)
-        .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+        .map_err(|e| db.err(format!("redb open session_attachments: {e}")))?;
     let att_keys: Vec<(u64, u32, String)> = att_table
         .range(
             (session_id, 0u32, String::new())..(session_range_end(session_id), 0u32, String::new()),
         )
-        .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
+        .map_err(|e| db.err(format!("redb range session_attachments: {e}")))?
         .filter_map(std::result::Result::ok)
         .map(|(k, _)| k.value())
         .collect();
     for key in att_keys {
         att_table
             .remove(key)
-            .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
+            .map_err(|e| db.err(format!("redb remove session_attachment: {e}")))?;
     }
     Ok(())
 }
@@ -112,13 +118,14 @@ pub(super) fn delete_session_attachments(
 /// range bound mirrors [`delete_session_attachments`] but scoped to a single
 /// `turn_id`.
 fn delete_turn_attachments(
+    db: &Store,
     write_txn: &redb::WriteTransaction,
     session_id: u64,
     turn_id: u32,
 ) -> io::Result<()> {
     let mut att_table = write_txn
         .open_table(SESSION_ATTACHMENTS)
-        .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+        .map_err(|e| db.err(format!("redb open session_attachments: {e}")))?;
     // `saturating_add` mirrors `session_range_end`: at the theoretical
     // `turn_id == u32::MAX` the bound equals the start, so the range is empty
     // (removes nothing) instead of overflowing in debug / wrapping in release.
@@ -127,14 +134,14 @@ fn delete_turn_attachments(
             (session_id, turn_id, String::new())
                 ..(session_id, turn_id.saturating_add(1), String::new()),
         )
-        .map_err(|e| db_err(format!("redb range session_attachments: {e}")))?
+        .map_err(|e| db.err(format!("redb range session_attachments: {e}")))?
         .filter_map(std::result::Result::ok)
         .map(|(k, _)| k.value())
         .collect();
     for key in att_keys {
         att_table
             .remove(key)
-            .map_err(|e| db_err(format!("redb remove session_attachment: {e}")))?;
+            .map_err(|e| db.err(format!("redb remove session_attachment: {e}")))?;
     }
     Ok(())
 }
@@ -153,6 +160,7 @@ fn delete_turn_attachments(
 /// empty-data images are skipped (nothing to persist), matching on read where
 /// an absent row simply leaves `data` empty.
 pub(super) fn write_turn_attachments(
+    db: &Store,
     write_txn: &redb::WriteTransaction,
     session_id: u64,
     turn_id: u32,
@@ -161,10 +169,10 @@ pub(super) fn write_turn_attachments(
     // Drop any attachment rows left over from a previous write of this turn —
     // the inserts below then persist exactly the current image set, so
     // write_turn stays idempotent.
-    delete_turn_attachments(write_txn, session_id, turn_id)?;
+    delete_turn_attachments(db, write_txn, session_id, turn_id)?;
     let mut attachments = write_txn
         .open_table(SESSION_ATTACHMENTS)
-        .map_err(|e| db_err(format!("redb open session_attachments: {e}")))?;
+        .map_err(|e| db.err(format!("redb open session_attachments: {e}")))?;
     for (i, img) in turn.displayed_images.iter().enumerate() {
         if img.data.is_empty() {
             continue; // nothing to persist
@@ -175,7 +183,7 @@ pub(super) fn write_turn_attachments(
         let slot = display_slot(u32::try_from(i).unwrap_or(u32::MAX));
         attachments
             .insert((session_id, turn_id, slot), img.data.as_slice())
-            .map_err(|e| db_err(format!("redb insert display attachment: {e}")))?;
+            .map_err(|e| db.err(format!("redb insert display attachment: {e}")))?;
     }
     for tr in &turn.tool_results {
         if let Some(image) = &tr.image
@@ -184,7 +192,7 @@ pub(super) fn write_turn_attachments(
             let slot = result_slot(&tr.call_id);
             attachments
                 .insert((session_id, turn_id, slot), image.data.as_slice())
-                .map_err(|e| db_err(format!("redb insert result attachment: {e}")))?;
+                .map_err(|e| db.err(format!("redb insert result attachment: {e}")))?;
         }
     }
     // No per-turn log here: this fires on every turn write (often with zero
@@ -204,6 +212,7 @@ pub(super) fn write_turn_attachments(
 /// stays empty, and a missing row leaves `data` empty rather than erroring —
 /// the request builder's placeholder path handles that case.
 pub(super) fn reattach_turn_attachments(
+    db: &Store,
     attachments: Option<&ReadOnlyAttachments<'_>>,
     session_id: u64,
     turn_id: u32,
@@ -219,7 +228,7 @@ pub(super) fn reattach_turn_attachments(
             let slot = display_slot(u32::try_from(i).unwrap_or(u32::MAX));
             if let Some(guard) = attachments
                 .get((session_id, turn_id, slot))
-                .map_err(|e| db_err(format!("redb get display attachment: {e}")))?
+                .map_err(|e| db.err(format!("redb get display attachment: {e}")))?
             {
                 img.data = guard.value().to_vec();
             }
@@ -232,7 +241,7 @@ pub(super) fn reattach_turn_attachments(
             let slot = result_slot(&tr.call_id);
             if let Some(guard) = attachments
                 .get((session_id, turn_id, slot))
-                .map_err(|e| db_err(format!("redb get result attachment: {e}")))?
+                .map_err(|e| db.err(format!("redb get result attachment: {e}")))?
             {
                 image.data = guard.value().to_vec();
             }
@@ -266,29 +275,27 @@ pub(super) fn reattach_turn_attachments(
 /// Returns Err only for a genuine redb failure (read transaction open, table
 /// open other than "does not exist", or the `get`).
 pub fn read_attachment(
-    db: &redb::Database,
+    db: &Store,
     session_id: u64,
     turn_id: u32,
     key: &ImageKey,
 ) -> io::Result<Option<Vec<u8>>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn (attachment): {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn (attachment): {e}")))?;
     let table = match read_txn.open_table(SESSION_ATTACHMENTS) {
         Ok(t) => t,
         // No attachments table yet (fresh database): nothing has ever been
         // split out, so the image is simply not found.
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
         Err(e) => {
-            return Err(db_err(format!(
-                "redb open session_attachments (attachment): {e}"
-            )));
+            return Err(db.err(format!("redb open session_attachments (attachment): {e}")));
         }
     };
     let slot = slot_for(key);
     match table
         .get((session_id, turn_id, slot))
-        .map_err(|e| db_err(format!("redb get attachment: {e}")))?
+        .map_err(|e| db.err(format!("redb get attachment: {e}")))?
     {
         Some(guard) => Ok(Some(guard.value().to_vec())),
         None => Ok(None),
@@ -316,7 +323,7 @@ pub fn read_attachment(
 /// Returns Err only for a genuine redb failure (write transaction open, table
 /// open, insert, or commit).
 pub fn write_attachment(
-    db: &redb::Database,
+    db: &Store,
     session_id: u64,
     turn_id: u32,
     key: &ImageKey,
@@ -327,18 +334,18 @@ pub fn write_attachment(
     }
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn (attachment): {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn (attachment): {e}")))?;
     {
         let mut table = write_txn
             .open_table(SESSION_ATTACHMENTS)
-            .map_err(|e| db_err(format!("redb open session_attachments (attachment): {e}")))?;
+            .map_err(|e| db.err(format!("redb open session_attachments (attachment): {e}")))?;
         table
             .insert((session_id, turn_id, slot_for(key)), data)
-            .map_err(|e| db_err(format!("redb insert attachment (emit): {e}")))?;
+            .map_err(|e| db.err(format!("redb insert attachment (emit): {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit attachment (emit): {e}")))?;
+        .map_err(|e| db.err(format!("redb commit attachment (emit): {e}")))?;
     Ok(())
 }
 
@@ -372,7 +379,7 @@ mod tests {
         // `d{index}` / `r{call_id}` slot by the shared reader. A missing
         // table/slot is `None`, never an error.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let id = 7u64;
 
         // Fresh DB: no attachments table yet → not found, not an error.
@@ -481,7 +488,7 @@ mod tests {
         // clears and rewrites the whole turn). This is the O(1) write that
         // replaced the per-image whole-turn rewrite in emit_image.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let id = 1u64;
 
         // Turn A with two displayed images plus a vision image, written the

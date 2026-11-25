@@ -12,25 +12,25 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use tracing::warn;
 
-use super::db_err;
 use super::schema::{CATALOG_ETAG_KEY, CATALOG_LAST_ATTEMPT_KEY, CATALOG_STATE};
+use super::store::Store;
 
 /// Read a raw value out of the `catalog_state` table.  `Ok(None)` when the
 /// table does not exist yet (it is created lazily on the first write) or the
 /// key is absent — the shared existence-tolerant read both getters use, so
 /// the redb boilerplate lives in one place.
-fn catalog_state_get(db: &redb::Database, key: &str) -> io::Result<Option<Vec<u8>>> {
+fn catalog_state_get(db: &Store, key: &str) -> io::Result<Option<Vec<u8>>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = match read_txn.open_table(CATALOG_STATE) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(db_err(format!("redb open catalog_state: {e}"))),
+        Err(e) => return Err(db.err(format!("redb open catalog_state: {e}"))),
     };
     match table
         .get(key)
-        .map_err(|e| db_err(format!("redb get catalog_state {key}: {e}")))?
+        .map_err(|e| db.err(format!("redb get catalog_state {key}: {e}")))?
     {
         Some(guard) => Ok(Some(guard.value().to_vec())),
         None => Ok(None),
@@ -41,30 +41,30 @@ fn catalog_state_get(db: &redb::Database, key: &str) -> io::Result<Option<Vec<u8
 /// `Some` inserts the value (creating the table on the first write); `None`
 /// removes the key.  Both writers (the maintenance thread's attempt
 /// timestamp, the command loop's etag) go through this.
-fn catalog_state_write(db: &redb::Database, key: &str, value: Option<&[u8]>) -> io::Result<()> {
+fn catalog_state_write(db: &Store, key: &str, value: Option<&[u8]>) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(CATALOG_STATE)
-            .map_err(|e| db_err(format!("redb open catalog_state: {e}")))?;
+            .map_err(|e| db.err(format!("redb open catalog_state: {e}")))?;
         match value {
             Some(value) => {
                 table
                     .insert(key, value)
-                    .map_err(|e| db_err(format!("redb set catalog_state {key}: {e}")))?;
+                    .map_err(|e| db.err(format!("redb set catalog_state {key}: {e}")))?;
             }
             None => {
                 table
                     .remove(key)
-                    .map_err(|e| db_err(format!("redb remove catalog_state {key}: {e}")))?;
+                    .map_err(|e| db.err(format!("redb remove catalog_state {key}: {e}")))?;
             }
         }
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit catalog_state {key}: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit catalog_state {key}: {e}")))?;
     Ok(())
 }
 
@@ -78,7 +78,7 @@ fn catalog_state_write(db: &redb::Database, key: &str, value: Option<&[u8]>) -> 
 /// # Errors
 ///
 /// Returns Err if the underlying `catalog_state` write fails.
-pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<()> {
+pub fn set_catalog_last_attempt_ms(db: &Store, ms: u64) -> io::Result<()> {
     catalog_state_write(db, CATALOG_LAST_ATTEMPT_KEY, Some(&ms.to_le_bytes()))
 }
 
@@ -92,7 +92,7 @@ pub fn set_catalog_last_attempt_ms(db: &redb::Database, ms: u64) -> io::Result<(
 /// # Errors
 ///
 /// Returns Err if the underlying `catalog_state` read fails.
-pub fn get_catalog_last_attempt_ms(db: &redb::Database) -> io::Result<Option<u64>> {
+pub fn get_catalog_last_attempt_ms(db: &Store) -> io::Result<Option<u64>> {
     let Some(bytes) = catalog_state_get(db, CATALOG_LAST_ATTEMPT_KEY)? else {
         return Ok(None);
     };
@@ -112,7 +112,7 @@ pub fn get_catalog_last_attempt_ms(db: &redb::Database) -> io::Result<Option<u64
 /// # Errors
 ///
 /// Returns Err if the underlying `catalog_state` write fails.
-pub fn set_catalog_etag(db: &redb::Database, etag: Option<&str>) -> io::Result<()> {
+pub fn set_catalog_etag(db: &Store, etag: Option<&str>) -> io::Result<()> {
     catalog_state_write(db, CATALOG_ETAG_KEY, etag.map(str::as_bytes))
 }
 
@@ -122,7 +122,7 @@ pub fn set_catalog_etag(db: &redb::Database, etag: Option<&str>) -> io::Result<(
 /// # Errors
 ///
 /// Returns Err if the underlying `catalog_state` read fails.
-pub fn get_catalog_etag(db: &redb::Database) -> io::Result<Option<String>> {
+pub fn get_catalog_etag(db: &Store) -> io::Result<Option<String>> {
     let Some(bytes) = catalog_state_get(db, CATALOG_ETAG_KEY)? else {
         return Ok(None);
     };
@@ -141,7 +141,7 @@ mod tests {
     #[test]
     fn catalog_last_attempt_ms_round_trips() {
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
 
         // A fresh database has no catalog_state table yet → None (the caller
         // treats that as "stale, fetch now").
@@ -169,7 +169,7 @@ mod tests {
         // the timestamp is advisory pacing and a corrupt value must not fail
         // the daemon.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         {
             let write_txn = db.begin_write().unwrap();
             {
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn catalog_etag_round_trips_and_clears() {
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
 
         assert_eq!(get_catalog_etag(&db).unwrap(), None);
 
@@ -206,7 +206,7 @@ mod tests {
     #[test]
     fn catalog_etag_blank_value_reads_as_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         {
             let write_txn = db.begin_write().unwrap();
             {

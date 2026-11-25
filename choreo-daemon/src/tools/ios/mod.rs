@@ -148,6 +148,8 @@ pub(crate) mod test_util {
     //! Deterministic test scaffolding shared by the per-tool test modules.
 
     use super::*;
+
+    use crate::db::Store;
     use crate::tools::ios_bridge::{MockBridge, MockResponse};
 
     /// A bridge wrapper that flips the context's cancellation flag DURING
@@ -180,7 +182,7 @@ pub(crate) mod test_util {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.redb");
-        let db = Arc::new(redb::Database::create(&path).unwrap());
+        let db = Arc::new(Store::from_db(redb::Database::create(&path).unwrap()));
         // Unlink while the handle is open — no mem::forget leak of the
         // TempDir (the previous approach leaked one tempdir per test run).
         let _ = std::fs::remove_file(&path);

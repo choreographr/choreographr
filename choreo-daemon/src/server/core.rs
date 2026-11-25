@@ -10,6 +10,7 @@
 //! byte-for-byte what it was before the split.
 
 use crate::daemon::{DaemonCommand, DaemonState};
+use crate::db::Store;
 use crate::sessions::SessionCommand;
 use std::path::Path;
 use std::sync::Arc;
@@ -77,7 +78,7 @@ pub(crate) struct DaemonCore {
     /// so sharing one `Arc` across every connection thread is safe and needs
     /// no per-connection handle. Cloned from [`DaemonState::db`] BEFORE
     /// `state` moves into the command-loop thread (`start_daemon_core`).
-    pub db: Arc<redb::Database>,
+    pub db: Arc<Store>,
     /// Socket write timeout handed to each accepted connection's writer thread
     /// (cloned from [`DaemonState::peer_stall`] before `state` moves
     /// into the command loop). Injectable so a wedged-writer test can use a
@@ -263,9 +264,15 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
     // honest response: nothing can be persisted any more, and the next launch
     // re-opens (and repairs) the store. Same sequence as the SIGINT drain — the
     // broadcast first so each client observes `ShuttingDown` rather than a bare
-    // EOF, then the stop — and the handler in `db::poison` guarantees it fires at
-    // most once however many sessions trip over the latched handle.
-    crate::db::install_poison_escalation(Arc::downgrade(&state.db), {
+    // EOF, then the stop — and the store's own one-shot fence (see
+    // `db::store`) guarantees it fires at most once however many sessions trip
+    // over the latched handle.
+    //
+    // This sends the shutdown pair directly for now. A later change routes it
+    // through the daemon's single shutdown trigger, so every stop request —
+    // signal, latched store, protocol command — takes one path into the
+    // command loop rather than each assembling its own sequence here.
+    state.db.set_escalation({
         let daemon_tx = daemon_tx.clone();
         move || {
             let _ = daemon_tx.send(DaemonCommand::BroadcastShuttingDown);

@@ -87,6 +87,7 @@ impl Tool for GetSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::tools::admin::tests::test_context;
     use std::sync::Arc;
 
@@ -131,7 +132,9 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         drop(rx);
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let ctx = ToolContext::new(42, db, tx);
         let args = GetSessionArgs { session_id: 1 };
         let result = execute_get_session(&args, None, Some(&ctx));

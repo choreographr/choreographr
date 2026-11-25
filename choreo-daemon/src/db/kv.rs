@@ -12,8 +12,8 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use tracing::debug;
 
-use super::db_err;
 use super::schema::{KvRangeIter, SESSION_KV, session_range_end};
+use super::store::Store;
 
 /// Insert or overwrite a key-value pair for the given session.
 ///
@@ -21,21 +21,21 @@ use super::schema::{KvRangeIter, SESSION_KV, session_range_end};
 ///
 /// Returns Err if the write transaction, table open, insert, or commit
 /// fails.
-pub fn kv_set(db: &redb::Database, session_id: u64, key: &str, value: &[u8]) -> io::Result<()> {
+pub fn kv_set(db: &Store, session_id: u64, key: &str, value: &[u8]) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(SESSION_KV)
-            .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+            .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
         table
             .insert((session_id, key.to_string()), value.to_vec())
-            .map_err(|e| db_err(format!("redb kv_set: {e}")))?;
+            .map_err(|e| db.err(format!("redb kv_set: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit kv_set: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit kv_set: {e}")))?;
     debug!("kv_set: session={} key=\"{}\" ok", session_id, key);
     Ok(())
 }
@@ -45,16 +45,16 @@ pub fn kv_set(db: &redb::Database, session_id: u64, key: &str, value: &[u8]) -> 
 /// # Errors
 ///
 /// Returns Err if the read transaction, table open, or row lookup fails.
-pub fn kv_get(db: &redb::Database, session_id: u64, key: &str) -> io::Result<Option<Vec<u8>>> {
+pub fn kv_get(db: &Store, session_id: u64, key: &str) -> io::Result<Option<Vec<u8>>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = read_txn
         .open_table(SESSION_KV)
-        .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+        .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
     match table
         .get((session_id, key.to_string()))
-        .map_err(|e| db_err(format!("redb kv_get: {e}")))?
+        .map_err(|e| db.err(format!("redb kv_get: {e}")))?
     {
         Some(guard) => Ok(Some(guard.value().clone())),
         None => Ok(None),
@@ -67,22 +67,22 @@ pub fn kv_get(db: &redb::Database, session_id: u64, key: &str) -> io::Result<Opt
 ///
 /// Returns Err if the write transaction, table open, removal, or commit
 /// fails.
-pub fn kv_delete(db: &redb::Database, session_id: u64, key: &str) -> io::Result<bool> {
+pub fn kv_delete(db: &Store, session_id: u64, key: &str) -> io::Result<bool> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     let removed = {
         let mut table = write_txn
             .open_table(SESSION_KV)
-            .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+            .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
         table
             .remove((session_id, key.to_string()))
-            .map_err(|e| db_err(format!("redb kv_delete: {e}")))?
+            .map_err(|e| db.err(format!("redb kv_delete: {e}")))?
             .is_some()
     };
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit kv_delete: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit kv_delete: {e}")))?;
     debug!(
         "kv_delete: session={} key=\"{}\" found={}",
         session_id, key, removed
@@ -100,30 +100,30 @@ pub fn kv_delete(db: &redb::Database, session_id: u64, key: &str) -> io::Result<
 /// Returns Err if the write transaction, table open/iteration, removals,
 /// or commit fails.
 pub fn kv_delete_range(
-    db: &redb::Database,
+    db: &Store,
     session_id: u64,
     start: &str,
     end: Option<&str>,
 ) -> io::Result<u64> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     let count = {
         let mut table = write_txn
             .open_table(SESSION_KV)
-            .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+            .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
         let range = if let Some(end) = end {
             let range_start = (session_id, start.to_string());
             let range_end = (session_id, end.to_string());
             table
                 .range((range_start)..(range_end))
-                .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
+                .map_err(|e| db.err(format!("redb range kv_delete_range: {e}")))?
         } else {
             let range_start = (session_id, start.to_string());
             let range_end = (session_range_end(session_id), String::new());
             table
                 .range((range_start)..(range_end))
-                .map_err(|e| db_err(format!("redb range kv_delete_range: {e}")))?
+                .map_err(|e| db.err(format!("redb range kv_delete_range: {e}")))?
         };
         let keys: Vec<(u64, String)> = range
             .filter_map(std::result::Result::ok)
@@ -133,13 +133,13 @@ pub fn kv_delete_range(
         for key in keys {
             table
                 .remove(key)
-                .map_err(|e| db_err(format!("redb kv_delete_range remove: {e}")))?;
+                .map_err(|e| db.err(format!("redb kv_delete_range remove: {e}")))?;
         }
         count
     };
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit kv_delete_range: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit kv_delete_range: {e}")))?;
     debug!(
         "kv_delete_range: session={} start=\"{}\" end={:?} removed={}",
         session_id, start, end, count
@@ -156,33 +156,33 @@ pub fn kv_delete_range(
 /// Returns Err if the read transaction, table open, range iteration, or
 /// row decode fails.
 pub fn kv_get_range(
-    db: &redb::Database,
+    db: &Store,
     session_id: u64,
     start: &str,
     end: Option<&str>,
 ) -> io::Result<Vec<(String, Vec<u8>)>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = read_txn
         .open_table(SESSION_KV)
-        .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+        .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
     let range = if let Some(end) = end {
         let range_start = (session_id, start.to_string());
         let range_end = (session_id, end.to_string());
         table
             .range((range_start)..(range_end))
-            .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
+            .map_err(|e| db.err(format!("redb range kv_get_range: {e}")))?
     } else {
         let range_start = (session_id, start.to_string());
         let range_end = (session_range_end(session_id), String::new());
         table
             .range((range_start)..(range_end))
-            .map_err(|e| db_err(format!("redb range kv_get_range: {e}")))?
+            .map_err(|e| db.err(format!("redb range kv_get_range: {e}")))?
     };
     let mut results = Vec::new();
     for result in range {
-        let (key, value) = result.map_err(|e| db_err(format!("redb iter kv_get_range: {e}")))?;
+        let (key, value) = result.map_err(|e| db.err(format!("redb iter kv_get_range: {e}")))?;
         results.push((key.value().1, value.value().clone()));
     }
     Ok(results)
@@ -198,17 +198,17 @@ pub fn kv_get_range(
 /// Returns Err if the read transaction, table open, range iteration, or
 /// row decode fails.
 pub fn kv_list(
-    db: &redb::Database,
+    db: &Store,
     session_id: u64,
     start: Option<&str>,
     end: Option<&str>,
 ) -> io::Result<Vec<String>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = read_txn
         .open_table(SESSION_KV)
-        .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+        .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
     let range: KvRangeIter<'_> = match (start, end) {
         (Some(start), Some(end)) => {
             let range_start = (session_id, start.to_string());
@@ -216,7 +216,7 @@ pub fn kv_list(
             Box::new(
                 table
                     .range((range_start)..(range_end))
-                    .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
+                    .map_err(|e| db.err(format!("redb range kv_list: {e}")))?,
             )
         }
         (Some(start), None) => {
@@ -225,7 +225,7 @@ pub fn kv_list(
             Box::new(
                 table
                     .range((range_start)..(range_end))
-                    .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
+                    .map_err(|e| db.err(format!("redb range kv_list: {e}")))?,
             )
         }
         (None, Some(end)) => {
@@ -234,7 +234,7 @@ pub fn kv_list(
             Box::new(
                 table
                     .range((range_start)..(range_end))
-                    .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
+                    .map_err(|e| db.err(format!("redb range kv_list: {e}")))?,
             )
         }
         (None, None) => {
@@ -243,13 +243,13 @@ pub fn kv_list(
             Box::new(
                 table
                     .range((range_start)..(range_end))
-                    .map_err(|e| db_err(format!("redb range kv_list: {e}")))?,
+                    .map_err(|e| db.err(format!("redb range kv_list: {e}")))?,
             )
         }
     };
     let mut keys = Vec::new();
     for result in range {
-        let (key, _) = result.map_err(|e| db_err(format!("redb iter kv_list: {e}")))?;
+        let (key, _) = result.map_err(|e| db.err(format!("redb iter kv_list: {e}")))?;
         keys.push(key.value().1);
     }
     Ok(keys)
@@ -264,13 +264,13 @@ pub fn kv_list(
 ///
 /// Returns Err if the read transaction, table open, range iteration, or
 /// row decode fails.
-pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> io::Result<u64> {
+pub fn kv_count(db: &Store, session_id: u64, prefix: Option<&str>) -> io::Result<u64> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = read_txn
         .open_table(SESSION_KV)
-        .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+        .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
     let range = if let Some(prefix) = prefix {
         let range_start = (session_id, prefix.to_string());
         // We need an upper bound for the prefix scan.  Appending 0xFF and feeding
@@ -286,17 +286,17 @@ pub fn kv_count(db: &redb::Database, session_id: u64, prefix: Option<&str>) -> i
         let range_end = (session_id, range_end_str);
         table
             .range((range_start)..(range_end))
-            .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
+            .map_err(|e| db.err(format!("redb range kv_count: {e}")))?
     } else {
         let range_start = (session_id, String::new());
         let range_end = (session_range_end(session_id), String::new());
         table
             .range((range_start)..(range_end))
-            .map_err(|e| db_err(format!("redb range kv_count: {e}")))?
+            .map_err(|e| db.err(format!("redb range kv_count: {e}")))?
     };
     let mut count: u64 = 0;
     for result in range {
-        result.map_err(|e| db_err(format!("redb iter kv_count: {e}")))?;
+        result.map_err(|e| db.err(format!("redb iter kv_count: {e}")))?;
         count += 1;
     }
     Ok(count)

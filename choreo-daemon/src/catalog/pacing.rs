@@ -11,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 use super::MaintenanceState;
+use crate::db::Store;
 use crate::db::set_catalog_last_attempt_ms;
 
 /// Cooldown between models.dev fetch attempts — the revalidation cadence AND
@@ -102,7 +103,7 @@ pub(super) fn wall_now_ms() -> u64 {
 /// is irrelevant to the pacing, which is the point of the no-reattempt rule.
 /// A DB write failure is logged, never fatal: the timestamp is advisory
 /// pacing, and the worst case is the next startup re-fetching.
-pub(super) fn record_attempt(db: &redb::Database, state: &mut MaintenanceState) {
+pub(super) fn record_attempt(db: &Store, state: &mut MaintenanceState) {
     let now_ms = wall_now_ms();
     state.last_attempt_ms = Some(now_ms);
     if let Err(e) = set_catalog_last_attempt_ms(db, now_ms) {
@@ -212,7 +213,7 @@ mod tests {
         // The cooldown anchor is crash-safe only if it reaches the DB before
         // the fetch runs, so pin both halves of the write.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("pacing.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("pacing.redb")).unwrap());
         let mut state = MaintenanceState {
             etag: None,
             last_attempt_ms: None,

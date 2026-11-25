@@ -63,12 +63,12 @@ fn turn_with_usage(usage: Option<u32>, undone: bool) -> Turn {
 /// filesystem path) keeps these unit tests off the system boundary — they
 /// exercise the session state machine, not redb's on-disk format — and needs
 /// no `tempfile`.
-fn test_db() -> Arc<redb::Database> {
-    Arc::new(
+fn test_db() -> Arc<Store> {
+    Arc::new(Store::from_db(
         redb::Database::builder()
             .create_with_backend(redb::backends::InMemoryBackend::new())
             .expect("create in-memory test db"),
-    )
+    ))
 }
 
 fn test_state() -> SessionState {

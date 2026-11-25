@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use crate::daemon::DaemonCommand;
+use crate::db::Store;
 
 /// Session-level context passed through tool execution.
 ///
@@ -15,7 +16,7 @@ pub struct ToolContext {
     /// The session that initiated this tool call.
     pub session_id: u64,
     /// Handle to the daemon's shared redb database.
-    pub db: Arc<redb::Database>,
+    pub db: Arc<Store>,
     /// Channel to the daemon command loop for daemon-level operations.
     pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// Tool groups active in the parent session (inherited by sub-sessions).
@@ -56,7 +57,7 @@ impl ToolContext {
     #[must_use]
     pub fn new(
         session_id: u64,
-        db: Arc<redb::Database>,
+        db: Arc<Store>,
         daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     ) -> Self {
         Self {

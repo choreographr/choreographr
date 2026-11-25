@@ -17,6 +17,8 @@
 //! enforces the per-tool timeout and drains the image channel. Dispatching N
 //! tools therefore adds up to 3N threads beyond the agent loop's own thread;
 //! the kernel scheduler handles that for typical N (< 10) with no trouble.
+
+use crate::db::Store;
 use crate::requests::system_content::{
     ToolResultSideEffectsParams, apply_tool_result_side_effects,
 };
@@ -115,7 +117,7 @@ pub(crate) fn broadcast_turn_appended(
 /// [`ImageKey::Displayed`]: choreo_proto::ImageKey::Displayed
 pub(crate) fn emit_image(
     cmd_tx: &crossbeam_channel::Sender<SessionCommand>,
-    db: &redb::Database,
+    db: &Store,
     image: PreparedImage,
     tool_call_id: Option<String>,
     session: &mut SessionState,

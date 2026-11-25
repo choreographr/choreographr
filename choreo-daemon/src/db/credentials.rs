@@ -15,8 +15,8 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use tracing::{info, warn};
 
-use super::db_err;
 use super::schema::{CREDENTIALS, KEYSTORE, KEYSTORE_BINDING_KEY};
+use super::store::Store;
 
 // ── Credential table ────────────────────────────────────────────────────────
 
@@ -25,18 +25,23 @@ use super::schema::{CREDENTIALS, KEYSTORE, KEYSTORE_BINDING_KEY};
 /// # Errors
 ///
 /// Returns Err if the write transaction, table open, insert, or commit
-/// fails.
-pub fn set_credential_blob(
-    db: &redb::Database,
-    service: &str,
-    blob: &[u8],
-) -> Result<(), redb::Error> {
-    let write_txn = db.begin_write()?;
+/// fails, with every failure built by `Store::err` — so a latched handle is
+/// escalated from here as it is from every other storage path.
+pub fn set_credential_blob(db: &Store, service: &str, blob: &[u8]) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
-        let mut table = write_txn.open_table(CREDENTIALS)?;
-        table.insert(service, blob)?;
+        let mut table = write_txn
+            .open_table(CREDENTIALS)
+            .map_err(|e| db.err(format!("redb open credentials: {e}")))?;
+        table
+            .insert(service, blob)
+            .map_err(|e| db.err(format!("redb set credential blob: {e}")))?;
     }
-    write_txn.commit()?;
+    write_txn
+        .commit()
+        .map_err(|e| db.err(format!("redb commit credential blob: {e}")))?;
     Ok(())
 }
 
@@ -45,22 +50,26 @@ pub fn set_credential_blob(
 ///
 /// # Errors
 ///
-/// Returns Err if the read transaction, table open, or iteration fails.
-pub fn get_all_credential_blobs(
-    db: &redb::Database,
-) -> Result<HashMap<String, Vec<u8>>, redb::Error> {
-    let read_txn = db.begin_read()?;
+/// Returns Err if the read transaction, table open, or iteration fails, with
+/// every failure built by `Store::err`.
+pub fn get_all_credential_blobs(db: &Store) -> io::Result<HashMap<String, Vec<u8>>> {
+    let read_txn = db
+        .begin_read()
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     // The credentials table may not exist yet (no credentials have ever been
     // saved).  Return an empty map instead of propagating the error so that
     // unlock can proceed without credentials.
     let table = match read_txn.open_table(CREDENTIALS) {
         Ok(table) => table,
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(HashMap::new()),
-        Err(e) => return Err(e.into()),
+        Err(e) => return Err(db.err(format!("redb open credentials: {e}"))),
     };
     let mut map = HashMap::new();
-    for result in table.iter()? {
-        let (key, value) = result?;
+    let iter = table
+        .iter()
+        .map_err(|e| db.err(format!("redb iter credentials: {e}")))?;
+    for result in iter {
+        let (key, value) = result.map_err(|e| db.err(format!("redb iter item: {e}")))?;
         map.insert(key.value().to_string(), value.value().to_vec());
     }
     Ok(map)
@@ -71,14 +80,22 @@ pub fn get_all_credential_blobs(
 /// # Errors
 ///
 /// Returns Err if the write transaction, table open, removal, or commit
-/// fails.
-pub fn remove_credential_blob(db: &redb::Database, service: &str) -> Result<(), redb::Error> {
-    let write_txn = db.begin_write()?;
+/// fails, with every failure built by `Store::err`.
+pub fn remove_credential_blob(db: &Store, service: &str) -> io::Result<()> {
+    let write_txn = db
+        .begin_write()
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
-        let mut table = write_txn.open_table(CREDENTIALS)?;
-        table.remove(service)?;
+        let mut table = write_txn
+            .open_table(CREDENTIALS)
+            .map_err(|e| db.err(format!("redb open credentials: {e}")))?;
+        table
+            .remove(service)
+            .map_err(|e| db.err(format!("redb remove credential blob: {e}")))?;
     }
-    write_txn.commit()?;
+    write_txn
+        .commit()
+        .map_err(|e| db.err(format!("redb commit credential blob: {e}")))?;
     Ok(())
 }
 
@@ -94,20 +111,20 @@ pub fn remove_credential_blob(db: &redb::Database, service: &str) -> Result<(), 
 /// # Errors
 ///
 /// Returns Err if the read transaction, table open, or row lookup fails.
-pub fn get_keystore_binding(db: &redb::Database) -> io::Result<Option<[u8; 32]>> {
+pub fn get_keystore_binding(db: &Store) -> io::Result<Option<[u8; 32]>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = match read_txn.open_table(KEYSTORE) {
         Ok(table) => table,
         // No table yet ⇒ the keystore has never been bound (fresh DB, or a
         // database upgraded from a build before the keystore table existed).
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
-        Err(e) => return Err(db_err(format!("redb open keystore: {e}"))),
+        Err(e) => return Err(db.err(format!("redb open keystore: {e}"))),
     };
     let Some(guard) = table
         .get(KEYSTORE_BINDING_KEY)
-        .map_err(|e| db_err(format!("redb get keystore binding: {e}")))?
+        .map_err(|e| db.err(format!("redb get keystore binding: {e}")))?
     else {
         return Ok(None);
     };
@@ -131,21 +148,21 @@ pub fn get_keystore_binding(db: &redb::Database) -> io::Result<Option<[u8; 32]>>
 ///
 /// Returns Err if the write transaction, table open, insert, or commit
 /// fails.
-pub fn set_keystore_binding(db: &redb::Database, public_key: &[u8; 32]) -> io::Result<()> {
+pub fn set_keystore_binding(db: &Store, public_key: &[u8; 32]) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(KEYSTORE)
-            .map_err(|e| db_err(format!("redb open keystore: {e}")))?;
+            .map_err(|e| db.err(format!("redb open keystore: {e}")))?;
         table
             .insert(KEYSTORE_BINDING_KEY, public_key.as_slice())
-            .map_err(|e| db_err(format!("redb set keystore binding: {e}")))?;
+            .map_err(|e| db.err(format!("redb set keystore binding: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit keystore binding: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit keystore binding: {e}")))?;
     info!("persisted keystore binding (TOFU adoption)");
     Ok(())
 }
@@ -161,7 +178,7 @@ mod tests {
         // exact 32-byte public key. The table is created lazily on first
         // write, so no schema bump or migration is needed.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
 
         assert_eq!(get_keystore_binding(&db).unwrap(), None);
 
@@ -177,7 +194,7 @@ mod tests {
         // same tolerant policy as the catalog getters. The next presented
         // key re-adopts the binding, the only usable recovery.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         {
             let write_txn = db.begin_write().unwrap();
             {

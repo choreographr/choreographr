@@ -25,7 +25,7 @@ use crate::accounts::{AccountConfig, AccountManager, AccountOverrides};
 use crate::broadcast::{ClientId, FanoutTarget, LagLimits, ReplyTarget, SubscriberSink};
 use crate::cache_warm::{CacheWarmingConfig, WarmPolicy};
 use crate::catalog::{CatalogPaths, MaintenanceEvent, RefreshReport, RefreshRequester};
-use crate::db::{self, SessionRecord};
+use crate::db::{self, SessionRecord, Store};
 use crate::mcp::trust::McpTrustStore;
 use crate::mcp::{McpManager, McpReloadOutcome, McpStatusReport, McpTrustOutcome};
 use crate::providers::{ImageProviderHandle, InferenceProvider, ProviderAuth};
@@ -337,10 +337,11 @@ pub struct DaemonState {
     /// could only report "locked", never "unbound", so a first-run client
     /// with no key had no signal that it should auto-bind.
     pub keystore_bound: bool,
-    /// The shared redb database handle. Every connection thread holds its own
-    /// clone for concurrent reads; the command loop is the writer for
+    /// The shared store handle: the `redb` database plus the latch escalation
+    /// that rides it (see [`crate::db::Store`]). Every connection thread holds
+    /// its own clone for concurrent reads; the command loop is the writer for
     /// daemon-owned records (sessions, credentials, the catalog etag).
-    pub db: Arc<redb::Database>,
+    pub db: Arc<Store>,
     /// The daemon's live tool catalogue, shared with every session and request
     /// worker as one `Arc<ArcSwap<…>>`. Readers load the current registry
     /// lock-free; the command loop is the SOLE writer, replacing the whole
@@ -1249,7 +1250,7 @@ pub enum DaemonCommand {
 /// the marker (and tombstone) stay in place so the session cannot be attached
 /// or resurrected; `purge_tombstoned_sessions` at the next startup retries.
 fn finalize_session_delete(
-    db: &Arc<redb::Database>,
+    db: &Arc<Store>,
     session_id: u64,
     daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
 ) {

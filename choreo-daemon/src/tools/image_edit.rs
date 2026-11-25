@@ -458,6 +458,7 @@ impl super::Tool for EditImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::providers::ImageProviderHandle;
     use crate::tools::Tool;
     use crate::tools::image_common::sample_png_b64;
@@ -573,7 +574,9 @@ mod tests {
             BASE64.decode(sample_png_b64()).expect("valid png"),
         )
         .expect("write mask");
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let working_dir = dir.path().to_path_buf();
         let _dir_guard = dir;
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<crate::daemon::DaemonCommand>();
@@ -622,7 +625,9 @@ mod tests {
         args: EditImageArgs,
     ) -> Result<DisplayImageReturn, ToolExecError> {
         let dir = tempfile::tempdir().expect("temp dir");
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let _dir_guard = dir;
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<crate::daemon::DaemonCommand>();
         std::thread::spawn(move || {

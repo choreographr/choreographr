@@ -7,11 +7,15 @@
 //! that was benchmarked against the C library. Kept as its own module so the
 //! storage plumbing beside it (`schema`, `open`, `migrate`) does not carry the
 //! codec details, its fixtures, or its tests.
+//!
+//! Every failure here is a DATA error — a row that is not one well-formed zstd
+//! frame — so it is built with `io::Error::other` rather than the store's error
+//! conversion. Probing the database from here would be pointless (the codec never
+//! touches it) and wrong (a corrupt row says nothing about the handle), while a
+//! caller that wants to skip the row treats both alike.
 
 use std::io;
 use std::io::Read;
-
-use super::db_err;
 
 // ── Codec constants ──────────────────────────────────────────────────────────
 
@@ -108,9 +112,9 @@ pub(super) fn zstd_decode_with_limit(blob: &[u8], limit: u64) -> io::Result<Vec<
     // second frame. This restores the "one row == one frame" contract and
     // bounds the decode below to a single complete frame.
     let frame_len = structured_zstd::decoding::find_frame_compressed_size(blob)
-        .map_err(|e| db_err(format!("zstd decode turn (frame size): {e:?}")))?;
+        .map_err(|e| io::Error::other(format!("zstd decode turn (frame size): {e:?}")))?;
     if frame_len != blob.len() {
-        return Err(db_err(format!(
+        return Err(io::Error::other(format!(
             "turn row is not exactly one zstd frame: first frame spans {frame_len} of {} bytes",
             blob.len()
         )));
@@ -129,9 +133,9 @@ pub(super) fn zstd_decode_with_limit(blob: &[u8], limit: u64) -> io::Result<Vec<
     let mut capped = decoder.take(limit + 1);
     capped
         .read_to_end(&mut buf)
-        .map_err(|e| db_err(format!("zstd decode turn: {e}")))?;
+        .map_err(|e| io::Error::other(format!("zstd decode turn: {e}")))?;
     if buf.len() as u64 > limit {
-        return Err(db_err(format!(
+        return Err(io::Error::other(format!(
             "turn frame expands past {limit} bytes; refusing"
         )));
     }

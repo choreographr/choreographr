@@ -11,6 +11,7 @@ pub(crate) use read_session::ReadSession;
 #[cfg(test)]
 pub(crate) mod tests {
     use crate::daemon::DaemonCommand;
+    use crate::db::Store;
     use crate::tools::context::ToolContext;
     use choreo_proto::{SessionStatus, SessionSummary, TokenUsage};
     use std::sync::Arc;
@@ -19,7 +20,9 @@ pub(crate) mod tests {
     pub(crate) fn test_context() -> (ToolContext, crossbeam_channel::Sender<DaemonCommand>) {
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let ctx = ToolContext::new(42, db, daemon_tx.clone());
 
         // Spawn a mock daemon that handles ListSessions and GetSession.

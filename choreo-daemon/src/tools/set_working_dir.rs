@@ -159,6 +159,7 @@ impl Tool for SetWorkingDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
@@ -178,7 +179,9 @@ mod tests {
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.keep(); // Leak: prevent early cleanup of the temp directory.
-        let db = Arc::new(redb::Database::create(db_path.join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(db_path.join("test.redb")).unwrap(),
+        ));
         let ctx = ToolContext::new(42, db, daemon_tx.clone());
         (ctx, daemon_tx, daemon_rx)
     }

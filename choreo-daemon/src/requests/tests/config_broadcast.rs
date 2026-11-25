@@ -280,7 +280,9 @@ fn finalize_and_broadcast_turn_strips_reasoning_artifact() {
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded::<DaemonCommand>();
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let db = Arc::new(Store::from_db(
+        redb::Database::create(dir.path().join("test.redb")).unwrap(),
+    ));
     let ctx = RequestContext {
         cmd_tx,
         session_id: 1,

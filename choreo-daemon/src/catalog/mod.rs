@@ -73,7 +73,7 @@ use tracing::{debug, info, warn};
 
 use crate::config_watch::ConfigChange;
 use crate::daemon::DaemonCommand;
-use crate::db::{get_catalog_etag, get_catalog_last_attempt_ms};
+use crate::db::{Store, get_catalog_etag, get_catalog_last_attempt_ms};
 
 use cache::ensure_runtime_dirs;
 use overlay::{read_user_overlay, reload_user_overlay};
@@ -155,7 +155,7 @@ struct MaintenanceState {
 /// loop is gone).
 pub(crate) fn spawn_catalog_maintenance(
     daemon_tx: Sender<DaemonCommand>,
-    db: Arc<redb::Database>,
+    db: Arc<Store>,
     paths: CatalogPaths,
     overlay_rx: Receiver<ConfigChange>,
 ) -> Sender<MaintenanceEvent> {
@@ -168,7 +168,7 @@ pub(crate) fn spawn_catalog_maintenance(
 
 fn maintenance_loop(
     daemon_tx: &Sender<DaemonCommand>,
-    db: &Arc<redb::Database>,
+    db: &Arc<Store>,
     paths: &CatalogPaths,
     rx: &Receiver<MaintenanceEvent>,
     overlay_rx: &Receiver<ConfigChange>,

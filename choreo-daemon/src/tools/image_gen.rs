@@ -218,6 +218,7 @@ impl super::Tool for GenerateImage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::providers::ImageProviderHandle;
     use crate::tools::Tool;
     use crate::tools::image::prepare_image_from_bytes;
@@ -293,7 +294,9 @@ mod tests {
         // In-crate test DB: a throwaway redb file (same pattern as the
         // other tools' unit tests; `tempfile` owns the cleanup).
         let dir = tempfile::tempdir().expect("temp dir");
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let _dir_guard = dir;
         let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded::<crate::daemon::DaemonCommand>();
         // Mock daemon loop: reply to exactly one provider-resolution command

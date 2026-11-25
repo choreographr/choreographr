@@ -20,6 +20,7 @@ use super::reply::ReplyHandle;
 use super::writer::{ConnectionWriter, writer_thread};
 use crate::broadcast::{ReplyTarget, SubscriberSink};
 use crate::daemon::DaemonCommand;
+use crate::db::Store;
 use crate::sessions::SessionCommand;
 
 /// Shared per-client context passed through the dispatch and handler functions.
@@ -36,7 +37,7 @@ pub(crate) struct ClientCtx<'a> {
     /// (redb's `Database` is built for concurrent readers). Used to serve
     /// on-demand image reads DIRECTLY on the connection thread instead of
     /// serializing them on the command loop.
-    pub(super) db: &'a redb::Database,
+    pub(super) db: &'a Store,
     /// Daemon-wide lag counter, shared by every connection; replies must
     /// increment it so the writer thread's per-dequeue decrement stays
     /// balanced. Held as the `Arc` (not a `&AtomicUsize`) so a
@@ -146,7 +147,7 @@ pub(crate) struct ClientConn {
     /// This connection's own handle to the shared redb database (see
     /// [`ClientCtx::db`]): on-demand image reads run here, on the connection
     /// thread, never as a command-loop round-trip.
-    db: Arc<redb::Database>,
+    db: Arc<Store>,
     /// This connection's delivery sink.
     writer: SubscriberSink,
     /// Daemon-wide lag counter, shared by every connection; kept so replies
@@ -178,7 +179,7 @@ pub(crate) struct ConnThreadArgs {
     pub daemon_tx: crossbeam_channel::Sender<DaemonCommand>,
     /// This connection's own handle to the shared redb database (see
     /// [`ClientCtx::db`]).
-    pub db: Arc<redb::Database>,
+    pub db: Arc<Store>,
     /// This connection's delivery sink.
     pub writer: SubscriberSink,
     /// The receiver end of this connection's writer channel.

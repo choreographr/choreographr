@@ -345,6 +345,7 @@ impl Tool for ReadSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::db::{SessionRecord, write_session, write_turn};
     use choreo_proto::{ContextConfig, TimestampMs, ToolResultRecord};
     use std::sync::Arc;
@@ -355,7 +356,9 @@ mod tests {
     /// session is `owner` (the `TempDir` guard keeps the DB alive).
     fn seed(owner: u64, target: u64, turns: Vec<(u32, Turn)>) -> (tempfile::TempDir, ToolContext) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let now = TimestampMs::now().as_millis();
         let turn_count = u32::try_from(turns.len()).unwrap();
         let record = SessionRecord {

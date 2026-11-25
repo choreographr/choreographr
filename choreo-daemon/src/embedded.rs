@@ -18,6 +18,7 @@
 //! `server::connection`, which forwards values instead of bytes) differ.
 
 use crate::daemon::{DaemonCommand, DaemonState};
+use crate::db::Store;
 use crate::server::core::{CoreOptions, DaemonCore, start_daemon_core};
 use choreo_proto::{ClientMessage, DaemonMessage};
 use std::io;
@@ -86,7 +87,7 @@ pub struct EmbeddedDaemon {
     /// hands each connection thread its own clone — on-demand image reads run
     /// on the connection thread, never on the command loop (same as the
     /// socket transports; see [`DaemonCore::db`]).
-    db: Arc<redb::Database>,
+    db: Arc<Store>,
     /// Ferry for connection-thread `JoinHandles` (same pattern as the TCP
     /// accept thread in `lifecycle.rs`): the accept path here is `connect()`
     /// itself, spawning on the CALLER's thread, so handles are sent over the

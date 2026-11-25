@@ -6,7 +6,7 @@
 //! unit — but they are only one of several things `db` persists (credentials,
 //! catalog state, the keystore binding, and the per-session KV store are the
 //! others). Splitting them out keeps the storage plumbing (`schema`, `open`,
-//! `migrate`, `attachments`, `codec`, `db_err`) from carrying all of the
+//! `migrate`, `attachments`, `codec`, `store`) from carrying all of the
 //! per-entity CRUD. The table definitions stay in `schema`, shared with the
 //! migration code, and are reached here via `super::schema`.
 //!
@@ -25,8 +25,8 @@ use tracing::{debug, error, info, warn};
 
 use super::attachments;
 use super::codec::{zstd_decode, zstd_encode};
-use super::db_err;
 use super::schema::{DELETED_SESSIONS, SESSION_KV, SESSION_TURNS, SESSIONS, session_range_end};
+use super::store::Store;
 
 /// A persisted session record: the durable form of a session's identity and
 /// configuration. Stored MessagePack-encoded under its session id in
@@ -110,18 +110,14 @@ pub struct SessionRecord {
 ///
 /// Returns Err if msgpack encoding, the write transaction, table open,
 /// insert, or commit fails.
-pub fn write_session(
-    db: &redb::Database,
-    session_id: u64,
-    record: &SessionRecord,
-) -> io::Result<()> {
+pub fn write_session(db: &Store, session_id: u64, record: &SessionRecord) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(SESSIONS)
-            .map_err(|e| db_err(format!("redb open sessions: {e}")))?;
+            .map_err(|e| db.err(format!("redb open sessions: {e}")))?;
         // Preserve the daemon-owned flags. The session thread writes the FULL
         // record on every mutation, but the incoming `record` is built from
         // `SessionConfig`, which does NOT carry `pinned`/`archived_at` (the
@@ -134,7 +130,7 @@ pub fn write_session(
         let mut record = record.clone();
         if let Some(guard) = table
             .get(session_id)
-            .map_err(|e| db_err(format!("redb get session: {e}")))?
+            .map_err(|e| db.err(format!("redb get session: {e}")))?
         {
             match rmp_serde::from_slice::<SessionRecord>(guard.value()) {
                 Ok(existing) => {
@@ -151,14 +147,14 @@ pub fn write_session(
             }
         }
         let payload = rmp_serde::to_vec_named(&record)
-            .map_err(|e| db_err(format!("codec encode session: {e}")))?;
+            .map_err(|e| db.err(format!("codec encode session: {e}")))?;
         table
             .insert(session_id, payload.as_slice())
-            .map_err(|e| db_err(format!("redb insert session: {e}")))?;
+            .map_err(|e| db.err(format!("redb insert session: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit session: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit session: {e}")))?;
     debug!("write_session: id={} ok", session_id);
     Ok(())
 }
@@ -179,7 +175,7 @@ pub fn write_session(
 /// Returns Err if the write transaction, table open, row lookup, decode of
 /// the CURRENT record, encode, insert, or commit fails.
 pub fn update_session_flags(
-    db: &redb::Database,
+    db: &Store,
     session_id: u64,
     pinned: bool,
     archived_at: Option<i64>,
@@ -187,17 +183,17 @@ pub fn update_session_flags(
     debug!("update_session_flags: id={session_id} pinned={pinned}");
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(SESSIONS)
-            .map_err(|e| db_err(format!("redb open sessions: {e}")))?;
+            .map_err(|e| db.err(format!("redb open sessions: {e}")))?;
         // Read the current row and decode it, so the OTHER fields survive the
         // flag update untouched. An absent row is a no-op (a deleted session
         // has no record to flag).
         let Some(guard) = table
             .get(session_id)
-            .map_err(|e| db_err(format!("redb get session: {e}")))?
+            .map_err(|e| db.err(format!("redb get session: {e}")))?
         else {
             debug!(session_id, "update_session_flags: no record, nothing to do");
             return Ok(());
@@ -219,14 +215,14 @@ pub fn update_session_flags(
         record.pinned = pinned;
         record.archived_at = archived_at;
         let payload = rmp_serde::to_vec_named(&record)
-            .map_err(|e| db_err(format!("codec encode session: {e}")))?;
+            .map_err(|e| db.err(format!("codec encode session: {e}")))?;
         table
             .insert(session_id, payload.as_slice())
-            .map_err(|e| db_err(format!("redb insert session: {e}")))?;
+            .map_err(|e| db.err(format!("redb insert session: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit session: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit session: {e}")))?;
     Ok(())
 }
 
@@ -240,17 +236,17 @@ pub fn update_session_flags(
 /// # Errors
 ///
 /// Returns Err if the read transaction, table open, or row lookup fails.
-pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<SessionRecord>> {
+pub fn read_session(db: &Store, session_id: u64) -> io::Result<Option<SessionRecord>> {
     debug!("read_session: id={}", session_id);
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = read_txn
         .open_table(SESSIONS)
-        .map_err(|e| db_err(format!("redb open sessions: {e}")))?;
+        .map_err(|e| db.err(format!("redb open sessions: {e}")))?;
     match table
         .get(session_id)
-        .map_err(|e| db_err(format!("redb get session: {e}")))?
+        .map_err(|e| db.err(format!("redb get session: {e}")))?
     {
         Some(guard) => match rmp_serde::from_slice::<SessionRecord>(guard.value()) {
             Ok(record) => Ok(Some(record)),
@@ -275,12 +271,12 @@ pub fn read_session(db: &redb::Database, session_id: u64) -> io::Result<Option<S
 ///
 /// Returns Err if the read transaction, table iteration, or row decode of
 /// a well-formed entry fails.
-pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRecord)>> {
+pub fn read_all_sessions(db: &Store) -> io::Result<Vec<(u64, SessionRecord)>> {
     debug!("read_all_sessions");
     let read_txn = db.begin_read().map_err(|e| {
         let msg = format!("redb read txn: {e}");
         error!("read_all_sessions: {msg}");
-        db_err(msg)
+        db.err(msg)
     })?;
     let table = match read_txn.open_table(SESSIONS) {
         Ok(t) => t,
@@ -295,7 +291,7 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
         Err(e) => {
             let msg = format!("redb iter sessions: {e}");
             error!("read_all_sessions: {msg}");
-            return Err(db_err(msg));
+            return Err(db.err(msg));
         }
     };
     for result in iter {
@@ -329,61 +325,61 @@ pub fn read_all_sessions(db: &redb::Database) -> io::Result<Vec<(u64, SessionRec
 ///
 /// Returns Err if the write transaction, table open, row removal, or
 /// commit fails.
-pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
+pub fn delete_session(db: &Store, session_id: u64) -> io::Result<()> {
     debug!("delete_session: id={}", session_id);
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut sessions = write_txn
             .open_table(SESSIONS)
-            .map_err(|e| db_err(format!("redb open sessions: {e}")))?;
+            .map_err(|e| db.err(format!("redb open sessions: {e}")))?;
         sessions
             .remove(session_id)
-            .map_err(|e| db_err(format!("redb remove session: {e}")))?;
+            .map_err(|e| db.err(format!("redb remove session: {e}")))?;
     }
     {
         let mut turns = write_txn
             .open_table(SESSION_TURNS)
-            .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+            .map_err(|e| db.err(format!("redb open turns: {e}")))?;
         // Bounded range scan over just this session's turn ids instead of
         // iterating the whole table (the old full-table scan made each delete
         // O(total turns) — costly for the largest sessions).
         let keys_to_remove: Vec<(u64, u32)> = turns
             .range((session_id, 0u32)..(session_range_end(session_id), 0u32))
-            .map_err(|e| db_err(format!("redb range turns: {e}")))?
+            .map_err(|e| db.err(format!("redb range turns: {e}")))?
             .filter_map(std::result::Result::ok)
             .map(|(key, _)| key.value())
             .collect();
         for key in keys_to_remove {
             turns
                 .remove(key)
-                .map_err(|e| db_err(format!("redb remove turn: {e}")))?;
+                .map_err(|e| db.err(format!("redb remove turn: {e}")))?;
         }
     }
     {
         let mut kv_table = write_txn
             .open_table(SESSION_KV)
-            .map_err(|e| db_err(format!("redb open session_kv: {e}")))?;
+            .map_err(|e| db.err(format!("redb open session_kv: {e}")))?;
         let kv_keys: Vec<(u64, String)> = kv_table
             .range((session_id, String::new())..(session_range_end(session_id), String::new()))
-            .map_err(|e| db_err(format!("redb range session_kv: {e}")))?
+            .map_err(|e| db.err(format!("redb range session_kv: {e}")))?
             .filter_map(std::result::Result::ok)
             .map(|(k, _)| k.value())
             .collect();
         for key in kv_keys {
             kv_table
                 .remove(key)
-                .map_err(|e| db_err(format!("redb remove session_kv: {e}")))?;
+                .map_err(|e| db.err(format!("redb remove session_kv: {e}")))?;
         }
     }
     // Range-remove this session's attachment rows too — the same
     // (session_id, …)..(session_range_end(session_id), …) bound as the
     // turns/KV deletes above, so no orphaned image bytes survive a delete.
-    attachments::delete_session_attachments(&write_txn, session_id)?;
+    attachments::delete_session_attachments(db, &write_txn, session_id)?;
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit delete: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit delete: {e}")))?;
     Ok(())
 }
 
@@ -399,22 +395,22 @@ pub fn delete_session(db: &redb::Database, session_id: u64) -> io::Result<()> {
 ///
 /// Returns Err if the write transaction, table open, insert, or commit
 /// fails.
-pub fn mark_session_deleted(db: &redb::Database, session_id: u64) -> io::Result<()> {
+pub fn mark_session_deleted(db: &Store, session_id: u64) -> io::Result<()> {
     debug!("mark_session_deleted: id={}", session_id);
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(DELETED_SESSIONS)
-            .map_err(|e| db_err(format!("redb open deleted_sessions: {e}")))?;
+            .map_err(|e| db.err(format!("redb open deleted_sessions: {e}")))?;
         table
             .insert(session_id, ())
-            .map_err(|e| db_err(format!("redb insert tombstone: {e}")))?;
+            .map_err(|e| db.err(format!("redb insert tombstone: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit tombstone: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit tombstone: {e}")))?;
     Ok(())
 }
 
@@ -428,22 +424,22 @@ pub fn mark_session_deleted(db: &redb::Database, session_id: u64) -> io::Result<
 ///
 /// Returns Err if the write transaction, table open, removal, or commit
 /// fails.
-pub fn clear_session_tombstone(db: &redb::Database, session_id: u64) -> io::Result<()> {
+pub fn clear_session_tombstone(db: &Store, session_id: u64) -> io::Result<()> {
     debug!("clear_session_tombstone: id={}", session_id);
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(DELETED_SESSIONS)
-            .map_err(|e| db_err(format!("redb open deleted_sessions: {e}")))?;
+            .map_err(|e| db.err(format!("redb open deleted_sessions: {e}")))?;
         table
             .remove(session_id)
-            .map_err(|e| db_err(format!("redb remove tombstone: {e}")))?;
+            .map_err(|e| db.err(format!("redb remove tombstone: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit tombstone: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit tombstone: {e}")))?;
     Ok(())
 }
 
@@ -460,19 +456,19 @@ pub fn clear_session_tombstone(db: &redb::Database, session_id: u64) -> io::Resu
 ///
 /// Returns Err if the read or write transactions, table opens/iterations,
 /// or commits fail.
-pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
+pub fn purge_tombstoned_sessions(db: &Store) -> io::Result<usize> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = match read_txn.open_table(DELETED_SESSIONS) {
         Ok(table) => table,
         // No tombstone table yet (e.g. a pre-upgrade database): nothing to purge.
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-        Err(e) => return Err(db_err(format!("redb open deleted_sessions: {e}"))),
+        Err(e) => return Err(db.err(format!("redb open deleted_sessions: {e}"))),
     };
     let ids: Vec<u64> = table
         .iter()
-        .map_err(|e| db_err(format!("redb iter deleted_sessions: {e}")))?
+        .map_err(|e| db.err(format!("redb iter deleted_sessions: {e}")))?
         .filter_map(std::result::Result::ok)
         .map(|(key, _)| key.value())
         .collect();
@@ -503,12 +499,7 @@ pub fn purge_tombstoned_sessions(db: &redb::Database) -> io::Result<usize> {
 ///
 /// Returns Err if msgpack/zstd encoding, the write transaction, table
 /// opens, inserts, or commit fails.
-pub fn write_turn(
-    db: &redb::Database,
-    session_id: u64,
-    turn_id: u32,
-    turn: &Turn,
-) -> io::Result<()> {
+pub fn write_turn(db: &Store, session_id: u64, turn_id: u32, turn: &Turn) -> io::Result<()> {
     // Build a "storage view" of the turn: clone it and empty every image byte
     // field (display + vision). The bytes themselves are persisted separately
     // into SESSION_ATTACHMENTS (raw, incompressible), so the zstd-compressed
@@ -526,12 +517,12 @@ pub fn write_turn(
         }
     }
     let payload =
-        rmp_serde::to_vec_named(&storage).map_err(|e| db_err(format!("codec encode turn: {e}")))?;
+        rmp_serde::to_vec_named(&storage).map_err(|e| db.err(format!("codec encode turn: {e}")))?;
     // Serialize first, then compress the whole blob (see [`zstd_encode`]).
     let compressed = zstd_encode(&payload);
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         // Persist the image/attachment bytes and the byte-less turn blob in the
         // SAME write transaction so they can never diverge: a crash leaves
@@ -542,17 +533,17 @@ pub fn write_turn(
         // so the codec/blob logic here stays focused; the ordering (clear
         // before insert) is what keeps write_turn idempotent under a shifted
         // image layout.
-        attachments::write_turn_attachments(&write_txn, session_id, turn_id, turn)?;
+        attachments::write_turn_attachments(db, &write_txn, session_id, turn_id, turn)?;
         let mut table = write_txn
             .open_table(SESSION_TURNS)
-            .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+            .map_err(|e| db.err(format!("redb open turns: {e}")))?;
         table
             .insert((session_id, turn_id), compressed.as_slice())
-            .map_err(|e| db_err(format!("redb insert turn: {e}")))?;
+            .map_err(|e| db.err(format!("redb insert turn: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit turn: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit turn: {e}")))?;
     Ok(())
 }
 
@@ -564,17 +555,17 @@ pub fn write_turn(
 ///
 /// Returns Err if the read transaction, table opens, iteration, or decode
 /// of a well-formed entry fails.
-pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, Turn)>> {
+pub fn read_turns(db: &Store, session_id: u64) -> io::Result<Vec<(u32, Turn)>> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = match read_txn.open_table(SESSION_TURNS) {
         Ok(t) => t,
         // A fresh database that has never persisted a turn has no table yet:
         // that is an empty session history, not an error (mirrors
         // `read_all_sessions`'s missing-`sessions` handling).
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
-        Err(e) => return Err(db_err(format!("redb open turns: {e}"))),
+        Err(e) => return Err(db.err(format!("redb open turns: {e}"))),
     };
     // The attachments table is opened in the SAME read transaction as the turns
     // table so both see a consistent snapshot — a turn and its attachment rows
@@ -584,7 +575,7 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     let attachments = match read_txn.open_table(attachments::SESSION_ATTACHMENTS) {
         Ok(t) => Some(t),
         Err(redb::TableError::TableDoesNotExist(_)) => None,
-        Err(e) => return Err(db_err(format!("redb open session_attachments: {e}"))),
+        Err(e) => return Err(db.err(format!("redb open session_attachments: {e}"))),
     };
     let mut turns: Vec<(u32, Turn)> = Vec::new();
     // Bounded range scan over exactly this session's turn ids rather than
@@ -593,9 +584,9 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
     // wasted zstd decode cycles on unrelated sessions' blobs.
     let iter = table
         .range((session_id, 0u32)..(session_range_end(session_id), 0u32))
-        .map_err(|e| db_err(format!("redb range turns: {e}")))?;
+        .map_err(|e| db.err(format!("redb range turns: {e}")))?;
     for result in iter {
-        let (key, value) = result.map_err(|e| db_err(format!("redb iter item: {e}")))?;
+        let (key, value) = result.map_err(|e| db.err(format!("redb iter item: {e}")))?;
         let (_, idx) = key.value();
         match zstd_decode(value.value())
             .and_then(|buf| rmp_serde::from_slice::<Turn>(&buf).map_err(io::Error::other))
@@ -606,6 +597,7 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
                 // "missing table / missing row ⇒ leave empty" semantics (see
                 // [`attachments::reattach_turn_attachments`]).
                 attachments::reattach_turn_attachments(
+                    db,
                     attachments.as_ref(),
                     session_id,
                     idx,
@@ -630,17 +622,17 @@ pub fn read_turns(db: &redb::Database, session_id: u64) -> io::Result<Vec<(u32, 
 ///
 /// Returns Err if the write transaction, table open/iteration, row
 /// removal, or commit fails.
-pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<()> {
+pub fn delete_session_turns(db: &Store, session_id: u64) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(SESSION_TURNS)
-            .map_err(|e| db_err(format!("redb open turns: {e}")))?;
+            .map_err(|e| db.err(format!("redb open turns: {e}")))?;
         let keys_to_remove: Vec<(u64, u32)> = table
             .iter()
-            .map_err(|e| db_err(format!("redb iter turns: {e}")))?
+            .map_err(|e| db.err(format!("redb iter turns: {e}")))?
             .filter_map(|result| match result {
                 Ok((key, _)) => {
                     if key.value().0 == session_id {
@@ -658,16 +650,16 @@ pub fn delete_session_turns(db: &redb::Database, session_id: u64) -> io::Result<
         for key in keys_to_remove {
             table
                 .remove(key)
-                .map_err(|e| db_err(format!("redb remove turn: {e}")))?;
+                .map_err(|e| db.err(format!("redb remove turn: {e}")))?;
         }
     }
     // Deleting all of a session's turns must also remove that session's
     // attachment rows, so no orphaned image bytes accumulate when turns are
     // cleared without deleting the whole session.
-    attachments::delete_session_attachments(&write_txn, session_id)?;
+    attachments::delete_session_attachments(db, &write_txn, session_id)?;
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit delete turns: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit delete turns: {e}")))?;
     Ok(())
 }
 
@@ -682,26 +674,26 @@ mod tests {
     /// Read the current `next_session_id` from the DB and atomically
     /// increment it.  Only used by tests — production code derives the
     /// next ID from max(existing keys) + 1 at startup.
-    fn next_session_id(db: &redb::Database) -> io::Result<u64> {
+    fn next_session_id(db: &Store) -> io::Result<u64> {
         let write_txn = db
             .begin_write()
-            .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+            .map_err(|e| db.err(format!("redb write txn: {e}")))?;
         let current = {
             let mut table = write_txn
                 .open_table(META)
-                .map_err(|e| db_err(format!("redb open meta: {e}")))?;
+                .map_err(|e| db.err(format!("redb open meta: {e}")))?;
             let current = table
                 .get("next_session_id")
-                .map_err(|e| db_err(format!("redb get meta: {e}")))?
+                .map_err(|e| db.err(format!("redb get meta: {e}")))?
                 .map_or(1, |g| g.value());
             table
                 .insert("next_session_id", current.wrapping_add(1))
-                .map_err(|e| db_err(format!("redb set meta: {e}")))?;
+                .map_err(|e| db.err(format!("redb set meta: {e}")))?;
             current
         };
         write_txn
             .commit()
-            .map_err(|e| db_err(format!("redb commit meta: {e}")))?;
+            .map_err(|e| db.err(format!("redb commit meta: {e}")))?;
         Ok(current)
     }
 
@@ -725,7 +717,7 @@ mod tests {
     #[test]
     fn round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
 
         let id = next_session_id(&db).unwrap();
         assert_eq!(id, 1);
@@ -797,7 +789,7 @@ mod tests {
         // session_attachments table on write, and re-attached on read so the
         // round-tripped turn matches the original byte-for-byte.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let id = 1u64;
 
         let mut turn = dummy_turn();
@@ -914,7 +906,7 @@ mod tests {
         // `read_turns` to the wrong slots. write_turn now clears the turn's
         // attachment range first, so only the current image set survives.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let id = 1u64;
 
         // First write: image at display index 0 (`d0`) and a tool-result vision
@@ -1008,7 +1000,7 @@ mod tests {
         // survive a write/read cycle so ResponseId-policy models chain across
         // user turns even after a daemon restart.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let id = 1u64;
         let record = SessionRecord {
             title: Some("t".into()),
@@ -1071,7 +1063,7 @@ mod tests {
         // archived_at=None — it never knows the daemon's flags); a full-record
         // write must NOT clobber flags the daemon set via update_session_flags.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         write_session(&db, 1, &flag_record()).unwrap();
 
         update_session_flags(&db, 1, true, Some(4242)).unwrap();
@@ -1107,7 +1099,7 @@ mod tests {
     #[test]
     fn update_session_flags_round_trips_and_preserves_other_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let record = flag_record();
         write_session(&db, 7, &record).unwrap();
 
@@ -1136,7 +1128,7 @@ mod tests {
         // an error — the caller's index update still runs and other rows are
         // untouched.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         // Create the SESSIONS table with a real row, so the reads below can
         // open it (a fresh DB has no table until the first committed write).
         write_session(&db, 1, &flag_record()).unwrap();
@@ -1152,7 +1144,7 @@ mod tests {
     #[test]
     fn read_turns_skips_corrupt_entries() {
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let id = 1u64;
 
         // Write a valid turn at index 0
@@ -1189,7 +1181,7 @@ mod tests {
         // daemon): read_session treats undecodable data as absent — warn and
         // return None — the same policy as the batch reads.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         {
             let write_txn = db.begin_write().unwrap();
             {
@@ -1215,7 +1207,7 @@ mod tests {
         // the daemon dies before the delete is finalized.  The startup purge
         // must remove the record so the deleted session cannot resurface.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let record = SessionRecord {
             title: Some("ghost".into()),
             selected_model: None,
@@ -1255,7 +1247,7 @@ mod tests {
         // A tombstone that is cleared (the exit finalize finished) must not
         // cause a still-valid record to be purged.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let record = SessionRecord {
             title: Some("live".into()),
             selected_model: None,
@@ -1285,7 +1277,7 @@ mod tests {
     #[test]
     fn purge_empty_database_is_zero() {
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         assert_eq!(purge_tombstoned_sessions(&db).unwrap(), 0);
     }
 }

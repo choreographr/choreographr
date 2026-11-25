@@ -8,16 +8,16 @@
 //! its full multi-megabyte length, and one `compact()` call returned it to
 //! tens of kilobytes.
 //!
-//! Compaction runs at startup, on the owned `redb::Database` handle, after
+//! Compaction runs at startup, on the owned `Store` handle, after
 //! [`super::run_migrations_at`]. Two orderings are load-bearing:
 //!
 //! - **After the pre-migration backup.** That snapshot exists to roll a failed
 //!   migration back, so it must image the pre-migration store; compacting
 //!   first would put a rewritten file where the rollback point should be.
 //! - **Before the handle is shared.** `redb::Database::compact()` takes
-//!   `&mut self`, which the `Arc<redb::Database>` the daemon threads everywhere
-//!   cannot give it. Startup is also the only point where the store is provably
-//!   free of the daemon's own read and write transactions.
+//!   `&mut self`, which the `Arc<Store>` the daemon threads everywhere cannot
+//!   give it. Startup is also the only point where the store is provably free
+//!   of the daemon's own read and write transactions.
 //!
 //! [`CompactionMode::Balanced`] is the mode used. `Maximum` also repacks
 //! partially filled pages, which measured no extra win on this schema — the
@@ -31,6 +31,8 @@ use std::io;
 use std::path::Path;
 
 use tracing::{debug, info};
+
+use super::store::Store;
 
 /// A store's on-disk length and the bytes its live records actually occupy.
 ///
@@ -111,14 +113,14 @@ impl Policy {
 ///
 /// Returns Err if the file's length cannot be read, the accounting-only write
 /// transaction cannot be opened, or `redb` fails to compact the file.
-pub(crate) fn maybe_compact(db: &mut redb::Database, path: &Path) -> io::Result<()> {
+pub(crate) fn maybe_compact(db: &mut Store, path: &Path) -> io::Result<()> {
     maybe_compact_with(db, path, PRODUCTION_POLICY)
 }
 
 /// [`maybe_compact`] with an injectable [`Policy`], so a test can exercise the
 /// real measure-and-compact path against a store too small to clear the
 /// production thresholds.
-fn maybe_compact_with(db: &mut redb::Database, path: &Path, policy: Policy) -> io::Result<()> {
+fn maybe_compact_with(db: &mut Store, path: &Path, policy: Policy) -> io::Result<()> {
     let before = measure(db, path)?;
     if !policy.worth_compacting(before) {
         debug!(
@@ -139,9 +141,10 @@ fn maybe_compact_with(db: &mut redb::Database, path: &Path, policy: Policy) -> i
     // One pass is complete: `Balanced` compaction moves live pages to the
     // front and truncates what that frees at the end, so a second call reports
     // no further compaction rather than finding more to do.
-    let performed = db
-        .compact(redb::CompactionMode::Balanced)
-        .map_err(|e| io::Error::other(format!("redb compact: {e}")))?;
+    let performed = match db.compact(redb::CompactionMode::Balanced) {
+        Ok(performed) => performed,
+        Err(e) => return Err(db.err(format!("redb compact: {e}"))),
+    };
     // `performed == false` means redb found nothing it could reclaim, which is
     // possible with a footprint that cleared the thresholds: the estimate
     // counts in-page slack that `Balanced` deliberately leaves for later
@@ -168,17 +171,17 @@ fn maybe_compact_with(db: &mut redb::Database, path: &Path, policy: Policy) -> i
 /// opened here is read-only in effect and is dropped without committing, so it
 /// leaves the store untouched. Startup is safe for it because no other
 /// transaction exists yet — `begin_write()` would otherwise block.
-fn measure(db: &redb::Database, path: &Path) -> io::Result<Footprint> {
+fn measure(db: &Store, path: &Path) -> io::Result<Footprint> {
     let file_bytes = std::fs::metadata(path)
         .map_err(|e| io::Error::other(format!("read {} length: {e}", path.display())))?
         .len();
     let stats = {
         let write_txn = db
             .begin_write()
-            .map_err(|e| io::Error::other(format!("redb write txn (stats): {e}")))?;
+            .map_err(|e| db.err(format!("redb write txn (stats): {e}")))?;
         write_txn
             .stats()
-            .map_err(|e| io::Error::other(format!("redb stats: {e}")))?
+            .map_err(|e| db.err(format!("redb stats: {e}")))?
         // Dropped here without `commit()`: an empty transaction is aborted, so
         // measuring costs no write.
     };
@@ -277,7 +280,7 @@ mod tests {
         write_then_delete_everything(&path);
 
         let before = std::fs::metadata(&path).unwrap().len();
-        let mut db = redb::Database::open(&path).unwrap();
+        let mut db = Store::from_db(redb::Database::open(&path).unwrap());
         maybe_compact_with(
             &mut db,
             &path,
@@ -305,7 +308,7 @@ mod tests {
         write_then_delete_everything(&path);
 
         let before = std::fs::metadata(&path).unwrap().len();
-        let mut db = redb::Database::open(&path).unwrap();
+        let mut db = Store::from_db(redb::Database::open(&path).unwrap());
         maybe_compact(&mut db, &path).unwrap();
         drop(db);
 

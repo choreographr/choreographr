@@ -88,6 +88,7 @@ impl Tool for ListSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::tools::admin::tests::test_context;
     use std::sync::Arc;
 
@@ -119,7 +120,9 @@ mod tests {
         // Drop the receiver so sends fail.
         drop(rx);
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         let ctx = ToolContext::new(42, db, tx);
         let result = execute_list_sessions(&ListSessionsArgs {}, None, Some(&ctx));
         assert!(result.is_err());

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 use super::migrate::{MIGRATIONS, SCHEMA_VERSION, initialize_schema_version, schema_version};
+use super::store::Store;
 
 /// Resolve the database file path: the `CHOREOGRAPHR_DB_PATH` override when
 /// set, otherwise the standard data directory (platform `dirs::data_dir()` by
@@ -231,7 +232,7 @@ pub(super) fn backup_db_file(path: &std::path::Path, from: u64) -> io::Result<()
 /// decision and (via the skip-if-exists check in `backup_db_file`) the
 /// runner's own backup step, so the two can never disagree about whether a
 /// backup exists before the migration runs.
-pub(crate) fn migration_backup_version(db: &redb::Database) -> io::Result<Option<u64>> {
+pub(crate) fn migration_backup_version(db: &Store) -> io::Result<Option<u64>> {
     let current = schema_version(db)?;
     debug!(current, "checking whether a pre-migration backup is needed");
     if current == 0 || current >= SCHEMA_VERSION || MIGRATIONS.is_empty() {
@@ -262,7 +263,7 @@ pub(crate) fn migration_backup_version(db: &redb::Database) -> io::Result<Option
 /// # Errors
 ///
 /// Returns Err if the database path cannot be resolved.
-pub fn open_db() -> io::Result<redb::Database> {
+pub fn open_db() -> io::Result<Store> {
     open_db_at(&db_path()?)
 }
 
@@ -279,7 +280,7 @@ pub fn open_db() -> io::Result<redb::Database> {
 /// stamped. A foreign-owned parent directory is refused; any other failure to
 /// create or tighten the parent is only warned about (the subsequent
 /// create/open reports the real failure).
-pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
+pub fn open_db_at(path: &std::path::Path) -> io::Result<Store> {
     info!(path = %path.display(), "opening database");
     if let Some(parent) = path.parent() {
         ensure_db_dir(parent)?;
@@ -297,8 +298,9 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
         let db = redb::Database::create(path)
             .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
         make_owner_only(path);
-        initialize_schema_version(&db)?;
-        return Ok(db);
+        let store = Store::from_db(db);
+        initialize_schema_version(&store)?;
+        return Ok(store);
     }
     match redb::Database::open(path) {
         Ok(db) => {
@@ -306,7 +308,7 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
             // the file was hardened carries the umask default and would stay
             // world-readable without this.
             make_owner_only(path);
-            Ok(db)
+            Ok(Store::from_db(db))
         }
         // File does not exist: fresh install. Create the database file and
         // stamp the initial schema version so `run_migrations` (called by
@@ -322,8 +324,9 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<redb::Database> {
             let db = redb::Database::create(path)
                 .map_err(|e| io::Error::other(format!("failed to create database: {e}")))?;
             make_owner_only(path);
-            initialize_schema_version(&db)?;
-            Ok(db)
+            let store = Store::from_db(db);
+            initialize_schema_version(&store)?;
+            Ok(store)
         }
         // redb file-format bump: the file is a valid redb database but in a
         // newer file format than this binary can read — the file was written by
@@ -468,8 +471,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let make_db_at = |version: u64| {
-            let db =
-                redb::Database::create(dir.path().join(format!("test-{version}.redb"))).unwrap();
+            let db = Store::from_db(
+                redb::Database::create(dir.path().join(format!("test-{version}.redb"))).unwrap(),
+            );
             if version > 0 {
                 stamp_schema_version(&db, version).unwrap();
             }
@@ -499,7 +503,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
 
-        let opened = redb::Database::create(&db_path).unwrap();
+        let opened = Store::from_db(redb::Database::create(&db_path).unwrap());
         stamp_schema_version(&opened, 1).unwrap();
         let version = migration_backup_version(&opened)
             .unwrap()
@@ -510,7 +514,7 @@ mod tests {
         let backup_path = db_path.with_file_name("state.redb.bak-v1");
         let backup_before = fs::read(&backup_path).unwrap();
 
-        let reopened = redb::Database::open(&db_path).unwrap();
+        let reopened = Store::from_db(redb::Database::open(&db_path).unwrap());
         run_migrations_to(&reopened, SCHEMA_VERSION, MIGRATIONS, &db_path).unwrap();
 
         assert_eq!(current_schema_version(&reopened).unwrap(), SCHEMA_VERSION);

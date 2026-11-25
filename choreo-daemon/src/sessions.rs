@@ -18,7 +18,7 @@ use crate::broadcast::{ClientId, LagLimits, ReplyTarget, SubscriberSink, fan_out
 use crate::cache_warm::WarmPolicy;
 use crate::context::{LoadedSkill, SkillMeta};
 use crate::daemon::{DaemonCommand, ResolvedAccount};
-use crate::db::{self, SessionRecord, write_session, write_turn};
+use crate::db::{self, SessionRecord, Store, write_session, write_turn};
 use crate::mcp::{ProjectToolSet, SessionMcpOverlay};
 use crate::providers::InferenceProvider;
 use crate::requests::run_agent_loop;

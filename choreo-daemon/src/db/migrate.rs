@@ -15,9 +15,9 @@ use redb::ReadableTable;
 use tracing::{debug, error, info, warn};
 
 use super::codec::{ZSTD_FRAME_MAGIC, zstd_encode};
-use super::db_err;
 use super::open::{backup_db_file, db_path};
 use super::schema::{META, SCHEMA_VERSION_KEY, SESSION_TURNS};
+use super::store::Store;
 
 /// Persisted schema version. Bump on any *breaking* change to persisted
 /// records: codec swap, key-type change, table split/merge, semantic change.
@@ -62,7 +62,7 @@ pub const INITIAL_SCHEMA_VERSION: u64 = 1;
 ///   applying the same migration twice must produce the identical final state.
 pub(super) struct Migration {
     pub(super) from: u64,
-    run: fn(&redb::Database) -> io::Result<()>,
+    run: fn(&Store) -> io::Result<()>,
 }
 
 /// Ordered migration chain. The first real entry (1 → 2, the `session_turns`
@@ -80,20 +80,20 @@ pub(super) const MIGRATIONS: &[Migration] = &[Migration {
 
 /// Read the persisted schema version, or `0` for an unversioned database
 /// (no `meta` table yet, or the `schema_version` key absent).
-pub(super) fn current_schema_version(db: &redb::Database) -> io::Result<u64> {
+pub(super) fn current_schema_version(db: &Store) -> io::Result<u64> {
     let read_txn = db
         .begin_read()
-        .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb read txn: {e}")))?;
     let table = match read_txn.open_table(META) {
         Ok(table) => table,
         // No meta table ⇒ either a freshly created DB (never stamped) or a
         // pre-release leftover. Both report 0 (unversioned).
         Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
-        Err(e) => return Err(db_err(format!("redb open meta: {e}"))),
+        Err(e) => return Err(db.err(format!("redb open meta: {e}"))),
     };
     Ok(table
         .get(SCHEMA_VERSION_KEY)
-        .map_err(|e| db_err(format!("redb get meta: {e}")))?
+        .map_err(|e| db.err(format!("redb get meta: {e}")))?
         .map_or(0, |guard| guard.value()))
 }
 
@@ -106,28 +106,28 @@ pub(super) fn current_schema_version(db: &redb::Database) -> io::Result<u64> {
 /// # Errors
 ///
 /// Returns Err if the read transaction or the `meta` table read fails.
-pub fn schema_version(db: &redb::Database) -> io::Result<u64> {
+pub fn schema_version(db: &Store) -> io::Result<u64> {
     current_schema_version(db)
 }
 
 /// Persist `version` under `SCHEMA_VERSION_KEY` in [`META`]. Opening the
 /// table inside a write transaction creates it on first use, so this also
 /// initializes the `meta` table on a fresh database.
-pub(super) fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Result<()> {
+pub(super) fn stamp_schema_version(db: &Store, version: u64) -> io::Result<()> {
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn: {e}")))?;
     {
         let mut table = write_txn
             .open_table(META)
-            .map_err(|e| db_err(format!("redb open meta: {e}")))?;
+            .map_err(|e| db.err(format!("redb open meta: {e}")))?;
         table
             .insert(SCHEMA_VERSION_KEY, version)
-            .map_err(|e| db_err(format!("redb set schema_version: {e}")))?;
+            .map_err(|e| db.err(format!("redb set schema_version: {e}")))?;
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit schema_version: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit schema_version: {e}")))?;
     info!(version, "stamped database schema version");
     Ok(())
 }
@@ -141,7 +141,7 @@ pub(super) fn stamp_schema_version(db: &redb::Database, version: u64) -> io::Res
 /// # Errors
 ///
 /// Returns Err if the database path cannot be resolved.
-pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
+pub fn run_migrations(db: &Store) -> io::Result<()> {
     run_migrations_at(db, &db_path()?)
 }
 
@@ -153,7 +153,7 @@ pub fn run_migrations(db: &redb::Database) -> io::Result<()> {
 /// Returns Err if the current version cannot be read, the database is
 /// newer than the target (downgrade protection), the migration chain is
 /// non-contiguous, or any migration step or backup write fails.
-pub fn run_migrations_at(db: &redb::Database, path: &std::path::Path) -> io::Result<()> {
+pub fn run_migrations_at(db: &Store, path: &std::path::Path) -> io::Result<()> {
     run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS, path)
 }
 
@@ -187,7 +187,7 @@ pub fn run_migrations_at(db: &redb::Database, path: &std::path::Path) -> io::Res
 ///   pre-existing unversioned file: stamped to 1 with a warning while the
 ///   target is 1, refused once the chain grows past 1.
 pub(super) fn run_migrations_to(
-    db: &redb::Database,
+    db: &Store,
     target: u64,
     migrations: &[Migration],
     db_path: &std::path::Path,
@@ -199,7 +199,7 @@ pub(super) fn run_migrations_to(
             supported = target,
             "refusing to open database: schema version newer than this binary supports"
         );
-        return Err(db_err(format!(
+        return Err(db.err(format!(
             "database schema version {current} is newer than this binary supports ({target}); \
              upgrade choreographr before continuing"
         )));
@@ -210,7 +210,7 @@ pub(super) fn run_migrations_to(
         let msg =
             "database has no schema version (pre-release data); recreate it or restore a backup";
         error!("{msg}");
-        return Err(db_err(msg.to_string()));
+        return Err(db.err(msg.to_string()));
     }
     if current == target {
         return Ok(()); // idempotent fast path
@@ -227,7 +227,7 @@ pub(super) fn run_migrations_to(
         let msg =
             format!("migration chain is not contiguous: has {provided:?}, needs {expected:?}");
         error!("{msg}");
-        return Err(db_err(msg));
+        return Err(db.err(msg));
     }
     if current == 0 {
         // A fresh DB or a pre-release dev DB. Both are stamped the same way —
@@ -277,7 +277,7 @@ pub(super) fn run_migrations_to(
 ///
 /// Runs the rewrite in exactly one redb write transaction (the atomic-change
 /// contract: a crash mid-rewrite leaves the pre-migration state intact).
-fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
+fn migrate_turn_values_to_zstd(db: &Store) -> io::Result<()> {
     info!("applying 1→2 migration: re-encoding session_turns values with zstd");
     // Pass 1 (read txn): identify which rows need re-encoding. We buffer only
     // the (session_id, turn_id) keys — never the values — so memory stays flat
@@ -288,19 +288,19 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
     {
         let read_txn = db
             .begin_read()
-            .map_err(|e| db_err(format!("redb read txn: {e}")))?;
+            .map_err(|e| db.err(format!("redb read txn: {e}")))?;
         let table = match read_txn.open_table(SESSION_TURNS) {
             // A fresh database with no turns has no table yet — nothing to migrate.
             Err(redb::TableError::TableDoesNotExist(_)) => return Ok(()),
             Ok(t) => t,
-            Err(e) => return Err(db_err(format!("redb open turns (migration): {e}"))),
+            Err(e) => return Err(db.err(format!("redb open turns (migration): {e}"))),
         };
         let iter = table
             .iter()
-            .map_err(|e| db_err(format!("redb iter turns (migration): {e}")))?;
+            .map_err(|e| db.err(format!("redb iter turns (migration): {e}")))?;
         for result in iter {
             let (key, value) =
-                result.map_err(|e| db_err(format!("redb iter item (migration): {e}")))?;
+                result.map_err(|e| db.err(format!("redb iter item (migration): {e}")))?;
             let (sid, idx) = key.value();
             // Already a zstd frame ⇒ this row survived an earlier (stamp-less)
             // run of this same migration; leave it byte-for-byte intact.
@@ -327,29 +327,29 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
     // lock while compressing is safe and keeps memory flat (only keys buffered).
     let write_txn = db
         .begin_write()
-        .map_err(|e| db_err(format!("redb write txn (migration): {e}")))?;
+        .map_err(|e| db.err(format!("redb write txn (migration): {e}")))?;
     {
         let mut table = write_txn
             .open_table(SESSION_TURNS)
-            .map_err(|e| db_err(format!("redb open turns (migration): {e}")))?;
+            .map_err(|e| db.err(format!("redb open turns (migration): {e}")))?;
         for key in &keys {
             // The write snapshot reflects the pre-write state for every key here
             // (keys are distinct, each read before its write), so get() returns
             // the legacy raw-MessagePack blob that Pass 1 identified.
             let raw = table
                 .get(*key)
-                .map_err(|e| db_err(format!("redb get turn (migration): {e}")))?
-                .ok_or_else(|| db_err(format!("turn vanished during migration: {key:?}")))
+                .map_err(|e| db.err(format!("redb get turn (migration): {e}")))?
+                .ok_or_else(|| db.err(format!("turn vanished during migration: {key:?}")))
                 .map(|g| g.value().to_vec())?;
             let compressed = zstd_encode(&raw);
             table
                 .insert(*key, compressed.as_slice())
-                .map_err(|e| db_err(format!("redb insert turn (migration): {e}")))?;
+                .map_err(|e| db.err(format!("redb insert turn (migration): {e}")))?;
         }
     }
     write_txn
         .commit()
-        .map_err(|e| db_err(format!("redb commit turn migration: {e}")))?;
+        .map_err(|e| db.err(format!("redb commit turn migration: {e}")))?;
     info!(
         encoded = keys.len(),
         skipped, "re-encoded session_turns values with zstd"
@@ -363,7 +363,7 @@ fn migrate_turn_values_to_zstd(db: &redb::Database) -> io::Result<()> {
 /// unversioned file and refuses once the chain grows past 1. Performing the
 /// 0 → 1 initialization here, at creation, keeps every later startup on the
 /// migrate-from-`current` path regardless of [`SCHEMA_VERSION`].
-pub(super) fn initialize_schema_version(db: &redb::Database) -> io::Result<()> {
+pub(super) fn initialize_schema_version(db: &Store) -> io::Result<()> {
     stamp_schema_version(db, INITIAL_SCHEMA_VERSION)
         .map_err(|e| io::Error::other(format!("failed to initialize schema version: {e}")))
 }
@@ -403,7 +403,7 @@ mod tests {
         // them — that "breaking codec change" is exactly why the migration owns
         // the 1→2 schema bump (see SCHEMA_VERSION).
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let sid = 1u64;
 
         // Write legacy raw-MessagePack turn blobs directly into SESSION_TURNS,
@@ -472,7 +472,7 @@ mod tests {
         // double-compress: a row already holding a zstd frame must be left
         // byte-for-byte intact.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         let sid = 1u64;
         let turn = dummy_turn();
         {
@@ -516,7 +516,7 @@ mod tests {
         // Simulate a database written by a future binary by stamping a
         // version above SCHEMA_VERSION directly into meta.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         {
             let write_txn = db.begin_write().unwrap();
             {
@@ -544,7 +544,7 @@ mod tests {
         // called db_path() here and silently snapshotted the real state.redb).
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let db = redb::Database::create(&db_path).unwrap();
+        let db = Store::from_db(redb::Database::create(&db_path).unwrap());
         stamp_schema_version(&db, 1).unwrap(); // a v1 database, pre-migration
 
         run_migrations_to(&db, SCHEMA_VERSION, MIGRATIONS, &db_path).unwrap();
@@ -562,21 +562,21 @@ mod tests {
 
     /// A stand-in for a real future migration: records a marker in `meta` so a
     /// test can assert the migration actually ran.
-    fn dummy_migrate_1_to_2(db: &redb::Database) -> io::Result<()> {
+    fn dummy_migrate_1_to_2(db: &Store) -> io::Result<()> {
         let write_txn = db
             .begin_write()
-            .map_err(|e| db_err(format!("redb write txn: {e}")))?;
+            .map_err(|e| db.err(format!("redb write txn: {e}")))?;
         {
             let mut table = write_txn
                 .open_table(META)
-                .map_err(|e| db_err(format!("redb open meta: {e}")))?;
+                .map_err(|e| db.err(format!("redb open meta: {e}")))?;
             table
                 .insert("migrated", 1u64)
-                .map_err(|e| db_err(format!("redb set migrated marker: {e}")))?;
+                .map_err(|e| db.err(format!("redb set migrated marker: {e}")))?;
         }
         write_txn
             .commit()
-            .map_err(|e| db_err(format!("redb commit migrated marker: {e}")))?;
+            .map_err(|e| db.err(format!("redb commit migrated marker: {e}")))?;
         Ok(())
     }
 
@@ -587,7 +587,7 @@ mod tests {
         // indexing — the entry's explicit `from` field (not its position)
         // determines what runs.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         stamp_schema_version(&db, 1).unwrap();
 
         run_migrations_to(
@@ -621,7 +621,7 @@ mod tests {
         // anything — stamping v2 over data that was never migrated would
         // corrupt every subsequent read.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         stamp_schema_version(&db, 1).unwrap();
 
         let err = run_migrations_to(
@@ -662,7 +662,7 @@ mod tests {
         // content and asserts the sentinel survives the migration.
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("state.redb");
-        let db = redb::Database::create(&db_path).unwrap();
+        let db = Store::from_db(redb::Database::create(&db_path).unwrap());
         stamp_schema_version(&db, 1).unwrap();
         let backup_path = db_path.with_file_name("state.redb.bak-v1");
         fs::write(&backup_path, b"pre-lock sentinel").unwrap();
@@ -684,7 +684,7 @@ mod tests {
         // INITIAL_SCHEMA_VERSION at creation; here a v1 stamp is applied
         // directly to keep the test independent of db_path()).
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         stamp_schema_version(&db, 1).unwrap();
         assert_eq!(schema_version(&db).unwrap(), 1);
     }
@@ -699,7 +699,7 @@ mod tests {
         // that was never migrated. Fresh installs never hit this branch
         // because open_db stamps INITIAL_SCHEMA_VERSION at creation.
         let dir = tempfile::tempdir().unwrap();
-        let db = redb::Database::create(dir.path().join("test.redb")).unwrap();
+        let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
 
         let err = run_migrations_to(
             &db,

@@ -76,6 +76,7 @@ impl JsonSchema for DbValue {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::db::Store;
     use crate::tools::context::ToolContext;
     use std::sync::Arc;
 
@@ -84,7 +85,9 @@ pub(crate) mod tests {
     /// isolated, pre-warmed session store.
     pub(crate) fn test_context() -> (tempfile::TempDir, ToolContext) {
         let dir = tempfile::tempdir().unwrap();
-        let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+        let db = Arc::new(Store::from_db(
+            redb::Database::create(dir.path().join("test.redb")).unwrap(),
+        ));
         // Note: `crate::db` is the redb KV layer; this module is
         // `crate::tools::db`, so the absolute path avoids any name shadowing
         // between the two `db` modules.

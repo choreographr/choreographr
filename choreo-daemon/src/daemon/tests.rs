@@ -79,7 +79,9 @@ fn register_client(state: &mut DaemonState, id: u32) {
 pub(super) fn make_daemon_state() -> (DaemonState, crossbeam_channel::Receiver<DaemonCommand>) {
     let (daemon_tx, daemon_rx) = crossbeam_channel::unbounded();
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let db = Arc::new(Store::from_db(
+        redb::Database::create(dir.path().join("test.redb")).unwrap(),
+    ));
     let tool_registry = crate::tools::ToolRegistry::new().build().into_shared();
     // The stays-alive detail: `add`/`save` later rewrite the accounts file
     // (tests seed accounts post-construction), so the directory holding it

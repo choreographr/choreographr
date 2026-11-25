@@ -1,4 +1,5 @@
 use choreo_daemon::broadcast::{ClientId, LagLimits, SubscriberSink};
+use choreo_daemon::db::Store;
 use choreo_daemon::{RequestContext, SessionCommand, db, session_main};
 use choreo_proto::{DaemonMessage, DaemonMessageType, SessionEvent};
 use std::path::PathBuf;
@@ -9,7 +10,7 @@ use std::sync::mpsc;
 use crate::common;
 
 fn spawn_session(
-    db: Arc<redb::Database>,
+    db: Arc<Store>,
     session_id: u64,
 ) -> (
     crossbeam_channel::Sender<SessionCommand>,

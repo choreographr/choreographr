@@ -1,6 +1,7 @@
 use super::handlers::*;
 use super::*;
 use crate::broadcast::{ClientId, test_sink};
+use crate::db::Store;
 use choreo_proto::{
     ClientMessage, ClientMessageType, DaemonMessage, DaemonMessageType, MessageKind, SessionEvent,
 };
@@ -17,16 +18,18 @@ fn cid(n: u32) -> ClientId {
 }
 
 /// Shared in-memory database for the `ClientCtx` literals in this module.
-/// Every literal now carries a `db: &'a redb::Database` field (required by
-/// the struct whether or not the handler under test reads through it), and
-/// a `redb::Database` is `Send + Sync`, so one lazily-initialized static —
-/// backed by `InMemoryBackend`, which needs no filesystem path — serves
-/// them all. Tests that DO exercise the store (the `GetImage` serve path)
-/// write into this same handle with unique session/turn ids.
-static TEST_DB: LazyLock<redb::Database> = LazyLock::new(|| {
-    redb::Database::builder()
-        .create_with_backend(redb::backends::InMemoryBackend::new())
-        .expect("create the in-memory test database")
+/// Every literal carries a `db: &'a Store` field (required by the struct
+/// whether or not the handler under test reads through it), and a `Store` is
+/// `Send + Sync` (it owns a `redb::Database`), so one lazily-initialized
+/// static — backed by `InMemoryBackend`, which needs no filesystem path —
+/// serves them all. Tests that DO exercise the store (the `GetImage` serve
+/// path) write into this same handle with unique session/turn ids.
+static TEST_DB: LazyLock<Store> = LazyLock::new(|| {
+    Store::from_db(
+        redb::Database::builder()
+            .create_with_backend(redb::backends::InMemoryBackend::new())
+            .expect("create the in-memory test database"),
+    )
 });
 
 /// A `ConnectionWriter` test double that forwards every written message

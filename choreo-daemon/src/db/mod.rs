@@ -10,10 +10,16 @@
 //! store), `codec` (the zstd turn-value codec), `credentials` (credential blobs
 //! and the keystore binding), `catalog` (the catalog-refresh state), `kv` (the
 //! per-session key-value store), `compact` (startup space reclamation), and
-//! `poison` (escalation from a `redb` handle that latched an I/O failure) —
-//! and their public items are re-exported here so `db::…` call sites are
-//! unchanged. The one thing that stays put is the error conversion every child
-//! funnels its failures through: `db_err`.
+//! `store` (the [`Store`] handle every child takes, which owns the `redb`
+//! database and the latch escalation that rides it) — and their public items
+//! are re-exported here so `db::…` call sites are unchanged.
+//!
+//! Every child takes a [`Store`] rather than a bare `redb::Database`, and builds
+//! its errors with `Store::err`. That is the module's single error conversion,
+//! and the one place able to notice a `redb` handle that latched a permanent I/O
+//! failure — see `store`. A failure that is *not* storage, e.g. a corrupt row the
+//! codec cannot decode, is built with `io::Error::other` instead: a data error
+//! says nothing about the handle.
 //!
 //! All I/O is synchronous `redb` transactions on the calling thread; `redb`'s
 //! `Database` is safe for concurrent readers, so one shared handle is threaded
@@ -36,8 +42,6 @@
 //! permissions are part of the access control: [`open_db_at`] keeps the data
 //! directory owner-only and forces the database file (and every pre-migration
 //! backup) to mode `0600`.
-
-use std::io;
 
 // Every child module below owns one concern; each is listed here so the
 // facade's re-exports are the only names `db::…` call sites depend on.
@@ -87,12 +91,16 @@ mod open;
 pub(crate) use open::migration_backup_version;
 pub use open::{backup_database, db_path, open_db, open_db_at};
 
-// Detection of a `redb` handle that latched a permanent I/O failure, and the
-// escalation to a daemon shutdown when one is. It rides `db_err` below rather
-// than each call site, so every storage failure — read or write — is covered by
-// one hook.
-mod poison;
-pub(crate) use poison::install as install_poison_escalation;
+// The durable handle: the `redb` database plus the escalation state of the
+// handle it owns. It rides `Store::err` rather than each call site, so every
+// storage failure — read or write, on any path — is covered by one hook.
+mod store;
+// Re-exported at the module root so a `test-utils` build (the integration suite)
+// can drive a latched handle through the same backend the unit tests use. Behind
+// the feature, so it never reaches the published public API.
+pub use store::Store;
+#[cfg(any(test, feature = "test-utils"))]
+pub use store::test_backend::BreakableBackend;
 
 // The table definitions and key constants every child reaches for.
 mod schema;
@@ -104,11 +112,3 @@ pub use sessions::{
     mark_session_deleted, purge_tombstoned_sessions, read_all_sessions, read_session, read_turns,
     update_session_flags, write_session, write_turn,
 };
-
-fn db_err(msg: String) -> io::Error {
-    // Every storage failure in this module is converted here, so this is the one
-    // place that can notice a `redb` handle latching itself unusable (see
-    // `poison`). Cheap when it has not: the probe is a flag read plus one atomic.
-    poison::observe(&msg);
-    io::Error::other(msg)
-}

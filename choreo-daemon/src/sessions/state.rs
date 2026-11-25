@@ -10,7 +10,7 @@ use super::{
     Arc, AssistantToolCallRecord, BTreeMap, ClientId, DaemonCommand, DaemonMessageType,
     DisplayedImageRecord, HashMap, HashSet, ImageReference, InferenceProvider, LoadedSkill,
     ProjectToolSet, ReasoningArtifact, ReasoningProducer, RequestContext, ResolvedAccount,
-    SessionCommand, SessionConfig, SessionEvent, SessionSnapshot, SkillMeta, SubscriberSink,
+    SessionCommand, SessionConfig, SessionEvent, SessionSnapshot, SkillMeta, Store, SubscriberSink,
     TimestampMs, TokenUsage, ToolOutput, ToolResultRecord, Turn, WarmPolicy, broadcast, debug, io,
     model_reasoning_capability, write_turn,
 };
@@ -529,12 +529,7 @@ impl SessionState {
     ///
     /// Returns Err if the turn does not exist, the session write fails
     /// after retries, or encoding/persisting any displayed image fails.
-    pub fn finalize_turn(
-        &self,
-        db: &redb::Database,
-        session_id: u64,
-        turn_id: u32,
-    ) -> io::Result<()> {
+    pub fn finalize_turn(&self, db: &Store, session_id: u64, turn_id: u32) -> io::Result<()> {
         if let Some(turn) = self.turns.get(&turn_id) {
             write_turn(db, session_id, turn_id, turn)
                 .map_err(|e| io::Error::other(format!("failed to persist turn {turn_id}: {e}")))?;

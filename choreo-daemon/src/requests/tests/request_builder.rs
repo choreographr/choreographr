@@ -301,7 +301,9 @@ fn record_tool_completion_persists_vision_image_at_emit_time() {
     // Keep the receiver alive so the mid-completion broadcast `send` succeeds.
     let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<SessionCommand>();
     let dir = tempfile::tempdir().unwrap();
-    let db = Arc::new(redb::Database::create(dir.path().join("test.redb")).unwrap());
+    let db = Arc::new(Store::from_db(
+        redb::Database::create(dir.path().join("test.redb")).unwrap(),
+    ));
     let ctx = RequestContext {
         cmd_tx,
         session_id: 1,

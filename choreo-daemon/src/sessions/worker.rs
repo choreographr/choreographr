@@ -3,7 +3,7 @@
 
 use super::{
     ChildResult, DaemonCommand, DaemonMessageType, InferenceProvider, RequestContext,
-    SessionCommand, SessionEvent, SessionRecord, SessionState, debug, error, info, io, mpsc,
+    SessionCommand, SessionEvent, SessionRecord, SessionState, Store, debug, error, info, io, mpsc,
     run_agent_loop, write_session,
 };
 
@@ -153,7 +153,7 @@ pub(super) enum RequestOutcome {
 
 pub(super) fn persist_and_exit(
     state: &SessionState,
-    db: &redb::Database,
+    db: &Store,
     session_id: u64,
     daemon_tx: &crossbeam_channel::Sender<DaemonCommand>,
 ) {

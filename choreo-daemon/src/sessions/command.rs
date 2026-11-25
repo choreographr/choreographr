@@ -8,7 +8,7 @@
 
 use super::{
     Arc, AtomicUsize, ClientId, DaemonCommand, DaemonMessageType, LagLimits, PathBuf, ReplyTarget,
-    ServiceCredential, SessionMcpOverlay, SessionSnapshot, SessionStatus, SessionSummary,
+    ServiceCredential, SessionMcpOverlay, SessionSnapshot, SessionStatus, SessionSummary, Store,
     SubscriberSink, TokenUsage, ToolRegistry, WarmPolicy, io, mpsc,
 };
 
@@ -295,7 +295,7 @@ pub struct RequestContext {
     /// The session ID scoping all operations.
     pub session_id: u64,
     /// Database handle for persisting state.
-    pub db: Arc<redb::Database>,
+    pub db: Arc<Store>,
     /// The daemon's live tool catalogue. Shared as the SAME
     /// `Arc<ArcSwap<…>>` across every session and request worker, so a
     /// list-changed rebuild on the command loop (the sole writer) is visible to
