@@ -103,8 +103,8 @@ impl DaemonState {
     /// # Errors
     ///
     /// Returns Err if the database cannot be opened or backed up, the
-    /// schema version cannot be read, compaction latched a permanent I/O
-    /// failure on the store, tombstone purge or session index load fails,
+    /// schema version cannot be read, the store cannot be re-opened after a
+    /// compaction that latched it, tombstone purge or session index load fails,
     /// accounts cannot be loaded, or tool registration under `tool_policy`
     /// fails.
     pub fn open(opts: OpenOptions) -> io::Result<Self> {
@@ -167,12 +167,23 @@ impl DaemonState {
         //   shared handle cannot give it. Startup is also the one moment the
         //   store provably has no live read or write transaction of ours.
         //
-        // The error propagates: `compact_at_startup` returns Err only when the
-        // handle latched a permanent I/O failure behind it, and such a store
-        // refuses every later read and write — failing startup is the point, so
-        // the next launch re-opens (and repairs) the file rather than this
-        // daemon running on while silently losing everything it is told.
-        db::compact_at_startup(&mut db, &opts.db_path)?;
+        // A pass that latches the handle is NOT fatal: `redb` latches for the
+        // life of the handle, but the file is intact, so the recovery is to
+        // drop the dead handle and re-open the same path. Dying here would let
+        // a transient disk-full condition make the store unstartable — the pass
+        // is the only writer running at this point, so on a full disk the pass
+        // is itself what fails — and every relaunch would pay it again.
+        if db::compact_at_startup(&mut db, &opts.db_path).latched() {
+            warn!(
+                path = %opts.db_path.display(),
+                "space reclamation latched the store handle; re-opening it and continuing \
+                 without reclaiming anything"
+            );
+            // `open_db_at` needs the file's whole-file exclusive lock, which the
+            // dead handle still holds, so it must go first.
+            drop(db);
+            db = db::open_db_at(&opts.db_path)?;
+        }
 
         // Share the handle for the daemon's lifetime: `redb::Database` is safe
         // for concurrent readers, so every connection thread and request worker

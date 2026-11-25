@@ -4,22 +4,29 @@
 //!
 //! This module is the facade. Each concern lives in a cohesive child module —
 //! `schema` (the table definitions and the key constants every child reaches
-//! for), `open` (resolving, opening, hardening and backing up the file),
-//! `migrate` (the schema version and the migration runner), `sessions` (session
-//! records, turns and deletion tombstones), `attachments` (the raw image byte
-//! store), `codec` (the zstd turn-value codec), `credentials` (credential blobs
-//! and the keystore binding), `catalog` (the catalog-refresh state), `kv` (the
-//! per-session key-value store), `compact` (startup space reclamation), and
-//! `store` (the [`Store`] handle every child takes, which owns the `redb`
-//! database and the latch escalation that rides it) — and their public items
-//! are re-exported here so `db::…` call sites are unchanged.
+//! for), `paths` (where the file lives), `perm` (the owner-only access-control
+//! policy), `backup` (pre-migration snapshots), `open` (opening, creating and
+//! stamping the file), `migrate` (the schema version, the migration runner, and
+//! the backup decision that mirrors it), `sessions` (session records, turns and
+//! deletion tombstones), `attachments` (the raw image byte store), `codec` (the
+//! zstd turn-value codec), `credentials` (credential blobs and the keystore
+//! binding), `catalog` (the catalog-refresh state), `kv` (the per-session
+//! key-value store), `compact` (startup space reclamation), and `store` (the
+//! [`Store`] handle every child takes, which owns the `redb` database and the
+//! latch escalation that rides it) — and their public items are re-exported here
+//! so `db::…` call sites are unchanged.
 //!
 //! Every child takes a [`Store`] rather than a bare `redb::Database`, and builds
-//! its errors with `Store::err`. That is the module's single error conversion,
-//! and the one place able to notice a `redb` handle that latched a permanent I/O
-//! failure — see `store`. A failure that is *not* storage, e.g. a corrupt row the
-//! codec cannot decode, is built with `io::Error::other` instead: a data error
-//! says nothing about the handle.
+//! its storage errors with `Store::err`. That is the module's single error
+//! conversion, and the one place able to notice a `redb` handle that latched a
+//! permanent failure — see `store`. Two rules follow from it:
+//!
+//! - A failure that is *not* storage — a corrupt row the codec cannot decode, a
+//!   record that will not serialize — is built with `io::Error::other` instead,
+//!   because a data error says nothing about the handle.
+//! - A failure raised *inside* an iteration is still a storage failure. The
+//!   range-scan helpers therefore propagate it (`?`), never skip it: a latch
+//!   first shows up on a page read, and a skipped error would hide it.
 //!
 //! All I/O is synchronous `redb` transactions on the calling thread; `redb`'s
 //! `Database` is safe for concurrent readers, so one shared handle is threaded
@@ -31,12 +38,14 @@
 //! Range queries go through `redb`'s `KeyRange` abstraction, whose key type is
 //! fixed by the `TableDefinition` the table was opened with: the call is
 //! `table.range(start..end)`, with **no** key-type turbofish (a turbofish does
-//! not compile). Every key and value type here is a `redb` built-in whose
-//! encoding is unchanged from `redb` 4, so an existing `state.redb` opens as-is
-//! — no `Legacy` wrapper and no migration entry — because the only encodings
-//! `redb` 5 changed are the `Option<&str>`/`Option<String>`/`Option<bool>`/
-//! `Option<char>` ones, and this schema stores every record as opaque bytes
-//! (`&[u8]` / `Vec<u8>`) rather than as a `redb`-encoded `Option`.
+//! not compile). A whole-range delete is `table.retain_in(start..end, |_, _|
+//! false)`: one pass, no key list, and the failure comes back. Every key and
+//! value type here is a `redb` built-in whose encoding is unchanged from
+//! `redb` 4, so an existing `state.redb` opens as-is — no `Legacy` wrapper and no
+//! migration entry — because the only encodings `redb` 5 changed are the
+//! `Option<&str>`/`Option<String>`/`Option<bool>`/`Option<char>` ones, and this
+//! schema stores every record as opaque bytes (`&[u8]` / `Vec<u8>`) rather than
+//! as a `redb`-encoded `Option`.
 //!
 //! The store holds plaintext transcripts and tool output, so its filesystem
 //! permissions are part of the access control: [`open_db_at`] keeps the data
@@ -51,6 +60,11 @@
 // read/write/delete.
 mod attachments;
 pub use attachments::{read_attachment, write_attachment};
+
+// The pre-migration snapshots: the `bak-v{from}` naming and the owner-only copy
+// that is the rollback point for a failed migration.
+mod backup;
+pub use backup::backup_database;
 
 // The runtime catalog-refresh state: the fetch-attempt timestamp and the etag.
 mod catalog;
@@ -67,6 +81,7 @@ mod codec;
 // store is shared, plus the test-only seam the integration suite drives it
 // through (see the module docs for why there is no gate).
 mod compact;
+pub use compact::StartupCompaction;
 pub(crate) use compact::compact_at_startup;
 #[cfg(any(test, feature = "test-utils"))]
 pub use compact::compact_at_startup_for_test;
@@ -85,14 +100,21 @@ pub use kv::{kv_count, kv_delete, kv_delete_range, kv_get, kv_get_range, kv_list
 
 // The schema version, the migration chain, and the runner that applies it.
 mod migrate;
+pub(crate) use migrate::migration_backup_version;
 pub use migrate::{
     INITIAL_SCHEMA_VERSION, SCHEMA_VERSION, run_migrations, run_migrations_at, schema_version,
 };
 
-// Opening, hardening and backing up the database file.
+// Opening, creating and stamping the database file.
 mod open;
-pub(crate) use open::migration_backup_version;
-pub use open::{backup_database, db_path, open_db, open_db_at};
+pub use open::{open_db, open_db_at};
+
+// Where the database file lives.
+mod paths;
+pub use paths::db_path;
+
+// The owner-only policy for the data directory and the files in it.
+mod perm;
 
 // The durable handle: the `redb` database plus the escalation state of the
 // handle it owns. It rides `Store::err` rather than each call site, so every
@@ -108,7 +130,9 @@ pub use store::test_backend::BreakableBackend;
 // The table definitions and key constants every child reaches for.
 mod schema;
 
-// The session-record and turn CRUD, including the deletion tombstones.
+// The session-record, turn and tombstone CRUD: this module owns the record and
+// its flags plus the session-level delete, `turns` the turn rows and their
+// attachments, `tombstones` the deleted-session markers.
 mod sessions;
 pub use sessions::{
     SessionRecord, clear_session_tombstone, delete_session, delete_session_turns,

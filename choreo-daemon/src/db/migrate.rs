@@ -14,8 +14,9 @@ use redb::ReadableDatabase;
 use redb::ReadableTable;
 use tracing::{debug, error, info, warn};
 
+use super::backup::backup_db_file;
 use super::codec::{ZSTD_FRAME_MAGIC, zstd_encode};
-use super::open::{backup_db_file, db_path};
+use super::paths::db_path;
 use super::schema::{META, SCHEMA_VERSION_KEY, SESSION_TURNS};
 use super::store::Store;
 
@@ -78,9 +79,17 @@ pub(super) const MIGRATIONS: &[Migration] = &[Migration {
     run: migrate_turn_values_to_zstd,
 }];
 
-/// Read the persisted schema version, or `0` for an unversioned database
-/// (no `meta` table yet, or the `schema_version` key absent).
-pub(super) fn current_schema_version(db: &Store) -> io::Result<u64> {
+/// Read the persisted schema version of an open database, or `0` for an
+/// unversioned one (no `meta` table yet, or the `schema_version` key absent).
+///
+/// Public so callers outside this module (the startup sequence's
+/// open → version → drop → backup → reopen path) can read the version without
+/// depending on the internal table layout.
+///
+/// # Errors
+///
+/// Returns Err if the read transaction or the `meta` table read fails.
+pub fn schema_version(db: &Store) -> io::Result<u64> {
     let read_txn = db
         .begin_read()
         .map_err(|e| db.err(format!("redb read txn: {e}")))?;
@@ -95,19 +104,6 @@ pub(super) fn current_schema_version(db: &Store) -> io::Result<u64> {
         .get(SCHEMA_VERSION_KEY)
         .map_err(|e| db.err(format!("redb get meta: {e}")))?
         .map_or(0, |guard| guard.value()))
-}
-
-/// Read the current schema version of an open database: the value stamped in
-/// `meta`, or `0` for an unversioned database. Public wrapper over the private
-/// `current_schema_version` so callers outside this module (the CLI's
-/// open→version→drop→backup→reopen startup sequence) can read the version
-/// without depending on the internal table layout.
-///
-/// # Errors
-///
-/// Returns Err if the read transaction or the `meta` table read fails.
-pub fn schema_version(db: &Store) -> io::Result<u64> {
-    current_schema_version(db)
 }
 
 /// Persist `version` under `SCHEMA_VERSION_KEY` in [`META`]. Opening the
@@ -157,6 +153,45 @@ pub fn run_migrations_at(db: &Store, path: &std::path::Path) -> io::Result<()> {
     run_migrations_to(db, SCHEMA_VERSION, MIGRATIONS, path)
 }
 
+/// Decide whether the pending migration would create a pre-migration backup,
+/// and if so return the schema version the backup must be named after (the
+/// source version). Returns `Ok(Some(version))` in EXACTLY the situations where
+/// [`run_migrations_to`] reaches [`backup_db_file`] for the production chain
+/// ([`MIGRATIONS`], target [`SCHEMA_VERSION`]), and `Ok(None)` otherwise:
+///
+/// - version 0: the 0 → 1 (or 0 → stamp) path is pure initialization — no
+///   migration writes, no backup;
+/// - version == [`SCHEMA_VERSION`]: the idempotent fast path, nothing runs;
+/// - version > [`SCHEMA_VERSION`]: the runner refuses the database BEFORE any
+///   write, so no backup is taken;
+/// - the migration chain is empty or not contiguous over `1..SCHEMA_VERSION`:
+///   the runner hard-errors before the backup in that case.
+///
+/// This is the single source of truth shared by the startup sequence's pre-lock
+/// backup decision and (via the skip-if-exists check in [`backup_db_file`]) the
+/// runner's own backup step, so the two can never disagree about whether a
+/// backup exists before the migration runs. It lives beside the runner it
+/// mirrors rather than beside the copy it decides about, so the decision reads
+/// the chain and the version constants without making the backup module depend
+/// on the migration machinery.
+pub(crate) fn migration_backup_version(db: &Store) -> io::Result<Option<u64>> {
+    let current = schema_version(db)?;
+    debug!(current, "checking whether a pre-migration backup is needed");
+    if current == 0 || current >= SCHEMA_VERSION || MIGRATIONS.is_empty() {
+        return Ok(None);
+    }
+    // Mirror run_migrations_to's chain validation: a broken/empty chain makes
+    // the runner error out BEFORE the backup, so no pre-copy must happen
+    // either (the gates above already cover the empty case; this covers
+    // non-contiguity).
+    let expected: Vec<u64> = (1..SCHEMA_VERSION).collect();
+    let provided: Vec<u64> = MIGRATIONS.iter().map(|m| m.from).collect();
+    if provided != expected {
+        return Ok(None);
+    }
+    Ok(Some(current))
+}
+
 /// The full migration runner, parameterized by the target version and the
 /// migration chain so the future (non-empty-chain) behavior is unit-testable
 /// today. Production entry point: [`run_migrations`].
@@ -192,7 +227,7 @@ pub(super) fn run_migrations_to(
     migrations: &[Migration],
     db_path: &std::path::Path,
 ) -> io::Result<()> {
-    let current = current_schema_version(db)?;
+    let current = schema_version(db)?;
     if current > target {
         error!(
             current,
@@ -554,7 +589,7 @@ mod tests {
             "the 1→2 migration must back up the source-version file"
         );
         assert_eq!(
-            current_schema_version(&db).unwrap(),
+            schema_version(&db).unwrap(),
             SCHEMA_VERSION,
             "the migration must reach the current schema version"
         );
@@ -601,7 +636,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(current_schema_version(&db).unwrap(), 2);
+        assert_eq!(schema_version(&db).unwrap(), 2);
         {
             let read_txn = db.begin_read().unwrap();
             let table = read_txn.open_table(META).unwrap();
@@ -641,7 +676,7 @@ mod tests {
             "error must describe the chain mismatch: {msg}"
         );
         // Nothing was applied or stamped: still at v1, marker absent.
-        assert_eq!(current_schema_version(&db).unwrap(), 1);
+        assert_eq!(schema_version(&db).unwrap(), 1);
         {
             let read_txn = db.begin_read().unwrap();
             let table = read_txn.open_table(META).unwrap();
@@ -674,19 +709,53 @@ mod tests {
             b"pre-lock sentinel",
             "the pre-existing backup must not be overwritten by the runner"
         );
-        assert_eq!(current_schema_version(&db).unwrap(), SCHEMA_VERSION);
+        assert_eq!(schema_version(&db).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
     fn schema_version_accessor_returns_stamped_version() {
-        // The public accessor the CLI startup sequence relies on must report
-        // the stamped version of a fresh database (open_db stamps
+        // The public accessor the startup sequence relies on must report the
+        // stamped version of a fresh database (open_db stamps
         // INITIAL_SCHEMA_VERSION at creation; here a v1 stamp is applied
         // directly to keep the test independent of db_path()).
         let dir = tempfile::tempdir().unwrap();
         let db = Store::from_db(redb::Database::create(dir.path().join("test.redb")).unwrap());
         stamp_schema_version(&db, 1).unwrap();
         assert_eq!(schema_version(&db).unwrap(), 1);
+    }
+
+    #[test]
+    fn migration_backup_version_matches_run_migrations_to_backup_conditions() {
+        // The version-gating helper must return Some exactly when
+        // run_migrations_to would take a backup for the production chain:
+        // Some(1) for a pending real migration from v1; None for version 0
+        // (pure initialization stamp, no backup), for version ==
+        // SCHEMA_VERSION (fast path), and for a newer-than-supported version
+        // (the runner refuses before any write). Keeping both sides pinned to
+        // one helper is what prevents the startup sequence's pre-lock backup
+        // decision from drifting away from the runner's own backup step.
+        let dir = tempfile::tempdir().unwrap();
+
+        let make_db_at = |version: u64| {
+            let db = Store::from_db(
+                redb::Database::create(dir.path().join(format!("test-{version}.redb"))).unwrap(),
+            );
+            if version > 0 {
+                stamp_schema_version(&db, version).unwrap();
+            }
+            db
+        };
+
+        assert_eq!(migration_backup_version(&make_db_at(1)).unwrap(), Some(1));
+        assert_eq!(migration_backup_version(&make_db_at(0)).unwrap(), None);
+        assert_eq!(
+            migration_backup_version(&make_db_at(SCHEMA_VERSION)).unwrap(),
+            None
+        );
+        assert_eq!(
+            migration_backup_version(&make_db_at(SCHEMA_VERSION + 1)).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -718,7 +787,7 @@ mod tests {
             "error must name the pre-release refusal: {msg}"
         );
         // Nothing was written: still unversioned, marker absent.
-        assert_eq!(current_schema_version(&db).unwrap(), 0);
+        assert_eq!(schema_version(&db).unwrap(), 0);
         {
             let read_txn = db.begin_read().unwrap();
             // The meta table may not exist at all (nothing was ever written)

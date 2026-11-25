@@ -462,9 +462,7 @@ fatally), the file itself forced to `0600` on every open path and after every
 backup copy (a typical `redb` create honours the umask and lands `0644`). A
 shared ancestor is never narrowed, and any tightening failure other than a
 foreign-owned directory only warns — losing the daemon over a permission quirk
-is worse than a visible log line. A latched store handle escalates to a daemon
-shutdown exactly once, and the fence that makes it one-shot lives on the handle
-rather than in a process-global.
+is worse than a visible log line.
 
 The per-path decision (which directories are shared roots, the open/create/
 recreate call sites, the backup copies) is documented in-source

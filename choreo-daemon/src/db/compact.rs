@@ -49,34 +49,62 @@
 //! the pre-pass image or the compacted one visible — never a half-written store
 //! — and an interrupted pass is repaired when the store is next opened.
 //!
-//! The caller owns *when* the pass runs; see `crate::daemon::open`, which places
-//! it after the pre-migration backup and the migrations and before the store is
-//! shared (because `redb::Database::compact` takes `&mut self`).
+//! The caller owns *when* the pass runs; see [`crate::daemon::open`], which
+//! places it after the pre-migration backup and the migrations and before the
+//! store is shared (because `redb::Database::compact` takes `&mut self`).
+//!
+//! ## A failed pass is never fatal
+//!
+//! Reclamation is an optimisation, so nothing here stops the daemon. Two
+//! outcomes are possible and [`StartupCompaction`] names them: the store is
+//! usable, or the pass failed in a way that latched the handle and the caller
+//! must re-open. The second case is why the failure cannot simply be swallowed:
+//! `redb` latches the first failed file operation for the life of the handle, so
+//! every later read and write through that handle fails — but the FILE is
+//! intact, and a fresh handle over it works. Compaction is itself a write pass,
+//! so on a nearly-full disk it can CAUSE the out-of-space it fails on; refusing
+//! to start would then make a transient disk-full condition unstartable, and
+//! every relaunch would pay the same failed pass again.
 //!
 //! [`CompactionMode::Maximum`]: redb::CompactionMode::Maximum
 
-use std::io;
 use std::path::Path;
 
 use tracing::{error, info, warn};
 
 use super::store::Store;
 
+/// What one startup pass decided about the store it ran on.
+///
+/// The pass never fails the daemon, so it reports an outcome rather than an
+/// error: the caller acts on it, and the recovery that needs both the path and
+/// ownership of the handle (re-opening) stays at the call site that has them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupCompaction {
+    /// The pass ran, failed harmlessly, or had nothing to do. The store handed
+    /// in is usable and whatever was reclaimed stays reclaimed.
+    StoreUsable,
+    /// The pass failed AND latched the handle: every later operation on the
+    /// `Store` handed in fails with `PreviousIo`. The file itself is intact, so
+    /// the caller must drop that store and re-open the same path to continue
+    /// without reclamation.
+    HandleLatched,
+}
+
+impl StartupCompaction {
+    /// Whether the pass latched the handle handed in (so it must be re-opened).
+    #[must_use]
+    pub fn latched(self) -> bool {
+        matches!(self, Self::HandleLatched)
+    }
+}
+
 /// Reclaim a `redb` store's free space before it is shared with the daemon's
 /// threads.
 ///
-/// Runs unconditionally: see the module docs for why gating it is not worth it.
-///
-/// # Errors
-///
-/// Returns Err only when the compaction failed AND the handle latched a
-/// permanent I/O failure behind it. `redb` latches the first failed file
-/// operation for the life of the handle, so such a store refuses every later
-/// read and write: startup must fail rather than hand the daemon a store that
-/// cannot persist anything. Any other failure is logged and passed over,
-/// because reclamation is an optimisation and losing the daemon over one would
-/// be worse.
-pub(crate) fn compact_at_startup(store: &mut Store, path: &Path) -> io::Result<()> {
+/// Runs unconditionally: see the module docs for why gating it is not worth it,
+/// and for why a failure is reported rather than raised.
+pub(crate) fn compact_at_startup(store: &mut Store, path: &Path) -> StartupCompaction {
     // The lengths only fill the log line below, so an unreadable path — an
     // in-memory store, or a file moved out from under us — must never fail
     // startup: an unknown length logs as `None`.
@@ -91,7 +119,7 @@ pub(crate) fn compact_at_startup(store: &mut Store, path: &Path) -> io::Result<(
                 reclaimed = ?reclaimed(before, after),
                 "database compaction finished"
             );
-            Ok(())
+            StartupCompaction::StoreUsable
         }
         Err(e) => {
             // Built through `Store::err`, the `db` module's single storage-error
@@ -100,12 +128,13 @@ pub(crate) fn compact_at_startup(store: &mut Store, path: &Path) -> io::Result<(
             // in startup, so this only constructs the error.
             let err = store.err(format!("redb compact: {e}"));
             if store.is_latched() {
-                // Nothing this process does can be persisted through a latched
-                // handle, so running on would lose every session it was told
-                // about. Fail startup deliberately; the next launch re-opens the
-                // store, which also runs redb's crash repair.
-                error!(error = %err, "database compaction latched the store; failing startup");
-                return Err(err);
+                // Nothing more can be written through THIS handle, but the file
+                // is fine — the caller re-opens it and runs without the pass.
+                error!(
+                    error = %err,
+                    "database compaction latched the store handle; re-opening without reclaiming space"
+                );
+                return StartupCompaction::HandleLatched;
             }
             // Not a shape `compact()` documents for a store with no live
             // transaction or savepoint (we hold neither at startup), but
@@ -115,7 +144,7 @@ pub(crate) fn compact_at_startup(store: &mut Store, path: &Path) -> io::Result<(
                 error = %err,
                 "database compaction failed; continuing at the file's current size"
             );
-            Ok(())
+            StartupCompaction::StoreUsable
         }
     }
 }
@@ -128,13 +157,8 @@ pub(crate) fn compact_at_startup(store: &mut Store, path: &Path) -> io::Result<(
 /// Deliberately a wrapper rather than exposing `Store::db_mut` to the suite: the
 /// mutable-handle route is the smaller hole, but it moves the mode constant into
 /// the test and lets the test pass while production compacts differently.
-///
-/// # Errors
-///
-/// Exactly the errors [`compact_at_startup`] documents: Err only when the pass
-/// failed and latched the handle.
 #[cfg(any(test, feature = "test-utils"))]
-pub fn compact_at_startup_for_test(store: &mut Store, path: &Path) -> io::Result<()> {
+pub fn compact_at_startup_for_test(store: &mut Store, path: &Path) -> StartupCompaction {
     compact_at_startup(store, path)
 }
 
@@ -180,8 +204,11 @@ mod tests {
         kv_set(&store, 1, "a", b"one").expect("write row a");
         kv_set(&store, 1, "b", b"two").expect("write row b");
 
-        compact_at_startup(&mut store, Path::new("in-memory"))
-            .expect("a healthy store must compact cleanly, with an unknown file length");
+        assert_eq!(
+            compact_at_startup(&mut store, Path::new("in-memory")),
+            StartupCompaction::StoreUsable,
+            "a healthy store must compact cleanly, with an unknown file length"
+        );
 
         kv_set(&store, 1, "c", b"three").expect("the store must still accept writes");
         assert_eq!(
@@ -196,25 +223,54 @@ mod tests {
         );
     }
 
-    /// A pass whose failure latched the handle is fatal: `redb` latches for the
-    /// life of the handle, so a daemon that ran on could write nothing.
+    /// A pass whose failure latched the handle is REPORTED, not swallowed: the
+    /// store handed in is unusable and the caller must re-open it.
     #[test]
-    fn a_compaction_that_latches_the_handle_is_fatal() {
+    fn a_compaction_that_latches_the_handle_is_reported() {
         let (mut store, failing) = in_memory_store();
         // A successful write first, so the failure below cannot be a
         // creation artefact.
         kv_set(&store, 1, "a", b"one").expect("write a row");
         failing.store(true, Ordering::SeqCst);
 
-        let err = compact_at_startup(&mut store, Path::new("in-memory"))
-            .expect_err("a pass that latches the handle must fail startup");
         assert!(
-            err.to_string().contains("redb compact"),
-            "the error must name the stage: {err}"
+            compact_at_startup(&mut store, Path::new("in-memory")).latched(),
+            "a pass that latches the handle must be reported as such"
         );
         assert!(
             store.is_latched(),
             "the backend's write failure must latch the handle"
+        );
+    }
+
+    /// The recovery the outcome exists for: the file survives a latched pass, so
+    /// a FRESH handle over it works. Reclamation is an optimisation; a daemon
+    /// must not refuse to start over one — a pass on a full disk latches the
+    /// handle and would otherwise make the store unstartable until space was
+    /// freed.
+    #[test]
+    fn the_file_outlives_a_latched_pass_and_reopens_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.redb");
+        let mut store = crate::db::open_db_at(&path).expect("open a file-backed store");
+        kv_set(&store, 1, "a", b"one").expect("write a row");
+
+        // A healthy pass leaves the store usable.
+        assert_eq!(
+            compact_at_startup(&mut store, &path),
+            StartupCompaction::StoreUsable
+        );
+
+        // The store's file is still a usable store after the pass. (The latched
+        // case cannot be produced over a real file without a full disk; the
+        // in-memory test above covers the latch, and this covers the property
+        // the recovery depends on: re-opening the same path yields a working
+        // handle that sees the pre-pass rows.)
+        drop(store);
+        let reopened = crate::db::open_db_at(&path).expect("re-open the store after the pass");
+        assert_eq!(
+            kv_get(&reopened, 1, "a").expect("read back the pre-pass row"),
+            Some(b"one".to_vec())
         );
     }
 }

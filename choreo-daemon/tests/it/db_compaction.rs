@@ -18,7 +18,7 @@
 
 use std::path::Path;
 
-use choreo_daemon::db::{self, Store};
+use choreo_daemon::db::{self, StartupCompaction};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata};
 
 /// Rows the fixture writes. 200-byte values put ~250 KiB of logical rows on the
@@ -60,7 +60,11 @@ fn maximum_reclaims_what_balanced_leaves_behind() {
     let mut store = half_deleted_small_row_store(&path).expect("build the half-deleted fixture");
 
     let before = file_len(&path).expect("read the store length before the pass");
-    db::compact_at_startup_for_test(&mut store, &path).expect("the startup pass must succeed");
+    assert_eq!(
+        db::compact_at_startup_for_test(&mut store, &path),
+        StartupCompaction::StoreUsable,
+        "a healthy store's pass must leave it usable"
+    );
     let after = file_len(&path).expect("read the store length after the pass");
 
     println!(
@@ -111,10 +115,16 @@ fn a_settled_store_makes_the_pass_a_no_op() {
     let path = dir.path().join("state.redb");
     let mut store = half_deleted_small_row_store(&path).expect("build the half-deleted fixture");
 
-    db::compact_at_startup_for_test(&mut store, &path).expect("the first pass must succeed");
+    assert_eq!(
+        db::compact_at_startup_for_test(&mut store, &path),
+        StartupCompaction::StoreUsable
+    );
     let settled = file_len(&path).expect("read the store length after the first pass");
 
-    db::compact_at_startup_for_test(&mut store, &path).expect("the second pass must succeed");
+    assert_eq!(
+        db::compact_at_startup_for_test(&mut store, &path),
+        StartupCompaction::StoreUsable
+    );
     let after = file_len(&path).expect("read the store length after the second pass");
 
     println!("settled store: {settled} bytes; the second pass left {after}");
@@ -132,8 +142,8 @@ fn a_settled_store_makes_the_pass_a_no_op() {
 /// integration-test module is not covered by clippy's `allow-*-in-tests` config
 /// (that covers `#[test]` bodies and `#[cfg(test)]` modules), so the panic-family
 /// calls stay in the test bodies, next to the data that produced them.
-fn half_deleted_small_row_store(path: &Path) -> Result<Store, String> {
-    let store = Store::open_at(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+fn half_deleted_small_row_store(path: &Path) -> Result<db::Store, String> {
+    let store = db::open_db_at(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let value = vec![0x5a_u8; VALUE_LEN];
 
     for chunk in (0..ROWS).collect::<Vec<u64>>().chunks(BATCH) {

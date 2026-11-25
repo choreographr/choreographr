@@ -92,19 +92,15 @@ pub(super) fn delete_session_attachments(
     let mut att_table = write_txn
         .open_table(SESSION_ATTACHMENTS)
         .map_err(|e| db.err(format!("redb open session_attachments: {e}")))?;
-    let att_keys: Vec<(u64, u32, String)> = att_table
-        .range(
+    // One `retain_in` pass over the session's own key range: no key list is
+    // buffered, and a per-row failure (where a latched handle surfaces) is
+    // returned rather than skipped.
+    att_table
+        .retain_in(
             (session_id, 0u32, String::new())..(session_range_end(session_id), 0u32, String::new()),
+            |_, _| false,
         )
-        .map_err(|e| db.err(format!("redb range session_attachments: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .map(|(k, _)| k.value())
-        .collect();
-    for key in att_keys {
-        att_table
-            .remove(key)
-            .map_err(|e| db.err(format!("redb remove session_attachment: {e}")))?;
-    }
+        .map_err(|e| db.err(format!("redb remove session_attachments: {e}")))?;
     Ok(())
 }
 
@@ -129,20 +125,13 @@ fn delete_turn_attachments(
     // `saturating_add` mirrors `session_range_end`: at the theoretical
     // `turn_id == u32::MAX` the bound equals the start, so the range is empty
     // (removes nothing) instead of overflowing in debug / wrapping in release.
-    let att_keys: Vec<(u64, u32, String)> = att_table
-        .range(
+    att_table
+        .retain_in(
             (session_id, turn_id, String::new())
                 ..(session_id, turn_id.saturating_add(1), String::new()),
+            |_, _| false,
         )
-        .map_err(|e| db.err(format!("redb range session_attachments: {e}")))?
-        .filter_map(std::result::Result::ok)
-        .map(|(k, _)| k.value())
-        .collect();
-    for key in att_keys {
-        att_table
-            .remove(key)
-            .map_err(|e| db.err(format!("redb remove session_attachment: {e}")))?;
-    }
+        .map_err(|e| db.err(format!("redb remove turn_attachments: {e}")))?;
     Ok(())
 }
 

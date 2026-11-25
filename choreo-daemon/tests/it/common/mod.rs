@@ -41,11 +41,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 /// A throwaway store for tests that need one directly. Built through the real
-/// open path (`Store::open_at`), so a test fixture is the same file the daemon
+/// open path (`db::open_db_at`), so a test fixture is the same file the daemon
 /// would produce — created, hardened, and schema-stamped.
 pub fn test_db() -> Store {
     let dir = tempfile::tempdir().unwrap();
-    Store::open_at(&dir.path().join("state.redb")).unwrap()
+    choreo_daemon::db::open_db_at(&dir.path().join("state.redb")).unwrap()
 }
 
 /// Build a minimal [`DaemonState`] suitable for running the real server
@@ -103,7 +103,9 @@ pub fn test_daemon_state_with_limits(limits: LagLimits) -> DaemonState {
     let (daemon_tx, _daemon_rx) = crossbeam_channel::unbounded();
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = Arc::new(Store::open_at(&dir.path().join("state.redb")).expect("test database"));
+    let db = Arc::new(
+        choreo_daemon::db::open_db_at(&dir.path().join("state.redb")).expect("test database"),
+    );
     let tool_registry = choreo_daemon::tools::ToolRegistry::new()
         .build()
         .into_shared();

@@ -7,7 +7,8 @@
 //! operation on that `Database` then fails with `StorageError::PreviousIo`,
 //! whose own message is "Please close and re-open the database". One `ENOSPC`
 //! on a full disk, or the `EROFS` a Linux filesystem returns after remounting
-//! itself read-only in response to an error, is enough to reach it.
+//! itself read-only in response to an error, is enough to reach it, and so is a
+//! panic that unwinds while a page of the write buffer is in use.
 //!
 //! The daemon holds one handle for its whole life and clones it into every
 //! session thread and the catalog worker, so it cannot re-open in place. The
@@ -38,7 +39,6 @@
 
 use std::io;
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -75,22 +75,6 @@ struct Escalation {
 }
 
 impl Store {
-    /// Open (or create) the store at `path`.
-    ///
-    /// [`open_db_at`](super::open_db_at) owns the create/stamp/harden sequence
-    /// and hands back a [`Store`]; this is the name a caller that already speaks
-    /// in stores looks for, and it adds nothing else — the file-level policy
-    /// keeps exactly one home.
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors [`open_db_at`](super::open_db_at) documents: the file
-    /// cannot be created or opened (corruption, permissions, lock contention), a
-    /// foreign-owned parent directory, or a failed initial schema stamp.
-    pub fn open_at(path: &Path) -> io::Result<Self> {
-        super::open_db_at(path)
-    }
-
     /// Build a store over an injectable storage backend.
     ///
     /// The only way to swap the filesystem out, which is how a latched handle is
@@ -136,7 +120,9 @@ impl Store {
     }
 
     /// Install the escalation route: called once by the daemon assembly, with a
-    /// notifier that asks the command loop to shut down.
+    /// notifier that fires the daemon's single shutdown trigger (which sets the
+    /// shared flag, wakes the blocking accept, and lets the normal drain
+    /// announce the stop, stop the sessions and unlink the socket).
     ///
     /// Takes `&self` because the store is shared through an `Arc` by the time the
     /// route exists. A second call is a programming error and is ignored with a
@@ -153,7 +139,7 @@ impl Store {
         }
     }
 
-    /// Whether this handle has latched a permanent I/O failure.
+    /// Whether this handle has latched an unrecoverable failure.
     ///
     /// `try_begin_write` rather than `begin_write`, for two reasons: it reports
     /// the latch before it contends for the write slot, so the answer is exact
@@ -162,7 +148,8 @@ impl Store {
     ///
     /// `PreviousIo` is unambiguous. A healthy handle yields `Ok` (dropped
     /// immediately, aborting an empty transaction) or `WouldBlock` while another
-    /// writer is live, and neither matches.
+    /// writer is live, and a handle that was closed yields `DatabaseClosed`;
+    /// none of those is a latch, so none matches.
     pub(crate) fn is_latched(&self) -> bool {
         matches!(
             self.db().try_begin_write(),
@@ -193,12 +180,25 @@ impl Store {
         let Some(escalation) = self.escalation.get() else {
             return;
         };
+        // Read the fence BEFORE probing the handle. Once this handle has
+        // escalated, every later failure re-observes the same latch, and
+        // probing each one would take the write slot and attempt the file lock
+        // on every failed write of every session — a storm of precisely the
+        // work the fence exists to avoid.
+        if escalation.escalated.load(Ordering::Acquire) {
+            debug!(
+                context,
+                "storage failure on an already-escalated handle; not escalating again"
+            );
+            return;
+        }
         if !self.is_latched() {
             return;
         }
         // The fence is claimed BEFORE the notifier runs, so a session writing in
         // a loop cannot emit one shutdown broadcast per write and bury the
-        // clients it means to inform.
+        // clients it means to inform. Two threads that both passed the check
+        // above race here, and exactly one wins.
         if escalation.escalated.swap(true, Ordering::AcqRel) {
             debug!(
                 context,
@@ -208,8 +208,9 @@ impl Store {
         }
         error!(
             context,
-            "the database handle latched a permanent I/O failure; every later read and write will \
-             fail. Shutting down — restart to repair and re-open the store"
+            "the database handle latched an unrecoverable failure (a failed file operation or an \
+             aborted page write); every later read and write will fail. Shutting down — restart to \
+             repair and re-open the store"
         );
         (escalation.notify)();
     }
