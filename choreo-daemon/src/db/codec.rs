@@ -5,7 +5,7 @@
 //! by `structured-zstd` (pure Rust, no libzstd C build); numeric compression
 //! levels map onto C zstd numbering, so [`COMPRESSION_LEVEL`] keeps the tuning
 //! that was benchmarked against the C library. Kept as its own module so the
-//! storage plumbing in `super` (schema, tables, migrations) does not carry the
+//! storage plumbing beside it (`schema`, `open`, `migrate`) does not carry the
 //! codec details, its fixtures, or its tests.
 
 use std::io;
