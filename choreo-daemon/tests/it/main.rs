@@ -54,6 +54,7 @@ mod sh_tool_integration;
 mod shell_streaming_integration;
 mod socket_permissions;
 mod spawn_subsession_integration;
+mod store_latch;
 mod stream_integrity;
 mod vm_integration;
 mod warm;

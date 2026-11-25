@@ -440,20 +440,43 @@ pub fn run_server(
     info!(%socket_path, "choreographr listening");
 
     // Transport-independent assembly (command channel, ACL install +
-    // watcher, config watchers, catalog-maintenance thread, shutdown flag,
-    // connection counter, command-loop thread). The shipped binary always
-    // passes the ACL and enables the config watchers; the Option/flag exist
-    // for the future embedded daemon (see CoreOptions). Behavior is identical
-    // to the pre-split inline assembly — the moved code is verbatim.
+    // watcher, config watchers, catalog-maintenance thread, connection
+    // counter, command-loop thread). The shipped binary always passes the ACL
+    // and enables the config watchers; the Option/flag exist for the future
+    // embedded daemon (see CoreOptions). Behavior is identical to the pre-split
+    // inline assembly — the moved code is verbatim.
+    //
+    // The daemon's single shutdown trigger is created HERE, not in the core:
+    // every stop request — SIGINT, a latched store handle, auto-exit — must set
+    // the flag this adapter's accept loops poll AND wake the `accept()` they sit
+    // in, and only this adapter knows the socket to dial. One trigger, three
+    // callers, one drain.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let request_shutdown = {
+        let shutdown = Arc::clone(&shutdown);
+        let socket_path = socket_path.to_string();
+        Arc::new(move || {
+            shutdown.store(true, Ordering::SeqCst);
+            // Wake the blocking accept() the same way the signal threads do;
+            // the stream only has to land in the accept backlog, so it is
+            // dropped immediately.
+            let _ = choreo_proto::connect_unix(&socket_path);
+        }) as Arc<dyn Fn() + Send + Sync>
+    };
+
     let core = start_daemon_core(
         state,
         &CoreOptions {
             acl: Some(Arc::clone(acl)),
             config_watchers: true,
-            // Auto-exit only makes sense for a socket-listening daemon: the
-            // decision arm wakes THIS socket's accept loop. The embedded
-            // daemon passes `None` (no socket, no auto-exit).
-            auto_exit_wake_path: auto_exit.then(|| socket_path.to_string()),
+            // Auto-exit only makes sense for a socket-listening daemon: its arm
+            // fires THIS daemon's trigger, which wakes this socket's accept
+            // loop. The embedded daemon passes `false` (no socket to wake).
+            auto_exit,
+            // Handed to the core and taken back below, so the trigger above and
+            // the accept loops here share exactly one flag.
+            shutdown,
+            request_shutdown: Some(request_shutdown),
         },
     );
     // Local clone of the core's command sender: the accept paths below clone
@@ -462,7 +485,9 @@ pub fn run_server(
     let daemon_tx = core.daemon_tx.clone();
     // Local clones of the core's shared state for the adapter code below,
     // keeping the moved bodies verbatim (`shutdown`/`global_lag`/`conn_count`
-    // names as before the split).
+    // names as before the split). `shutdown` is the SAME flag created above and
+    // handed to the core — the trigger captured it, so a store latch or
+    // auto-exit reaches these accept loops exactly as a signal does.
     let shutdown = Arc::clone(&core.shutdown);
     let global_lag = Arc::clone(&core.global_lag);
     let conn_count = Arc::clone(&core.conn_count);

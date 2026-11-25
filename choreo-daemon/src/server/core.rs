@@ -2,12 +2,19 @@
 //!
 //! Step 2 of the embedded-daemon refactor: everything `run_server` used to do
 //! that does NOT touch a transport listener (command channel wiring, ACL
-//! install, config watchers, catalog maintenance, the shutdown flag, the
-//! command-loop thread) now lives here and returns a [`DaemonCore`] bundle.
-//! The transport adapters (Unix accept loop, TCP accept thread, signal
-//! threads, metrics server, shutdown drain) remain in `lifecycle.rs` as
-//! functions over `&DaemonCore` fields, so the shipped binary's behavior is
-//! byte-for-byte what it was before the split.
+//! install, config watchers, catalog maintenance, the command-loop thread) now
+//! lives here and returns a [`DaemonCore`] bundle. The transport adapters (Unix
+//! accept loop, TCP accept thread, signal threads, metrics server, shutdown
+//! drain) remain in `lifecycle.rs` as functions over `&DaemonCore` fields, so
+//! the shipped binary's behavior is byte-for-byte what it was before the split.
+//!
+//! The shutdown flag and the trigger that sets it are adapter-owned
+//! ([`CoreOptions::shutdown`] and [`CoreOptions::request_shutdown`]): only the
+//! adapter knows how to wake its own blocking `accept()`, and every stop
+//! request — a signal, a latched store handle, auto-exit — has to reach the
+//! accept loop, not just the command loop. The core takes the flag and the
+//! trigger as inputs and calls the trigger; it assembles no stop sequence of
+//! its own.
 
 use crate::daemon::{DaemonCommand, DaemonState};
 use crate::db::Store;
@@ -36,13 +43,27 @@ pub(crate) struct CoreOptions {
     /// managed externally (or none at all), so the flag lets the adapter
     /// decide; the shipped binary passes `true`.
     pub config_watchers: bool,
-    /// Auto-exit wake socket (`--auto-exit`): when `Some(path)`, the command
-    /// loop, upon receiving [`DaemonCommand::LastClientDisconnected`] with a
-    /// zero live-connection count, sets the shutdown flag and connects to
-    /// `path` to unblock the accept loop — the exact SIGINT shutdown path.
-    /// `None` when auto-exit is off, and for the embedded daemon (no socket
-    /// to wake; auto-exit is a CLI-daemon feature only).
-    pub auto_exit_wake_path: Option<String>,
+    /// Whether the auto-exit decision is armed: on
+    /// [`DaemonCommand::LastClientDisconnected`] with a zero live-connection
+    /// count, the command loop asks for a shutdown through
+    /// [`Self::request_shutdown`] — the exact SIGINT shutdown path. The
+    /// CLI/TUI daemon passes `true` (its connection threads report
+    /// disconnects and its accept loop can be woken); the embedded daemon
+    /// passes `false`, because it has no accept loop to wake.
+    pub auto_exit: bool,
+    /// The flag the adapter's accept loops poll, and the one
+    /// [`Self::request_shutdown`] sets. Created by the adapter so the trigger
+    /// can capture it: one `Arc` shared by the trigger, the core, and the
+    /// accept loops is what makes a stop request reach the blocking
+    /// `accept()` at all.
+    pub shutdown: Arc<AtomicBool>,
+    /// The daemon's single shutdown trigger: set the flag and wake the
+    /// blocking accept. Every stop request routes through it — a signal, a
+    /// latched store handle, auto-exit — so all of them run the same drain.
+    /// `Some` for the socket daemons; `None` for the embedded daemon, which
+    /// has no accept loop and whose core therefore stops its own command
+    /// loop.
+    pub request_shutdown: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Transport-independent daemon core assembled by [`start_daemon_core`]: the
@@ -56,7 +77,10 @@ pub(crate) struct DaemonCore {
     /// Cooperative cancellation flag (thread-comm exception #1): every
     /// transport adapter — signal threads, accept loops, TCP accept thread,
     /// metrics server — polls this single-bit flag as a best-effort stop hint;
-    /// all actual control flow still travels over channels/sockets.
+    /// all actual control flow still travels over channels/sockets. Created by
+    /// the adapter and handed in through [`CoreOptions::shutdown`], so the
+    /// daemon's shutdown trigger ([`CoreOptions::request_shutdown`]) captures
+    /// the very flag the accept loops poll.
     pub shutdown: Arc<AtomicBool>,
     /// Daemon-wide delivery-lag byte counter (exception #6). Cloned from
     /// [`DaemonState::global_lag`] so the accept paths hand the SAME counter
@@ -257,26 +281,45 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
     #[cfg(feature = "mcp")]
     crate::mcp::oauth::install(daemon_tx.clone());
 
+    // The daemon's single shutdown trigger (see `CoreOptions::request_shutdown`),
+    // cloned once: the store escalation below and the command loop's auto-exit
+    // arm both fire it.
+    let request_shutdown = opts.request_shutdown.clone();
+
     // Route a store handle that latches a permanent I/O failure to a shutdown.
     // `redb` rejects every later operation on a latched handle and only a
     // close-and-reopen clears it, but every session thread holds a clone of this
-    // one, so it cannot be re-opened in place. Announcing and stopping is the
-    // honest response: nothing can be persisted any more, and the next launch
-    // re-opens (and repairs) the store. Same sequence as the SIGINT drain — the
-    // broadcast first so each client observes `ShuttingDown` rather than a bare
-    // EOF, then the stop — and the store's own one-shot fence (see
-    // `db::store`) guarantees it fires at most once however many sessions trip
-    // over the latched handle.
+    // one, so it cannot be re-opened in place. Once the handle is latched the
+    // honest response is to stop — nothing can be persisted any more, and the
+    // next launch re-opens (and repairs) the store.
     //
-    // This sends the shutdown pair directly for now. A later change routes it
-    // through the daemon's single shutdown trigger, so every stop request —
-    // signal, latched store, protocol command — takes one path into the
-    // command loop rather than each assembling its own sequence here.
+    // The stop has to go through the shutdown TRIGGER, not straight into the
+    // command loop. Stopping the command loop alone leaves the accept loop
+    // waiting for a flag nobody set: the process keeps running with the socket
+    // bound and redb's exclusive file lock held, serving a store that cannot be
+    // written. That is also what makes the latch unrecoverable — the next launch
+    // finds a live listener at the socket path, `remove_stale_socket` refuses to
+    // start over it, and the store stays unreachable. The trigger instead runs
+    // the very drain SIGINT runs: set the flag, wake the blocking `accept()`, and
+    // let the adapter broadcast `ShuttingDown` (so each client sees the
+    // notification rather than a bare EOF), stop the sessions, and unlink the
+    // socket. The store's own one-shot fence (see `db::store`) guarantees this
+    // fires at most once however many sessions trip over the latched handle.
     state.db.set_escalation({
+        let request_shutdown = request_shutdown.clone();
+        // The embedded fallback: with no accept loop to wake, the command loop
+        // is the thing that must stop.
         let daemon_tx = daemon_tx.clone();
         move || {
-            let _ = daemon_tx.send(DaemonCommand::BroadcastShuttingDown);
-            let _ = daemon_tx.send(DaemonCommand::Shutdown);
+            if let Some(request) = &request_shutdown {
+                request();
+            } else {
+                // No accept loop to wake: stop the command loop from inside. The
+                // embedded host learns of the stop from the closed link;
+                // surfacing the reason to its UI is a follow-up.
+                let _ = daemon_tx.send(DaemonCommand::BroadcastShuttingDown);
+                let _ = daemon_tx.send(DaemonCommand::Shutdown);
+            }
         }
     });
 
@@ -437,7 +480,11 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
     let power_rx = power_monitor.events().clone();
     spawn_power_event_forwarder(daemon_tx.clone(), power_rx);
 
-    let shutdown = Arc::new(AtomicBool::new(false));
+    // The SAME flag the transport adapters poll: it is created by the adapter
+    // and handed in through `opts`, so the shutdown trigger — which captures its
+    // own clone — sets exactly the flag the accept loops check. A distinct flag
+    // here would never reach the drain.
+    let shutdown = Arc::clone(&opts.shutdown);
 
     // Clone the daemon-wide lag counter for the transport adapters BEFORE
     // `state` moves into the command-loop thread below: every connection's
@@ -462,14 +509,13 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
 
     // Auto-exit state for the command loop: the decision must be made on ONE
     // thread (the command loop — same thread that owns every other shutdown
-    // decision), so it needs its own clone of the connection counter, a clone
-    // of the shutdown flag to set, and the wake path. `opts` moves into the
-    // closure below, so extract these before the move.
-    let auto_exit_wake_path = opts.auto_exit_wake_path.clone();
+    // decision), so it needs its own clone of the connection counter and a clone
+    // of the shutdown trigger to fire. `opts` is a borrow and the closure below
+    // is `move` and `'static`, so every value it needs is extracted before the
+    // move.
+    let auto_exit = opts.auto_exit;
     let auto_exit_conn_count = Arc::clone(&conn_count);
-    // The SAME flag the accept loop polls — setting a distinct flag would
-    // never reach run_server's drain.
-    let auto_exit_shutdown = Arc::clone(&shutdown);
+    let auto_exit_request_shutdown = request_shutdown.clone();
 
     // Daemon command handler thread.
     let cmd_handle = thread::spawn(move || {
@@ -496,19 +542,21 @@ pub(crate) fn start_daemon_core(state: DaemonState, opts: &CoreOptions) -> Daemo
                     // accept path to take the decision mutex per connection,
                     // which the message-passing rules forbid for a bookkeeping
                     // counter; the tiny retry cost is the accepted trade-off.
-                    if let Some(wake_path) = &auto_exit_wake_path
+                    if auto_exit
                         && auto_exit_conn_count.load(std::sync::atomic::Ordering::Relaxed) == 0
                     {
                         info!("auto-exit: last client disconnected; beginning graceful shutdown");
-                        auto_exit_shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
-                        // Wake the blocking accept() with a self-connect so
-                        // run_server observes the flag and runs its normal
-                        // drain (BroadcastShuttingDown → Shutdown → unlink),
-                        // exactly as on SIGINT. The dial lives in choreo-proto
-                        // (the one cross-platform primitive); we only need it
-                        // to land in the accept backlog, so the stream is
-                        // dropped immediately.
-                        let _ = choreo_proto::connect_unix(wake_path);
+                        // Same trigger a latched store and the signal path use:
+                        // set the flag and wake the accept loop, which then runs
+                        // the normal drain (BroadcastShuttingDown → Shutdown →
+                        // session joins → socket unlink).
+                        if let Some(request) = &auto_exit_request_shutdown {
+                            request();
+                        } else {
+                            // Embedded: no accept loop exists to wake, so the
+                            // command loop is the thing that stops.
+                            break;
+                        }
                     }
                 }
                 Ok(DaemonCommand::Shutdown) => {

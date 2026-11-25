@@ -23,7 +23,7 @@ use crate::server::core::{CoreOptions, DaemonCore, start_daemon_core};
 use choreo_proto::{ClientMessage, DaemonMessage};
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::thread;
 use std::time::Instant;
 use tracing::{error, info, warn};
@@ -111,12 +111,14 @@ pub struct EmbeddedDaemon {
 /// watchers) and NOTHING transport-specific — no Unix socket, no TCP
 /// listener, no signal threads, no metrics server.
 ///
-/// `CoreOptions { acl: None, config_watchers: true }`: the embedder owns its
-/// ACL policy upstream (an app sandbox has no `authorized_clients.toml` to
-/// share), but the config watchers are ON because they degrade gracefully —
-/// accounts.toml / models-overlay auto-reload still work inside an app
-/// sandbox where the standard config dir resolves, and simply never fire
-/// where it does not.
+/// `CoreOptions { acl: None, config_watchers: true, auto_exit: false }`: the
+/// embedder owns its ACL policy upstream (an app sandbox has no
+/// `authorized_clients.toml` to share), but the config watchers are ON because
+/// they degrade gracefully — accounts.toml / models-overlay auto-reload still
+/// work inside an app sandbox where the standard config dir resolves, and
+/// simply never fire where it does not. There is no accept loop here, so there
+/// is nothing for a shutdown request to wake: the core stops its own command
+/// loop (see `CoreOptions::request_shutdown`).
 ///
 /// # Errors
 ///
@@ -129,9 +131,17 @@ pub fn spawn_embedded(state: DaemonState, _opts: EmbeddedOptions) -> io::Result<
         &CoreOptions {
             acl: None,
             config_watchers: true,
-            // The embedded daemon has no Unix socket and no accept loop to
-            // wake — auto-exit is a CLI-daemon feature only.
-            auto_exit_wake_path: None,
+            // Auto-exit is a CLI-daemon feature: its arm wakes a socket accept
+            // loop, and the embedded daemon has none.
+            auto_exit: false,
+            // Nothing polls this flag — there is no accept loop — but the core
+            // carries it as part of its shape, and the signal path has no
+            // meaning here either. The embedded teardown below stops the
+            // command loop directly.
+            shutdown: Arc::new(AtomicBool::new(false)),
+            // No accept loop to wake, so a latched store stops the command loop
+            // from inside the core instead of going through a trigger.
+            request_shutdown: None,
         },
     );
     let daemon_tx = core.daemon_tx.clone();
