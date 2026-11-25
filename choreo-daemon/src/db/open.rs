@@ -267,6 +267,26 @@ pub fn open_db() -> io::Result<Store> {
     open_db_at(&db_path()?)
 }
 
+/// Build the hard error for a store whose redb file format is newer than this
+/// binary can read.
+///
+/// Recreating the file would destroy the data, so the guidance names the real
+/// database path and what to do instead. The recoveries are not equally
+/// available: a newer binary always is, while a `.bak-v*` snapshot is written
+/// only before a real schema migration — so an install that has never migrated
+/// has none beside the file. The snapshot is therefore offered conditionally
+/// ("if one was taken"), which keeps the message from sending the reader after
+/// a file that cannot be there.
+fn upgrade_required_message(actual: u8, path: &std::path::Path) -> String {
+    format!(
+        "database file format version {actual} is newer than this binary supports; \
+         upgrade choreographr before continuing, or restore a .bak-v* snapshot from \
+         before that upgrade, if one was taken (kept beside {}); deleting the file \
+         loses every session",
+        path.display()
+    )
+}
+
 /// [`open_db`] parameterized by an explicit database file path, so non-CLI
 /// embedders (the GUI's embedded daemon, tests) can open state without the
 /// environment-variable override dance (`CHOREOGRAPHR_DB_PATH`). Same
@@ -328,18 +348,17 @@ pub fn open_db_at(path: &std::path::Path) -> io::Result<Store> {
             initialize_schema_version(&store)?;
             Ok(store)
         }
-        // redb file-format bump: the file is a valid redb database but in a
-        // newer file format than this binary can read — the file was written by
-        // a newer choreographr and this one is the downgrade. Hard error with
-        // recovery guidance that names only paths that actually exist:
-        // recreating would destroy the data, and the two real options are a
-        // newer binary or a pre-upgrade snapshot.
-        Err(redb::DatabaseError::UpgradeRequired(actual)) => Err(io::Error::other(format!(
-            "database file format version {actual} is newer than this binary supports; \
-             upgrade choreographr before continuing, or restore a .bak-v* snapshot from \
-             before that upgrade, kept beside {} (deleting the file loses every session)",
-            path.display()
-        ))),
+        // redb file-format bump: the file is a valid redb database in a newer
+        // format than this binary can read — a newer choreographr wrote it and
+        // this one is the downgrade. Recreating would destroy the data, so this
+        // is a hard error whose recoveries are a newer binary, or a pre-upgrade
+        // `.bak-v*` snapshot when one exists. A snapshot is written only before
+        // a real schema migration, so an install that has never migrated has
+        // none — hence the conditional wording, which must not send the reader
+        // after a file that cannot be there.
+        Err(redb::DatabaseError::UpgradeRequired(actual)) => {
+            Err(io::Error::other(upgrade_required_message(actual, path)))
+        }
         // Any other open failure (corruption, permissions, lock contention…)
         // is also a hard error: the old "trying to recreate" catch-all could
         // silently clobber a potentially-recoverable file.
@@ -395,6 +414,30 @@ mod tests {
 
         let file_mode = fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
         assert_eq!(file_mode, 0o600, "an existing 0644 file must be tightened");
+    }
+
+    #[test]
+    fn upgrade_required_message_offers_the_snapshot_only_conditionally() {
+        // A `.bak-v*` snapshot is written only when a real schema migration is
+        // about to run, so an install that has never migrated has none. The
+        // refusal shown when this binary cannot read the store at all must
+        // therefore offer the snapshot conditionally, while still naming the
+        // real database path and the cost of deleting it.
+        let msg = upgrade_required_message(7, std::path::Path::new("/data/state.redb"));
+        assert!(
+            msg.contains("version 7 is newer than this binary supports"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("upgrade choreographr before continuing"),
+            "{msg}"
+        );
+        assert!(msg.contains("if one was taken"), "{msg}");
+        assert!(msg.contains("/data/state.redb"), "{msg}");
+        assert!(
+            msg.contains("deleting the file loses every session"),
+            "{msg}"
+        );
     }
 
     #[test]
